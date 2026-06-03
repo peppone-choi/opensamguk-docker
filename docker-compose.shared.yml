@@ -1,0 +1,197 @@
+# 공유 스택 — 전 게임 서버 공통(로그인/로비/어드민/배포)
+# 프로젝트명: opensamguk-shared
+# 기동: docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env up -d
+#
+# 멀티서버 구조에서 "공유"되는 것:
+#   - 유저/인증 DB(gateway-postgres) — 계정은 서버에 종속되지 않음
+#   - 게이트웨이 API + 게이트웨이 웹(로비/어드민)
+#   - nginx(게이트웨이 진입점, /)
+#   - deployer 사이드카(서버별 버전 bounce 배포)
+#   - socket-proxy(deployer에만 제한된 docker API 노출)
+# 게임 월드(엔진/게임DB/게임API/게임웹)는 docker-compose.server.yml로 서버마다 따로 띄운다.
+name: opensamguk-shared
+
+services:
+  # 유저/인증 전용 DB. 게임 월드 DB(서버별 game-postgres)와 분리된 단일 공유 DB.
+  gateway-postgres:
+    image: postgres:16-alpine
+    container_name: opensamguk-gateway-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${GATEWAY_POSTGRES_DB:-sammo_gateway}
+      POSTGRES_USER: ${GATEWAY_POSTGRES_USER:-sammo}
+      POSTGRES_PASSWORD: ${GATEWAY_POSTGRES_PASSWORD:?GATEWAY_POSTGRES_PASSWORD required}
+    volumes:
+      - gateway-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${GATEWAY_POSTGRES_USER:-sammo}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - opensamguk-net
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  gateway-api:
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/gateway-api:${IMAGE_TAG:-latest}
+    container_name: opensamguk-gateway-api
+    restart: unless-stopped
+    environment:
+      # 인증/유저 DB는 gateway-postgres(공유). 게임 월드 DB는 참조하지 않는다.
+      GAME_DATABASE_URL: jdbc:postgresql://gateway-postgres:5432/${GATEWAY_POSTGRES_DB:-sammo_gateway}
+      GAME_DB_USER: ${GATEWAY_POSTGRES_USER:-sammo}
+      GAME_DB_PASSWORD: ${GATEWAY_POSTGRES_PASSWORD:?GATEWAY_POSTGRES_PASSWORD required}
+      # JWT — gateway-api가 토큰을 발급(서버별 game-api와 동일 시크릿이어야 함).
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required — 모든 game-api와 동일 값}
+      JWT_ACCESS_EXPIRATION: ${JWT_ACCESS_EXPIRATION:-900000}
+      JWT_REFRESH_EXPIRATION: ${JWT_REFRESH_EXPIRATION:-604800000}
+      # 관리자 시드(빈 users 테이블에서 1회 멱등 생성).
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-peppone}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD required}
+      # --- 멀티서버 fan-out / 버전 배포 ---
+      # 게임 서버 레지스트리(JSON 배열). 로비·어드민이 각 서버 game-api/엔진을 알기 위한 표.
+      # 예: [{"id":"s1","name":"통일 서버","gameApiUrl":"http://s1-game-api:8081",
+      #       "gameEngineUrl":"http://s1-game-engine:8082","deployProject":"opensamguk-s1"}]
+      SERVER_REGISTRY_JSON: ${SERVER_REGISTRY_JSON:-[]}
+      # 어드민 버전 패널 → deployer 사이드카(내부망 + 토큰)로 bounce 배포 위임.
+      DEPLOYER_URL: ${DEPLOYER_URL:-http://deployer:9000}
+      DEPLOYER_TOKEN: ${DEPLOYER_TOKEN:?DEPLOYER_TOKEN required}
+      JAVA_OPTS: "-XX:+UseG1GC -XX:MaxRAMPercentage=40.0 -XX:InitialRAMPercentage=25.0 -Djava.security.egd=file:/dev/./urandom"
+    depends_on:
+      gateway-postgres:
+        condition: service_healthy
+    expose:
+      - "8080"
+    networks:
+      - opensamguk-net
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  web-gateway:
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/web-gateway:${IMAGE_TAG:-latest}
+    container_name: opensamguk-web-gateway
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      # 서버 전용 프록시 타깃(NEXT_PUBLIC_GAME_URL은 빌드타임에 이미지에 인라인됨).
+      GATEWAY_API_URL: ${GATEWAY_API_URL:-http://gateway-api:8080}
+    depends_on:
+      - gateway-api
+    expose:
+      - "3000"
+    networks:
+      - opensamguk-net
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: opensamguk-nginx
+    restart: unless-stopped
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx-cache:/var/cache/nginx
+    depends_on:
+      - gateway-api
+      - web-gateway
+    ports:
+      - "${NGINX_HTTP_PORT:-80}:80"
+      - "${NGINX_HTTPS_PORT:-443}:443"
+    networks:
+      - opensamguk-net
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # 배포 사이드카 — 어드민/게이트웨이가 토큰으로 호출하면 서버별 IMAGE_TAG를 바꾸고
+  # 스테이트리스 서비스(game-api, web-game)만 bounce. game-engine은 절대 건드리지 않는다.
+  # 외부 포트 노출 없음(expose만) — 내부망에서 gateway-api만 도달.
+  deployer:
+    build:
+      context: ./deployer
+    image: opensamguk-deployer:local
+    container_name: opensamguk-deployer
+    restart: unless-stopped
+    environment:
+      # 배포 호출 인증 토큰(gateway-api와 동일 값).
+      DEPLOYER_TOKEN: ${DEPLOYER_TOKEN:?DEPLOYER_TOKEN required}
+      # docker.sock 직접 접근 금지 — socket-proxy 경유(least-privilege).
+      DOCKER_HOST: tcp://socket-proxy:2375
+      # 컨테이너 안에서 compose/서버 env 파일이 마운트된 경로.
+      COMPOSE_DIR: /workspace
+      SERVERS_DIR: /workspace/servers
+      COMPOSE_SERVER_FILE: /workspace/docker-compose.server.yml
+      # GHCR 태그 조회용(공개 패키지면 익명, private면 토큰 필요 — 미해결 가정 참고).
+      GHCR_OWNER: ${GHCR_OWNER:-peppone-choi}
+      GHCR_TOKEN: ${GHCR_TOKEN:-}
+    volumes:
+      # compose 파일 + 서버 env 파일을 read-write로 마운트(IMAGE_TAG 갱신 + compose 실행).
+      - ./:/workspace:rw
+    expose:
+      - "9000"
+    depends_on:
+      - socket-proxy
+    networks:
+      - opensamguk-net
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # docker.sock 프록시 — deployer에게 compose up에 필요한 최소 docker API만 노출.
+  # docker.sock은 read-only로 마운트. 외부 노출 없음.
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    container_name: opensamguk-socket-proxy
+    restart: unless-stopped
+    environment:
+      # 허용(1) — compose pull/up에 필요한 범위만. 나머지는 기본 거부(0).
+      CONTAINERS: 1
+      SERVICES: 1
+      IMAGES: 1
+      NETWORKS: 1
+      VOLUMES: 1
+      INFO: 1
+      VERSION: 1
+      # 생성/시작 등 변경 호출 허용(POST). 위험 호출은 아래에서 명시 거부.
+      POST: 1
+      # 명시적 거부 — 컨테이너 삭제/시스템/스왐/시크릿/이미지 빌드 등은 막는다.
+      CONTAINERS_DELETE: 0
+      EXEC: 0
+      SWARM: 0
+      SECRETS: 0
+      CONFIGS: 0
+      PLUGINS: 0
+      SYSTEM: 0
+      BUILD: 0
+      COMMIT: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - opensamguk-net
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+volumes:
+  gateway-pgdata:
+    driver: local
+  nginx-cache:
+    driver: local
+
+networks:
+  # 공유 스택과 모든 서버 스택이 공통으로 join하는 외부 네트워크.
+  # 최초 1회: docker network create opensamguk-net
+  opensamguk-net:
+    external: true
