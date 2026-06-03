@@ -3,6 +3,10 @@
 .env.*
 !.env.example
 
+# 서버별 env(실제 비밀값) — *.example만 커밋
+servers/*.env
+!servers/*.env.example
+
 # OS / 에디터
 .DS_Store
 *.swp
