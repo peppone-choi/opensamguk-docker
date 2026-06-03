@@ -56,7 +56,9 @@ scripts/deploy.sh           # (단일서버) 서버 배포 헬퍼
 - 앱(gateway-api)은 `docker.sock`에 **직접 접근하지 않는다.** docker 접근은 `deployer`만,
   그것도 `socket-proxy`를 거쳐 **compose에 필요한 최소 API**(CONTAINERS/SERVICES/IMAGES/POST 등)만.
 - `gateway-api → deployer`는 내부망 + Bearer 토큰(`DEPLOYER_TOKEN`). 외부 노출 없음.
-- `socket-proxy`는 `docker.sock`을 **read-only**로 마운트하고 위험 호출(EXEC/DELETE/SWARM/BUILD …)을 거부.
+- `socket-proxy`는 `docker.sock`을 **read-only**로 마운트하고 위험 섹션(EXEC/BUILD/SWARM/SECRETS/SYSTEM …)을
+  거부. (컨테이너 생성/정지/삭제는 compose 재생성에 필수라 `CONTAINERS`+`POST`로 허용 — 엔진 보호는
+  socket-proxy가 아니라 deployer 코드의 스테이트리스 화이트리스트가 담당.)
 
 ---
 
@@ -86,12 +88,13 @@ docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env
 서버마다 `servers/<id>.env`를 만들고(예시 복제) 포트/비밀번호/`SERVER_ID`가 겹치지 않게 한다.
 
 ```bash
-cp servers/s1.env.example servers/s1.env    # SERVER_ID=s1, IMAGE_TAG, GAME_API_PORT/WEB_GAME_PORT,
+cp servers/s1.env.example servers/s1.env    # SERVER_ID=1 (접두 s 없이 — compose가 s${SERVER_ID}로 합성),
+                                            # IMAGE_TAG, GAME_API_PORT/WEB_GAME_PORT,
                                             # GAME_POSTGRES_PASSWORD, JWT_SECRET(공유와 동일) 채우기
 docker compose -p opensamguk-s1 -f docker-compose.server.yml --env-file servers/s1.env up -d
 
-# 서버 2개째 — s2.env 복제(SERVER_ID=s2, 포트 82xx/32xx 등 충돌 없게)
-cp servers/s1.env.example servers/s2.env    # 편집 후
+# 서버 2개째 — s2.env 복제(SERVER_ID=2, 포트 82xx/32xx 등 충돌 없게)
+cp servers/s1.env.example servers/s2.env    # 편집 후 (파일명은 s2.env, 내부 SERVER_ID=2)
 docker compose -p opensamguk-s2 -f docker-compose.server.yml --env-file servers/s2.env up -d
 ```
 
@@ -181,6 +184,17 @@ docker compose up -d
 - `NEXT_PUBLIC_GATEWAY_URL` / `NEXT_PUBLIC_GAME_URL`을 실제 도메인으로 교체(빌드타임 인라인).
 - `JWT_SECRET`은 gateway-api(발급)·모든 game-api(검증)가 **동일** 값을 써야 한다.
 - `DEPLOYER_TOKEN`은 강한 랜덤 값으로 — 이 토큰이 곧 배포 권한이다. 외부 노출 금지(내부망 전용).
+
+## GHCR 이미지 인증 (private 패키지일 때)
+
+이미지 `pull`은 **공개(public) GHCR 패키지면 인증이 필요 없다**(권장 — 비밀 0 배포 유지).
+패키지를 **private**로 두면 pull/태그조회 양쪽에 인증이 필요하다:
+
+- **수동/부팅 pull**: 호스트에서 `docker login ghcr.io`(PAT, `read:packages`) — `compose pull`이 그 자격을 쓴다.
+- **deployer의 bounce pull**: deployer 컨테이너 안 docker CLI가 pull을 호출하므로, 그 컨테이너에 자격이
+  있어야 한다 — `~/.docker/config.json`을 deployer에 마운트하거나(공유 compose에 추가) 패키지를 공개로 둘 것.
+- **deployer의 `availableTags` 조회**: `GHCR_TOKEN`(read:packages) env 없으면 private 패키지는 빈 배열을
+  돌려준다(상태 조회 자체는 막지 않음 — 현재 태그는 env 파일에서 읽으므로 항상 표시된다).
 
 ## 대상 환경
 
