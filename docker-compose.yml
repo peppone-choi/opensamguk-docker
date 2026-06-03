@@ -1,0 +1,214 @@
+# Production Docker Compose — EC2 t3.large (2 vCPU, 8 GiB RAM)
+# Usage: docker compose -f docker-compose.production.yml up -d
+name: opensamguk
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: opensamguk-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-sammo}
+      POSTGRES_USER: ${POSTGRES_USER:-sammo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sammo}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - opensamguk
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+
+  redis:
+    image: redis:7-alpine
+    container_name: opensamguk-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - opensamguk
+    deploy:
+      resources:
+        limits:
+          memory: 300M
+
+  game-engine:
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-opensamguk}/game-engine:${IMAGE_TAG:-latest}
+    container_name: opensamguk-game-engine
+    restart: unless-stopped
+    environment:
+      GAME_DATABASE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-sammo}
+      GAME_DB_USER: ${POSTGRES_USER:-sammo}
+      GAME_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      TURN_PROFILE_NAME: ${TURN_PROFILE_NAME:-che:scenario_2}
+      # Scenario seed (idempotent on empty world_state) — scenario_1010 = 174 generals.
+      SCENARIO_SEED_ENABLED: ${SCENARIO_SEED_ENABLED:-true}
+      SCENARIO_CODE: ${SCENARIO_CODE:-scenario_1010}
+      JAVA_OPTS: "-XX:+UseG1GC -XX:MaxRAMPercentage=60.0 -XX:InitialRAMPercentage=40.0 -Djava.security.egd=file:/dev/./urandom"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    expose:
+      - "8082"
+    networks:
+      - opensamguk
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  game-api:
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-opensamguk}/game-api:${IMAGE_TAG:-latest}
+    container_name: opensamguk-game-api
+    restart: unless-stopped
+    environment:
+      GAME_DATABASE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-sammo}
+      GAME_DB_USER: ${POSTGRES_USER:-sammo}
+      GAME_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      OPENSAMGUK_PROFILE: ${TURN_PROFILE_NAME:-che:scenario_2}
+      # JWT — game-api VERIFIES tokens issued by gateway-api. SAME secret, verify-only.
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required — same value as gateway-api}
+      JAVA_OPTS: "-XX:+UseG1GC -XX:MaxRAMPercentage=50.0 -XX:InitialRAMPercentage=30.0 -Djava.security.egd=file:/dev/./urandom"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    expose:
+      - "8081"
+    networks:
+      - opensamguk
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+
+  gateway-api:
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-opensamguk}/gateway-api:${IMAGE_TAG:-latest}
+    container_name: opensamguk-gateway-api
+    restart: unless-stopped
+    environment:
+      GAME_DATABASE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-sammo}
+      GAME_DB_USER: ${POSTGRES_USER:-sammo}
+      GAME_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # JWT — gateway-api ISSUES tokens with this secret (SAME value as game-api).
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required — same value as game-api}
+      JWT_ACCESS_EXPIRATION: ${JWT_ACCESS_EXPIRATION:-900000}
+      JWT_REFRESH_EXPIRATION: ${JWT_REFRESH_EXPIRATION:-604800000}
+      # Admin seed (idempotent on empty users table).
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-peppone}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD required}
+      JAVA_OPTS: "-XX:+UseG1GC -XX:MaxRAMPercentage=40.0 -XX:InitialRAMPercentage=25.0 -Djava.security.egd=file:/dev/./urandom"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    expose:
+      - "8080"
+    networks:
+      - opensamguk
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  web-gateway:
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-opensamguk}/web-gateway:${IMAGE_TAG:-latest}
+    container_name: opensamguk-web-gateway
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      # Server-only proxy target (NEXT_PUBLIC_GAME_URL is baked into the image at build).
+      GATEWAY_API_URL: ${GATEWAY_API_URL:-http://gateway-api:8080}
+    depends_on:
+      - gateway-api
+    expose:
+      - "3000"
+    networks:
+      - opensamguk
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  web-game:
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-opensamguk}/web-game:${IMAGE_TAG:-latest}
+    container_name: opensamguk-web-game
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      # Server-only proxy targets (NEXT_PUBLIC_GATEWAY_URL is baked into the image at build).
+      GAME_API_URL: ${GAME_API_URL:-http://game-api:8081}
+      GATEWAY_API_URL: ${GATEWAY_API_URL:-http://gateway-api:8080}
+    depends_on:
+      - game-api
+      - gateway-api
+      - game-engine
+    expose:
+      - "3001"
+    networks:
+      - opensamguk
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: opensamguk-nginx
+    restart: unless-stopped
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx-cache:/var/cache/nginx
+    depends_on:
+      - gateway-api
+      - game-api
+      - game-engine
+      - web-gateway
+      - web-game
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - opensamguk
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+volumes:
+  pgdata:
+    driver: local
+  redisdata:
+    driver: local
+  nginx-cache:
+    driver: local
+
+networks:
+  opensamguk:
+    driver: bridge

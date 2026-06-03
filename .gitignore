@@ -1,0 +1,8 @@
+# 실제 환경변수/비밀값 — 절대 커밋 금지
+.env
+.env.*
+!.env.example
+
+# OS / 에디터
+.DS_Store
+*.swp
