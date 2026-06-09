@@ -26,6 +26,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -726,7 +727,7 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 	}
 	detail, downErr := c.downServerStack(entry.DeployProject, envFile)
 	if downErr != nil {
-		_ = os.WriteFile(envFile, originalEnv, 0o600)
+		_ = writeFileAtomic(envFile, originalEnv)
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: detail}, http.StatusInternalServerError
 	}
 	upDetail, upErr := c.upServerStack(entry.DeployProject, envFile)
@@ -738,11 +739,11 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 		detail += "\n=== shared reload ===\n" + reloadDetail
 	}
 	if upErr != nil {
-		_ = os.WriteFile(envFile, originalEnv, 0o600)
+		_ = writeFileAtomic(envFile, originalEnv)
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: detail}, http.StatusInternalServerError
 	}
 	if reloadErr != nil {
-		_ = os.WriteFile(envFile, originalEnv, 0o600)
+		_ = writeFileAtomic(envFile, originalEnv)
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: detail}, http.StatusInternalServerError
 	}
 	return createServerResponse{
@@ -871,7 +872,40 @@ func writeEnvLinesAtomic(path string, lines []envLine) error {
 		sb.WriteString(line.Raw)
 		sb.WriteByte('\n')
 	}
+	return writeFileAtomic(path, []byte(sb.String()))
+}
+
+type fileAttrs struct {
+	mode     os.FileMode
+	uid      int
+	gid      int
+	hasOwner bool
+}
+
+func atomicWriteAttrs(path string) fileAttrs {
+	attrs := fileAttrs{mode: 0o600}
+	if info, err := os.Stat(path); err == nil {
+		attrs.mode = info.Mode().Perm()
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+			attrs.uid = int(stat.Uid)
+			attrs.gid = int(stat.Gid)
+			attrs.hasOwner = true
+		}
+		return attrs
+	}
+	if info, err := os.Stat(filepath.Dir(path)); err == nil {
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+			attrs.uid = int(stat.Uid)
+			attrs.gid = int(stat.Gid)
+			attrs.hasOwner = true
+		}
+	}
+	return attrs
+}
+
+func writeFileAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
+	attrs := atomicWriteAttrs(path)
 	tmp, err := os.CreateTemp(dir, ".env-write-*")
 	if err != nil {
 		return err
@@ -884,7 +918,17 @@ func writeEnvLinesAtomic(path string, lines []envLine) error {
 		_ = tmp.Close()
 		return err
 	}
-	if _, err := tmp.WriteString(sb.String()); err != nil {
+	if attrs.hasOwner && os.Geteuid() == 0 {
+		if err := tmp.Chown(attrs.uid, attrs.gid); err != nil {
+			_ = tmp.Close()
+			return err
+		}
+	}
+	if err := tmp.Chmod(attrs.mode); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
 		return err
 	}
@@ -1174,6 +1218,13 @@ func (c config) writeRegistry(registry []registryEntry) error {
 }
 
 func (c config) ensurePortsAvailable(newID string, requested map[string]string) error {
+	for sharedKey, sharedPort := range c.sharedOccupiedPorts() {
+		for key, port := range requested {
+			if sharedPort == port {
+				return fmt.Errorf("%s=%s 는 공유 스택의 %s가 사용 중입니다.", key, port, sharedKey)
+			}
+		}
+	}
 	entries, err := os.ReadDir(c.serversDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1210,6 +1261,17 @@ func (c config) ensurePortsAvailable(newID string, requested map[string]string) 
 	return nil
 }
 
+func (c config) sharedOccupiedPorts() map[string]string {
+	return map[string]string{
+		"NGINX_HTTP_PORT":  envOrValue(c.sharedEnvValue("NGINX_HTTP_PORT"), "80"),
+		"NGINX_HTTPS_PORT": envOrValue(c.sharedEnvValue("NGINX_HTTPS_PORT"), "443"),
+		"GATEWAY_API_PORT": envOrValue(c.sharedEnvValue("GATEWAY_API_PORT"), "18081"),
+		"WEB_GATEWAY_PORT": envOrValue(c.sharedEnvValue("WEB_GATEWAY_PORT"), "3000"),
+		"GAME_API_PORT":    envOrValue(c.sharedEnvValue("GAME_API_PORT"), "18080"),
+		"WEB_GAME_PORT":    envOrValue(c.sharedEnvValue("WEB_GAME_PORT"), "3001"),
+	}
+}
+
 func (c config) upServerStack(project, envFile string) (string, error) {
 	return c.runDocker(
 		"compose", "-p", project,
@@ -1233,7 +1295,7 @@ func (c config) reloadSharedRegistry() (string, error) {
 		"compose",
 		"--env-file", c.sharedEnvFile(),
 		"-f", c.composeShared,
-		"up", "-d", "--no-deps",
+		"up", "-d",
 	}, sharedRegistryReloadServices...)
 	return c.runDocker(args...)
 }
@@ -1257,12 +1319,7 @@ func (c config) writeImageTag(project, tag string) error {
 		}
 		out = s + newLine + "\n"
 	}
-	// 원자적 쓰기 — 임시 파일 후 rename.
-	tmp := envFile + ".tmp"
-	if err := os.WriteFile(tmp, []byte(out), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, envFile)
+	return writeFileAtomic(envFile, []byte(out))
 }
 
 // 스테이트리스 서비스만 pull 후 up -d --no-deps. game-engine은 절대 미포함.

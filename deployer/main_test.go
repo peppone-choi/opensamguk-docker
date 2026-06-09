@@ -200,6 +200,27 @@ func TestCreateServerRejectsPortCollisions(t *testing.T) {
 	}
 }
 
+func TestCreateServerRejectsSharedPortCollision(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\nGAME_API_PORT=18080\n")
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		t.Fatalf("docker should not be called for a shared port collision: %#v", args)
+		return "", nil
+	}
+
+	res := envRequest(t, cfg.withAuth(cfg.handleServers), http.MethodPost, "/servers", `{"id":"1","name":"통일 서버","gameApiPort":"18080","webGamePort":"3201"}`)
+	if res.Code != http.StatusConflict {
+		t.Fatalf("POST status = %d body=%s", res.Code, res.Body.String())
+	}
+	var body createServerResponse
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.OK || !strings.Contains(body.Detail, "공유 스택") || !strings.Contains(body.Detail, "GAME_API_PORT") {
+		t.Fatalf("shared collision response = %#v", body)
+	}
+}
+
 func TestDeleteServerStopsStackRemovesEnvAndRegistry(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
