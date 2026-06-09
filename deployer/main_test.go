@@ -136,15 +136,18 @@ func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 	if !strings.Contains(sharedEnv, `"id":"s1"`) || !strings.Contains(sharedEnv, `"deployProject":"opensamguk-s1"`) {
 		t.Fatalf("registry not updated:\n%s", sharedEnv)
 	}
-	waitForCalls(t, func() int { return len(calls) }, 2)
-	if len(calls) != 2 {
+	waitForCalls(t, func() int { return len(calls) }, 3)
+	if len(calls) != 3 {
 		t.Fatalf("docker calls = %#v", calls)
 	}
 	if !strings.Contains(calls[0], "compose -p opensamguk-s1") || strings.Contains(calls[0], "--no-deps") {
 		t.Fatalf("server compose call = %q", calls[0])
 	}
-	if !strings.Contains(calls[1], "gateway-api web-gateway nginx") {
+	if !strings.Contains(calls[1], "gateway-api web-gateway") || strings.Contains(calls[1], " nginx") {
 		t.Fatalf("shared reload call = %q", calls[1])
+	}
+	if !strings.Contains(calls[2], "--force-recreate --no-deps nginx") {
+		t.Fatalf("nginx reload call = %q", calls[2])
 	}
 }
 
@@ -254,14 +257,17 @@ SERVER_REGISTRY_JSON=[{"id":"s1","name":"통일 서버","gameApiUrl":"http://s1-
 	if strings.Contains(sharedEnv, `"id":"s1"`) || !strings.Contains(sharedEnv, `"id":"spep"`) {
 		t.Fatalf("registry not pruned correctly:\n%s", sharedEnv)
 	}
-	if len(calls) != 2 {
+	if len(calls) != 3 {
 		t.Fatalf("docker calls = %#v", calls)
 	}
 	if !strings.Contains(calls[0], "compose -p opensamguk-s1") || !strings.Contains(calls[0], "down --volumes --remove-orphans") {
 		t.Fatalf("delete compose call = %q", calls[0])
 	}
-	if !strings.Contains(calls[1], "gateway-api web-gateway nginx") {
+	if !strings.Contains(calls[1], "gateway-api web-gateway") || strings.Contains(calls[1], " nginx") {
 		t.Fatalf("shared reload call = %q", calls[1])
+	}
+	if !strings.Contains(calls[2], "--force-recreate --no-deps nginx") {
+		t.Fatalf("nginx reload call = %q", calls[2])
 	}
 }
 
@@ -319,8 +325,8 @@ SERVER_REGISTRY_JSON=[{"id":"s1","name":"통일 서버","gameApiUrl":"http://s1-
 	if !body.OK || body.ID != "s1" || body.Project != "opensamguk-s1" {
 		t.Fatalf("reset response = %#v", body)
 	}
-	waitForCalls(t, func() int { return len(calls) }, 3)
-	if len(calls) != 3 {
+	waitForCalls(t, func() int { return len(calls) }, 4)
+	if len(calls) != 4 {
 		t.Fatalf("docker calls = %#v", calls)
 	}
 	if !strings.Contains(calls[0], "down --volumes --remove-orphans") {
@@ -329,8 +335,11 @@ SERVER_REGISTRY_JSON=[{"id":"s1","name":"통일 서버","gameApiUrl":"http://s1-
 	if !strings.Contains(calls[1], "up -d") {
 		t.Fatalf("reset up call = %q", calls[1])
 	}
-	if !strings.Contains(calls[2], "gateway-api web-gateway nginx") {
+	if !strings.Contains(calls[2], "gateway-api web-gateway") || strings.Contains(calls[2], " nginx") {
 		t.Fatalf("shared reload call = %q", calls[2])
+	}
+	if !strings.Contains(calls[3], "--force-recreate --no-deps nginx") {
+		t.Fatalf("nginx reload call = %q", calls[3])
 	}
 	serverEnv := readFile(t, filepath.Join(cfg.serversDir, "s1.env"))
 	for _, want := range []string{
