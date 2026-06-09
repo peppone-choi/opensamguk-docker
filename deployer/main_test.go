@@ -145,6 +145,33 @@ func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 	}
 }
 
+func TestCreateServerUsesConfiguredInternalUrls(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.gameAPIInternalPort = "18080"
+	cfg.gatewayAPIURL = "http://gateway-api:18081"
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		return "ok\n", nil
+	}
+
+	res := envRequest(t, cfg.withAuth(cfg.handleServers), http.MethodPost, "/servers", `{"id":"2","name":"호환 서버","gameApiPort":"8201","webGamePort":"3201"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("POST status = %d body=%s", res.Code, res.Body.String())
+	}
+
+	serverEnv := readFile(t, filepath.Join(cfg.serversDir, "s2.env"))
+	if !strings.Contains(serverEnv, "GAME_API_URL=http://s2-game-api:18080\n") {
+		t.Fatalf("server env GAME_API_URL did not use override:\n%s", serverEnv)
+	}
+	if !strings.Contains(serverEnv, "GATEWAY_API_URL=http://gateway-api:18081\n") {
+		t.Fatalf("server env GATEWAY_API_URL did not use override:\n%s", serverEnv)
+	}
+	sharedEnv := readFile(t, filepath.Join(cfg.composeDir, ".env"))
+	if !strings.Contains(sharedEnv, `"gameApiUrl":"http://s2-game-api:18080"`) {
+		t.Fatalf("registry GAME_API_URL did not use override:\n%s", sharedEnv)
+	}
+}
+
 func TestStatelessServicesExcludeGameEngine(t *testing.T) {
 	joined := strings.Join(statelessServices, ",")
 	if strings.Contains(joined, "game-engine") {

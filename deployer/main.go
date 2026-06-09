@@ -72,25 +72,31 @@ var sharedEnvAllowlist = map[string]envFieldSpec{
 
 // 환경변수 묶음.
 type config struct {
-	token         string // Bearer 인증 토큰
-	composeDir    string // compose 파일 디렉터리(/workspace)
-	serversDir    string // 서버 env 파일 디렉터리(/workspace/servers)
-	composeServer string // 서버 compose 파일 절대경로
-	composeShared string
-	ghcrOwner     string // GHCR 패키지 소유자(태그 조회)
-	ghcrToken     string // GHCR 조회 토큰(private면 필요, 없으면 익명)
-	dockerRunner  func(args ...string) (string, error)
+	token                  string // Bearer 인증 토큰
+	composeDir             string // compose 파일 디렉터리(/workspace)
+	serversDir             string // 서버 env 파일 디렉터리(/workspace/servers)
+	composeServer          string // 서버 compose 파일 절대경로
+	composeShared          string
+	ghcrOwner              string // GHCR 패키지 소유자(태그 조회)
+	ghcrToken              string // GHCR 조회 토큰(private면 필요, 없으면 익명)
+	dockerRunner           func(args ...string) (string, error)
+	gameAPIInternalPort    string
+	gameEngineInternalPort string
+	gatewayAPIURL          string
 }
 
 func loadConfig() config {
 	c := config{
-		token:         os.Getenv("DEPLOYER_TOKEN"),
-		composeDir:    envOr("COMPOSE_DIR", "/workspace"),
-		serversDir:    envOr("SERVERS_DIR", "/workspace/servers"),
-		composeServer: envOr("COMPOSE_SERVER_FILE", "/workspace/docker-compose.server.yml"),
-		composeShared: envOr("COMPOSE_SHARED_FILE", "/workspace/docker-compose.shared.yml"),
-		ghcrOwner:     envOr("GHCR_OWNER", "peppone-choi"),
-		ghcrToken:     os.Getenv("GHCR_TOKEN"),
+		token:                  os.Getenv("DEPLOYER_TOKEN"),
+		composeDir:             envOr("COMPOSE_DIR", "/workspace"),
+		serversDir:             envOr("SERVERS_DIR", "/workspace/servers"),
+		composeServer:          envOr("COMPOSE_SERVER_FILE", "/workspace/docker-compose.server.yml"),
+		composeShared:          envOr("COMPOSE_SHARED_FILE", "/workspace/docker-compose.shared.yml"),
+		ghcrOwner:              envOr("GHCR_OWNER", "peppone-choi"),
+		ghcrToken:              os.Getenv("GHCR_TOKEN"),
+		gameAPIInternalPort:    envOr("DEPLOYER_GAME_API_INTERNAL_PORT", "8081"),
+		gameEngineInternalPort: envOr("DEPLOYER_GAME_ENGINE_INTERNAL_PORT", "8082"),
+		gatewayAPIURL:          envOr("DEPLOYER_GATEWAY_API_URL", "http://gateway-api:8080"),
 	}
 	return c
 }
@@ -119,6 +125,18 @@ func envList(key string, def []string) []string {
 		return def
 	}
 	return values
+}
+
+func (c config) gameAPIURLFor(id string) string {
+	return "http://" + id + "-game-api:" + envOrValue(c.gameAPIInternalPort, "8081")
+}
+
+func (c config) gameEngineURLFor(id string) string {
+	return "http://" + id + "-game-engine:" + envOrValue(c.gameEngineInternalPort, "8082")
+}
+
+func (c config) defaultGatewayAPIURL() string {
+	return envOrValue(c.gatewayAPIURL, "http://gateway-api:8080")
 }
 
 // 서버 env 파일 절대경로 — project명에서 servers/<id>.env 로 매핑.
@@ -530,8 +548,8 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 		{Raw: "TURN_PROFILE_NAME=che:scenario_2", Key: "TURN_PROFILE_NAME", Value: "che:scenario_2", IsKV: true},
 		{Raw: "SCENARIO_SEED_ENABLED=" + boolText(seedEnabled), Key: "SCENARIO_SEED_ENABLED", Value: boolText(seedEnabled), IsKV: true},
 		{Raw: "SCENARIO_CODE=" + scenarioCode, Key: "SCENARIO_CODE", Value: scenarioCode, IsKV: true},
-		{Raw: "GAME_API_URL=http://" + id + "-game-api:8081", Key: "GAME_API_URL", Value: "http://" + id + "-game-api:8081", IsKV: true},
-		{Raw: "GATEWAY_API_URL=" + envOrValue(c.sharedEnvValue("GATEWAY_API_URL"), "http://gateway-api:8080"), Key: "GATEWAY_API_URL", Value: envOrValue(c.sharedEnvValue("GATEWAY_API_URL"), "http://gateway-api:8080"), IsKV: true},
+		{Raw: "GAME_API_URL=" + c.gameAPIURLFor(id), Key: "GAME_API_URL", Value: c.gameAPIURLFor(id), IsKV: true},
+		{Raw: "GATEWAY_API_URL=" + envOrValue(c.sharedEnvValue("GATEWAY_API_URL"), c.defaultGatewayAPIURL()), Key: "GATEWAY_API_URL", Value: envOrValue(c.sharedEnvValue("GATEWAY_API_URL"), c.defaultGatewayAPIURL()), IsKV: true},
 	}
 	if err := writeEnvLinesAtomic(envFile, envLines); err != nil {
 		return createServerResponse{OK: false, ID: id, Detail: fmt.Sprintf("서버 env 쓰기 실패: %v", err)}, http.StatusInternalServerError
@@ -539,8 +557,8 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 	entry := registryEntry{
 		ID:            id,
 		Name:          name,
-		GameAPIURL:    "http://" + id + "-game-api:8081",
-		GameEngineURL: "http://" + id + "-game-engine:8082",
+		GameAPIURL:    c.gameAPIURLFor(id),
+		GameEngineURL: c.gameEngineURLFor(id),
 		DeployProject: "opensamguk-" + id,
 	}
 	if err := c.upsertRegistryEntry(entry); err != nil {
