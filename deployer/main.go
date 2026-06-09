@@ -632,17 +632,17 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 	if err := c.upsertRegistryEntry(entry); err != nil {
 		return createServerResponse{OK: false, ID: id, Name: name, Project: entry.DeployProject, Detail: fmt.Sprintf("레지스트리 갱신 실패: %v", err)}, http.StatusInternalServerError
 	}
-	detail, serverErr := c.upServerStack(entry.DeployProject, envFile)
-	reloadDetail, reloadErr := c.reloadSharedRegistry()
-	if reloadDetail != "" {
-		detail += "\n=== shared reload ===\n" + reloadDetail
-	}
-	if serverErr != nil {
-		return createServerResponse{OK: false, ID: id, Name: name, Project: entry.DeployProject, Detail: detail}, http.StatusInternalServerError
-	}
-	if reloadErr != nil {
-		return createServerResponse{OK: false, ID: id, Name: name, Project: entry.DeployProject, Detail: detail}, http.StatusInternalServerError
-	}
+	c.startLifecycleJob("create "+id, func() (string, error) {
+		detail, serverErr := c.upServerStack(entry.DeployProject, envFile)
+		reloadDetail, reloadErr := c.reloadSharedRegistry()
+		if reloadDetail != "" {
+			detail += "\n=== shared reload ===\n" + reloadDetail
+		}
+		if serverErr != nil {
+			return detail, serverErr
+		}
+		return detail, reloadErr
+	})
 	return createServerResponse{
 		OK:               true,
 		ID:               id,
@@ -650,7 +650,7 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 		Project:          entry.DeployProject,
 		RestartRequired:  true,
 		AffectedServices: append(append([]string{}, sharedRegistryReloadServices...), "server-stack"),
-		Detail:           detail,
+		Detail:           "서버 생성 작업을 시작했습니다. 상태가 준비될 때까지 잠시 기다려 주세요.",
 	}, http.StatusOK
 }
 
@@ -725,27 +725,30 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 	if err := c.applyResetOptions(envFile, req); err != nil {
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: fmt.Sprintf("리셋 옵션 저장 실패: %v", err)}, http.StatusBadRequest
 	}
-	detail, downErr := c.downServerStack(entry.DeployProject, envFile)
-	if downErr != nil {
-		_ = writeFileAtomic(envFile, originalEnv)
-		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: detail}, http.StatusInternalServerError
-	}
-	upDetail, upErr := c.upServerStack(entry.DeployProject, envFile)
-	if upDetail != "" {
-		detail += "\n=== server up ===\n" + upDetail
-	}
-	reloadDetail, reloadErr := c.reloadSharedRegistry()
-	if reloadDetail != "" {
-		detail += "\n=== shared reload ===\n" + reloadDetail
-	}
-	if upErr != nil {
-		_ = writeFileAtomic(envFile, originalEnv)
-		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: detail}, http.StatusInternalServerError
-	}
-	if reloadErr != nil {
-		_ = writeFileAtomic(envFile, originalEnv)
-		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: detail}, http.StatusInternalServerError
-	}
+	c.startLifecycleJob("reset "+id, func() (string, error) {
+		detail, downErr := c.downServerStack(entry.DeployProject, envFile)
+		if downErr != nil {
+			_ = writeFileAtomic(envFile, originalEnv)
+			return detail, downErr
+		}
+		upDetail, upErr := c.upServerStack(entry.DeployProject, envFile)
+		if upDetail != "" {
+			detail += "\n=== server up ===\n" + upDetail
+		}
+		reloadDetail, reloadErr := c.reloadSharedRegistry()
+		if reloadDetail != "" {
+			detail += "\n=== shared reload ===\n" + reloadDetail
+		}
+		if upErr != nil {
+			_ = writeFileAtomic(envFile, originalEnv)
+			return detail, upErr
+		}
+		if reloadErr != nil {
+			_ = writeFileAtomic(envFile, originalEnv)
+			return detail, reloadErr
+		}
+		return detail, nil
+	})
 	return createServerResponse{
 		OK:               true,
 		ID:               id,
@@ -753,8 +756,19 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 		Project:          entry.DeployProject,
 		RestartRequired:  true,
 		AffectedServices: append(append([]string{}, sharedRegistryReloadServices...), "server-stack"),
-		Detail:           detail,
+		Detail:           "서버 리셋 작업을 시작했습니다. 상태가 준비될 때까지 잠시 기다려 주세요.",
 	}, http.StatusOK
+}
+
+func (c config) startLifecycleJob(name string, job func() (string, error)) {
+	go func() {
+		detail, err := job()
+		if err != nil {
+			log.Printf("server lifecycle job failed name=%s err=%v detail=%s", name, err, detail)
+			return
+		}
+		log.Printf("server lifecycle job completed name=%s detail=%s", name, detail)
+	}()
 }
 
 // 서버 env 파일에서 IMAGE_TAG= 값을 읽는다.

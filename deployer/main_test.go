@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestServerEnvGetPatchHappyPath(t *testing.T) {
@@ -135,6 +136,7 @@ func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 	if !strings.Contains(sharedEnv, `"id":"s1"`) || !strings.Contains(sharedEnv, `"deployProject":"opensamguk-s1"`) {
 		t.Fatalf("registry not updated:\n%s", sharedEnv)
 	}
+	waitForCalls(t, func() int { return len(calls) }, 2)
 	if len(calls) != 2 {
 		t.Fatalf("docker calls = %#v", calls)
 	}
@@ -317,6 +319,7 @@ SERVER_REGISTRY_JSON=[{"id":"s1","name":"통일 서버","gameApiUrl":"http://s1-
 	if !body.OK || body.ID != "s1" || body.Project != "opensamguk-s1" {
 		t.Fatalf("reset response = %#v", body)
 	}
+	waitForCalls(t, func() int { return len(calls) }, 3)
 	if len(calls) != 3 {
 		t.Fatalf("docker calls = %#v", calls)
 	}
@@ -374,12 +377,14 @@ SERVER_REGISTRY_JSON=[{"id":"s1","name":"통일 서버","gameApiUrl":"http://s1-
 		"/servers/reset?id=s1",
 		`{"confirm":"RESET s1","scenarioCode":"scenario_1002","turnTerm":"30"}`,
 	)
-	if res.Code != http.StatusInternalServerError {
+	if res.Code != http.StatusOK {
 		t.Fatalf("RESET status = %d body=%s", res.Code, res.Body.String())
 	}
+	waitForCalls(t, func() int { return len(calls) }, 1)
 	if len(calls) != 1 || !strings.Contains(calls[0], "down --volumes --remove-orphans") {
 		t.Fatalf("reset should stop after failed down, calls=%#v", calls)
 	}
+	waitForContent(t, filepath.Join(cfg.serversDir, "s1.env"), original)
 	if got := readFile(t, filepath.Join(cfg.serversDir, "s1.env")); got != original {
 		t.Fatalf("env was not restored after failed reset:\n%s", got)
 	}
@@ -465,4 +470,24 @@ func fileMode(t *testing.T, path string) os.FileMode {
 		t.Fatal(err)
 	}
 	return info.Mode().Perm()
+}
+
+func waitForCalls(t *testing.T, callCount func() int, want int) {
+	t.Helper()
+	for i := 0; i < 100; i++ {
+		if callCount() >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForContent(t *testing.T, path, want string) {
+	t.Helper()
+	for i := 0; i < 100; i++ {
+		if data, err := os.ReadFile(path); err == nil && string(data) == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
