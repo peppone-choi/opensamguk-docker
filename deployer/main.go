@@ -13,6 +13,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -42,6 +44,7 @@ var (
 // 스테이트리스 bounce 대상 — game-engine은 의도적으로 제외.
 var statelessServices = []string{"game-api", "web-game"}
 var sharedEnvServices = []string{"gateway-api", "web-gateway", "nginx", "deployer"}
+var sharedRegistryReloadServices = []string{"gateway-api", "web-gateway", "nginx"}
 
 var serverEnvAllowlist = map[string]envFieldSpec{
 	"IMAGE_TAG":             {Description: "게임 서버 이미지 태그"},
@@ -73,8 +76,10 @@ type config struct {
 	composeDir    string // compose 파일 디렉터리(/workspace)
 	serversDir    string // 서버 env 파일 디렉터리(/workspace/servers)
 	composeServer string // 서버 compose 파일 절대경로
+	composeShared string
 	ghcrOwner     string // GHCR 패키지 소유자(태그 조회)
 	ghcrToken     string // GHCR 조회 토큰(private면 필요, 없으면 익명)
+	dockerRunner  func(args ...string) (string, error)
 }
 
 func loadConfig() config {
@@ -83,6 +88,7 @@ func loadConfig() config {
 		composeDir:    envOr("COMPOSE_DIR", "/workspace"),
 		serversDir:    envOr("SERVERS_DIR", "/workspace/servers"),
 		composeServer: envOr("COMPOSE_SERVER_FILE", "/workspace/docker-compose.server.yml"),
+		composeShared: envOr("COMPOSE_SHARED_FILE", "/workspace/docker-compose.shared.yml"),
 		ghcrOwner:     envOr("GHCR_OWNER", "peppone-choi"),
 		ghcrToken:     os.Getenv("GHCR_TOKEN"),
 	}
@@ -139,6 +145,35 @@ type envPatchRequest struct {
 	Values map[string]string `json:"values"`
 }
 
+type createServerRequest struct {
+	ID                  string `json:"id"`
+	Name                string `json:"name"`
+	ImageTag            string `json:"imageTag"`
+	GameAPIPort         string `json:"gameApiPort"`
+	WebGamePort         string `json:"webGamePort"`
+	ScenarioCode        string `json:"scenarioCode"`
+	ScenarioSeedEnabled *bool  `json:"scenarioSeedEnabled"`
+	JWTSecret           string `json:"jwtSecret"`
+}
+
+type createServerResponse struct {
+	OK               bool     `json:"ok"`
+	ID               string   `json:"id"`
+	Name             string   `json:"name"`
+	Project          string   `json:"project"`
+	RestartRequired  bool     `json:"restartRequired"`
+	AffectedServices []string `json:"affectedServices"`
+	Detail           string   `json:"detail"`
+}
+
+type registryEntry struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	GameAPIURL    string `json:"gameApiUrl"`
+	GameEngineURL string `json:"gameEngineUrl"`
+	DeployProject string `json:"deployProject"`
+}
+
 type envResponse struct {
 	OK               bool                `json:"ok"`
 	Scope            string              `json:"scope"`
@@ -181,6 +216,7 @@ func main() {
 	})
 	mux.HandleFunc("/status", cfg.withAuth(cfg.handleStatus))
 	mux.HandleFunc("/deploy", cfg.withAuth(cfg.handleDeploy))
+	mux.HandleFunc("/servers", cfg.withAuth(cfg.handleServers))
 	mux.HandleFunc("/env/shared", cfg.withAuth(cfg.handleSharedEnv))
 	mux.HandleFunc("/env/server", cfg.withAuth(cfg.handleServerEnv))
 
@@ -302,6 +338,25 @@ func (c config) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (c config) handleServers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "POST only"})
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "body 읽기 실패"})
+		return
+	}
+	var req createServerRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "JSON 파싱 실패"})
+		return
+	}
+	res, status := c.createServer(req)
+	writeJSON(w, status, res)
+}
+
 func (c config) handleSharedEnv(w http.ResponseWriter, r *http.Request) {
 	c.handleEnv(w, r, envRequestContext{
 		scope:            "shared",
@@ -385,6 +440,113 @@ func (c config) handleEnv(w http.ResponseWriter, r *http.Request, ctx envRequest
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "GET/PATCH only"})
 	}
+}
+
+func (c config) createServer(req createServerRequest) (createServerResponse, int) {
+	id, serverNumber, err := normalizeCreateServerID(req.ID)
+	if err != nil {
+		return createServerResponse{OK: false, Detail: err.Error()}, http.StatusBadRequest
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" || strings.ContainsAny(name, "\r\n") {
+		return createServerResponse{OK: false, ID: id, Detail: "서버 이름이 올바르지 않습니다."}, http.StatusBadRequest
+	}
+	imageTag := strings.TrimSpace(req.ImageTag)
+	if imageTag == "" {
+		imageTag = c.sharedEnvValue("IMAGE_TAG")
+	}
+	if imageTag == "" {
+		imageTag = "latest"
+	}
+	if !tagRe.MatchString(imageTag) {
+		return createServerResponse{OK: false, ID: id, Detail: "이미지 태그가 올바르지 않습니다."}, http.StatusBadRequest
+	}
+	gameAPIPort := strings.TrimSpace(req.GameAPIPort)
+	webGamePort := strings.TrimSpace(req.WebGamePort)
+	if !isPort(gameAPIPort) || !isPort(webGamePort) {
+		return createServerResponse{OK: false, ID: id, Detail: "포트는 1-65535 숫자여야 합니다."}, http.StatusBadRequest
+	}
+	scenarioCode := strings.TrimSpace(req.ScenarioCode)
+	if scenarioCode == "" {
+		scenarioCode = "scenario_1010"
+	}
+	if !isSafeToken(scenarioCode) {
+		return createServerResponse{OK: false, ID: id, Detail: "시나리오 코드가 올바르지 않습니다."}, http.StatusBadRequest
+	}
+	seedEnabled := true
+	if req.ScenarioSeedEnabled != nil {
+		seedEnabled = *req.ScenarioSeedEnabled
+	}
+	jwtSecret := strings.TrimSpace(req.JWTSecret)
+	if jwtSecret == "" {
+		jwtSecret = c.sharedEnvValue("JWT_SECRET")
+	}
+	if jwtSecret == "" || strings.ContainsAny(jwtSecret, "\r\n") {
+		return createServerResponse{OK: false, ID: id, Detail: "공유 JWT_SECRET이 필요합니다."}, http.StatusBadRequest
+	}
+	envFile := c.serverEnvFileForID(id)
+	if _, err := os.Stat(envFile); err == nil {
+		return createServerResponse{OK: false, ID: id, Detail: "이미 존재하는 서버입니다."}, http.StatusConflict
+	} else if !os.IsNotExist(err) {
+		return createServerResponse{OK: false, ID: id, Detail: fmt.Sprintf("서버 env 확인 실패: %v", err)}, http.StatusInternalServerError
+	}
+	if err := os.MkdirAll(c.serversDir, 0o755); err != nil {
+		return createServerResponse{OK: false, ID: id, Detail: fmt.Sprintf("servers 디렉터리 생성 실패: %v", err)}, http.StatusInternalServerError
+	}
+	gamePassword, err := randomHex(24)
+	if err != nil {
+		return createServerResponse{OK: false, ID: id, Detail: fmt.Sprintf("비밀번호 생성 실패: %v", err)}, http.StatusInternalServerError
+	}
+	envLines := []envLine{
+		{Raw: "SERVER_ID=" + serverNumber, Key: "SERVER_ID", Value: serverNumber, IsKV: true},
+		{Raw: "GHCR_REGISTRY=ghcr.io", Key: "GHCR_REGISTRY", Value: "ghcr.io", IsKV: true},
+		{Raw: "GHCR_OWNER=" + c.ghcrOwner, Key: "GHCR_OWNER", Value: c.ghcrOwner, IsKV: true},
+		{Raw: "IMAGE_TAG=" + imageTag, Key: "IMAGE_TAG", Value: imageTag, IsKV: true},
+		{Raw: "GAME_API_PORT=" + gameAPIPort, Key: "GAME_API_PORT", Value: gameAPIPort, IsKV: true},
+		{Raw: "WEB_GAME_PORT=" + webGamePort, Key: "WEB_GAME_PORT", Value: webGamePort, IsKV: true},
+		{Raw: "GAME_POSTGRES_DB=sammo", Key: "GAME_POSTGRES_DB", Value: "sammo", IsKV: true},
+		{Raw: "GAME_POSTGRES_USER=sammo", Key: "GAME_POSTGRES_USER", Value: "sammo", IsKV: true},
+		{Raw: "GAME_POSTGRES_PASSWORD=" + gamePassword, Key: "GAME_POSTGRES_PASSWORD", Value: gamePassword, IsKV: true},
+		{Raw: "JWT_SECRET=" + jwtSecret, Key: "JWT_SECRET", Value: jwtSecret, IsKV: true},
+		{Raw: "TURN_PROFILE_NAME=che:scenario_2", Key: "TURN_PROFILE_NAME", Value: "che:scenario_2", IsKV: true},
+		{Raw: "SCENARIO_SEED_ENABLED=" + boolText(seedEnabled), Key: "SCENARIO_SEED_ENABLED", Value: boolText(seedEnabled), IsKV: true},
+		{Raw: "SCENARIO_CODE=" + scenarioCode, Key: "SCENARIO_CODE", Value: scenarioCode, IsKV: true},
+		{Raw: "GAME_API_URL=http://" + id + "-game-api:8081", Key: "GAME_API_URL", Value: "http://" + id + "-game-api:8081", IsKV: true},
+		{Raw: "GATEWAY_API_URL=" + envOrValue(c.sharedEnvValue("GATEWAY_API_URL"), "http://gateway-api:8080"), Key: "GATEWAY_API_URL", Value: envOrValue(c.sharedEnvValue("GATEWAY_API_URL"), "http://gateway-api:8080"), IsKV: true},
+	}
+	if err := writeEnvLinesAtomic(envFile, envLines); err != nil {
+		return createServerResponse{OK: false, ID: id, Detail: fmt.Sprintf("서버 env 쓰기 실패: %v", err)}, http.StatusInternalServerError
+	}
+	entry := registryEntry{
+		ID:            id,
+		Name:          name,
+		GameAPIURL:    "http://" + id + "-game-api:8081",
+		GameEngineURL: "http://" + id + "-game-engine:8082",
+		DeployProject: "opensamguk-" + id,
+	}
+	if err := c.upsertRegistryEntry(entry); err != nil {
+		return createServerResponse{OK: false, ID: id, Name: name, Project: entry.DeployProject, Detail: fmt.Sprintf("레지스트리 갱신 실패: %v", err)}, http.StatusInternalServerError
+	}
+	detail, serverErr := c.upServerStack(entry.DeployProject, envFile)
+	reloadDetail, reloadErr := c.reloadSharedRegistry()
+	if reloadDetail != "" {
+		detail += "\n=== shared reload ===\n" + reloadDetail
+	}
+	if serverErr != nil {
+		return createServerResponse{OK: false, ID: id, Name: name, Project: entry.DeployProject, Detail: detail}, http.StatusInternalServerError
+	}
+	if reloadErr != nil {
+		return createServerResponse{OK: false, ID: id, Name: name, Project: entry.DeployProject, Detail: detail}, http.StatusInternalServerError
+	}
+	return createServerResponse{
+		OK:               true,
+		ID:               id,
+		Name:             name,
+		Project:          entry.DeployProject,
+		RestartRequired:  true,
+		AffectedServices: append(append([]string{}, sharedRegistryReloadServices...), "server-stack"),
+		Detail:           detail,
+	}, http.StatusOK
 }
 
 // 서버 env 파일에서 IMAGE_TAG= 값을 읽는다.
@@ -566,6 +728,152 @@ func isEnvKey(key string) bool {
 	return true
 }
 
+func normalizeCreateServerID(raw string) (string, string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", "", fmt.Errorf("서버 id가 필요합니다.")
+	}
+	if strings.ContainsAny(trimmed, "/\\.\r\n") {
+		return "", "", fmt.Errorf("서버 id가 올바르지 않습니다.")
+	}
+	id := trimmed
+	if !strings.HasPrefix(id, "s") {
+		id = "s" + id
+	}
+	if !serverIDRe.MatchString(id) {
+		return "", "", fmt.Errorf("서버 id는 s<영숫자> 형식이어야 합니다.")
+	}
+	serverNumber := strings.TrimPrefix(id, "s")
+	if serverNumber == "" {
+		return "", "", fmt.Errorf("서버 id는 s<영숫자> 형식이어야 합니다.")
+	}
+	return id, serverNumber, nil
+}
+
+func isPort(value string) bool {
+	if value == "" {
+		return false
+	}
+	n := 0
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n >= 1 && n <= 65535
+}
+
+func isSafeToken(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r >= 'A' && r <= 'Z' {
+			continue
+		}
+		if r >= 'a' && r <= 'z' {
+			continue
+		}
+		if r >= '0' && r <= '9' {
+			continue
+		}
+		if r == '_' || r == '-' || r == ':' || r == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func boolText(value bool) string {
+	if value {
+		return "true"
+	}
+	return "false"
+}
+
+func envOrValue(value, fallback string) string {
+	if value != "" {
+		return value
+	}
+	return fallback
+}
+
+func randomHex(bytes int) (string, error) {
+	buf := make([]byte, bytes)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+func (c config) sharedEnvValue(key string) string {
+	lines, err := readEnvLines(c.sharedEnvFile())
+	if err != nil {
+		return ""
+	}
+	for _, line := range lines {
+		if line.IsKV && line.Key == key {
+			return line.Value
+		}
+	}
+	return ""
+}
+
+func (c config) upsertRegistryEntry(entry registryEntry) error {
+	lines, err := readEnvLines(c.sharedEnvFile())
+	if err != nil {
+		return err
+	}
+	registry := []registryEntry{}
+	for _, line := range lines {
+		if line.IsKV && line.Key == "SERVER_REGISTRY_JSON" && strings.TrimSpace(line.Value) != "" {
+			if err := json.Unmarshal([]byte(line.Value), &registry); err != nil {
+				return fmt.Errorf("SERVER_REGISTRY_JSON 파싱 실패: %w", err)
+			}
+		}
+	}
+	found := false
+	for i := range registry {
+		if registry[i].ID == entry.ID {
+			registry[i] = entry
+			found = true
+			break
+		}
+	}
+	if !found {
+		registry = append(registry, entry)
+	}
+	data, err := json.Marshal(registry)
+	if err != nil {
+		return err
+	}
+	_, err = patchEnvFile(c.sharedEnvFile(), map[string]envFieldSpec{
+		"SERVER_REGISTRY_JSON": {Description: "서버 레지스트리"},
+	}, map[string]string{"SERVER_REGISTRY_JSON": string(data)})
+	return err
+}
+
+func (c config) upServerStack(project, envFile string) (string, error) {
+	return c.runDocker(
+		"compose", "-p", project,
+		"--env-file", envFile,
+		"-f", c.composeServer,
+		"up", "-d",
+	)
+}
+
+func (c config) reloadSharedRegistry() (string, error) {
+	args := append([]string{
+		"compose",
+		"--env-file", c.sharedEnvFile(),
+		"-f", c.composeShared,
+		"up", "-d", "--no-deps",
+	}, sharedRegistryReloadServices...)
+	return c.runDocker(args...)
+}
+
 // 서버 env 파일의 IMAGE_TAG= 행을 새 태그로 치환. 행이 없으면 추가.
 func (c config) writeImageTag(project, tag string) error {
 	envFile := c.envFileFor(project)
@@ -634,6 +942,9 @@ func (c config) bounceStateless(project, envFile string) (string, error) {
 
 // docker CLI 실행 — DOCKER_HOST는 환경에서 상속(socket-proxy). stdout+stderr 합쳐 반환.
 func (c config) runDocker(args ...string) (string, error) {
+	if c.dockerRunner != nil {
+		return c.dockerRunner(args...)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "docker", args...)
