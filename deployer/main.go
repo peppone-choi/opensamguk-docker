@@ -1305,13 +1305,37 @@ func (c config) downServerStack(project, envFile string) (string, error) {
 }
 
 func (c config) reloadSharedRegistry() (string, error) {
+	services := withoutService(sharedRegistryReloadServices, "nginx")
 	args := append([]string{
 		"compose",
 		"--env-file", c.sharedEnvFile(),
 		"-f", c.composeShared,
-		"up", "-d",
-	}, sharedRegistryReloadServices...)
-	return c.runDocker(args...)
+		"up", "-d", "--no-deps",
+	}, services...)
+	detail, err := c.runDocker(args...)
+	if err != nil {
+		return detail, err
+	}
+	nginxDetail, nginxErr := c.runDocker(
+		"compose",
+		"--env-file", c.sharedEnvFile(),
+		"-f", c.composeShared,
+		"up", "-d", "--force-recreate", "--no-deps", "nginx",
+	)
+	if nginxDetail != "" {
+		detail += "\n=== nginx reload ===\n" + nginxDetail
+	}
+	return detail, nginxErr
+}
+
+func withoutService(values []string, remove string) []string {
+	out := []string{}
+	for _, value := range values {
+		if value != remove {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 // 서버 env 파일의 IMAGE_TAG= 행을 새 태그로 치환. 행이 없으면 추가.
