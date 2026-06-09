@@ -139,6 +139,21 @@ GET  deployer/status?project=opensamguk-s1   → {"currentTag":"v1.2.0","availab
 POST deployer/deploy  {"project":"opensamguk-s1","tag":"v1.3.0"}
 ```
 
+환경변수 관리 API도 같은 Bearer 토큰 인증을 사용한다. 임의 raw editor가 아니라 명시 allowlist만 수정한다.
+`DEPLOYER_TOKEN`은 서버 내부 권한 토큰이므로 API 수정 대상에서 제외한다. `JWT_SECRET`, `ADMIN_PASSWORD`,
+`GHCR_TOKEN` 같은 민감값은 PATCH로만 쓰고 GET/PATCH 응답에는 원문 값을 반환하지 않는다.
+
+```text
+GET   deployer/env/shared
+PATCH deployer/env/shared {"values":{"NEXT_PUBLIC_GATEWAY_URL":"https://sam.example.com"}}
+
+GET   deployer/env/server?id=s1
+PATCH deployer/env/server?id=s1 {"values":{"IMAGE_TAG":"v1.3.0","JWT_SECRET":"base64-secret"}}
+```
+
+PATCH 응답의 `restartRequired`와 `affectedServices`는 재기동이 필요한 대상을 알려준다. 서버별 env 변경의
+대상은 스테이트리스(`game-api`, `web-game`)뿐이며 `game-engine`은 포함하지 않는다.
+
 **(B) 수동 (시즌 경계 / 엔진 포함 전체 갱신)** — 엔진까지 새 버전으로 올릴 때:
 
 ```bash
@@ -153,6 +168,37 @@ docker compose -p opensamguk-s1 -f docker-compose.server.yml --env-file servers/
 > **무손실 보장**: game-engine은 부팅 시 `world_state`(DB)에서 `InMemoryTurnWorld`를 재수화한다.
 > 따라서 엔진 컨테이너를 새 이미지로 교체해도(같은 버전 로직이면) 진행 상태를 잃지 않는다.
 > 단, **로직이 바뀌는 버전 점프는 RNG/로그 desync**를 일으키므로 **시즌 종료/서버 리셋 시점**에만 적용한다.
+
+### Deployer env API 수동 QA
+
+로컬 임시 파일로 C001/C002 성격의 동작을 확인할 수 있다.
+
+```bash
+tmp=$(mktemp -d)
+mkdir -p "$tmp/servers"
+cp .env.example "$tmp/.env"
+cp servers/s1.env.example "$tmp/servers/s1.env"
+
+DEPLOYER_TOKEN=test-token \
+COMPOSE_DIR="$tmp" \
+SERVERS_DIR="$tmp/servers" \
+COMPOSE_SERVER_FILE="$PWD/docker-compose.server.yml" \
+(cd deployer && go run .)
+
+curl -sS -H 'Authorization: Bearer test-token' \
+  'http://localhost:9000/env/server?id=s1'
+
+curl -sS -X PATCH -H 'Authorization: Bearer test-token' -H 'Content-Type: application/json' \
+  -d '{"values":{"IMAGE_TAG":"v1.3.0","JWT_SECRET":"new-secret"}}' \
+  'http://localhost:9000/env/server?id=s1'
+
+curl -sS -X PATCH -H 'Authorization: Bearer test-token' -H 'Content-Type: application/json' \
+  -d '{"values":{"DEPLOYER_TOKEN":"must-not-write"}}' \
+  'http://localhost:9000/env/shared'
+```
+
+기대값: 첫 두 호출은 200, `JWT_SECRET` 원문은 응답에 없음, `affectedServices`에 `game-engine` 없음,
+마지막 호출은 400이며 `DEPLOYER_TOKEN`은 파일에 쓰이지 않음.
 
 ### 버전 고정 / 다운그레이드
 
