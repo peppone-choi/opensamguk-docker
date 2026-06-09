@@ -250,9 +250,12 @@ SERVER_REGISTRY_JSON=[{"id":"s1","name":"통일 서버","gameApiUrl":"http://s1-
 	if !body.OK || body.ID != "s1" || body.Project != "opensamguk-s1" {
 		t.Fatalf("delete response = %#v", body)
 	}
+	waitForCalls(t, func() int { return len(calls) }, 3)
+	waitForMissing(t, filepath.Join(cfg.serversDir, "s1.env"))
 	if _, err := os.Stat(filepath.Join(cfg.serversDir, "s1.env")); !os.IsNotExist(err) {
 		t.Fatalf("server env still exists or unexpected error: %v", err)
 	}
+	waitForContentNotContaining(t, filepath.Join(cfg.composeDir, ".env"), `"id":"s1"`)
 	sharedEnv := readFile(t, filepath.Join(cfg.composeDir, ".env"))
 	if strings.Contains(sharedEnv, `"id":"s1"`) || !strings.Contains(sharedEnv, `"id":"spep"`) {
 		t.Fatalf("registry not pruned correctly:\n%s", sharedEnv)
@@ -283,9 +286,10 @@ SERVER_REGISTRY_JSON=[{"id":"s1","name":"통일 서버","gameApiUrl":"http://s1-
 	}
 
 	res := envRequest(t, cfg.withAuth(cfg.handleServers), http.MethodDelete, "/servers?id=s1&confirm=DELETE%20s1", "")
-	if res.Code != http.StatusInternalServerError {
+	if res.Code != http.StatusOK {
 		t.Fatalf("DELETE status = %d body=%s", res.Code, res.Body.String())
 	}
+	time.Sleep(20 * time.Millisecond)
 	if _, err := os.Stat(filepath.Join(cfg.serversDir, "s1.env")); err != nil {
 		t.Fatalf("server env should remain on down failure: %v", err)
 	}
@@ -495,6 +499,26 @@ func waitForContent(t *testing.T, path, want string) {
 	t.Helper()
 	for i := 0; i < 100; i++ {
 		if data, err := os.ReadFile(path); err == nil && string(data) == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForMissing(t *testing.T, path string) {
+	t.Helper()
+	for i := 0; i < 100; i++ {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForContentNotContaining(t *testing.T, path, needle string) {
+	t.Helper()
+	for i := 0; i < 100; i++ {
+		if data, err := os.ReadFile(path); err == nil && !strings.Contains(string(data), needle) {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
