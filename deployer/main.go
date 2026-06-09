@@ -670,24 +670,24 @@ func (c config) deleteServer(rawID string, confirm string) (createServerResponse
 		return createServerResponse{OK: false, ID: id, Detail: "알 수 없는 서버입니다."}, http.StatusNotFound
 	}
 	envFile := c.serverEnvFileForID(id)
-	detail, downErr := c.downServerStack(entry.DeployProject, envFile)
-	if downErr != nil {
-		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: detail}, http.StatusInternalServerError
-	}
-	removeErr := os.Remove(envFile)
-	if removeErr != nil && !os.IsNotExist(removeErr) {
-		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: fmt.Sprintf("서버 env 삭제 실패: %v", removeErr)}, http.StatusInternalServerError
-	}
-	if _, err := c.removeRegistryEntry(id); err != nil {
-		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: fmt.Sprintf("레지스트리 갱신 실패: %v", err)}, http.StatusInternalServerError
-	}
-	reloadDetail, reloadErr := c.reloadSharedRegistry()
-	if reloadDetail != "" {
-		detail += "\n=== shared reload ===\n" + reloadDetail
-	}
-	if reloadErr != nil {
-		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: detail}, http.StatusInternalServerError
-	}
+	c.startLifecycleJob("delete "+id, func() (string, error) {
+		detail, downErr := c.downServerStack(entry.DeployProject, envFile)
+		if downErr != nil {
+			return detail, downErr
+		}
+		removeErr := os.Remove(envFile)
+		if removeErr != nil && !os.IsNotExist(removeErr) {
+			return detail, removeErr
+		}
+		if _, err := c.removeRegistryEntry(id); err != nil {
+			return detail, err
+		}
+		reloadDetail, reloadErr := c.reloadSharedRegistry()
+		if reloadDetail != "" {
+			detail += "\n=== shared reload ===\n" + reloadDetail
+		}
+		return detail, reloadErr
+	})
 	return createServerResponse{
 		OK:               true,
 		ID:               id,
@@ -695,7 +695,7 @@ func (c config) deleteServer(rawID string, confirm string) (createServerResponse
 		Project:          entry.DeployProject,
 		RestartRequired:  true,
 		AffectedServices: append(append([]string{}, sharedRegistryReloadServices...), "server-stack"),
-		Detail:           detail,
+		Detail:           "서버 삭제 작업을 시작했습니다. 목록에서 사라질 때까지 잠시 기다려 주세요.",
 	}, http.StatusOK
 }
 
