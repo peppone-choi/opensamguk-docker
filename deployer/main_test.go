@@ -95,6 +95,56 @@ func TestServerEnvMasksWriteOnlySecrets(t *testing.T) {
 	}
 }
 
+func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+	calls := []string{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		calls = append(calls, strings.Join(args, " "))
+		return "ok\n", nil
+	}
+
+	res := envRequest(t, cfg.withAuth(cfg.handleServers), http.MethodPost, "/servers", `{"id":"1","name":"통일 서버","gameApiPort":"8101","webGamePort":"3101","imageTag":"v2","scenarioCode":"scenario_1010"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("POST status = %d body=%s", res.Code, res.Body.String())
+	}
+	var body createServerResponse
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !body.OK || body.ID != "s1" || body.Project != "opensamguk-s1" {
+		t.Fatalf("create response = %#v", body)
+	}
+
+	serverEnv := readFile(t, filepath.Join(cfg.serversDir, "s1.env"))
+	for _, want := range []string{
+		"SERVER_ID=1\n",
+		"IMAGE_TAG=v2\n",
+		"GAME_API_PORT=8101\n",
+		"WEB_GAME_PORT=3101\n",
+		"JWT_SECRET=shared-secret\n",
+		"SCENARIO_SEED_ENABLED=true\n",
+		"GAME_API_URL=http://s1-game-api:8081\n",
+	} {
+		if !strings.Contains(serverEnv, want) {
+			t.Fatalf("server env missing %q:\n%s", want, serverEnv)
+		}
+	}
+	sharedEnv := readFile(t, filepath.Join(cfg.composeDir, ".env"))
+	if !strings.Contains(sharedEnv, `"id":"s1"`) || !strings.Contains(sharedEnv, `"deployProject":"opensamguk-s1"`) {
+		t.Fatalf("registry not updated:\n%s", sharedEnv)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("docker calls = %#v", calls)
+	}
+	if !strings.Contains(calls[0], "compose -p opensamguk-s1") || strings.Contains(calls[0], "--no-deps") {
+		t.Fatalf("server compose call = %q", calls[0])
+	}
+	if !strings.Contains(calls[1], "gateway-api web-gateway nginx") {
+		t.Fatalf("shared reload call = %q", calls[1])
+	}
+}
+
 func TestStatelessServicesExcludeGameEngine(t *testing.T) {
 	joined := strings.Join(statelessServices, ",")
 	if strings.Contains(joined, "game-engine") {
@@ -114,6 +164,7 @@ func testConfig(t *testing.T) config {
 		composeDir:    root,
 		serversDir:    serversDir,
 		composeServer: filepath.Join(root, "docker-compose.server.yml"),
+		composeShared: filepath.Join(root, "docker-compose.shared.yml"),
 		ghcrOwner:     "owner",
 	}
 }
