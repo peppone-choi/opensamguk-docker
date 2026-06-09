@@ -42,9 +42,9 @@ var (
 )
 
 // 스테이트리스 bounce 대상 — game-engine은 의도적으로 제외.
-var statelessServices = []string{"game-api", "web-game"}
-var sharedEnvServices = []string{"gateway-api", "web-gateway", "nginx", "deployer"}
-var sharedRegistryReloadServices = []string{"gateway-api", "web-gateway", "nginx"}
+var statelessServices = envList("DEPLOYER_STATELESS_SERVICES", []string{"game-api", "web-game"})
+var sharedEnvServices = envList("DEPLOYER_SHARED_ENV_SERVICES", []string{"gateway-api", "web-gateway", "nginx", "deployer"})
+var sharedRegistryReloadServices = envList("DEPLOYER_SHARED_REGISTRY_RELOAD_SERVICES", []string{"gateway-api", "web-gateway", "nginx"})
 
 var serverEnvAllowlist = map[string]envFieldSpec{
 	"IMAGE_TAG":             {Description: "게임 서버 이미지 태그"},
@@ -100,6 +100,25 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func envList(key string, def []string) []string {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return def
+	}
+	parts := strings.Split(raw, ",")
+	values := make([]string, 0, len(parts))
+	for _, part := range parts {
+		value := strings.TrimSpace(part)
+		if value != "" {
+			values = append(values, value)
+		}
+	}
+	if len(values) == 0 {
+		return def
+	}
+	return values
 }
 
 // 서버 env 파일 절대경로 — project명에서 servers/<id>.env 로 매핑.
