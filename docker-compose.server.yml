@@ -61,7 +61,7 @@ services:
   # 턴 데몬 — 그 월드의 source of truth. deployer 자동 재배포에서 제외(진행 중 desync 방지).
   # gateway-api/deployer를 참조하지 않는다(독립). 업데이트는 운영자 수동 bounce만.
   game-engine:
-    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/game-engine:${IMAGE_TAG:-latest}
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/opensamguk:game-engine-${IMAGE_TAG:-latest}
     container_name: s${SERVER_ID}-game-engine
     restart: unless-stopped
     environment:
@@ -91,7 +91,7 @@ services:
 
   # 그 서버 read/precheck/intake/SSE. 스테이트리스 — deployer가 bounce로 갱신.
   game-api:
-    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/game-api:${IMAGE_TAG:-latest}
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/opensamguk:game-api-${IMAGE_TAG:-latest}
     container_name: s${SERVER_ID}-game-api
     restart: unless-stopped
     environment:
@@ -123,7 +123,7 @@ services:
 
   # 그 서버 게임 프론트. 스테이트리스 — deployer가 bounce로 갱신.
   web-game:
-    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/web-game:${IMAGE_TAG:-latest}
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/opensamguk:web-game-${IMAGE_TAG:-latest}
     container_name: s${SERVER_ID}-web-game
     restart: unless-stopped
     environment:
