@@ -121,9 +121,10 @@ services:
         limits:
           memory: 1.5G
 
-  # 그 서버 게임 프론트. 스테이트리스 — deployer가 bounce로 갱신.
+  # 그 서버 게임 프론트. 스테이트리스 — CI(deploy.yml)가 매 push마다 자동 pull+bounce.
+  # WEB_GAME_TAG(프론트 전용)로 game-api/engine의 IMAGE_TAG 핀과 독립 갱신 — 미설정 시 IMAGE_TAG로 폴백.
   web-game:
-    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/opensamguk:web-game-${IMAGE_TAG:-latest}
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/opensamguk:web-game-${WEB_GAME_TAG:-${IMAGE_TAG:-latest}}
     container_name: s${SERVER_ID}-web-game
     restart: unless-stopped
     environment:
