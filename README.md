@@ -22,8 +22,9 @@ servers/s1.env.example      # 게임 서버 env 예시(서버마다 복제)
 scripts/deploy.sh           # (단일서버) 서버 배포 헬퍼
 ```
 
-앱 이미지는 `ghcr.io/${GHCR_OWNER}/{game-engine,game-api,gateway-api,web-gateway,web-game}:${IMAGE_TAG}`
-에서 받아온다. 이미지 빌드·푸시는 소스 저장소(opensamguk)의 CI가 담당한다.
+앱 이미지는 `ghcr.io/${GHCR_OWNER}/opensamguk:<서비스>-${IMAGE_TAG}`에서 받아온다.
+이미지 빌드·푸시는 소스 저장소(opensamguk)의 CI가 담당한다. 이 저장소는 compose/nginx/deployer 같은
+오케스트레이션만 배포한다.
 
 ---
 
@@ -82,6 +83,8 @@ docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env
 
 - 브라우저: `http://<호스트>/` (nginx 경유 게이트웨이/로비/어드민)
 - 관리자: 빈 DB 첫 부팅 시 `ADMIN_USERNAME`/`ADMIN_PASSWORD`로 1회 시드(멱등).
+- 첫 설치 직후에는 게임 서버가 0개여도 정상이다. `SERVER_REGISTRY_JSON=[]` 상태에서 공유 스택만 먼저
+  기동하고, 이후 어드민/수동 절차로 게임 서버를 만든다.
 
 ### 2) 게임 서버 N회 기동
 
@@ -109,6 +112,35 @@ docker compose -p opensamguk-s2 -f docker-compose.server.yml --env-file servers/
 
 > `gameApiUrl`/`gameEngineUrl` 호스트명은 그 서버 컨테이너 이름(`s<id>-game-api` 등)과 **반드시 일치**.
 > `deployProject`는 그 서버 compose 프로젝트명(`opensamguk-s<id>`) — deployer가 이 값으로 bounce 대상을 찾는다.
+
+---
+
+## GitHub Actions 배포 경계
+
+자동 배포는 두 저장소가 역할을 나눈다.
+
+### opensamguk-docker
+
+이 저장소의 `main`에 `deployer/`, compose, nginx, workflow 변경이 들어오면 EC2 self-hosted runner가
+`~/opensamguk-docker`를 fast-forward하고 다음만 자동 승격한다.
+
+- `deployer`: 로컬 이미지 rebuild 후 컨테이너 recreate
+- `nginx`: 설정 reload를 위해 force-recreate
+- compose/nginx/deployer 소스: git main으로 동기화
+
+게임 서버가 아직 하나도 없어도 성공해야 한다. 검증은 deployer `/healthz`와 nginx `/health`를 항상 확인하고,
+`s1-web-game`이 실행 중일 때만 `/game/s1`을 확인한다.
+
+### opensamguk
+
+소스 저장소의 `main` 배포는 앱 이미지를 만들고 공유 스택(`gateway-api`, `web-gateway`, `nginx`)만 자동 갱신한다.
+실행 중 게임 서버의 `servers/<id>.env`는 CI가 수정하지 않는다.
+
+- `IMAGE_TAG`: 그 서버의 `game-api`/`game-engine` 핀
+- `WEB_GAME_TAG`: 그 서버의 `web-game` 핀
+
+진행 중 서버 승격은 어드민/deployer에서 서버별로 하거나, 시즌 경계/재시드 같은 명시 운영 시점에 수동으로 한다.
+이 경계가 깨지면 게임 도중 로직/프론트가 갑자기 바뀌어 패러티와 UX가 같이 흔들릴 수 있다.
 
 ---
 

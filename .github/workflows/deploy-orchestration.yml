@@ -51,4 +51,8 @@ jobs:
           set -euo pipefail
           sudo docker exec opensamguk-deployer wget -qO- http://localhost:9000/healthz | grep -q '"status":"up"'
           curl -fsS http://localhost/health | grep -q '"status":"up"'
-          curl -fsS http://localhost/game/s1 >/dev/null
+          if sudo docker ps --format '{{.Names}}' | grep -q '^s1-web-game$'; then
+            curl -fsS http://localhost/game/s1 >/dev/null
+          else
+            echo "s1 is not running; game route check skipped"
+          fi
