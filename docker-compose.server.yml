@@ -101,6 +101,9 @@ services:
       REDIS_HOST: s${SERVER_ID}-game-redis
       REDIS_PORT: 6379
       OPENSAMGUK_PROFILE: ${TURN_PROFILE_NAME:-che:scenario_2}
+      SERVER_ID: s${SERVER_ID}
+      SERVER_NAME: ${SERVER_NAME:-}
+      SERVER_GENERATION: ${SERVER_GENERATION:-1}
       # JWT — game-api는 gateway-api가 발급한 토큰을 검증(동일 시크릿, verify-only).
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required — gateway-api와 동일 값}
       JAVA_OPTS: "-XX:+UseG1GC -XX:MaxRAMPercentage=50.0 -XX:InitialRAMPercentage=30.0 -Djava.security.egd=file:/dev/./urandom"

@@ -1,0 +1,58 @@
+name: Deploy Orchestration to EC2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/deploy-orchestration.yml"
+      - "deployer/**"
+      - "docker-compose.shared.yml"
+      - "docker-compose.server.yml"
+      - "infra/nginx/**"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-orchestration-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, ec2-prod]
+    permissions:
+      contents: read
+    steps:
+      - name: Sync orchestration repo on box
+        run: |
+          set -euo pipefail
+          STACK="$HOME/opensamguk-docker"
+          cd "$STACK"
+
+          git fetch --prune origin main
+          if ! git diff --quiet || ! git diff --cached --quiet; then
+            echo "::error::opensamguk-docker has local tracked changes; refusing to overwrite prod orchestration files"
+            git status --short
+            exit 1
+          fi
+          git merge --ff-only origin/main
+
+      - name: Rebuild deployer and reload nginx
+        run: |
+          set -euo pipefail
+          STACK="$HOME/opensamguk-docker"
+          cd "$STACK"
+          COMPOSE="sudo docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env"
+
+          $COMPOSE build deployer
+          $COMPOSE up -d --no-deps deployer
+          $COMPOSE up -d --force-recreate --no-deps nginx
+
+      - name: Verify orchestration endpoints
+        run: |
+          set -euo pipefail
+          sudo docker exec opensamguk-deployer wget -qO- http://localhost:9000/healthz | grep -q '"status":"up"'
+          curl -fsS http://localhost/health | grep -q '"status":"up"'
+          if sudo docker ps --format '{{.Names}}' | grep -q '^s1-web-game$'; then
+            curl -fsS http://localhost/game/s1 >/dev/null
+          else
+            echo "s1 is not running; game route check skipped"
+          fi
