@@ -106,7 +106,7 @@ func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 		return "ok\n", nil
 	}
 
-	res := envRequest(t, cfg.withAuth(cfg.handleServers), http.MethodPost, "/servers", `{"id":"1","name":"통일 서버","gameApiPort":"8101","webGamePort":"3101","imageTag":"v2","scenarioCode":"scenario_1010"}`)
+	res := envRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create", `{"id":"1","name":"통일 서버","generation":"3","gameApiPort":"8101","webGamePort":"3101","imageTag":"v2","scenarioCode":"scenario_1010"}`)
 	if res.Code != http.StatusOK {
 		t.Fatalf("POST status = %d body=%s", res.Code, res.Body.String())
 	}
@@ -122,6 +122,8 @@ func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 	for _, want := range []string{
 		"SERVER_ID=1\n",
 		"IMAGE_TAG=v2\n",
+		"SERVER_NAME=통일 서버\n",
+		"SERVER_GENERATION=3\n",
 		"GAME_API_PORT=8101\n",
 		"WEB_GAME_PORT=3101\n",
 		"JWT_SECRET=shared-secret\n",
@@ -133,7 +135,7 @@ func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 		}
 	}
 	sharedEnv := readFile(t, filepath.Join(cfg.composeDir, ".env"))
-	if !strings.Contains(sharedEnv, `"id":"s1"`) || !strings.Contains(sharedEnv, `"deployProject":"opensamguk-s1"`) {
+	if !strings.Contains(sharedEnv, `"id":"s1"`) || !strings.Contains(sharedEnv, `"generation":3`) || !strings.Contains(sharedEnv, `"deployProject":"opensamguk-s1"`) {
 		t.Fatalf("registry not updated:\n%s", sharedEnv)
 	}
 	waitForCalls(t, func() int { return len(calls) }, 3)
@@ -175,6 +177,26 @@ func TestCreateServerUsesConfiguredInternalUrls(t *testing.T) {
 	sharedEnv := readFile(t, filepath.Join(cfg.composeDir, ".env"))
 	if !strings.Contains(sharedEnv, `"gameApiUrl":"http://s2-game-api:18080"`) {
 		t.Fatalf("registry GAME_API_URL did not use override:\n%s", sharedEnv)
+	}
+}
+
+func TestServersGetReturnsRegistry(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
+JWT_SECRET=shared-secret
+SERVER_REGISTRY_JSON=[{"id":"s3","name":"테스트 서버","generation":4,"gameApiUrl":"http://s3-game-api:8081","gameEngineUrl":"http://s3-game-engine:8082","deployProject":"opensamguk-s3"}]
+`)
+
+	res := envRequest(t, cfg.withAuth(cfg.handleServers), http.MethodGet, "/servers", "")
+	if res.Code != http.StatusOK {
+		t.Fatalf("GET status = %d body=%s", res.Code, res.Body.String())
+	}
+	var body []registryEntry
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(body) != 1 || body[0].ID != "s3" || body[0].Generation != 4 {
+		t.Fatalf("registry response = %#v", body)
 	}
 }
 
@@ -239,7 +261,7 @@ SERVER_REGISTRY_JSON=[{"id":"s1","name":"통일 서버","gameApiUrl":"http://s1-
 		return "ok\n", nil
 	}
 
-	res := envRequest(t, cfg.withAuth(cfg.handleServers), http.MethodDelete, "/servers?id=s1&confirm=DELETE%20s1", "")
+	res := envRequest(t, cfg.withAuth(cfg.handleServerClose), http.MethodPost, "/servers/close", `{"id":"s1"}`)
 	if res.Code != http.StatusOK {
 		t.Fatalf("DELETE status = %d body=%s", res.Code, res.Body.String())
 	}
@@ -303,9 +325,9 @@ func TestResetServerRecreatesStackWithVolumes(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
 JWT_SECRET=shared-secret
-SERVER_REGISTRY_JSON=[{"id":"s1","name":"통일 서버","gameApiUrl":"http://s1-game-api:8081","gameEngineUrl":"http://s1-game-engine:8082","deployProject":"opensamguk-s1"}]
+SERVER_REGISTRY_JSON=[{"id":"s1","name":"통일 서버","generation":1,"gameApiUrl":"http://s1-game-api:8081","gameEngineUrl":"http://s1-game-engine:8082","deployProject":"opensamguk-s1"}]
 `)
-	writeEnv(t, filepath.Join(cfg.serversDir, "s1.env"), "SCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "s1.env"), "SERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n")
 	calls := []string{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
 		calls = append(calls, strings.Join(args, " "))
@@ -316,8 +338,8 @@ SERVER_REGISTRY_JSON=[{"id":"s1","name":"통일 서버","gameApiUrl":"http://s1-
 		t,
 		cfg.withAuth(cfg.handleServerReset),
 		http.MethodPost,
-		"/servers/reset?id=s1",
-		`{"confirm":"RESET s1","scenarioCode":"scenario_1002","turnTerm":"30","sync":"1","fiction":"0","extend":"1","blockGeneralCreate":"2","npcMode":"2","showImgLevel":"3","autorunUserOptions":["develop","battle"],"autorunUserMinutes":"1440","joinMode":"onlyRandom","tournamentTrig":"1","reserveOpen":"2026-06-10 20:00","preReserveOpen":"2026-06-10 19:00"}`,
+		"/servers/reset",
+		`{"id":"s1","confirm":"RESET s1","generation":"2","scenarioCode":"scenario_1002","turnTerm":"30","sync":"1","fiction":"0","extend":"1","blockGeneralCreate":"2","npcMode":"2","showImgLevel":"3","autorunUserOptions":["develop","battle"],"autorunUserMinutes":"1440","joinMode":"onlyRandom","tournamentTrig":"1","reserveOpen":"2026-06-10 20:00","preReserveOpen":"2026-06-10 19:00"}`,
 	)
 	if res.Code != http.StatusOK {
 		t.Fatalf("RESET status = %d body=%s", res.Code, res.Body.String())
@@ -349,6 +371,7 @@ SERVER_REGISTRY_JSON=[{"id":"s1","name":"통일 서버","gameApiUrl":"http://s1-
 	for _, want := range []string{
 		"SCENARIO_CODE=scenario_1002\n",
 		"SCENARIO_SEED_ENABLED=true\n",
+		"SERVER_GENERATION=2\n",
 		"RESET_TURNTERM=30\n",
 		"RESET_SYNC=1\n",
 		"RESET_FICTION=0\n",
@@ -366,6 +389,10 @@ SERVER_REGISTRY_JSON=[{"id":"s1","name":"통일 서버","gameApiUrl":"http://s1-
 		if !strings.Contains(serverEnv, want) {
 			t.Fatalf("server env missing %q:\n%s", want, serverEnv)
 		}
+	}
+	sharedEnv := readFile(t, filepath.Join(cfg.composeDir, ".env"))
+	if !strings.Contains(sharedEnv, `"id":"s1"`) || !strings.Contains(sharedEnv, `"generation":2`) {
+		t.Fatalf("registry generation was not updated:\n%s", sharedEnv)
 	}
 }
 

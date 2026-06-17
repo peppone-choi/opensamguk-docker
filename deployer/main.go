@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -54,6 +55,8 @@ var serverEnvAllowlist = map[string]envFieldSpec{
 	"TURN_PROFILE_NAME":          {Description: "턴 프로필"},
 	"SCENARIO_SEED_ENABLED":      {Description: "시나리오 자동 시드 활성화"},
 	"SCENARIO_CODE":              {Description: "시드할 시나리오 코드"},
+	"SERVER_NAME":                {Description: "서버 이름"},
+	"SERVER_GENERATION":          {Description: "서버 기수"},
 	"GAME_API_URL":               {Description: "game-api 내부 URL"},
 	"GATEWAY_API_URL":            {Description: "gateway-api 내부 URL"},
 	"JWT_SECRET":                 {Description: "JWT 검증 시크릿", WriteOnly: true},
@@ -199,6 +202,7 @@ type envPatchRequest struct {
 type createServerRequest struct {
 	ID                  string `json:"id"`
 	Name                string `json:"name"`
+	Generation          string `json:"generation"`
 	ImageTag            string `json:"imageTag"`
 	GameAPIPort         string `json:"gameApiPort"`
 	WebGamePort         string `json:"webGamePort"`
@@ -208,7 +212,9 @@ type createServerRequest struct {
 }
 
 type resetServerRequest struct {
+	ID                  string   `json:"id"`
 	Confirm             string   `json:"confirm"`
+	Generation          string   `json:"generation"`
 	ScenarioCode        string   `json:"scenarioCode"`
 	ScenarioSeedEnabled *bool    `json:"scenarioSeedEnabled"`
 	TurnTerm            string   `json:"turnTerm"`
@@ -239,6 +245,7 @@ type createServerResponse struct {
 type registryEntry struct {
 	ID            string `json:"id"`
 	Name          string `json:"name"`
+	Generation    int    `json:"generation,omitempty"`
 	GameAPIURL    string `json:"gameApiUrl"`
 	GameEngineURL string `json:"gameEngineUrl"`
 	DeployProject string `json:"deployProject"`
@@ -287,6 +294,8 @@ func main() {
 	mux.HandleFunc("/status", cfg.withAuth(cfg.handleStatus))
 	mux.HandleFunc("/deploy", cfg.withAuth(cfg.handleDeploy))
 	mux.HandleFunc("/servers", cfg.withAuth(cfg.handleServers))
+	mux.HandleFunc("/servers/create", cfg.withAuth(cfg.handleServerCreate))
+	mux.HandleFunc("/servers/close", cfg.withAuth(cfg.handleServerClose))
 	mux.HandleFunc("/servers/reset", cfg.withAuth(cfg.handleServerReset))
 	mux.HandleFunc("/env/shared", cfg.withAuth(cfg.handleSharedEnv))
 	mux.HandleFunc("/env/server", cfg.withAuth(cfg.handleServerEnv))
@@ -411,25 +420,62 @@ func (c config) handleDeploy(w http.ResponseWriter, r *http.Request) {
 
 func (c config) handleServers(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
-	case http.MethodPost:
-		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+	case http.MethodGet:
+		registry, err := c.readRegistry()
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "body 읽기 실패"})
+			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("레지스트리 조회 실패: %v", err)})
 			return
 		}
-		var req createServerRequest
-		if err := json.Unmarshal(body, &req); err != nil {
-			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "JSON 파싱 실패"})
-			return
-		}
-		res, status := c.createServer(req)
-		writeJSON(w, status, res)
+		writeJSON(w, http.StatusOK, registry)
+	case http.MethodPost:
+		c.handleServerCreate(w, r)
 	case http.MethodDelete:
 		res, status := c.deleteServer(r.URL.Query().Get("id"), r.URL.Query().Get("confirm"))
 		writeJSON(w, status, res)
 	default:
-		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "POST/DELETE only"})
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "GET/POST/DELETE only"})
 	}
+}
+
+func (c config) handleServerCreate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "POST only"})
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "body 읽기 실패"})
+		return
+	}
+	var req createServerRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "JSON 파싱 실패"})
+		return
+	}
+	res, status := c.createServer(req)
+	writeJSON(w, status, res)
+}
+
+func (c config) handleServerClose(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "POST only"})
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "body 읽기 실패"})
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "JSON 파싱 실패"})
+		return
+	}
+	id := strings.TrimSpace(req.ID)
+	res, status := c.deleteServer(id, "DELETE "+id)
+	writeJSON(w, status, res)
 }
 
 func (c config) handleServerReset(w http.ResponseWriter, r *http.Request) {
@@ -449,7 +495,11 @@ func (c config) handleServerReset(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	res, status := c.resetServer(r.URL.Query().Get("id"), req)
+	rawID := r.URL.Query().Get("id")
+	if rawID == "" {
+		rawID = req.ID
+	}
+	res, status := c.resetServer(rawID, req)
 	writeJSON(w, status, res)
 }
 
@@ -547,6 +597,10 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 	if name == "" || strings.ContainsAny(name, "\r\n") {
 		return createServerResponse{OK: false, ID: id, Detail: "서버 이름이 올바르지 않습니다."}, http.StatusBadRequest
 	}
+	generation, err := parseGeneration(req.Generation, 1)
+	if err != nil {
+		return createServerResponse{OK: false, ID: id, Detail: err.Error()}, http.StatusBadRequest
+	}
 	imageTag := strings.TrimSpace(req.ImageTag)
 	if imageTag == "" {
 		imageTag = c.sharedEnvValue("IMAGE_TAG")
@@ -607,6 +661,8 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 		{Raw: "GHCR_REGISTRY=ghcr.io", Key: "GHCR_REGISTRY", Value: "ghcr.io", IsKV: true},
 		{Raw: "GHCR_OWNER=" + c.ghcrOwner, Key: "GHCR_OWNER", Value: c.ghcrOwner, IsKV: true},
 		{Raw: "IMAGE_TAG=" + imageTag, Key: "IMAGE_TAG", Value: imageTag, IsKV: true},
+		{Raw: "SERVER_NAME=" + name, Key: "SERVER_NAME", Value: name, IsKV: true},
+		{Raw: "SERVER_GENERATION=" + strconv.Itoa(generation), Key: "SERVER_GENERATION", Value: strconv.Itoa(generation), IsKV: true},
 		{Raw: "GAME_API_PORT=" + gameAPIPort, Key: "GAME_API_PORT", Value: gameAPIPort, IsKV: true},
 		{Raw: "WEB_GAME_PORT=" + webGamePort, Key: "WEB_GAME_PORT", Value: webGamePort, IsKV: true},
 		{Raw: "GAME_POSTGRES_DB=sammo", Key: "GAME_POSTGRES_DB", Value: "sammo", IsKV: true},
@@ -625,6 +681,7 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 	entry := registryEntry{
 		ID:            id,
 		Name:          name,
+		Generation:    generation,
 		GameAPIURL:    c.gameAPIURLFor(id),
 		GameEngineURL: c.gameEngineURLFor(id),
 		DeployProject: "opensamguk-" + id,
@@ -722,13 +779,26 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 	if err != nil {
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: fmt.Sprintf("서버 env 백업 실패: %v", err)}, http.StatusInternalServerError
 	}
+	originalEntry := entry
+	if strings.TrimSpace(req.Generation) != "" {
+		generation, err := parseGeneration(req.Generation, 1)
+		if err != nil {
+			return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: err.Error()}, http.StatusBadRequest
+		}
+		entry.Generation = generation
+		if err := c.upsertRegistryEntry(entry); err != nil {
+			return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: fmt.Sprintf("레지스트리 기수 갱신 실패: %v", err)}, http.StatusInternalServerError
+		}
+	}
 	if err := c.applyResetOptions(envFile, req); err != nil {
+		_ = c.upsertRegistryEntry(originalEntry)
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: fmt.Sprintf("리셋 옵션 저장 실패: %v", err)}, http.StatusBadRequest
 	}
 	c.startLifecycleJob("reset "+id, func() (string, error) {
 		detail, downErr := c.downServerStack(entry.DeployProject, envFile)
 		if downErr != nil {
 			_ = writeFileAtomic(envFile, originalEnv)
+			_ = c.upsertRegistryEntry(originalEntry)
 			return detail, downErr
 		}
 		upDetail, upErr := c.upServerStack(entry.DeployProject, envFile)
@@ -741,10 +811,12 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 		}
 		if upErr != nil {
 			_ = writeFileAtomic(envFile, originalEnv)
+			_ = c.upsertRegistryEntry(originalEntry)
 			return detail, upErr
 		}
 		if reloadErr != nil {
 			_ = writeFileAtomic(envFile, originalEnv)
+			_ = c.upsertRegistryEntry(originalEntry)
 			return detail, reloadErr
 		}
 		return detail, nil
@@ -1029,6 +1101,18 @@ func isPort(value string) bool {
 	return n >= 1 && n <= 65535
 }
 
+func parseGeneration(value string, fallback int) (int, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return fallback, nil
+	}
+	n, err := strconv.Atoi(trimmed)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("기수는 1 이상의 숫자여야 합니다.")
+	}
+	return n, nil
+}
+
 func isSafeToken(value string) bool {
 	if value == "" {
 		return false
@@ -1160,6 +1244,13 @@ func (c config) applyResetOptions(envFile string, req resetServerRequest) error 
 	}
 	if req.ScenarioSeedEnabled != nil {
 		values["SCENARIO_SEED_ENABLED"] = boolText(*req.ScenarioSeedEnabled)
+	}
+	if strings.TrimSpace(req.Generation) != "" {
+		generation, err := parseGeneration(req.Generation, 1)
+		if err != nil {
+			return err
+		}
+		values["SERVER_GENERATION"] = strconv.Itoa(generation)
 	}
 	for key, value := range map[string]string{
 		"RESET_TURNTERM":             req.TurnTerm,

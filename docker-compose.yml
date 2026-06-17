@@ -47,7 +47,7 @@ services:
           memory: 300M
 
   game-engine:
-    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-opensamguk}/game-engine:${IMAGE_TAG:-latest}
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/opensamguk:game-engine-${IMAGE_TAG:-latest}
     container_name: opensamguk-game-engine
     restart: unless-stopped
     environment:
@@ -76,7 +76,7 @@ services:
           memory: 2G
 
   game-api:
-    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-opensamguk}/game-api:${IMAGE_TAG:-latest}
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/opensamguk:game-api-${IMAGE_TAG:-latest}
     container_name: opensamguk-game-api
     restart: unless-stopped
     environment:
@@ -104,7 +104,7 @@ services:
           memory: 1.5G
 
   gateway-api:
-    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-opensamguk}/gateway-api:${IMAGE_TAG:-latest}
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/opensamguk:gateway-api-${IMAGE_TAG:-latest}
     container_name: opensamguk-gateway-api
     restart: unless-stopped
     environment:
@@ -136,7 +136,7 @@ services:
           memory: 512M
 
   web-gateway:
-    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-opensamguk}/web-gateway:${IMAGE_TAG:-latest}
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/opensamguk:web-gateway-${IMAGE_TAG:-latest}
     container_name: opensamguk-web-gateway
     restart: unless-stopped
     environment:
@@ -156,7 +156,7 @@ services:
           memory: 256M
 
   web-game:
-    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-opensamguk}/web-game:${IMAGE_TAG:-latest}
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/opensamguk:web-game-${IMAGE_TAG:-latest}
     container_name: opensamguk-web-game
     restart: unless-stopped
     environment:

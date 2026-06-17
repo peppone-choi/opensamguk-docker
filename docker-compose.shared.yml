@@ -36,8 +36,22 @@ services:
         limits:
           memory: 512M
 
+  gateway-redis:
+    image: redis:7-alpine
+    container_name: opensamguk-gateway-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+    volumes:
+      - gateway-redisdata:/data
+    networks:
+      - opensamguk-net
+    deploy:
+      resources:
+        limits:
+          memory: 150M
+
   gateway-api:
-    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/gateway-api:${IMAGE_TAG:-latest}
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/opensamguk:gateway-api-${IMAGE_TAG:-latest}
     container_name: opensamguk-gateway-api
     restart: unless-stopped
     environment:
@@ -52,12 +66,14 @@ services:
       # 관리자 시드(빈 users 테이블에서 1회 멱등 생성).
       ADMIN_USERNAME: ${ADMIN_USERNAME:-peppone}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD required}
+      REDIS_HOST: gateway-redis
+      REDIS_PORT: 6379
       # --- 멀티서버 fan-out / 버전 배포 ---
       # 게임 서버 레지스트리(JSON 배열). 로비·어드민이 각 서버 game-api/엔진을 알기 위한 표.
-      # 예: [{"id":"s1","name":"통일 서버","gameApiUrl":"http://s1-game-api:8081",
+      # 예: [{"id":"s1","name":"통일 서버","generation":1,"gameApiUrl":"http://s1-game-api:8081",
       #       "gameEngineUrl":"http://s1-game-engine:8082","deployProject":"opensamguk-s1"}]
-      SERVER_REGISTRY_JSON: ${SERVER_REGISTRY_JSON:-"[]"}
       # 어드민 버전 패널 → deployer 사이드카(내부망 + 토큰)로 bounce 배포 위임.
+      SERVER_REGISTRY_JSON: ${SERVER_REGISTRY_JSON:-[]}
       DEPLOYER_URL: ${DEPLOYER_URL:-http://deployer:9000}
       DEPLOYER_TOKEN: ${DEPLOYER_TOKEN:?DEPLOYER_TOKEN required}
       JAVA_OPTS: "-XX:+UseG1GC -XX:MaxRAMPercentage=40.0 -XX:InitialRAMPercentage=25.0 -Djava.security.egd=file:/dev/./urandom"
@@ -74,7 +90,7 @@ services:
           memory: 512M
 
   web-gateway:
-    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/web-gateway:${IMAGE_TAG:-latest}
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/opensamguk:web-gateway-${IMAGE_TAG:-latest}
     container_name: opensamguk-web-gateway
     restart: unless-stopped
     environment:
@@ -82,7 +98,7 @@ services:
       PORT: 3000
       # 서버 전용 프록시 타깃(NEXT_PUBLIC_GAME_URL은 빌드타임에 이미지에 인라인됨).
       GATEWAY_API_URL: ${GATEWAY_API_URL:-http://gateway-api:8080}
-      SERVER_REGISTRY_JSON: ${SERVER_REGISTRY_JSON:-"[]"}
+      SERVER_REGISTRY_JSON: ${SERVER_REGISTRY_JSON:-[]}
     depends_on:
       - gateway-api
     expose:
@@ -99,8 +115,10 @@ services:
     container_name: opensamguk-nginx
     restart: unless-stopped
     volumes:
-      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ${COMPOSE_HOST_DIR:-${PWD:-.}}/infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - nginx-cache:/var/cache/nginx
+      - ${COMPOSE_HOST_DIR:-${PWD:-.}}/infra/nginx/certs:/etc/nginx/certs:ro
+      - /var/www/certbot:/var/www/certbot:ro
     depends_on:
       - gateway-api
       - web-gateway
@@ -132,6 +150,8 @@ services:
       COMPOSE_DIR: /workspace
       SERVERS_DIR: /workspace/servers
       COMPOSE_SERVER_FILE: /workspace/docker-compose.server.yml
+      COMPOSE_SHARED_FILE: /workspace/docker-compose.shared.yml
+      COMPOSE_HOST_DIR: ${COMPOSE_HOST_DIR:-${PWD:-.}}
       # GHCR 태그 조회용(공개 패키지면 익명, private면 토큰 필요 — 미해결 가정 참고).
       GHCR_OWNER: ${GHCR_OWNER:-peppone-choi}
       GHCR_TOKEN: ${GHCR_TOKEN:-}
@@ -191,6 +211,9 @@ services:
 
 volumes:
   gateway-pgdata:
+    driver: local
+
+  gateway-redisdata:
     driver: local
   nginx-cache:
     driver: local

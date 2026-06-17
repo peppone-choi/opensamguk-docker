@@ -61,7 +61,7 @@ services:
   # 턴 데몬 — 그 월드의 source of truth. deployer 자동 재배포에서 제외(진행 중 desync 방지).
   # gateway-api/deployer를 참조하지 않는다(독립). 업데이트는 운영자 수동 bounce만.
   game-engine:
-    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/game-engine:${IMAGE_TAG:-latest}
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/opensamguk:game-engine-${IMAGE_TAG:-latest}
     container_name: s${SERVER_ID}-game-engine
     restart: unless-stopped
     environment:
@@ -91,7 +91,7 @@ services:
 
   # 그 서버 read/precheck/intake/SSE. 스테이트리스 — deployer가 bounce로 갱신.
   game-api:
-    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/game-api:${IMAGE_TAG:-latest}
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/opensamguk:game-api-${IMAGE_TAG:-latest}
     container_name: s${SERVER_ID}-game-api
     restart: unless-stopped
     environment:
@@ -101,6 +101,9 @@ services:
       REDIS_HOST: s${SERVER_ID}-game-redis
       REDIS_PORT: 6379
       OPENSAMGUK_PROFILE: ${TURN_PROFILE_NAME:-che:scenario_2}
+      SERVER_ID: s${SERVER_ID}
+      SERVER_NAME: ${SERVER_NAME:-}
+      SERVER_GENERATION: ${SERVER_GENERATION:-1}
       # JWT — game-api는 gateway-api가 발급한 토큰을 검증(동일 시크릿, verify-only).
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required — gateway-api와 동일 값}
       JAVA_OPTS: "-XX:+UseG1GC -XX:MaxRAMPercentage=50.0 -XX:InitialRAMPercentage=30.0 -Djava.security.egd=file:/dev/./urandom"
@@ -121,9 +124,10 @@ services:
         limits:
           memory: 1.5G
 
-  # 그 서버 게임 프론트. 스테이트리스 — deployer가 bounce로 갱신.
+  # 그 서버 게임 프론트. 스테이트리스 — CI(deploy.yml)가 매 push마다 자동 pull+bounce.
+  # WEB_GAME_TAG(프론트 전용)로 game-api/engine의 IMAGE_TAG 핀과 독립 갱신 — 미설정 시 IMAGE_TAG로 폴백.
   web-game:
-    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/web-game:${IMAGE_TAG:-latest}
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/opensamguk:web-game-${WEB_GAME_TAG:-${IMAGE_TAG:-latest}}
     container_name: s${SERVER_ID}-web-game
     restart: unless-stopped
     environment:
