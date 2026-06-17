@@ -92,7 +92,7 @@ docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env
 
 ```bash
 cp servers/s1.env.example servers/s1.env    # SERVER_ID=1 (접두 s 없이 — compose가 s${SERVER_ID}로 합성),
-                                            # IMAGE_TAG, GAME_API_PORT/WEB_GAME_PORT,
+                                            # SERVER_NAME/SERVER_GENERATION, IMAGE_TAG, GAME_API_PORT/WEB_GAME_PORT,
                                             # GAME_POSTGRES_PASSWORD, JWT_SECRET(공유와 동일) 채우기
 docker compose -p opensamguk-s1 -f docker-compose.server.yml --env-file servers/s1.env up -d
 
@@ -105,13 +105,14 @@ docker compose -p opensamguk-s2 -f docker-compose.server.yml --env-file servers/
 
 ```json
 [
-  {"id":"s1","name":"통일 서버","gameApiUrl":"http://s1-game-api:8081","gameEngineUrl":"http://s1-game-engine:8082","deployProject":"opensamguk-s1"},
-  {"id":"s2","name":"군웅 서버","gameApiUrl":"http://s2-game-api:8081","gameEngineUrl":"http://s2-game-engine:8082","deployProject":"opensamguk-s2"}
+  {"id":"s1","name":"통일 서버","generation":1,"gameApiUrl":"http://s1-game-api:8081","gameEngineUrl":"http://s1-game-engine:8082","deployProject":"opensamguk-s1"},
+  {"id":"s2","name":"군웅 서버","generation":1,"gameApiUrl":"http://s2-game-api:8081","gameEngineUrl":"http://s2-game-engine:8082","deployProject":"opensamguk-s2"}
 ]
 ```
 
 > `gameApiUrl`/`gameEngineUrl` 호스트명은 그 서버 컨테이너 이름(`s<id>-game-api` 등)과 **반드시 일치**.
 > `deployProject`는 그 서버 compose 프로젝트명(`opensamguk-s<id>`) — deployer가 이 값으로 bounce 대상을 찾는다.
+> `generation`은 로비/어드민/게임 메인에 표시되는 기수이며, `servers/<id>.env`의 `SERVER_GENERATION`과 맞춰 둔다.
 
 ---
 
