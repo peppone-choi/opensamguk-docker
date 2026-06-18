@@ -29,7 +29,7 @@ func TestServerEnvGetPatchHappyPath(t *testing.T) {
 		t.Fatalf("IMAGE_TAG field = %#v", body.Fields["IMAGE_TAG"])
 	}
 
-	res = envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodPatch, "/env/server?id=s1", `{"values":{"IMAGE_TAG":"v2","GAME_API_PORT":"8201"}}`)
+	res = envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodPatch, "/env/server?id=s1", `{"values":{"IMAGE_TAG":"v2","GAME_API_PORT":"8201","WEB_GAME_TAG":"v3"}}`)
 	if res.Code != http.StatusOK {
 		t.Fatalf("PATCH status = %d body=%s", res.Code, res.Body.String())
 	}
@@ -42,7 +42,7 @@ func TestServerEnvGetPatchHappyPath(t *testing.T) {
 	}
 
 	data := readFile(t, filepath.Join(cfg.serversDir, "s1.env"))
-	if !strings.Contains(data, "# server\nIMAGE_TAG=v2\nGAME_API_PORT=8201\nJWT_SECRET=old-secret\n") {
+	if !strings.Contains(data, "# server\nIMAGE_TAG=v2\nGAME_API_PORT=8201\nJWT_SECRET=old-secret\nWEB_GAME_TAG=v3\n") {
 		t.Fatalf("env comments/order not preserved:\n%s", data)
 	}
 	mode := fileMode(t, filepath.Join(cfg.serversDir, "s1.env"))
