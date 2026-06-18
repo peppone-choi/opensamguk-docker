@@ -245,7 +245,7 @@ type createServerResponse struct {
 type registryEntry struct {
 	ID            string `json:"id"`
 	Name          string `json:"name"`
-	Generation    int    `json:"generation,omitempty"`
+	Generation    int    `json:"generation"`
 	GameAPIURL    string `json:"gameApiUrl"`
 	GameEngineURL string `json:"gameEngineUrl"`
 	DeployProject string `json:"deployProject"`
@@ -1107,8 +1107,8 @@ func parseGeneration(value string, fallback int) (int, error) {
 		return fallback, nil
 	}
 	n, err := strconv.Atoi(trimmed)
-	if err != nil || n < 1 {
-		return 0, fmt.Errorf("기수는 1 이상의 숫자여야 합니다.")
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("기수는 0 이상의 숫자여야 합니다.")
 	}
 	return n, nil
 }

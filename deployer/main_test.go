@@ -180,6 +180,28 @@ func TestCreateServerUsesConfiguredInternalUrls(t *testing.T) {
 	}
 }
 
+func TestCreateServerAllowsGenerationZeroForAlpha(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		return "ok\n", nil
+	}
+
+	res := envRequest(t, cfg.withAuth(cfg.handleServers), http.MethodPost, "/servers", `{"id":"0","name":"알파 서버","generation":"0","gameApiPort":"8100","webGamePort":"3100"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("POST status = %d body=%s", res.Code, res.Body.String())
+	}
+
+	serverEnv := readFile(t, filepath.Join(cfg.serversDir, "s0.env"))
+	if !strings.Contains(serverEnv, "SERVER_GENERATION=0\n") {
+		t.Fatalf("server env did not carry generation zero:\n%s", serverEnv)
+	}
+	sharedEnv := readFile(t, filepath.Join(cfg.composeDir, ".env"))
+	if !strings.Contains(sharedEnv, `"generation":0`) {
+		t.Fatalf("registry did not carry generation zero:\n%s", sharedEnv)
+	}
+}
+
 func TestServersGetReturnsRegistry(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
@@ -393,6 +415,34 @@ SERVER_REGISTRY_JSON=[{"id":"s1","name":"통일 서버","generation":1,"gameApiU
 	sharedEnv := readFile(t, filepath.Join(cfg.composeDir, ".env"))
 	if !strings.Contains(sharedEnv, `"id":"s1"`) || !strings.Contains(sharedEnv, `"generation":2`) {
 		t.Fatalf("registry generation was not updated:\n%s", sharedEnv)
+	}
+}
+
+func TestResetServerAllowsGenerationZeroForAlpha(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
+JWT_SECRET=shared-secret
+SERVER_REGISTRY_JSON=[{"id":"s1","name":"통일 서버","generation":1,"gameApiUrl":"http://s1-game-api:8081","gameEngineUrl":"http://s1-game-engine:8082","deployProject":"opensamguk-s1"}]
+`)
+	writeEnv(t, filepath.Join(cfg.serversDir, "s1.env"), "SERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n")
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		return "ok\n", nil
+	}
+
+	res := envRequest(
+		t,
+		cfg.withAuth(cfg.handleServerReset),
+		http.MethodPost,
+		"/servers/reset",
+		`{"id":"s1","confirm":"RESET s1","generation":"0","scenarioCode":"scenario_1010"}`,
+	)
+	if res.Code != http.StatusOK {
+		t.Fatalf("RESET status = %d body=%s", res.Code, res.Body.String())
+	}
+	waitForContent(t, filepath.Join(cfg.serversDir, "s1.env"), "SERVER_GENERATION=0\n")
+	sharedEnv := readFile(t, filepath.Join(cfg.composeDir, ".env"))
+	if !strings.Contains(sharedEnv, `"generation":0`) {
+		t.Fatalf("registry generation was not updated to zero:\n%s", sharedEnv)
 	}
 }
 

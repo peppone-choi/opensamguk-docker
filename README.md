@@ -112,7 +112,7 @@ docker compose -p opensamguk-s2 -f docker-compose.server.yml --env-file servers/
 
 > `gameApiUrl`/`gameEngineUrl` 호스트명은 그 서버 컨테이너 이름(`s<id>-game-api` 등)과 **반드시 일치**.
 > `deployProject`는 그 서버 compose 프로젝트명(`opensamguk-s<id>`) — deployer가 이 값으로 bounce 대상을 찾는다.
-> `generation`은 로비/어드민/게임 메인에 표시되는 기수이며, `servers/<id>.env`의 `SERVER_GENERATION`과 맞춰 둔다.
+> `generation`은 로비/어드민/게임 메인에 표시되는 기수이며, `servers/<id>.env`의 `SERVER_GENERATION`과 맞춰 둔다. 알파/테스트 서버는 `0`을 쓸 수 있고, 정식 기수는 보통 `1` 이상으로 시작한다.
 
 ---
 
