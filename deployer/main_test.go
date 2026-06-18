@@ -51,6 +51,77 @@ func TestServerEnvGetPatchHappyPath(t *testing.T) {
 	}
 }
 
+func TestServerEnvPatchSyncsRegistrySnapshotAndReloadsShared(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
+JWT_SECRET=shared-secret
+SERVER_REGISTRY_JSON=[{"id":"s1","name":"통일 서버","generation":1,"gameApiUrl":"http://s1-game-api:8081","gameEngineUrl":"http://s1-game-engine:8082","deployProject":"opensamguk-s1"}]
+`)
+	writeEnv(t, filepath.Join(cfg.serversDir, "s1.env"), "IMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://s1-game-api:8081\nJWT_SECRET=old-secret\n")
+	calls := []string{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		calls = append(calls, strings.Join(args, " "))
+		return "ok\n", nil
+	}
+
+	res := envRequest(
+		t,
+		cfg.withAuth(cfg.handleServerEnv),
+		http.MethodPatch,
+		"/env/server?id=s1",
+		`{"values":{"IMAGE_TAG":"v2","SERVER_NAME":"새 서버","SERVER_GENERATION":"0","GAME_API_URL":"http://s1-game-api-new:8081","RESET_TURNTERM":"30","JWT_SECRET":"new-secret"}}`,
+	)
+	if res.Code != http.StatusOK {
+		t.Fatalf("PATCH status = %d body=%s", res.Code, res.Body.String())
+	}
+	body := decodeEnvResponse(t, res)
+	affected := strings.Join(body.AffectedServices, ",")
+	for _, want := range []string{"game-api", "web-game", "gateway-api", "web-gateway", "nginx"} {
+		if !strings.Contains(affected, want) {
+			t.Fatalf("affected services missing %q: %#v", want, body.AffectedServices)
+		}
+	}
+
+	registry, err := cfg.readRegistry()
+	if err != nil {
+		t.Fatalf("read registry: %v", err)
+	}
+	if len(registry) != 1 {
+		t.Fatalf("registry = %#v", registry)
+	}
+	entry := registry[0]
+	if entry.Name != "새 서버" || entry.Generation != 0 || entry.GameAPIURL != "http://s1-game-api-new:8081" {
+		t.Fatalf("registry entry not synced: %#v", entry)
+	}
+	for key, want := range map[string]string{
+		"IMAGE_TAG":         "v2",
+		"SERVER_NAME":       "새 서버",
+		"SERVER_GENERATION": "0",
+		"GAME_API_URL":      "http://s1-game-api-new:8081",
+		"RESET_TURNTERM":    "30",
+	} {
+		if entry.Env[key] != want {
+			t.Fatalf("registry env[%s]=%q want %q in %#v", key, entry.Env[key], want, entry.Env)
+		}
+	}
+	if _, ok := entry.Env["JWT_SECRET"]; ok {
+		t.Fatalf("registry env leaked JWT_SECRET: %#v", entry.Env)
+	}
+	if strings.Contains(readFile(t, filepath.Join(cfg.composeDir, ".env")), "new-secret") {
+		t.Fatalf("shared registry leaked secret:\n%s", readFile(t, filepath.Join(cfg.composeDir, ".env")))
+	}
+	waitForCalls(t, func() int { return len(calls) }, 2)
+	if len(calls) != 2 {
+		t.Fatalf("docker calls = %#v", calls)
+	}
+	if !strings.Contains(calls[0], "gateway-api web-gateway") || strings.Contains(calls[0], " nginx") {
+		t.Fatalf("shared reload call = %q", calls[0])
+	}
+	if !strings.Contains(calls[1], "--force-recreate --no-deps nginx") {
+		t.Fatalf("nginx reload call = %q", calls[1])
+	}
+}
+
 func TestSharedEnvRejectsUnknownKey(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\n")
