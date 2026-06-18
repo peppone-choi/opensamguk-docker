@@ -53,6 +53,7 @@ var serverEnvAllowlist = map[string]envFieldSpec{
 	"IMAGE_TAG":                  {Description: "게임 서버 이미지 태그"},
 	"GAME_API_PORT":              {Description: "game-api 호스트 포트"},
 	"WEB_GAME_PORT":              {Description: "web-game 호스트 포트"},
+	"WEB_GAME_TAG":               {Description: "web-game 이미지 태그"},
 	"TURN_PROFILE_NAME":          {Description: "턴 프로필"},
 	"SCENARIO_SEED_ENABLED":      {Description: "시나리오 자동 시드 활성화"},
 	"SCENARIO_CODE":              {Description: "시드할 시나리오 코드"},
