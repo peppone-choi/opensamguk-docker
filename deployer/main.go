@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -243,12 +244,13 @@ type createServerResponse struct {
 }
 
 type registryEntry struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	Generation    int    `json:"generation"`
-	GameAPIURL    string `json:"gameApiUrl"`
-	GameEngineURL string `json:"gameEngineUrl"`
-	DeployProject string `json:"deployProject"`
+	ID            string            `json:"id"`
+	Name          string            `json:"name"`
+	Generation    int               `json:"generation"`
+	GameAPIURL    string            `json:"gameApiUrl"`
+	GameEngineURL string            `json:"gameEngineUrl"`
+	DeployProject string            `json:"deployProject"`
+	Env           map[string]string `json:"env,omitempty"`
 }
 
 type envResponse struct {
@@ -575,12 +577,24 @@ func (c config) handleEnv(w http.ResponseWriter, r *http.Request, ctx envRequest
 			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("env 파일 쓰기 실패: %v", err)})
 			return
 		}
+		affectedServices := append([]string{}, ctx.affectedServices...)
+		if ctx.scope == "server" {
+			changed, err := c.syncRegistryEntryFromEnv(ctx.id, ctx.path)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("레지스트리 동기화 실패: %v", err)})
+				return
+			}
+			if changed {
+				affectedServices = appendUnique(affectedServices, sharedRegistryReloadServices)
+				c.startLifecycleJob("reload registry "+ctx.id, c.reloadSharedRegistry)
+			}
+		}
 		writeJSON(w, http.StatusOK, envResponse{
 			OK:               true,
 			Scope:            ctx.scope,
 			ID:               ctx.id,
 			RestartRequired:  true,
-			AffectedServices: append([]string{}, ctx.affectedServices...),
+			AffectedServices: affectedServices,
 			Fields:           fields,
 		})
 	default:
@@ -685,6 +699,7 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 		GameAPIURL:    c.gameAPIURLFor(id),
 		GameEngineURL: c.gameEngineURLFor(id),
 		DeployProject: "opensamguk-" + id,
+		Env:           registryEnvSnapshot(envValuesFromLines(envLines)),
 	}
 	if err := c.upsertRegistryEntry(entry); err != nil {
 		return createServerResponse{OK: false, ID: id, Name: name, Project: entry.DeployProject, Detail: fmt.Sprintf("레지스트리 갱신 실패: %v", err)}, http.StatusInternalServerError
@@ -793,6 +808,14 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 	if err := c.applyResetOptions(envFile, req); err != nil {
 		_ = c.upsertRegistryEntry(originalEntry)
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: fmt.Sprintf("리셋 옵션 저장 실패: %v", err)}, http.StatusBadRequest
+	}
+	if _, err := c.syncRegistryEntryFromEnv(id, envFile); err != nil {
+		_ = writeFileAtomic(envFile, originalEnv)
+		_ = c.upsertRegistryEntry(originalEntry)
+		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: fmt.Sprintf("레지스트리 동기화 실패: %v", err)}, http.StatusInternalServerError
+	}
+	if updatedEntry, err := c.registryEntryByID(id); err == nil && updatedEntry.ID != "" {
+		entry = updatedEntry
 	}
 	c.startLifecycleJob("reset "+id, func() (string, error) {
 		detail, downErr := c.downServerStack(entry.DeployProject, envFile)
@@ -1222,6 +1245,94 @@ func (c config) registryEntryByID(id string) (registryEntry, error) {
 	return registryEntry{}, nil
 }
 
+func (c config) syncRegistryEntryFromEnv(id string, envFile string) (bool, error) {
+	if _, err := os.Stat(c.sharedEnvFile()); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	values, err := readEnvValues(envFile)
+	if err != nil {
+		return false, err
+	}
+	current, err := c.registryEntryByID(id)
+	if err != nil {
+		return false, err
+	}
+	next := c.registryEntryFromServerEnv(id, values, current)
+	if reflect.DeepEqual(current, next) {
+		return false, nil
+	}
+	return true, c.upsertRegistryEntry(next)
+}
+
+func (c config) registryEntryFromServerEnv(id string, values map[string]string, current registryEntry) registryEntry {
+	next := current
+	if next.ID == "" {
+		next.ID = id
+	}
+	if next.DeployProject == "" {
+		next.DeployProject = "opensamguk-" + id
+	}
+	if name := strings.TrimSpace(values["SERVER_NAME"]); name != "" {
+		next.Name = name
+	}
+	if next.Name == "" {
+		next.Name = id
+	}
+	if rawGeneration := strings.TrimSpace(values["SERVER_GENERATION"]); rawGeneration != "" {
+		if generation, err := parseGeneration(rawGeneration, next.Generation); err == nil {
+			next.Generation = generation
+		}
+	}
+	if gameAPIURL := strings.TrimSpace(values["GAME_API_URL"]); gameAPIURL != "" {
+		next.GameAPIURL = gameAPIURL
+	}
+	if next.GameAPIURL == "" {
+		next.GameAPIURL = c.gameAPIURLFor(id)
+	}
+	if next.GameEngineURL == "" {
+		next.GameEngineURL = c.gameEngineURLFor(id)
+	}
+	next.Env = registryEnvSnapshot(values)
+	return next
+}
+
+func registryEnvSnapshot(values map[string]string) map[string]string {
+	out := map[string]string{}
+	for key, spec := range serverEnvAllowlist {
+		if spec.WriteOnly {
+			continue
+		}
+		if value, ok := values[key]; ok {
+			out[key] = value
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func readEnvValues(path string) (map[string]string, error) {
+	lines, err := readEnvLines(path)
+	if err != nil {
+		return nil, err
+	}
+	return envValuesFromLines(lines), nil
+}
+
+func envValuesFromLines(lines []envLine) map[string]string {
+	values := map[string]string{}
+	for _, line := range lines {
+		if line.IsKV {
+			values[line.Key] = line.Value
+		}
+	}
+	return values
+}
+
 func (c config) applyResetOptions(envFile string, req resetServerRequest) error {
 	values := map[string]string{}
 	putSafe := func(key, value string) error {
@@ -1423,6 +1534,28 @@ func withoutService(values []string, remove string) []string {
 	out := []string{}
 	for _, value := range values {
 		if value != remove {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func appendUnique(values []string, additions ...[]string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	for _, list := range additions {
+		for _, value := range list {
+			if value == "" || seen[value] {
+				continue
+			}
+			seen[value] = true
 			out = append(out, value)
 		}
 	}

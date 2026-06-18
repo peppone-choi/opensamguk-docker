@@ -175,6 +175,10 @@ POST deployer/deploy  {"project":"opensamguk-s1","tag":"v1.3.0"}
 환경변수 관리 API도 같은 Bearer 토큰 인증을 사용한다. 임의 raw editor가 아니라 명시 allowlist만 수정한다.
 `DEPLOYER_TOKEN`은 서버 내부 권한 토큰이므로 API 수정 대상에서 제외한다. `JWT_SECRET`, `ADMIN_PASSWORD`,
 `GHCR_TOKEN` 같은 민감값은 PATCH로만 쓰고 GET/PATCH 응답에는 원문 값을 반환하지 않는다.
+서버별 env PATCH는 `JWT_SECRET` 같은 write-only 비밀값을 제외한 서버 env 전체를 `SERVER_REGISTRY_JSON`
+의 해당 서버 `env` 스냅샷으로 동기화한다. `SERVER_NAME`, `SERVER_GENERATION`, `GAME_API_URL`처럼 로비와
+어드민이 직접 쓰는 값은 registry의 top-level 필드도 함께 갱신하고, 공유 스택 registry reload 대상
+(`gateway-api`, `web-gateway`, `nginx`)을 `affectedServices`에 포함한다.
 
 ```text
 GET   deployer/env/shared
@@ -185,7 +189,8 @@ PATCH deployer/env/server?id=s1 {"values":{"IMAGE_TAG":"v1.3.0","JWT_SECRET":"ba
 ```
 
 PATCH 응답의 `restartRequired`와 `affectedServices`는 재기동이 필요한 대상을 알려준다. 서버별 env 변경의
-대상은 스테이트리스(`game-api`, `web-game`)뿐이며 `game-engine`은 포함하지 않는다.
+대상은 스테이트리스(`game-api`, `web-game`)와 registry reload가 필요한 공유 스택뿐이며 `game-engine`은
+포함하지 않는다.
 
 **(B) 수동 (시즌 경계 / 엔진 포함 전체 갱신)** — 엔진까지 새 버전으로 올릴 때:
 
