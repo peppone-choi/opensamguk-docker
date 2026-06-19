@@ -2,7 +2,7 @@
 //
 // 책임:
 //   - GET  /status?project=<p> : 그 서버 env 파일의 IMAGE_TAG + (best-effort) GHCR 가용 태그.
-//   - POST /deploy             : 서버 env 파일 IMAGE_TAG 치환 후 스테이트리스(game-api, web-game)만 bounce.
+//   - POST /deploy             : 서버 env 파일 IMAGE_TAG/WEB_GAME_TAG 치환 후 스테이트리스만 bounce.
 //
 // 불변 규칙:
 //   - game-engine은 절대 건드리지 않는다(진행 중 desync 방지). bounce 대상은 스테이트리스만.
@@ -40,8 +40,6 @@ var (
 	serverIDRe = regexp.MustCompile(`^s[a-zA-Z0-9_-]+$`)
 	// 이미지 태그 — 도커 태그 문자셋(영숫자/점/언더스코어/하이픈).
 	tagRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
-	// env 파일에서 IMAGE_TAG= 행을 찾고 교체하기 위한 패턴(멀티라인, 행 단위).
-	imageTagLineRe = regexp.MustCompile(`(?m)^IMAGE_TAG=.*$`)
 )
 
 // 스테이트리스 bounce 대상 — game-engine은 의도적으로 제외.
@@ -401,13 +399,13 @@ func (c config) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1) 서버 env 파일의 IMAGE_TAG 치환.
+	// 1) 서버 env 파일의 IMAGE_TAG/WEB_GAME_TAG 치환.
 	if err := c.writeImageTag(req.Project, req.Tag); err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("IMAGE_TAG 치환 실패: %v", err)})
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("IMAGE_TAG/WEB_GAME_TAG 치환 실패: %v", err)})
 		return
 	}
 
-	// 2) 스테이트리스만 pull → up -d --no-deps (game-engine 제외).
+	// 2) 스테이트리스만 pull → up -d --force-recreate --no-deps (game-engine 제외).
 	detail, err := c.bounceStateless(req.Project, envFile)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, deployResponse{
@@ -1563,26 +1561,14 @@ func appendUnique(values []string, additions ...[]string) []string {
 	return out
 }
 
-// 서버 env 파일의 IMAGE_TAG= 행을 새 태그로 치환. 행이 없으면 추가.
+// 서버 env 파일의 app 핀을 새 태그로 치환. game-engine은 실행 중 월드 보호를 위해 bounce하지 않는다.
 func (c config) writeImageTag(project, tag string) error {
 	envFile := c.envFileFor(project)
-	data, err := os.ReadFile(envFile)
-	if err != nil {
-		return err
-	}
-	newLine := "IMAGE_TAG=" + tag
-	var out string
-	if imageTagLineRe.Match(data) {
-		out = imageTagLineRe.ReplaceAllString(string(data), newLine)
-	} else {
-		// 행이 없으면 끝에 추가(개행 보장).
-		s := string(data)
-		if len(s) > 0 && !strings.HasSuffix(s, "\n") {
-			s += "\n"
-		}
-		out = s + newLine + "\n"
-	}
-	return writeFileAtomic(envFile, []byte(out))
+	_, err := patchEnvFile(envFile, serverEnvAllowlist, map[string]string{
+		"IMAGE_TAG":    tag,
+		"WEB_GAME_TAG": tag,
+	})
+	return err
 }
 
 // 스테이트리스 서비스만 pull 후 up -d --no-deps. game-engine은 절대 미포함.
@@ -1605,12 +1591,12 @@ func (c config) bounceStateless(project, envFile string) (string, error) {
 		sb.WriteString(out)
 	}
 
-	// docker compose -p <project> --env-file <env> -f <server.yml> up -d --no-deps <svc...>
+	// docker compose -p <project> --env-file <env> -f <server.yml> up -d --force-recreate --no-deps <svc...>
 	upArgs := append([]string{
 		"compose", "-p", project,
 		"--env-file", envFile,
 		"-f", c.composeServer,
-		"up", "-d", "--no-deps",
+		"up", "-d", "--force-recreate", "--no-deps",
 	}, statelessServices...)
 	if out, err := c.runDocker(upArgs...); err != nil {
 		sb.WriteString("\n=== up 실패 ===\n")

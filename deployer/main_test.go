@@ -51,6 +51,45 @@ func TestServerEnvGetPatchHappyPath(t *testing.T) {
 	}
 }
 
+func TestDeployPromotesApiAndWebGameTags(t *testing.T) {
+	cfg := testConfig(t)
+	envFile := filepath.Join(cfg.serversDir, "s1.env")
+	writeEnv(t, envFile, "# server\nIMAGE_TAG=v1\nWEB_GAME_TAG=v-old\nJWT_SECRET=old-secret\n")
+	calls := []string{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		calls = append(calls, strings.Join(args, " "))
+		return "ok\n", nil
+	}
+
+	res := envRequest(t, cfg.withAuth(cfg.handleDeploy), http.MethodPost, "/deploy", `{"project":"opensamguk-s1","tag":"v2"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("POST status = %d body=%s", res.Code, res.Body.String())
+	}
+	var body deployResponse
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !body.OK || body.Project != "opensamguk-s1" || body.Tag != "v2" {
+		t.Fatalf("deploy response = %#v", body)
+	}
+
+	data := readFile(t, envFile)
+	for _, want := range []string{"IMAGE_TAG=v2\n", "WEB_GAME_TAG=v2\n", "JWT_SECRET=old-secret\n"} {
+		if !strings.Contains(data, want) {
+			t.Fatalf("env missing %q:\n%s", want, data)
+		}
+	}
+	if len(calls) != 2 {
+		t.Fatalf("docker calls = %#v", calls)
+	}
+	if !strings.Contains(calls[0], "pull game-api web-game") {
+		t.Fatalf("pull call = %q", calls[0])
+	}
+	if !strings.Contains(calls[1], "up -d --force-recreate --no-deps game-api web-game") {
+		t.Fatalf("up call = %q", calls[1])
+	}
+}
+
 func TestServerEnvPatchSyncsRegistrySnapshotAndReloadsShared(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1

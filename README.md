@@ -163,8 +163,8 @@ docker compose -p opensamguk-s2 -f docker-compose.server.yml --env-file servers/
 **(A) 어드민 UI / deployer (권장)** — gateway-api 어드민 버전 패널이 `deployer`에 위임:
 
 1. 어드민이 서버 + 새 태그 선택 → gateway-api가 `DEPLOYER_TOKEN`으로 `POST deployer/deploy` 호출.
-2. deployer가 `servers/<id>.env`의 `IMAGE_TAG`를 치환.
-3. deployer가 그 프로젝트의 **스테이트리스만**(`game-api`, `web-game`) `pull` 후 `up -d --no-deps` 으로 교체.
+2. deployer가 `servers/<id>.env`의 `IMAGE_TAG`와 `WEB_GAME_TAG`를 같은 태그로 치환.
+3. deployer가 그 프로젝트의 **스테이트리스만**(`game-api`, `web-game`) `pull` 후 `up -d --force-recreate --no-deps` 으로 교체.
 4. **`game-engine`은 건드리지 않는다** — 진행 중 월드 desync 방지. (엔진 버전 변경은 아래 수동 절차.)
 
 ```
@@ -185,7 +185,7 @@ GET   deployer/env/shared
 PATCH deployer/env/shared {"values":{"NEXT_PUBLIC_GATEWAY_URL":"https://sam.example.com"}}
 
 GET   deployer/env/server?id=s1
-PATCH deployer/env/server?id=s1 {"values":{"IMAGE_TAG":"v1.3.0","JWT_SECRET":"base64-secret"}}
+PATCH deployer/env/server?id=s1 {"values":{"IMAGE_TAG":"v1.3.0","WEB_GAME_TAG":"v1.3.0","JWT_SECRET":"base64-secret"}}
 ```
 
 PATCH 응답의 `restartRequired`와 `affectedServices`는 재기동이 필요한 대상을 알려준다. 서버별 env 변경의
