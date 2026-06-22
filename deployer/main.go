@@ -246,6 +246,7 @@ type registryEntry struct {
 	ID            string            `json:"id"`
 	Name          string            `json:"name"`
 	Generation    int               `json:"generation"`
+	ScenarioCode  string            `json:"scenarioCode,omitempty"`
 	GameAPIURL    string            `json:"gameApiUrl"`
 	GameEngineURL string            `json:"gameEngineUrl"`
 	DeployProject string            `json:"deployProject"`
@@ -695,6 +696,7 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 		ID:            id,
 		Name:          name,
 		Generation:    generation,
+		ScenarioCode:  scenarioCode,
 		GameAPIURL:    c.gameAPIURLFor(id),
 		GameEngineURL: c.gameEngineURLFor(id),
 		DeployProject: "opensamguk-" + id,
@@ -1284,6 +1286,9 @@ func (c config) registryEntryFromServerEnv(id string, values map[string]string, 
 		if generation, err := parseGeneration(rawGeneration, next.Generation); err == nil {
 			next.Generation = generation
 		}
+	}
+	if scenarioCode := strings.TrimSpace(values["SCENARIO_CODE"]); scenarioCode != "" {
+		next.ScenarioCode = scenarioCode
 	}
 	if gameAPIURL := strings.TrimSpace(values["GAME_API_URL"]); gameAPIURL != "" {
 		next.GameAPIURL = gameAPIURL
