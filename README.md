@@ -132,6 +132,14 @@ docker compose -p opensamguk-s2 -f docker-compose.server.yml --env-file servers/
 게임 서버가 아직 하나도 없어도 성공해야 한다. 검증은 deployer `/healthz`와 nginx `/health`를 항상 확인하고,
 `s1-web-game`이 실행 중일 때만 `/game/s1`을 확인한다.
 
+게임 서버를 모두 닫은 뒤 public admin/gateway 경로가 아직 복구되지 않았다면 GitHub Actions
+**Recreate Game Server** 워크플로를 수동 실행한다. 이 워크플로는 EC2 self-hosted runner 내부에서
+`DEPLOYER_TOKEN`을 읽어 deployer `/servers/create`를 호출하므로, gateway/nginx public 경로가 내려간
+상태에서도 `s1` 같은 게임 서버를 다시 만들 수 있다. 입력값은 `server_id`, `server_name`,
+`generation`, `image_tag`, `scenario_code`, `game_api_port`, `web_game_port`이며 `jwtSecret`은 비워
+shared `JWT_SECRET`을 복사한다. 실행 후에는 `Deploy Orchestration to EC2`를 한 번 더 실행해 shared
+stack과 nginx를 재검증한다.
+
 ### opensamguk
 
 소스 저장소의 `main` 배포는 앱 이미지를 만들고 공유 스택(`gateway-api`, `web-gateway`, `nginx`)만 자동 갱신한다.
