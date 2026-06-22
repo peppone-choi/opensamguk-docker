@@ -245,7 +245,10 @@ func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 		}
 	}
 	sharedEnv := readFile(t, filepath.Join(cfg.composeDir, ".env"))
-	if !strings.Contains(sharedEnv, `"id":"s1"`) || !strings.Contains(sharedEnv, `"generation":3`) || !strings.Contains(sharedEnv, `"deployProject":"opensamguk-s1"`) {
+	if !strings.Contains(sharedEnv, `"id":"s1"`) ||
+		!strings.Contains(sharedEnv, `"generation":3`) ||
+		!strings.Contains(sharedEnv, `"scenarioCode":"scenario_1010"`) ||
+		!strings.Contains(sharedEnv, `"deployProject":"opensamguk-s1"`) {
 		t.Fatalf("registry not updated:\n%s", sharedEnv)
 	}
 	waitForCalls(t, func() int { return len(calls) }, 3)
@@ -523,8 +526,10 @@ SERVER_REGISTRY_JSON=[{"id":"s1","name":"통일 서버","generation":1,"gameApiU
 		}
 	}
 	sharedEnv := readFile(t, filepath.Join(cfg.composeDir, ".env"))
-	if !strings.Contains(sharedEnv, `"id":"s1"`) || !strings.Contains(sharedEnv, `"generation":2`) {
-		t.Fatalf("registry generation was not updated:\n%s", sharedEnv)
+	if !strings.Contains(sharedEnv, `"id":"s1"`) ||
+		!strings.Contains(sharedEnv, `"generation":2`) ||
+		!strings.Contains(sharedEnv, `"scenarioCode":"scenario_1002"`) {
+		t.Fatalf("registry generation/scenario was not updated:\n%s", sharedEnv)
 	}
 }
 
@@ -551,8 +556,9 @@ SERVER_REGISTRY_JSON=[{"id":"s1","name":"통일 서버","generation":1,"gameApiU
 	}
 	waitForContent(t, filepath.Join(cfg.serversDir, "s1.env"), "SERVER_GENERATION=0\n")
 	sharedEnv := readFile(t, filepath.Join(cfg.composeDir, ".env"))
-	if !strings.Contains(sharedEnv, `"generation":0`) {
-		t.Fatalf("registry generation was not updated to zero:\n%s", sharedEnv)
+	if !strings.Contains(sharedEnv, `"generation":0`) ||
+		!strings.Contains(sharedEnv, `"scenarioCode":"scenario_1010"`) {
+		t.Fatalf("registry generation/scenario was not updated to zero:\n%s", sharedEnv)
 	}
 }
 
