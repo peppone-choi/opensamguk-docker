@@ -1,0 +1,108 @@
+name: Recreate Game Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_id:
+        description: "Server id, e.g. s1"
+        required: true
+        default: "s1"
+      server_name:
+        description: "Display name"
+        required: true
+        default: "빼섭"
+      generation:
+        description: "Generation number"
+        required: true
+        default: "0"
+      image_tag:
+        description: "opensamguk image tag"
+        required: true
+      scenario_code:
+        description: "Scenario code"
+        required: true
+        default: "scenario_1010"
+      game_api_port:
+        description: "Host port for game-api"
+        required: true
+        default: "8101"
+      web_game_port:
+        description: "Host port for web-game"
+        required: true
+        default: "3101"
+
+concurrency:
+  group: recreate-game-server-${{ inputs.server_id }}
+  cancel-in-progress: false
+
+jobs:
+  recreate:
+    runs-on: [self-hosted, ec2-prod]
+    permissions:
+      contents: read
+    steps:
+      - name: Sync orchestration repo on box
+        run: |
+          set -euo pipefail
+          STACK="$HOME/opensamguk-docker"
+          cd "$STACK"
+
+          git fetch --prune origin main
+          if ! git diff --quiet || ! git diff --cached --quiet; then
+            echo "::error::opensamguk-docker has local tracked changes; refusing to overwrite prod orchestration files"
+            git status --short
+            exit 1
+          fi
+          git merge --ff-only origin/main
+
+      - name: Recreate server through deployer
+        env:
+          SERVER_ID: ${{ inputs.server_id }}
+          SERVER_NAME: ${{ inputs.server_name }}
+          GENERATION: ${{ inputs.generation }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          SCENARIO_CODE: ${{ inputs.scenario_code }}
+          GAME_API_PORT: ${{ inputs.game_api_port }}
+          WEB_GAME_PORT: ${{ inputs.web_game_port }}
+        run: |
+          set -euo pipefail
+          STACK="$HOME/opensamguk-docker"
+          cd "$STACK"
+
+          DEPLOYER_TOKEN="$(grep '^DEPLOYER_TOKEN=' .env | cut -d= -f2-)"
+          test -n "$DEPLOYER_TOKEN"
+
+          BODY="$(python3 -c 'import json, os; print(json.dumps({"id": os.environ["SERVER_ID"], "name": os.environ["SERVER_NAME"], "generation": os.environ["GENERATION"], "imageTag": os.environ["IMAGE_TAG"], "gameApiPort": os.environ["GAME_API_PORT"], "webGamePort": os.environ["WEB_GAME_PORT"], "scenarioCode": os.environ["SCENARIO_CODE"], "scenarioSeedEnabled": True, "jwtSecret": ""}, ensure_ascii=False))')"
+
+          RESPONSE="$(sudo docker exec -i -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
+            cat > /tmp/recreate-server.json
+            wget -qO- \
+              --header="Authorization: Bearer $DEPLOYER_TOKEN" \
+              --header="Content-Type: application/json" \
+              --post-file=/tmp/recreate-server.json \
+              http://localhost:9000/servers/create
+          ' <<<"$BODY")"
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep -q '"ok":true'
+
+      - name: Wait for server and route
+        env:
+          SERVER_ID: ${{ inputs.server_id }}
+        run: |
+          set -euo pipefail
+          NUM="${SERVER_ID#s}"
+          for i in $(seq 1 90); do
+            if sudo docker ps --format '{{.Names}}' | grep -q "^s${NUM}-game-api$" &&
+               sudo docker ps --format '{{.Names}}' | grep -q "^s${NUM}-game-engine$" &&
+               sudo docker ps --format '{{.Names}}' | grep -q "^s${NUM}-web-game$" &&
+               curl -fsS http://localhost/health | grep -q '"status":"up"' &&
+               curl -fsS "http://localhost/game/s${NUM}" >/dev/null; then
+              echo "server s${NUM} is ready"
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "::error::server ${SERVER_ID} did not become ready"
+          sudo docker ps --format 'table {{.Names}}\t{{.Status}}'
+          exit 1
