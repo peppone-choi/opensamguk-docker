@@ -20,6 +20,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -44,6 +45,7 @@ var (
 
 // 스테이트리스 bounce 대상 — game-engine은 의도적으로 제외.
 var statelessServices = envList("DEPLOYER_STATELESS_SERVICES", []string{"game-api", "web-game"})
+var requiredPromoteImagePrefixes = []string{"game-api-", "game-engine-", "web-game-"}
 var sharedEnvServices = envList("DEPLOYER_SHARED_ENV_SERVICES", []string{"gateway-api", "web-gateway", "nginx", "deployer"})
 var sharedRegistryReloadServices = envList("DEPLOYER_SHARED_REGISTRY_RELOAD_SERVICES", []string{"gateway-api", "web-gateway", "nginx"})
 
@@ -96,6 +98,7 @@ type config struct {
 	composeShared          string
 	ghcrOwner              string // GHCR 패키지 소유자(태그 조회)
 	ghcrToken              string // GHCR 조회 토큰(private면 필요, 없으면 익명)
+	ghcrAPIBaseURL         string
 	dockerRunner           func(args ...string) (string, error)
 	gameAPIInternalPort    string
 	gameEngineInternalPort string
@@ -111,6 +114,7 @@ func loadConfig() config {
 		composeShared:          envOr("COMPOSE_SHARED_FILE", "/workspace/docker-compose.shared.yml"),
 		ghcrOwner:              envOr("GHCR_OWNER", "peppone-choi"),
 		ghcrToken:              os.Getenv("GHCR_TOKEN"),
+		ghcrAPIBaseURL:         envOr("DEPLOYER_GHCR_API_BASE_URL", "https://api.github.com"),
 		gameAPIInternalPort:    envOr("DEPLOYER_GAME_API_INTERNAL_PORT", "8081"),
 		gameEngineInternalPort: envOr("DEPLOYER_GAME_ENGINE_INTERNAL_PORT", "8082"),
 		gatewayAPIURL:          envOr("DEPLOYER_GATEWAY_API_URL", "http://gateway-api:8080"),
@@ -400,14 +404,28 @@ func (c config) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1) 서버 env 파일의 IMAGE_TAG/WEB_GAME_TAG 치환.
+	tempEnvFile, cleanup, err := c.tempImageTagEnvFile(envFile, req.Tag)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("임시 env 생성 실패: %v", err)})
+		return
+	}
+	defer cleanup()
+
+	detail, err := c.pullStateless(req.Project, tempEnvFile)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, deployResponse{
+			Project: req.Project, Tag: req.Tag, OK: false, Detail: detail,
+		})
+		return
+	}
+
 	if err := c.writeImageTag(req.Project, req.Tag); err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("IMAGE_TAG/WEB_GAME_TAG 치환 실패: %v", err)})
 		return
 	}
 
-	// 2) 스테이트리스만 pull → up -d --force-recreate --no-deps (game-engine 제외).
-	detail, err := c.bounceStateless(req.Project, envFile)
+	upDetail, err := c.upStateless(req.Project, envFile)
+	detail += "\n" + upDetail
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, deployResponse{
 			Project: req.Project, Tag: req.Tag, OK: false, Detail: detail,
@@ -1576,8 +1594,53 @@ func (c config) writeImageTag(project, tag string) error {
 	return err
 }
 
+func (c config) tempImageTagEnvFile(envFile, tag string) (string, func(), error) {
+	data, err := os.ReadFile(envFile)
+	if err != nil {
+		return "", func() {}, err
+	}
+	tmp, err := os.CreateTemp(c.serversDir, ".deploy-*.env")
+	if err != nil {
+		return "", func() {}, err
+	}
+	tmpPath := tmp.Name()
+	cleanup := func() {
+		_ = os.Remove(tmpPath)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return "", func() {}, err
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return "", func() {}, err
+	}
+	if err := os.Chmod(tmpPath, 0o600); err != nil {
+		cleanup()
+		return "", func() {}, err
+	}
+	if _, err := patchEnvFile(tmpPath, serverEnvAllowlist, map[string]string{
+		"IMAGE_TAG":    tag,
+		"WEB_GAME_TAG": tag,
+	}); err != nil {
+		cleanup()
+		return "", func() {}, err
+	}
+	return tmpPath, cleanup, nil
+}
+
 // 스테이트리스 서비스만 pull 후 up -d --no-deps. game-engine은 절대 미포함.
 func (c config) bounceStateless(project, envFile string) (string, error) {
+	pullDetail, err := c.pullStateless(project, envFile)
+	if err != nil {
+		return pullDetail, err
+	}
+	upDetail, err := c.upStateless(project, envFile)
+	return pullDetail + "\n" + upDetail, err
+}
+
+func (c config) pullStateless(project, envFile string) (string, error) {
 	var sb strings.Builder
 
 	// docker compose -p <project> --env-file <env> -f <server.yml> pull <svc...>
@@ -1595,6 +1658,11 @@ func (c config) bounceStateless(project, envFile string) (string, error) {
 		sb.WriteString("=== pull ===\n")
 		sb.WriteString(out)
 	}
+	return sb.String(), nil
+}
+
+func (c config) upStateless(project, envFile string) (string, error) {
+	var sb strings.Builder
 
 	// docker compose -p <project> --env-file <env> -f <server.yml> up -d --force-recreate --no-deps <svc...>
 	upArgs := append([]string{
@@ -1628,15 +1696,18 @@ func (c config) runDocker(args ...string) (string, error) {
 	return string(out), err
 }
 
-// GHCR 공개 패키지 태그 목록(best-effort). 실패 시 빈 슬라이스.
-// 미해결 가정: private 패키지면 GHCR_TOKEN(read:packages) 필요. 없으면 익명 → 비공개는 빈 배열.
 func (c config) fetchAvailableTags() []string {
+	rawTags := c.fetchPackageTags("opensamguk")
+	return deployableAppTags(rawTags)
+}
+
+func (c config) fetchPackageTags(packageName string) []string {
 	tags := []string{}
-	// GHCR(GitHub Packages) container 태그는 GitHub REST API로 조회.
-	// game-api 패키지 기준 대표 조회(앱 이미지는 같은 태그로 함께 푸시된다고 가정).
 	url := fmt.Sprintf(
-		"https://api.github.com/users/%s/packages/container/game-api/versions?per_page=50",
-		c.ghcrOwner,
+		"%s/users/%s/packages/container/%s/versions?per_page=100",
+		strings.TrimRight(envOrValue(c.ghcrAPIBaseURL, "https://api.github.com"), "/"),
+		url.PathEscape(c.ghcrOwner),
+		url.PathEscape(packageName),
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
@@ -1677,6 +1748,61 @@ func (c config) fetchAvailableTags() []string {
 		}
 	}
 	return tags
+}
+
+func deployableAppTags(rawTags []string) []string {
+	type candidate struct {
+		firstIndex int
+		have       map[string]bool
+	}
+	candidates := map[string]*candidate{}
+	for i, rawTag := range rawTags {
+		for _, prefix := range requiredPromoteImagePrefixes {
+			if !strings.HasPrefix(rawTag, prefix) {
+				continue
+			}
+			suffix := strings.TrimPrefix(rawTag, prefix)
+			if suffix == "" || suffix == "latest" || !tagRe.MatchString(suffix) {
+				continue
+			}
+			entry := candidates[suffix]
+			if entry == nil {
+				entry = &candidate{firstIndex: i, have: map[string]bool{}}
+				candidates[suffix] = entry
+			}
+			if i < entry.firstIndex {
+				entry.firstIndex = i
+			}
+			entry.have[prefix] = true
+		}
+	}
+	complete := make([]struct {
+		tag        string
+		firstIndex int
+	}, 0, len(candidates))
+	for tag, entry := range candidates {
+		ok := true
+		for _, prefix := range requiredPromoteImagePrefixes {
+			if !entry.have[prefix] {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			complete = append(complete, struct {
+				tag        string
+				firstIndex int
+			}{tag: tag, firstIndex: entry.firstIndex})
+		}
+	}
+	sort.SliceStable(complete, func(i, j int) bool {
+		return complete[i].firstIndex < complete[j].firstIndex
+	})
+	out := make([]string, 0, len(complete))
+	for _, entry := range complete {
+		out = append(out, entry.tag)
+	}
+	return out
 }
 
 // JSON 응답 헬퍼.

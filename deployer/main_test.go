@@ -90,6 +90,51 @@ func TestDeployPromotesApiAndWebGameTags(t *testing.T) {
 	}
 }
 
+func TestDeployDoesNotMutateEnvWhenPullFails(t *testing.T) {
+	cfg := testConfig(t)
+	envFile := filepath.Join(cfg.serversDir, "s1.env")
+	original := "# server\nIMAGE_TAG=v1\nWEB_GAME_TAG=v-old\nJWT_SECRET=old-secret\n"
+	writeEnv(t, envFile, original)
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		return "web-game Error not found\n", errors.New("pull failed")
+	}
+
+	res := envRequest(t, cfg.withAuth(cfg.handleDeploy), http.MethodPost, "/deploy", `{"project":"opensamguk-s1","tag":"missing"}`)
+	if res.Code != http.StatusInternalServerError {
+		t.Fatalf("POST status = %d body=%s", res.Code, res.Body.String())
+	}
+	if got := readFile(t, envFile); got != original {
+		t.Fatalf("env mutated after failed pull:\n%s", got)
+	}
+}
+
+func TestFetchAvailableTagsReturnsOnlyCompleteDeployableAppTags(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/users/owner/packages/container/opensamguk/versions" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if r.URL.Query().Get("per_page") != "100" {
+			t.Fatalf("unexpected query: %s", r.URL.RawQuery)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[
+			{"metadata":{"container":{"tags":["game-api-missing-web","game-api-complete"]}}},
+			{"metadata":{"container":{"tags":["game-engine-complete","web-game-complete"]}}},
+			{"metadata":{"container":{"tags":["game-api-latest","game-engine-latest","web-game-latest"]}}},
+			{"metadata":{"container":{"tags":["web-game-second","game-engine-second","game-api-second"]}}}
+		]`))
+	}))
+	defer srv.Close()
+
+	cfg := testConfig(t)
+	cfg.ghcrAPIBaseURL = srv.URL
+
+	got := cfg.fetchAvailableTags()
+	if strings.Join(got, ",") != "complete,second" {
+		t.Fatalf("available tags = %#v", got)
+	}
+}
+
 func TestServerEnvPatchSyncsRegistrySnapshotAndReloadsShared(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
@@ -611,12 +656,13 @@ func testConfig(t *testing.T) config {
 		t.Fatal(err)
 	}
 	return config{
-		token:         "test-token",
-		composeDir:    root,
-		serversDir:    serversDir,
-		composeServer: filepath.Join(root, "docker-compose.server.yml"),
-		composeShared: filepath.Join(root, "docker-compose.shared.yml"),
-		ghcrOwner:     "owner",
+		token:          "test-token",
+		composeDir:     root,
+		serversDir:     serversDir,
+		composeServer:  filepath.Join(root, "docker-compose.server.yml"),
+		composeShared:  filepath.Join(root, "docker-compose.shared.yml"),
+		ghcrOwner:      "owner",
+		ghcrAPIBaseURL: "https://api.github.com",
 	}
 }
 
