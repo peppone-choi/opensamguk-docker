@@ -7,6 +7,10 @@ on:
         description: "Server id, e.g. s1"
         required: true
         default: "s1"
+      image_tag:
+        description: "Optional existing image tag to write into server env before start"
+        required: false
+        default: ""
 
 concurrency:
   group: start-game-server-${{ inputs.server_id }}
@@ -35,6 +39,7 @@ jobs:
       - name: Start existing server stack
         env:
           SERVER_ID: ${{ inputs.server_id }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
           set -euo pipefail
           STACK="$HOME/opensamguk-docker"
@@ -44,6 +49,19 @@ jobs:
           ENV_FILE="servers/s${NUM}.env"
           PROJECT="opensamguk-s${NUM}"
           test -f "$ENV_FILE"
+
+          if [ -n "$IMAGE_TAG" ]; then
+            if [[ ! "$IMAGE_TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "::error::invalid image_tag"
+              exit 1
+            fi
+            sudo sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=${IMAGE_TAG}/" "$ENV_FILE"
+            if sudo grep -q '^WEB_GAME_TAG=' "$ENV_FILE"; then
+              sudo sed -i "s/^WEB_GAME_TAG=.*/WEB_GAME_TAG=${IMAGE_TAG}/" "$ENV_FILE"
+            else
+              echo "WEB_GAME_TAG=${IMAGE_TAG}" | sudo tee -a "$ENV_FILE" >/dev/null
+            fi
+          fi
 
           sudo docker compose -p "$PROJECT" \
             --env-file "$ENV_FILE" \
