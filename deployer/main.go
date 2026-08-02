@@ -351,6 +351,7 @@ func main() {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "up"})
 	})
+	mux.HandleFunc("/readyz", cfg.handleReady)
 	mux.HandleFunc("/status", cfg.withAuth(cfg.handleStatus))
 	mux.HandleFunc("/deploy", cfg.withAuth(cfg.handleDeploy))
 	mux.HandleFunc("/servers", cfg.withAuth(cfg.handleServers))
@@ -369,6 +370,18 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func (c config) handleReady(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "GET only"})
+		return
+	}
+	if _, err := c.readRegistry(); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: fmt.Sprintf("레지스트리 준비 실패: %v", err)})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
 // Bearer 토큰 검증 미들웨어.

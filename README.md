@@ -19,7 +19,7 @@ deployer/                   # 버전 bounce 배포 사이드카(Go stdlib, 외�
 infra/nginx/nginx.conf      # 리버스 프록시(게이트웨이 / 진입점)
 servers/s1.env.example      # 게임 서버 env 예시(서버마다 복제)
 .env.example                # 공유 스택 env 예시(.env로 복사)
-scripts/deploy.sh           # (단일서버) 서버 배포 헬퍼
+scripts/deploy.sh           # GCP 멀티서버 배포에서는 fail-fast (GitHub Actions 사용)
 ```
 
 앱 이미지는 `ghcr.io/${GHCR_OWNER}/opensamguk:<서비스>-${IMAGE_TAG}`에서 받아온다.
@@ -48,8 +48,10 @@ scripts/deploy.sh           # (단일서버) 서버 배포 헬퍼
   + `game-postgres` + `game-redis` + 자기 `IMAGE_TAG`. 서버끼리 월드/버전이 완전히 격리된다.
 - **공유 스택**: `gateway-postgres`(유저/인증) + `gateway-api` + `web-gateway` + `nginx`
   + `deployer` 사이드카 + `socket-proxy`. 전 서버 공통(로그인/로비/어드민/배포).
-- **로비/게임 진입**: nginx는 `/game/<public-id>`를 해당 게임 서버로 보낸다. `/api/game`은 httpOnly
-  `sam_access` 쿠키를 Bearer로 바꾸는 `web-gateway`를 항상 통과하고, `sam_server` 쿠키를 가진
+- **로비/게임 진입**: nginx는 `/game/<public-id>`를 해당 게임 서버로 보낸다. 브라우저의 게임 관리 호출은
+  `/api/game/api/admin/...`을 포함한 `/api/game/...`이며, httpOnly `sam_access` 쿠키를 Bearer로 바꾸는
+  `web-gateway`를 항상 통과한다. direct `/api/admin/...`도 game-api bypass가 없는 `/api/` surface라
+  `web-gateway`가 안전하게 404 처리할 수 있다. `sam_server` 쿠키를 가진
   `/game/_next/static`은 같은 게임 웹으로 프록시한다. 잘못된 path/cookie id는 404로 fail-closed 한다.
 
 ### 공개 서버 ID 계약
@@ -143,8 +145,12 @@ docker compose -p opensamguk-salpha -f docker-compose.server.yml --env-file serv
 - `nginx`: 설정 reload를 위해 force-recreate
 - compose/nginx/deployer 소스: git main으로 동기화
 
-게임 서버가 아직 하나도 없어도 성공해야 한다. 검증은 deployer `/healthz`와 nginx `/health`를 항상 확인하고,
+게임 서버가 아직 하나도 없어도 성공해야 한다. 검증은 deployer `/healthz`와 registry 검증을 수행하는 `/readyz`,
+nginx `/health`를 항상 확인하고,
 레지스트리에 있는 실행 중 public 서버가 있을 때만 `/game/<public-id>`를 확인한다.
+
+GCP의 shared/per-server orchestration 배포는 GitHub Actions **Deploy Orchestration to GCP**만 지원한다.
+`scripts/deploy.sh`는 과거 root single-stack 경로를 실행하지 않고 즉시 실패하므로 운영 배포에 사용하지 않는다.
 
 게임 서버를 닫았거나 복구해야 할 때에는 다음 순서를 따른다.
 

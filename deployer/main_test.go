@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -64,6 +65,24 @@ func TestServerCloseRejectsWhitespaceAroundPublicID(t *testing.T) {
 	res := envRequest(t, cfg.withAuth(cfg.handleServerClose), http.MethodPost, "/servers/close", `{"id":" pep "}`)
 	if res.Code != http.StatusBadRequest {
 		t.Fatalf("POST status = %d body=%s", res.Code, res.Body.String())
+	}
+}
+
+func TestReadyzRequiresCanonicalRegistry(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","deployProject":"opensamguk-spep"}]
+`)
+
+	res := envRequest(t, cfg.handleReady, http.MethodGet, "/readyz", "")
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"status":"ready"`) {
+		t.Fatalf("valid readiness = %d body=%s", res.Code, res.Body.String())
+	}
+
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"spep","deployProject":"opensamguk-spep"}]
+`)
+	res = envRequest(t, cfg.handleReady, http.MethodGet, "/readyz", "")
+	if res.Code != http.StatusServiceUnavailable || !strings.Contains(res.Body.String(), "one-time migration") {
+		t.Fatalf("invalid readiness = %d body=%s", res.Code, res.Body.String())
 	}
 }
 
@@ -429,6 +448,57 @@ func TestServerComposeExportsPublicIDAndSynthesizesInternalNames(t *testing.T) {
 	}
 	if strings.Contains(compose, "SERVER_ID: s${SERVER_ID}") {
 		t.Fatalf("compose leaked internal key as public SERVER_ID")
+	}
+}
+
+func TestNginxRouteReservationsAndApiProxyContract(t *testing.T) {
+	nginx := readFile(t, filepath.Join("..", "infra", "nginx", "nginx.conf"))
+	const suffix = `)(?:/|$)`
+	var routeLists [][]string
+	for _, prefix := range []string{`~^/game/(?:`, `location ~ ^/game/(?:`} {
+		for remaining := nginx; ; {
+			start := strings.Index(remaining, prefix)
+			if start < 0 {
+				break
+			}
+			remaining = remaining[start+len(prefix):]
+			end := strings.Index(remaining, suffix)
+			if end < 0 {
+				t.Fatalf("nginx route pattern missing suffix after %q", remaining)
+			}
+			routes := strings.Split(remaining[:end], "|")
+			sort.Strings(routes)
+			routeLists = append(routeLists, routes)
+			remaining = remaining[end+len(suffix):]
+		}
+	}
+	if len(routeLists) != 3 {
+		t.Fatalf("nginx reserved route list count = %d, want 3", len(routeLists))
+	}
+
+	gameRoutes := make([]string, 0, len(reservedGameRouteIDs))
+	for route := range reservedGameRouteIDs {
+		gameRoutes = append(gameRoutes, route)
+	}
+	sort.Strings(gameRoutes)
+	pathRoutes := append([]string{"all"}, gameRoutes...)
+	sort.Strings(pathRoutes)
+	if strings.Join(routeLists[0], ",") != strings.Join(pathRoutes, ",") {
+		t.Fatalf("nginx path reservations = %v, want %v", routeLists[0], pathRoutes)
+	}
+	for _, routes := range routeLists[1:] {
+		if strings.Join(routes, ",") != strings.Join(gameRoutes, ",") {
+			t.Fatalf("nginx cookie route reservations = %v, want %v", routes, gameRoutes)
+		}
+	}
+
+	for _, forbidden := range []string{"game_cookie_api_upstream", "location /api/admin/", "location = /api/game", "location ^~ /api/game/"} {
+		if strings.Contains(nginx, forbidden) {
+			t.Fatalf("nginx still has direct game API route %q", forbidden)
+		}
+	}
+	if got := strings.Count(nginx, "location /api/ {\n            proxy_pass http://web_gateway/api/;"); got != 2 {
+		t.Fatalf("web-gateway API proxy count = %d, want 2", got)
 	}
 }
 

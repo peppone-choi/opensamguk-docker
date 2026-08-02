@@ -61,6 +61,7 @@ jobs:
           set -euo pipefail
           STACK="$HOME/opensamguk-docker"
           sudo docker exec opensamguk-deployer wget -qO- http://localhost:9000/healthz | grep -q '"status":"up"'
+          sudo docker exec opensamguk-deployer wget -qO- http://localhost:9000/readyz | grep -q '"status":"ready"'
           curl -fsS http://localhost/health | grep -q '"status":"up"'
 
           SERVER_ID="$(python3 - "$STACK/.env" <<'PY'
