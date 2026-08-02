@@ -424,13 +424,28 @@ func TestMaintenanceAPIBearerLoopbackAndIdempotency(t *testing.T) {
 	}
 
 	get := loopbackRequest(t, handler, http.MethodGet, "/maintenance", "")
+	getRaw := append([]byte(nil), get.Body.Bytes()...)
 	if get.Code != http.StatusOK || decodeMaintenanceResponse(t, get).State != maintenanceStateOpen {
 		t.Fatalf("initial maintenance response = %d body=%s", get.Code, get.Body.String())
 	}
+	var getPayload map[string]any
+	if err := json.Unmarshal(getRaw, &getPayload); err != nil {
+		t.Fatalf("decode maintenance GET payload: %v", err)
+	}
+	if _, leaked := getPayload["lease"]; leaked {
+		t.Fatalf("maintenance GET leaked lease: %#v", getPayload)
+	}
+	lease := ""
 	for attempt := 0; attempt < 2; attempt++ {
 		enter := loopbackRequest(t, handler, http.MethodPost, "/maintenance/enter", "")
-		if enter.Code != http.StatusOK || decodeMaintenanceResponse(t, enter).State != maintenanceStateDrained {
+		body := decodeMaintenanceResponse(t, enter)
+		if enter.Code != http.StatusOK || body.State != maintenanceStateDrained || !lifecycleJobIDRe.MatchString(body.Lease) {
 			t.Fatalf("maintenance enter attempt %d = %d body=%s", attempt, enter.Code, enter.Body.String())
+		}
+		if attempt == 0 {
+			lease = body.Lease
+		} else if body.Lease != lease {
+			t.Fatalf("idempotent maintenance enter changed lease %q -> %q", lease, body.Lease)
 		}
 	}
 	if _, err := os.Stat(cfg.maintenanceFile); err != nil {
@@ -438,12 +453,124 @@ func TestMaintenanceAPIBearerLoopbackAndIdempotency(t *testing.T) {
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		leave := loopbackRequest(t, handler, http.MethodPost, "/maintenance/leave", "")
-		if leave.Code != http.StatusOK || decodeMaintenanceResponse(t, leave).State != maintenanceStateOpen {
+		body := decodeMaintenanceResponse(t, leave)
+		if leave.Code != http.StatusOK || body.State != maintenanceStateOpen || body.Lease != "" {
 			t.Fatalf("maintenance leave attempt %d = %d body=%s", attempt, leave.Code, leave.Body.String())
 		}
 	}
 	if _, err := os.Stat(cfg.maintenanceFile); !os.IsNotExist(err) {
 		t.Fatalf("maintenance marker remained after leave: %v", err)
+	}
+}
+
+func TestMaintenanceLeasePermitsOnlyOneLoopbackIdempotentCreate(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+	dockerStarted := make(chan struct{})
+	releaseDocker := make(chan struct{})
+	var started sync.Once
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		started.Do(func() {
+			close(dockerStarted)
+			<-releaseDocker
+		})
+		return "ok\n", nil
+	}
+	defer func() {
+		select {
+		case <-releaseDocker:
+		default:
+			close(releaseDocker)
+		}
+	}()
+
+	maintenanceHandler := cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance))
+	enter := loopbackRequest(t, maintenanceHandler, http.MethodPost, "/maintenance/enter", "")
+	entered := decodeMaintenanceResponse(t, enter)
+	if enter.Code != http.StatusOK || entered.State != maintenanceStateDrained || !lifecycleJobIDRe.MatchString(entered.Lease) {
+		t.Fatalf("maintenance enter = %d", enter.Code)
+	}
+
+	operationID := "0123456789abcdef0123456789abcdef"
+	body := `{"id":"pep","name":"첫 서버","gameApiPort":"8101","webGamePort":"3101","operationId":"` + operationID + `"}`
+	createHandler := cfg.withAuth(cfg.handleServerCreate)
+	requestCreate := func(remoteAddr, lease string, requestBody string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/servers/create", bytes.NewBufferString(requestBody))
+		req.Header.Set("Authorization", "Bearer test-token")
+		req.Header.Set("Content-Type", "application/json")
+		if lease != "" {
+			req.Header.Set(maintenanceLeaseHeader, lease)
+		}
+		req.RemoteAddr = remoteAddr
+		res := httptest.NewRecorder()
+		createHandler(res, req)
+		return res
+	}
+
+	nonLoopback := requestCreate("198.51.100.4:31000", entered.Lease, body)
+	if nonLoopback.Code != http.StatusForbidden {
+		t.Fatalf("non-loopback leased create = %d", nonLoopback.Code)
+	}
+
+	first := requestCreate("127.0.0.1:31000", entered.Lease, body)
+	firstRaw := append([]byte(nil), first.Body.Bytes()...)
+	if first.Code != http.StatusOK {
+		t.Fatalf("leased create = %d body=%s", first.Code, first.Body.String())
+	}
+	var firstBody createServerResponse
+	if err := json.Unmarshal(firstRaw, &firstBody); err != nil {
+		t.Fatalf("decode leased create: %v", err)
+	}
+	if !lifecycleJobIDRe.MatchString(firstBody.JobID) || strings.Contains(string(firstRaw), entered.Lease) {
+		t.Fatal("leased create did not return exactly one redacted lifecycle job")
+	}
+	select {
+	case <-dockerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("leased create did not enter Docker work")
+	}
+
+	retry := requestCreate("198.51.100.4:31000", "", body)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("idempotent retry after ambiguous leased create = %d body=%s", retry.Code, retry.Body.String())
+	}
+	var retryBody createServerResponse
+	if err := json.NewDecoder(retry.Body).Decode(&retryBody); err != nil {
+		t.Fatalf("decode idempotent retry: %v", err)
+	}
+	if retryBody.JobID != firstBody.JobID {
+		t.Fatalf("idempotent retry job %q, want %q", retryBody.JobID, firstBody.JobID)
+	}
+
+	secondBody := `{"id":"foo","name":"둘 서버","gameApiPort":"8102","webGamePort":"3102","operationId":"fedcba9876543210fedcba9876543210"}`
+	second := requestCreate("127.0.0.1:31000", entered.Lease, secondBody)
+	if second.Code != http.StatusServiceUnavailable || second.Header().Get("Retry-After") != "5" {
+		t.Fatalf("second leased create = %d retry=%q body=%s", second.Code, second.Header().Get("Retry-After"), second.Body.String())
+	}
+	blocked := envRequest(t, cfg.withAuth(cfg.handleSharedEnv), http.MethodPatch, "/env/shared", `{"values":{"COOKIE_SECURE":"true"}}`)
+	if blocked.Code != http.StatusServiceUnavailable || blocked.Header().Get("Retry-After") != "5" {
+		t.Fatalf("direct mutation while leased create runs = %d", blocked.Code)
+	}
+	cfg.operations.mu.Lock()
+	lease := cfg.operations.maintenanceLease
+	leaseValid := lease != nil && lease.consumed && lease.operationID == operationID && lease.jobID == firstBody.JobID
+	cfg.operations.mu.Unlock()
+	if !leaseValid {
+		t.Fatal("maintenance lease was not consumed by the matching create only")
+	}
+
+	close(releaseDocker)
+	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, firstBody.JobID, lifecycleJobSucceeded); completed.Status != lifecycleJobSucceeded {
+		t.Fatalf("leased create completion = %#v", completed)
+	}
+	get := loopbackRequest(t, maintenanceHandler, http.MethodGet, "/maintenance", "")
+	getRaw := append([]byte(nil), get.Body.Bytes()...)
+	if get.Code != http.StatusOK || decodeMaintenanceResponse(t, get).State != maintenanceStateDrained || strings.Contains(string(getRaw), "lease") {
+		t.Fatal("completed leased create did not leave a redacted drained marker")
+	}
+	leave := loopbackRequest(t, maintenanceHandler, http.MethodPost, "/maintenance/leave", "")
+	if leave.Code != http.StatusOK || decodeMaintenanceResponse(t, leave).State != maintenanceStateOpen {
+		t.Fatalf("maintenance leave after leased create = %d body=%s", leave.Code, leave.Body.String())
 	}
 }
 
@@ -473,6 +600,50 @@ func TestPersistedMaintenanceMarkerStartsClosedUntilLeave(t *testing.T) {
 	open := envRequest(t, restarted.withAuth(restarted.handleSharedEnv), http.MethodPatch, "/env/shared", `{"values":{"COOKIE_SECURE":"true"}}`)
 	if open.Code != http.StatusOK {
 		t.Fatalf("mutation after marker leave = %d body=%s", open.Code, open.Body.String())
+	}
+}
+
+func TestRestartedMaintenanceMarkerRejectsDirectMutationsAndLosesInMemoryJob(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "COOKIE_SECURE=false\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+	maintenanceHandler := cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance))
+	enter := loopbackRequest(t, maintenanceHandler, http.MethodPost, "/maintenance/enter", "")
+	entered := decodeMaintenanceResponse(t, enter)
+	if enter.Code != http.StatusOK || !lifecycleJobIDRe.MatchString(entered.Lease) {
+		t.Fatalf("maintenance enter before restart = %d", enter.Code)
+	}
+	lostJobID, err := cfg.lifecycleJobs.reserve()
+	if err != nil {
+		t.Fatalf("reserve in-memory job before restart: %v", err)
+	}
+
+	restarted := cfg
+	restarted.lifecycleJobs = newLifecycleJobManager()
+	restarted.operations = newOperationCoordinator(restarted.maintenanceFile, restarted.lifecycleJobs)
+	restartedMaintenance := restarted.withAuth(restarted.withLoopback(restarted.handleMaintenance))
+	get := loopbackRequest(t, restartedMaintenance, http.MethodGet, "/maintenance", "")
+	getRaw := append([]byte(nil), get.Body.Bytes()...)
+	if get.Code != http.StatusOK || decodeMaintenanceResponse(t, get).State != maintenanceStateDrained || strings.Contains(string(getRaw), "lease") {
+		t.Fatal("restart did not retain a redacted closed marker")
+	}
+
+	blocked := envRequest(t, restarted.withAuth(restarted.handleSharedEnv), http.MethodPatch, "/env/shared", `{"values":{"COOKIE_SECURE":"true"}}`)
+	if blocked.Code != http.StatusServiceUnavailable || blocked.Header().Get("Retry-After") != "5" {
+		t.Fatalf("direct PATCH after restart = %d retry=%q", blocked.Code, blocked.Header().Get("Retry-After"))
+	}
+	staleCreate := httptest.NewRequest(http.MethodPost, "/servers/create", bytes.NewBufferString(`{"id":"pep","name":"첫 서버","gameApiPort":"8101","webGamePort":"3101","operationId":"0123456789abcdef0123456789abcdef"}`))
+	staleCreate.Header.Set("Authorization", "Bearer test-token")
+	staleCreate.Header.Set("Content-Type", "application/json")
+	staleCreate.Header.Set(maintenanceLeaseHeader, entered.Lease)
+	staleCreate.RemoteAddr = "127.0.0.1:31000"
+	staleCreateResponse := httptest.NewRecorder()
+	restarted.withAuth(restarted.handleServerCreate)(staleCreateResponse, staleCreate)
+	if staleCreateResponse.Code != http.StatusServiceUnavailable || staleCreateResponse.Header().Get("Retry-After") != "5" {
+		t.Fatalf("stale lease create after restart = %d retry=%q", staleCreateResponse.Code, staleCreateResponse.Header().Get("Retry-After"))
+	}
+	lost := envRequest(t, restarted.withAuth(restarted.handleLifecycleJob), http.MethodGet, "/jobs/"+lostJobID, "")
+	if lost.Code != http.StatusNotFound {
+		t.Fatalf("lost in-memory job lookup = %d body=%s", lost.Code, lost.Body.String())
 	}
 }
 
@@ -1370,6 +1541,8 @@ func TestRecreateWorkflowRetriesIdempotentlyAndDrainsCancellationBeforeUnlock(t 
 		"flock -w 1800 9",
 		"CLIENT_OPERATION_ID",
 		`"operationId": os.environ["CLIENT_OPERATION_ID"]`,
+		"maintenance_enter_fields",
+		"--header=\"X-Maintenance-Lease: $MAINTENANCE_LEASE\"",
 		"for create_attempt in 1 2 3",
 		"payload.get(\"jobId\")",
 		"http://localhost:9000/jobs/$1",
@@ -1377,12 +1550,13 @@ func TestRecreateWorkflowRetriesIdempotentlyAndDrainsCancellationBeforeUnlock(t 
 		"cancel_and_await_lifecycle_job",
 		"for attempt in 1 2 3",
 		"--header=\"Authorization: Bearer $DEPLOYER_TOKEN\"",
-		"deadline=$((SECONDS + 1200))",
+		"for attempt in $(seq 1 12)",
+		"for poll_attempt in $(seq 1 240)",
 		"pending|running|cancelled)",
 		"failed)",
-		"lifecycle job lookup remained unavailable",
-		"lifecycle job returned malformed status responses",
-		"lifecycle job cancellation could not be confirmed",
+		"lifecycle job returned an HTTP error or was lost after deployer restart",
+		"bounded lifecycle cancellation/drain could not be confirmed",
+		"maintenance barrier did not reopen after lifecycle terminal and server postconditions",
 	} {
 		if !strings.Contains(workflow, want) {
 			t.Fatalf("recreate workflow missing %q", want)
@@ -1395,25 +1569,44 @@ func TestRecreateWorkflowRetriesIdempotentlyAndDrainsCancellationBeforeUnlock(t 
 	}
 
 	lock := strings.Index(workflow, "exec 9>/tmp/opensamguk-production.lock")
+	enter := strings.Index(workflow, "maintenance_post /maintenance/enter")
+	merge := strings.Index(workflow, "git merge --ff-only origin/main")
 	operationID := strings.Index(workflow, "CLIENT_OPERATION_ID")
 	create := strings.Index(workflow, "http://localhost:9000/servers/create")
 	parse := strings.Index(workflow, "payload.get(\"jobId\")")
-	pollEndpoint := strings.Index(workflow, "http://localhost:9000/jobs/$1")
 	poll := strings.LastIndex(workflow, "$(lifecycle_status \"$JOB_ID\")")
-	cancel := strings.LastIndex(workflow, "cancel_and_await_lifecycle_job \"$JOB_ID\"")
-	deadline := strings.Index(workflow, "if (( SECONDS >= deadline )); then")
 	succeeded := strings.Index(workflow, "succeeded)")
-	failed := strings.Index(workflow, "failed)")
-	sleep := failed + strings.Index(workflow[failed:], "sleep 5")
 	postconditions := strings.Index(workflow, "for i in $(seq 1 90); do")
-	if lock < 0 || operationID < 0 || create < 0 || parse < 0 || pollEndpoint < 0 || poll < 0 || cancel < 0 || deadline < 0 || succeeded < 0 || failed < 0 || sleep < 0 || postconditions < 0 {
-		t.Fatalf("missing lifecycle ordering markers: lock=%d operationID=%d create=%d parse=%d pollEndpoint=%d poll=%d cancel=%d deadline=%d succeeded=%d failed=%d sleep=%d postconditions=%d", lock, operationID, create, parse, pollEndpoint, poll, cancel, deadline, succeeded, failed, sleep, postconditions)
+	leave := strings.LastIndex(workflow, "maintenance_post /maintenance/leave")
+	if lock < 0 || enter < 0 || merge < 0 || operationID < 0 || create < 0 || parse < 0 || poll < 0 || succeeded < 0 || postconditions < 0 || leave < 0 {
+		t.Fatalf("missing lease lifecycle markers: lock=%d enter=%d merge=%d operationID=%d create=%d parse=%d poll=%d succeeded=%d postconditions=%d leave=%d", lock, enter, merge, operationID, create, parse, poll, succeeded, postconditions, leave)
 	}
-	if !(lock < operationID && operationID < pollEndpoint && pollEndpoint < create && create < parse && parse < poll && poll < succeeded && deadline < cancel && cancel < postconditions && failed < sleep && sleep < postconditions) {
-		t.Fatalf("unexpected lifecycle ordering: lock=%d operationID=%d create=%d parse=%d pollEndpoint=%d poll=%d cancel=%d deadline=%d succeeded=%d failed=%d sleep=%d postconditions=%d", lock, operationID, create, parse, pollEndpoint, poll, cancel, deadline, succeeded, failed, sleep, postconditions)
+	if !(lock < enter && enter < merge && merge < operationID && operationID < create && create < parse && parse < poll && poll < succeeded && succeeded < postconditions && postconditions < leave) {
+		t.Fatalf("unexpected closed-barrier ordering: lock=%d enter=%d merge=%d operationID=%d create=%d parse=%d poll=%d succeeded=%d postconditions=%d leave=%d", lock, enter, merge, operationID, create, parse, poll, succeeded, postconditions, leave)
 	}
-	if strings.Contains(workflow[poll:postconditions], "404)") {
-		t.Fatal("recreate workflow must not accept a restarted deployer job 404")
+	if strings.Contains(workflow[enter:create], "maintenance_post /maintenance/leave") {
+		t.Fatal("recreate must not reopen maintenance before the leased create")
+	}
+	for _, forbidden := range []string{"while [[ -z \"$JOB_ID\" ]]", "while true", "lifecycle job lookup remained unavailable; retrying", "lifecycle job cancellation could not be confirmed"} {
+		if strings.Contains(workflow, forbidden) {
+			t.Fatalf("recreate workflow retained an unbounded lifecycle path: %q", forbidden)
+		}
+	}
+}
+
+func TestRecreateWorkflowLostJobAbortsBoundedAndKeepsMarkerClosed(t *testing.T) {
+	run := runRecreateWorkflowWithLostJob(t)
+	if run.err == nil {
+		t.Fatalf("lost-job recreate workflow unexpectedly succeeded: %s", run.output)
+	}
+	if strings.Contains(run.output, "0123456789abcdef0123456789abcdef") {
+		t.Fatal("recreate workflow leaked its maintenance lease")
+	}
+	if !strings.Contains(run.output, "lifecycle job returned an HTTP error or was lost after deployer restart") {
+		t.Fatalf("lost-job recreate workflow did not fail promptly: %s", run.output)
+	}
+	if strings.Contains(run.dockerCalls, "leave") {
+		t.Fatalf("lost-job recreate workflow reopened maintenance: %s", run.dockerCalls)
 	}
 }
 
@@ -1452,8 +1645,9 @@ func TestMaintenanceWorkflowOrderingAndLegacyFailClosedBoundary(t *testing.T) {
 		"exec 9>/tmp/opensamguk-production.lock",
 		"maintenance_post /maintenance/enter",
 		"git merge --ff-only origin/main",
-		"maintenance_post /maintenance/leave",
 		"http://localhost:9000/servers/create",
+		"for i in $(seq 1 90); do",
+		"maintenance_post /maintenance/leave",
 	)
 
 	for name, workflow := range map[string]string{"deploy": deploy, "start": start, "recreate": recreate} {
@@ -1922,6 +2116,94 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	}
 }
 
+func TestConcurrentServerPatchThenResetFailurePreservesPatchSnapshot(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
+JWT_SECRET=shared-secret
+SERVER_REGISTRY_JSON=[{"id":"pep","name":"before","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep","env":{"IMAGE_TAG":"v1","SERVER_NAME":"before","SERVER_GENERATION":"1","GAME_API_URL":"http://spep-game-api:8081"}}]
+`)
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "IMAGE_TAG=v1\nSERVER_NAME=before\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\nSCENARIO_CODE=scenario_1010\n")
+	patchReloadStarted := make(chan struct{})
+	releasePatchReload := make(chan struct{})
+	var patchReloadOnce sync.Once
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		call := strings.Join(args, " ")
+		if strings.Contains(call, "gateway-api web-gateway") {
+			patchReloadOnce.Do(func() {
+				close(patchReloadStarted)
+				<-releasePatchReload
+			})
+			return "reload complete\n", nil
+		}
+		if strings.Contains(call, "down --volumes --remove-orphans") {
+			return "down failed\n", errors.New("compose down failed")
+		}
+		return "ok\n", nil
+	}
+	defer func() {
+		select {
+		case <-releasePatchReload:
+		default:
+			close(releasePatchReload)
+		}
+	}()
+
+	patch := envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodPatch, "/env/server?id=pep", `{"values":{"SERVER_NAME":"patched"}}`)
+	if patch.Code != http.StatusOK {
+		t.Fatalf("PATCH status = %d body=%s", patch.Code, patch.Body.String())
+	}
+	patchJobID := decodeEnvResponse(t, patch).JobID
+	if !lifecycleJobIDRe.MatchString(patchJobID) {
+		t.Fatalf("PATCH job id = %q", patchJobID)
+	}
+	select {
+	case <-patchReloadStarted:
+	case <-time.After(time.Second):
+		t.Fatal("PATCH did not hold the coordinator through registry reload")
+	}
+
+	type resetResult struct {
+		response *httptest.ResponseRecorder
+	}
+	resetResultCh := make(chan resetResult, 1)
+	go func() {
+		resetResultCh <- resetResult{response: envRequest(t, cfg.withAuth(cfg.handleServerReset), http.MethodPost, "/servers/reset", `{"id":"pep","confirm":"RESET pep","scenarioCode":"scenario_1002"}`)}
+	}()
+	select {
+	case result := <-resetResultCh:
+		t.Fatalf("reset bypassed PATCH-held coordinator lease: status=%d body=%s", result.response.Code, result.response.Body.String())
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releasePatchReload)
+	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, patchJobID, lifecycleJobSucceeded); completed.Status != lifecycleJobSucceeded {
+		t.Fatalf("PATCH completion = %#v", completed)
+	}
+	var resetResponse *httptest.ResponseRecorder
+	select {
+	case result := <-resetResultCh:
+		resetResponse = result.response
+	case <-time.After(time.Second):
+		t.Fatal("reset did not begin after PATCH released the coordinator lease")
+	}
+	if resetResponse.Code != http.StatusOK {
+		t.Fatalf("reset status = %d body=%s", resetResponse.Code, resetResponse.Body.String())
+	}
+	var resetBody createServerResponse
+	if err := json.NewDecoder(resetResponse.Body).Decode(&resetBody); err != nil {
+		t.Fatalf("decode reset response: %v", err)
+	}
+	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, resetBody.JobID, lifecycleJobFailed); completed.Status != lifecycleJobFailed {
+		t.Fatalf("reset completion = %#v", completed)
+	}
+	if got := readFile(t, filepath.Join(cfg.serversDir, "spep.env")); !strings.Contains(got, "SERVER_NAME=patched\n") || strings.Contains(got, "SCENARIO_CODE=scenario_1002\n") {
+		t.Fatalf("failed reset did not restore PATCH snapshot:\n%s", got)
+	}
+	if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); !strings.Contains(shared, `"name":"patched"`) || strings.Contains(shared, `"scenarioCode":"scenario_1002"`) {
+		t.Fatalf("failed reset did not restore patched registry snapshot:\n%s", shared)
+	}
+}
+
 func TestStatelessServicesExcludeGameEngine(t *testing.T) {
 	joined := strings.Join(statelessServices, ",")
 	if strings.Contains(joined, "game-engine") {
@@ -2128,6 +2410,25 @@ type startWorkflowRun struct {
 	envFile     string
 }
 
+func commandEnvironment(values ...string) []string {
+	keys := map[string]struct{}{}
+	for _, value := range values {
+		if index := strings.IndexByte(value, '='); index > 0 {
+			keys[value[:index]] = struct{}{}
+		}
+	}
+	environment := make([]string, 0, len(os.Environ())+len(values))
+	for _, value := range os.Environ() {
+		if index := strings.IndexByte(value, '='); index > 0 {
+			if _, replaced := keys[value[:index]]; replaced {
+				continue
+			}
+		}
+		environment = append(environment, value)
+	}
+	return append(environment, values...)
+}
+
 func runStartWorkflow(t *testing.T, serverID, imageTag, envFileName, envContent string) startWorkflowRun {
 	t.Helper()
 	root := t.TempDir()
@@ -2160,7 +2461,7 @@ func runStartWorkflow(t *testing.T, serverID, imageTag, envFileName, envContent 
 	scriptPath := filepath.Join(root, "start-server.sh")
 	writeExecutable(t, scriptPath, script)
 	cmd := exec.Command("bash", scriptPath)
-	cmd.Env = append(os.Environ(),
+	cmd.Env = commandEnvironment(
 		"HOME="+home,
 		"PATH="+bin+":"+os.Getenv("PATH"),
 		"SERVER_ID="+serverID,
@@ -2177,6 +2478,89 @@ func runStartWorkflow(t *testing.T, serverID, imageTag, envFileName, envContent 
 		err:         err,
 		dockerCalls: string(dockerCalls),
 		envFile:     envFile,
+	}
+}
+
+func runRecreateWorkflowWithLostJob(t *testing.T) startWorkflowRun {
+	t.Helper()
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	stack := filepath.Join(home, "opensamguk-docker")
+	bin := filepath.Join(root, "bin")
+	if err := os.MkdirAll(filepath.Join(stack, "servers"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeEnv(t, filepath.Join(stack, ".env"), "DEPLOYER_TOKEN=test-token\n")
+	dockerLog := filepath.Join(root, "docker.calls")
+	writeExecutable(t, filepath.Join(bin, "flock"), "#!/usr/bin/env bash\nexit 0\n")
+	writeExecutable(t, filepath.Join(bin, "git"), "#!/usr/bin/env bash\nexit 0\n")
+	writeExecutable(t, filepath.Join(bin, "sudo"), "#!/usr/bin/env bash\nexec \"$@\"\n")
+	writeExecutable(t, filepath.Join(bin, "sleep"), "#!/usr/bin/env bash\nexit 0\n")
+	writeExecutable(t, filepath.Join(bin, "python3"), "#!/usr/bin/env bash\nargs=\"$*\"\nif [[ \"$args\" == *\"state\\\"] + \\\":\\\"\"* ]]; then\n  printf 'drained:0123456789abcdef0123456789abcdef\\n'\nelif [[ \"$args\" == *\"payload.get(\\\"jobId\\\")\"* ]]; then\n  printf 'abcdef0123456789abcdef0123456789\\n'\nelif [[ \"$args\" == *\"import secrets\"* ]]; then\n  printf 'abcdef0123456789abcdef0123456789\\n'\nelif [[ \"$args\" == *\"json.dumps\"* ]]; then\n  printf '{}\\n'\nelse\n  printf 'drained\\n'\nfi\n")
+	dockerScript := `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == "exec" ]]; then
+  args="$*"
+  if [[ "$args" == *"/maintenance/enter"* ]]; then
+    printf '{"capability":"maintenance-v1","state":"drained","lease":"0123456789abcdef0123456789abcdef"}\n'
+    exit 0
+  fi
+  if [[ "$args" == *"/maintenance/leave"* ]]; then
+    printf 'leave\n' >> "$WORKFLOW_DOCKER_LOG"
+    printf '{"capability":"maintenance-v1","state":"open"}\n'
+    exit 0
+  fi
+  if [[ "$args" == *"/maintenance"* ]]; then
+    printf '{"capability":"maintenance-v1","state":"drained"}\n'
+    exit 0
+  fi
+  if [[ "$args" == *"/servers/create"* ]]; then
+    printf '{"jobId":"abcdef0123456789abcdef0123456789"}\n'
+    exit 0
+  fi
+  if [[ "$args" == *"/jobs/"* ]]; then
+    exit 8
+  fi
+fi
+if [[ "$1" == "ps" ]]; then
+  printf '%s\n' opensamguk-deployer
+fi
+`
+	writeExecutable(t, filepath.Join(bin, "docker"), dockerScript)
+
+	script := workflowRunScript(t, filepath.Join("..", ".github", "workflows", "recreate-server.yml"))
+	scriptPath := filepath.Join(root, "recreate-server.sh")
+	writeExecutable(t, scriptPath, script)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bash", scriptPath)
+	cmd.Env = commandEnvironment(
+		"HOME="+home,
+		"PATH="+bin+":"+os.Getenv("PATH"),
+		"SERVER_ID=pep",
+		"SERVER_NAME=테스트",
+		"GENERATION=0",
+		"IMAGE_TAG=",
+		"SCENARIO_CODE=scenario_1010",
+		"GAME_API_PORT=8101",
+		"WEB_GAME_PORT=3101",
+		"WORKFLOW_DOCKER_LOG="+dockerLog,
+	)
+	output, err := cmd.CombinedOutput()
+	dockerCalls, readErr := os.ReadFile(dockerLog)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		t.Fatal(readErr)
+	}
+	if ctx.Err() == context.DeadlineExceeded {
+		t.Fatalf("lost-job recreate workflow exceeded its bounded abort deadline: %s calls=%s", output, dockerCalls)
+	}
+	return startWorkflowRun{
+		output:      string(output),
+		err:         err,
+		dockerCalls: string(dockerCalls),
 	}
 }
 

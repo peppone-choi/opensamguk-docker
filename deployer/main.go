@@ -43,8 +43,10 @@ const (
 	longestServerDockerLabelSuffix = "-game-postgres"
 	maxPublicServerIDLength        = maxDockerDNSLabelLength - len(internalServerKeyPrefix) - len(longestServerDockerLabelSuffix)
 	lifecycleJobIDBytes            = 16
+	maintenanceLeaseBytes          = 16
 	lifecycleJobMaxEntries         = 128
 	lifecycleJobTerminalRetention  = time.Hour
+	maintenanceLeaseHeader         = "X-Maintenance-Lease"
 )
 
 // 입력 검증용 화이트리스트 정규식.
@@ -208,6 +210,7 @@ type lifecycleJobManager struct {
 var (
 	errMaintenanceClosed      = errors.New("maintenance barrier is closed")
 	errLifecycleJobNotPending = errors.New("lifecycle job is no longer pending")
+	errMaintenanceLeaseUsed   = errors.New("maintenance lease has already been consumed")
 )
 
 // operationCoordinator serializes every durable control-plane mutation. Unlike
@@ -215,12 +218,20 @@ var (
 // maintenance marker, so a workflow can drain the running deployer before
 // replacing containers or shared files.
 type operationCoordinator struct {
-	mu         sync.Mutex
-	cond       *sync.Cond
-	closed     bool
-	active     *operationLease
-	markerPath string
-	jobs       *lifecycleJobManager
+	mu               sync.Mutex
+	cond             *sync.Cond
+	closed           bool
+	active           *operationLease
+	maintenanceLease *maintenanceAdmissionLease
+	markerPath       string
+	jobs             *lifecycleJobManager
+}
+
+type maintenanceAdmissionLease struct {
+	token       string
+	operationID string
+	jobID       string
+	consumed    bool
 }
 
 type operationLease struct {
@@ -248,6 +259,10 @@ func newOperationCoordinator(markerPath string, jobs *lifecycleJobManager) *oper
 }
 
 func (c *operationCoordinator) begin(jobID string) (*operationLease, error) {
+	return c.beginWithMaintenanceLease(jobID, "", "")
+}
+
+func (c *operationCoordinator) beginWithMaintenanceLease(jobID, token, operationID string) (*operationLease, error) {
 	if c == nil {
 		return nil, errors.New("operation coordinator unavailable")
 	}
@@ -256,11 +271,14 @@ func (c *operationCoordinator) begin(jobID string) (*operationLease, error) {
 		c.cond.Wait()
 	}
 	if c.closed {
-		c.mu.Unlock()
-		if jobID != "" && c.jobs != nil {
-			c.jobs.requestCancel(jobID)
+		lease := c.maintenanceLease
+		if c.active != nil || jobID == "" || operationID == "" || lease == nil || lease.consumed || !secureEqual(lease.token, token) {
+			c.mu.Unlock()
+			if jobID != "" && c.jobs != nil {
+				c.jobs.requestCancel(jobID)
+			}
+			return nil, errMaintenanceClosed
 		}
-		return nil, errMaintenanceClosed
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -270,6 +288,11 @@ func (c *operationCoordinator) begin(jobID string) (*operationLease, error) {
 			cancel()
 			return nil, errLifecycleJobNotPending
 		}
+	}
+	if c.closed {
+		c.maintenanceLease.consumed = true
+		c.maintenanceLease.operationID = operationID
+		c.maintenanceLease.jobID = jobID
 	}
 	lease := &operationLease{
 		coordinator: c,
@@ -349,15 +372,15 @@ func (c *operationCoordinator) maintenanceStateLocked() maintenanceState {
 	return maintenanceStateDrained
 }
 
-func (c *operationCoordinator) enterMaintenance() (maintenanceState, error) {
+func (c *operationCoordinator) enterMaintenance() (maintenanceState, string, error) {
 	if c == nil {
-		return maintenanceStateDrained, errors.New("operation coordinator unavailable")
+		return maintenanceStateDrained, "", errors.New("operation coordinator unavailable")
 	}
 	c.mu.Lock()
 	if !c.closed {
 		if err := writeMaintenanceMarkerAtomic(c.markerPath); err != nil {
 			c.mu.Unlock()
-			return maintenanceStateOpen, err
+			return maintenanceStateOpen, "", err
 		}
 		c.closed = true
 	}
@@ -376,9 +399,23 @@ func (c *operationCoordinator) enterMaintenance() (maintenanceState, error) {
 	for c.active != nil {
 		c.cond.Wait()
 	}
+	if c.maintenanceLease == nil {
+		token, err := randomHex(maintenanceLeaseBytes)
+		if err != nil {
+			state := c.maintenanceStateLocked()
+			c.mu.Unlock()
+			return state, "", err
+		}
+		c.maintenanceLease = &maintenanceAdmissionLease{token: token}
+	} else if c.maintenanceLease.consumed {
+		state := c.maintenanceStateLocked()
+		c.mu.Unlock()
+		return state, "", errMaintenanceLeaseUsed
+	}
 	state := c.maintenanceStateLocked()
+	token := c.maintenanceLease.token
 	c.mu.Unlock()
-	return state, nil
+	return state, token, nil
 }
 
 func (c *operationCoordinator) leaveMaintenance() (maintenanceState, error) {
@@ -399,6 +436,7 @@ func (c *operationCoordinator) leaveMaintenance() (maintenanceState, error) {
 	if err := os.Remove(c.markerPath); err != nil && !os.IsNotExist(err) {
 		return maintenanceStateDrained, err
 	}
+	c.maintenanceLease = nil
 	c.closed = false
 	c.cond.Broadcast()
 	return maintenanceStateOpen, nil
@@ -733,6 +771,7 @@ const (
 type maintenanceResponse struct {
 	Capability string           `json:"capability"`
 	State      maintenanceState `json:"state"`
+	Lease      string           `json:"lease,omitempty"`
 }
 
 type envPatchRequest struct {
@@ -945,12 +984,7 @@ func (c config) withAuth(next http.HandlerFunc) http.HandlerFunc {
 
 func (c config) withLoopback(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		host, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
-			host = r.RemoteAddr
-		}
-		ip := net.ParseIP(host)
-		if ip == nil || !ip.IsLoopback() {
+		if !isLoopbackRequest(r) {
 			writeJSON(w, http.StatusForbidden, errorResponse{Error: "loopback 요청만 허용"})
 			return
 		}
@@ -958,9 +992,18 @@ func (c config) withLoopback(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func isLoopbackRequest(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func (c config) handleMaintenance(w http.ResponseWriter, r *http.Request) {
-	respond := func(state maintenanceState) {
-		writeJSON(w, http.StatusOK, maintenanceResponse{Capability: "maintenance-v1", State: state})
+	respond := func(state maintenanceState, lease string) {
+		writeJSON(w, http.StatusOK, maintenanceResponse{Capability: "maintenance-v1", State: state, Lease: lease})
 	}
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/maintenance":
@@ -968,21 +1011,25 @@ func (c config) handleMaintenance(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "maintenance coordinator unavailable"})
 			return
 		}
-		respond(c.operations.maintenanceState())
+		respond(c.operations.maintenanceState(), "")
 	case r.Method == http.MethodPost && r.URL.Path == "/maintenance/enter":
-		state, err := c.operations.enterMaintenance()
+		state, lease, err := c.operations.enterMaintenance()
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "maintenance enter failed"})
+			status := http.StatusInternalServerError
+			if errors.Is(err, errMaintenanceLeaseUsed) {
+				status = http.StatusConflict
+			}
+			writeJSON(w, status, errorResponse{Error: "maintenance enter failed"})
 			return
 		}
-		respond(state)
+		respond(state, lease)
 	case r.Method == http.MethodPost && r.URL.Path == "/maintenance/leave":
 		state, err := c.operations.leaveMaintenance()
 		if err != nil {
 			writeJSON(w, http.StatusConflict, errorResponse{Error: "maintenance leave failed"})
 			return
 		}
-		respond(state)
+		respond(state, "")
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "maintenance endpoint unavailable"})
 	}
@@ -1129,6 +1176,11 @@ func (c config) handleServerCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "POST only"})
 		return
 	}
+	maintenanceLease := r.Header.Get(maintenanceLeaseHeader)
+	if maintenanceLease != "" && !isLoopbackRequest(r) {
+		writeJSON(w, http.StatusForbidden, errorResponse{Error: "maintenance lease requires a loopback request"})
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<16))
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "body 읽기 실패"})
@@ -1139,7 +1191,7 @@ func (c config) handleServerCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "JSON 파싱 실패"})
 		return
 	}
-	res, status := c.createServer(req)
+	res, status := c.createServerWithMaintenanceLease(req, maintenanceLease)
 	writeCreateServerResponse(w, status, res)
 }
 
@@ -1382,6 +1434,10 @@ func (c config) serverEnvPatchChangesRegistry(id string, path string, updates ma
 }
 
 func (c config) createServer(req createServerRequest) (createServerResponse, int) {
+	return c.createServerWithMaintenanceLease(req, "")
+}
+
+func (c config) createServerWithMaintenanceLease(req createServerRequest, maintenanceLease string) (createServerResponse, int) {
 	operationID, err := normalizeLifecycleOperationID(req.OperationID)
 	if err != nil {
 		return createServerResponse{OK: false, Detail: err.Error()}, http.StatusBadRequest
@@ -1513,7 +1569,7 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 		Env:           registryEnvSnapshot(envValuesFromLines(envLines)),
 	}
 	admissionAttempted = true
-	lease, err := c.beginMutation(jobID)
+	lease, err := c.beginMaintenanceCreate(jobID, maintenanceLease, operationID)
 	if err != nil {
 		detail, status := mutationAdmissionFailure(err)
 		return createServerResponse{OK: false, ID: id, Detail: detail}, status
@@ -1660,7 +1716,22 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 	if req.Confirm != "RESET "+id {
 		return createServerResponse{OK: false, ID: id, Detail: "리셋 확인 문구가 일치하지 않습니다."}, http.StatusBadRequest
 	}
-	if _, err := resetEnvUpdates(req); err != nil {
+	lease, err := c.beginMutation("")
+	if err != nil {
+		detail, status := mutationAdmissionFailure(err)
+		return createServerResponse{OK: false, ID: id, Detail: detail}, status
+	}
+	leaseTransferred := false
+	defer func() {
+		if !leaseTransferred {
+			lease.Done()
+		}
+	}()
+	if err := lease.Context().Err(); err != nil {
+		return createServerResponse{OK: false, ID: id, Detail: "maintenance in progress"}, http.StatusServiceUnavailable
+	}
+	updates, err := resetEnvUpdates(req)
+	if err != nil {
 		return createServerResponse{OK: false, ID: id, Detail: err.Error()}, http.StatusBadRequest
 	}
 	entry, err := c.registryEntryByID(id)
@@ -1678,17 +1749,20 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 	if err != nil {
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: fmt.Sprintf("서버 env 백업 실패: %v", err)}, http.StatusInternalServerError
 	}
+	if err := lease.Context().Err(); err != nil {
+		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: "maintenance in progress"}, http.StatusServiceUnavailable
+	}
 	jobID, err := c.lifecycleJobs.reserve()
 	if err != nil {
 		detail, status := lifecycleJobReservationFailure(err)
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: detail}, status
 	}
-	lease, err := c.beginMutation(jobID)
-	if err != nil {
+	if err := c.operations.claimLifecycleJob(lease, jobID); err != nil {
 		c.lifecycleJobs.discard(jobID)
 		detail, status := mutationAdmissionFailure(err)
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: detail}, status
 	}
+	leaseTransferred = true
 	originalEntry := entry
 	c.startClaimedLifecycleJob(lease, jobID, "reset "+id, func(ctx context.Context) (string, error) {
 		restore := func() {
@@ -1698,7 +1772,7 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		if err := c.applyResetOptions(envFile, req); err != nil {
+		if err := applyResetUpdates(envFile, updates); err != nil {
 			return "", err
 		}
 		if _, err := c.syncRegistryEntryFromEnv(id, envFile); err != nil {
@@ -1764,6 +1838,13 @@ func (c config) beginMutation(jobID string) (*operationLease, error) {
 		return nil, errors.New("operation coordinator unavailable")
 	}
 	return c.operations.begin(jobID)
+}
+
+func (c config) beginMaintenanceCreate(jobID, maintenanceLease, operationID string) (*operationLease, error) {
+	if c.operations == nil {
+		return nil, errors.New("operation coordinator unavailable")
+	}
+	return c.operations.beginWithMaintenanceLease(jobID, maintenanceLease, operationID)
 }
 
 func writeMutationAdmissionError(w http.ResponseWriter, err error) {
@@ -2371,6 +2452,10 @@ func (c config) applyResetOptions(envFile string, req resetServerRequest) error 
 	if err != nil {
 		return err
 	}
+	return applyResetUpdates(envFile, values)
+}
+
+func applyResetUpdates(envFile string, values map[string]string) error {
 	if len(values) == 0 {
 		return nil
 	}
@@ -2378,7 +2463,7 @@ func (c config) applyResetOptions(envFile string, req resetServerRequest) error 
 	for key := range values {
 		spec[key] = envFieldSpec{Description: "리셋 옵션"}
 	}
-	_, err = patchEnvFile(envFile, spec, values)
+	_, err := patchEnvFile(envFile, spec, values)
 	return err
 }
 

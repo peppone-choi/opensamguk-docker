@@ -161,14 +161,16 @@ workflow는 deployer 컨테이너의 loopback에서만 다음 Bearer API를 호�
 
 ```text
 GET  /maintenance        -> {"capability":"maintenance-v1","state":"open|draining|drained"}
-POST /maintenance/enter  -> drained 후에만 반환
+POST /maintenance/enter  -> drained 후 32-hex 단발 lease를 포함해 반환
 POST /maintenance/leave  -> 성공한 workflow가 마지막에만 open
 ```
 
 **처음 설치되어 deployer 컨테이너가 전혀 없는 경우**에는 workflow가 marker를 먼저 만들고 deployer를 closed로
 기동한 뒤 확인한다. Deploy Orchestration과 Start Existing Game Server는 성공 검증 뒤에만 leave 한다. Recreate Game
-Server는 git sync를 drain 아래에서 끝낸 뒤 create API와 self-deadlock하지 않도록 leave한 후 lifecycle job을 호출한다.
-실패한 workflow는 marker를 남겨 fail-closed 상태를 유지한다.
+Server는 marker를 lifecycle job과 서버 postcondition 전체 동안 닫아 둔다. enter가 준 lease는 메모리 안의 단발
+권한이며 loopback + Bearer POST /servers/create에만 전달된다. GET, 로그, create 응답에는 lease를 넣지 않는다.
+동일 operationId의 모호한 재시도는 기존 job만 돌려주며 lease를 다시 소비하지 않는다. deployer 재시작으로
+in-memory job이 사라지거나 어떤 단계가 실패하면 workflow는 bounded abort하고 marker를 남겨 fail-closed 상태를 유지한다.
 
 #### 구버전 deployer의 1회 bridge
 

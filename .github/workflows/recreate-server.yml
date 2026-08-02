@@ -63,7 +63,10 @@ jobs:
 
           DEPLOYER_TOKEN="$(grep '^DEPLOYER_TOKEN=' .env | cut -d= -f2-)"
           maintenance_response_state() {
-            printf '%s' "$1" | python3 -c 'import json, sys; payload = json.load(sys.stdin); valid = isinstance(payload, dict) and set(payload) == {"capability", "state"} and payload["capability"] == "maintenance-v1" and payload["state"] in {"open", "draining", "drained"}; valid or sys.exit(1); print(payload["state"])'
+            printf '%s' "$1" | python3 -c 'import json, re, sys; payload = json.load(sys.stdin); keys = set(payload) if isinstance(payload, dict) else set(); valid = keys in ({"capability", "state"}, {"capability", "state", "lease"}) and payload.get("capability") == "maintenance-v1" and payload.get("state") in {"open", "draining", "drained"} and ("lease" not in payload or re.fullmatch(r"[a-f0-9]{32}", payload["lease"]) is not None); valid or sys.exit(1); print(payload["state"])'
+          }
+          maintenance_enter_fields() {
+            printf '%s' "$1" | python3 -c 'import json, re, sys; payload = json.load(sys.stdin); valid = isinstance(payload, dict) and set(payload) == {"capability", "state", "lease"} and payload["capability"] == "maintenance-v1" and payload["state"] == "drained" and re.fullmatch(r"[a-f0-9]{32}", payload["lease"]) is not None; valid or sys.exit(1); print(payload["state"] + ":" + payload["lease"])'
           }
           maintenance_get() {
             sudo docker exec -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
@@ -76,13 +79,19 @@ jobs:
             ' maintenance "$1" 2>/dev/null
           }
           DEPLOYER_FRESH=false
+          MAINTENANCE_LEASE=""
           if sudo docker ps -a --format '{{.Names}}' | grep -Fxq opensamguk-deployer; then
             if [ -z "$DEPLOYER_TOKEN" ] || ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_get)")"; then
               echo "::error::running deployer lacks a valid maintenance-v1 capability; aborting before control-plane mutation"
               exit 1
             fi
-            if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_post /maintenance/enter)")" || [ "$MAINTENANCE_STATE" != drained ]; then
-              echo "::error::deployer maintenance drain did not reach drained; aborting before control-plane mutation"
+            if ! MAINTENANCE_ENTER="$(maintenance_enter_fields "$(maintenance_post /maintenance/enter)")"; then
+              echo "::error::deployer maintenance drain did not yield a recreate lease; aborting before control-plane mutation"
+              exit 1
+            fi
+            IFS=: read -r MAINTENANCE_STATE MAINTENANCE_LEASE <<<"$MAINTENANCE_ENTER"
+            if [ "$MAINTENANCE_STATE" != drained ] || [[ ! "$MAINTENANCE_LEASE" =~ ^[a-f0-9]{32}$ ]]; then
+              echo "::error::deployer maintenance drain did not yield a valid recreate lease"
               exit 1
             fi
           else
@@ -115,11 +124,15 @@ jobs:
               echo "::error::fresh deployer did not boot closed with maintenance-v1"
               exit 1
             fi
-          fi
-
-          if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_post /maintenance/leave)")" || [ "$MAINTENANCE_STATE" != open ]; then
-            echo "::error::deployer maintenance barrier did not reopen before lifecycle create"
-            exit 1
+            if ! MAINTENANCE_ENTER="$(maintenance_enter_fields "$(maintenance_post /maintenance/enter)")"; then
+              echo "::error::fresh deployer did not yield a recreate lease"
+              exit 1
+            fi
+            IFS=: read -r MAINTENANCE_STATE MAINTENANCE_LEASE <<<"$MAINTENANCE_ENTER"
+            if [ "$MAINTENANCE_STATE" != drained ] || [[ ! "$MAINTENANCE_LEASE" =~ ^[a-f0-9]{32}$ ]]; then
+              echo "::error::fresh deployer did not yield a valid recreate lease"
+              exit 1
+            fi
           fi
 
           RAW_SERVER_ID="$SERVER_ID"
@@ -149,7 +162,7 @@ jobs:
 
           lifecycle_status() {
             local target_job_id="$1"
-            local attempt job_response job_status
+            local attempt job_response job_status request_status
             local malformed=false
             for attempt in 1 2 3; do
               if job_response="$(sudo docker exec -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
@@ -160,6 +173,11 @@ jobs:
                   return 0
                 fi
                 malformed=true
+              else
+                request_status=$?
+                if (( request_status == 8 )); then
+                  return 3
+                fi
               fi
               sleep 2
             done
@@ -171,17 +189,23 @@ jobs:
 
           request_lifecycle_cancel() {
             local target_job_id="$1"
-            local attempt cancel_response cancel_status
+            local attempt cancel_response cancel_status request_status
             for attempt in 1 2 3; do
               if cancel_response="$(sudo docker exec -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
                 wget -qO- -T 10 -t 1 \
                   --header="Authorization: Bearer $DEPLOYER_TOKEN" \
                   --post-data="" \
                   "http://localhost:9000/jobs/$1/cancel"
-              ' job "$target_job_id" 2>/dev/null)" &&
-                cancel_status="$(printf '%s' "$cancel_response" | JOB_ID="$target_job_id" python3 -c 'import json, os, sys; payload = json.load(sys.stdin); valid = isinstance(payload, dict) and set(payload) == {"id", "status"} and payload["id"] == os.environ["JOB_ID"] and payload["status"] in {"pending", "running", "succeeded", "failed", "cancelled"}; valid or sys.exit(1); print(payload["status"])' 2>/dev/null)"; then
-                printf '%s\n' "$cancel_status"
-                return 0
+              ' job "$target_job_id" 2>/dev/null)"; then
+                if cancel_status="$(printf '%s' "$cancel_response" | JOB_ID="$target_job_id" python3 -c 'import json, os, sys; payload = json.load(sys.stdin); valid = isinstance(payload, dict) and set(payload) == {"id", "status"} and payload["id"] == os.environ["JOB_ID"] and payload["status"] in {"pending", "running", "succeeded", "failed", "cancelled"}; valid or sys.exit(1); print(payload["status"])' 2>/dev/null)"; then
+                  printf '%s\n' "$cancel_status"
+                  return 0
+                fi
+              else
+                request_status=$?
+                if (( request_status == 8 )); then
+                  return 2
+                fi
               fi
               sleep 2
             done
@@ -190,18 +214,20 @@ jobs:
 
           cancel_and_await_lifecycle_job() {
             local target_job_id="$1"
-            local cancellation_confirmed=false
-            local cancellation_warning_emitted=false
-            local terminal_status=""
-            while true; do
-              if [[ "$cancellation_confirmed" != true ]]; then
-                if request_lifecycle_cancel "$target_job_id" >/dev/null; then
-                  cancellation_confirmed=true
-                elif [[ "$cancellation_warning_emitted" != true ]]; then
-                  echo "::warning::lifecycle job cancellation could not be confirmed; continuing to drain" >&2
-                  cancellation_warning_emitted=true
-                fi
-              fi
+            local attempt cancellation_status cancellation_exit terminal_status lookup_status
+            if cancellation_status="$(request_lifecycle_cancel "$target_job_id")"; then
+              :
+            else
+              cancellation_exit=$?
+              return "$cancellation_exit"
+            fi
+            case "$cancellation_status" in
+              succeeded|failed|cancelled)
+                printf '%s\n' "$cancellation_status"
+                return 0
+                ;;
+            esac
+            for attempt in $(seq 1 12); do
               if terminal_status="$(lifecycle_status "$target_job_id")"; then
                 case "$terminal_status" in
                   succeeded|failed|cancelled)
@@ -209,9 +235,15 @@ jobs:
                     return 0
                     ;;
                 esac
+              else
+                lookup_status=$?
+                if (( lookup_status == 2 || lookup_status == 3 )); then
+                  return "$lookup_status"
+                fi
               fi
-              sleep 5
+              sleep 2
             done
+            return 1
           }
 
           JOB_ID=""
@@ -221,7 +253,9 @@ jobs:
             local exit_status="$?"
             if [[ -n "$JOB_ID" && "$LIFECYCLE_TERMINAL" != true && "$LIFECYCLE_DRAINING" != true ]]; then
               LIFECYCLE_DRAINING=true
-              cancel_and_await_lifecycle_job "$JOB_ID" >/dev/null
+              if ! cancel_and_await_lifecycle_job "$JOB_ID"; then
+                echo "::warning::bounded lifecycle cancellation/drain could not be confirmed; leaving maintenance marker closed" >&2
+              fi
               LIFECYCLE_TERMINAL=true
             fi
             return "$exit_status"
@@ -230,34 +264,43 @@ jobs:
           trap 'exit 130' INT
           trap 'exit 143' TERM
 
-          while [[ -z "$JOB_ID" ]]; do
-            for create_attempt in 1 2 3; do
-              if RESPONSE="$(sudo docker exec -i -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
+          for create_attempt in 1 2 3; do
+            if RESPONSE="$(sudo docker exec -i -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" -e MAINTENANCE_LEASE="$MAINTENANCE_LEASE" opensamguk-deployer sh -c '
                 cat > /tmp/recreate-server.json
                 wget -qO- \
                   --header="Authorization: Bearer $DEPLOYER_TOKEN" \
+                  --header="X-Maintenance-Lease: $MAINTENANCE_LEASE" \
                   --header="Content-Type: application/json" \
                   --post-file=/tmp/recreate-server.json \
                   http://localhost:9000/servers/create
-              ' <<<"$BODY" 2>/dev/null)" &&
-                JOB_ID="$(printf '%s' "$RESPONSE" | python3 -c 'import json, re, sys; payload = json.load(sys.stdin); job_id = payload.get("jobId") if isinstance(payload, dict) else None; (isinstance(job_id, str) and re.fullmatch(r"[a-f0-9]{32}", job_id) is not None) or sys.exit(1); print(job_id)' 2>/dev/null)"; then
+              ' <<<"$BODY" 2>/dev/null)"; then
+              if JOB_ID="$(printf '%s' "$RESPONSE" | python3 -c 'import json, re, sys; payload = json.load(sys.stdin); job_id = payload.get("jobId") if isinstance(payload, dict) else None; (isinstance(job_id, str) and re.fullmatch(r"[a-f0-9]{32}", job_id) is not None) or sys.exit(1); print(job_id)' 2>/dev/null)"; then
                 break
               fi
-              JOB_ID=""
-              sleep 2
-            done
-            if [[ -z "$JOB_ID" ]]; then
-              echo "::warning::server creation response remained unavailable; retrying idempotently"
-              sleep 5
+              create_exit=1
+            else
+              create_exit=$?
             fi
+            JOB_ID=""
+            if (( create_exit == 8 )); then
+              echo "::error::server creation was rejected by deployer; leaving maintenance marker closed"
+              exit 1
+            fi
+            echo "::warning::transient server creation attempt ${create_attempt}/3 failed"
+            sleep 2
           done
+          if [[ -z "$JOB_ID" ]]; then
+            echo "::error::server creation did not return a lifecycle job after 3 bounded attempts; leaving maintenance marker closed"
+            exit 1
+          fi
 
-          deadline=$((SECONDS + 1200))
-          while true; do
+          JOB_SUCCEEDED=false
+          for poll_attempt in $(seq 1 240); do
             if JOB_STATUS="$(lifecycle_status "$JOB_ID")"; then
               case "$JOB_STATUS" in
                 succeeded)
                   LIFECYCLE_TERMINAL=true
+                  JOB_SUCCEEDED=true
                   break
                   ;;
                 pending|running|cancelled)
@@ -275,34 +318,55 @@ jobs:
               esac
             else
               lookup_status=$?
-              if (( lookup_status == 2 )); then
-                echo "::warning::lifecycle job returned malformed status responses; retrying"
-              else
-                echo "::warning::lifecycle job lookup remained unavailable; retrying"
-              fi
-            fi
-            if (( SECONDS >= deadline )); then
-              echo "::error::lifecycle job did not succeed within 20 minutes; requesting cancellation"
-              terminal_status="$(cancel_and_await_lifecycle_job "$JOB_ID")"
-              LIFECYCLE_TERMINAL=true
-              echo "::error::lifecycle job reached terminal status ${terminal_status} after deadline"
-              exit 1
+              case "$lookup_status" in
+                3)
+                  echo "::error::lifecycle job returned an HTTP error or was lost after deployer restart; leaving maintenance marker closed"
+                  exit 1
+                  ;;
+                2)
+                  echo "::error::lifecycle job returned malformed status responses; leaving maintenance marker closed"
+                  exit 1
+                  ;;
+                *)
+                  echo "::warning::transient lifecycle job lookup failed; retrying within bounded poll budget"
+                  ;;
+              esac
             fi
             sleep 5
           done
+          if [[ "$JOB_SUCCEEDED" != true ]]; then
+            echo "::error::lifecycle job did not succeed within 20 minutes; requesting bounded cancellation"
+            if terminal_status="$(cancel_and_await_lifecycle_job "$JOB_ID")"; then
+              LIFECYCLE_TERMINAL=true
+              echo "::error::lifecycle job reached terminal status $terminal_status after deadline"
+            else
+              cancellation_exit=$?
+              LIFECYCLE_TERMINAL=true
+              echo "::error::bounded lifecycle cancellation/drain failed with status $cancellation_exit; leaving maintenance marker closed"
+            fi
+            exit 1
+          fi
 
+          server_ready=false
           for i in $(seq 1 90); do
             if sudo docker ps --format '{{.Names}}' | grep -q "^${INTERNAL_ID}-game-api$" &&
                sudo docker ps --format '{{.Names}}' | grep -q "^${INTERNAL_ID}-game-engine$" &&
                sudo docker ps --format '{{.Names}}' | grep -q "^${INTERNAL_ID}-web-game$" &&
                curl -fsS http://localhost/health | grep -q '"status":"up"' &&
                curl -fsS "http://localhost/game/${PUBLIC_ID}" >/dev/null; then
-              echo "server ${PUBLIC_ID} is ready"
-              exit 0
+              server_ready=true
+              break
             fi
             sleep 5
           done
 
-          echo "::error::server ${PUBLIC_ID} did not become ready"
-          sudo docker ps --format 'table {{.Names}}\t{{.Status}}'
-          exit 1
+          if [[ "$server_ready" != true ]]; then
+            echo "::error::server ${PUBLIC_ID} did not become ready"
+            sudo docker ps --format 'table {{.Names}}\t{{.Status}}'
+            exit 1
+          fi
+          if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_post /maintenance/leave)")" || [ "$MAINTENANCE_STATE" != open ]; then
+            echo "::error::deployer maintenance barrier did not reopen after lifecycle terminal and server postconditions"
+            exit 1
+          fi
+          echo "server ${PUBLIC_ID} is ready"
