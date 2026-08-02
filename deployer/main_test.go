@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -193,6 +195,212 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	}
 }
 
+func TestConcurrentAuthenticatedCreatesWaitForPriorLifecycleTransaction(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+
+	firstDockerCall := make(chan struct{})
+	releaseFirstDockerCall := make(chan struct{})
+	var blockFirstDockerCall sync.Once
+	var releaseFirstDockerOnce sync.Once
+	releaseDocker := func() {
+		releaseFirstDockerOnce.Do(func() { close(releaseFirstDockerCall) })
+	}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		blockFirstDockerCall.Do(func() {
+			close(firstDockerCall)
+			<-releaseFirstDockerCall
+		})
+		return "ok\n", nil
+	}
+	defer releaseDocker()
+
+	handler := cfg.withAuth(cfg.handleServerCreate)
+	request := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/servers/create", bytes.NewBufferString(body))
+		req.Header.Set("Authorization", "Bearer test-token")
+		req.Header.Set("Content-Type", "application/json")
+		res := httptest.NewRecorder()
+		handler(res, req)
+		return res
+	}
+
+	firstResponse := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		firstResponse <- request(`{"id":"pep","name":"첫 서버","gameApiPort":"8101","webGamePort":"3101"}`)
+	}()
+	first := <-firstResponse
+	if first.Code != http.StatusOK {
+		t.Fatalf("first create status = %d body=%s", first.Code, first.Body.String())
+	}
+	var firstBody createServerResponse
+	if err := json.NewDecoder(first.Body).Decode(&firstBody); err != nil {
+		t.Fatalf("decode first create response: %v", err)
+	}
+
+	select {
+	case <-firstDockerCall:
+	case <-time.After(time.Second):
+		t.Fatal("first create did not enter Docker work")
+	}
+
+	secondResponse := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		secondResponse <- request(`{"id":"foo","name":"둘 서버","gameApiPort":"8102","webGamePort":"3102"}`)
+	}()
+	select {
+	case second := <-secondResponse:
+		t.Fatalf("second create bypassed active lifecycle transaction: status=%d body=%s", second.Code, second.Body.String())
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	releaseDocker()
+	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, firstBody.JobID, lifecycleJobSucceeded); completed.Status != lifecycleJobSucceeded {
+		t.Fatalf("first job completion = %#v", completed)
+	}
+
+	var second *httptest.ResponseRecorder
+	select {
+	case second = <-secondResponse:
+	case <-time.After(time.Second):
+		t.Fatal("second create did not resume after first lifecycle transaction")
+	}
+	if second.Code != http.StatusOK {
+		t.Fatalf("second create status = %d body=%s", second.Code, second.Body.String())
+	}
+	var secondBody createServerResponse
+	if err := json.NewDecoder(second.Body).Decode(&secondBody); err != nil {
+		t.Fatalf("decode second create response: %v", err)
+	}
+	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, secondBody.JobID, lifecycleJobSucceeded); completed.Status != lifecycleJobSucceeded {
+		t.Fatalf("second job completion = %#v", completed)
+	}
+
+	registry, err := cfg.readRegistry()
+	if err != nil {
+		t.Fatalf("read registry: %v", err)
+	}
+	ids := map[string]bool{}
+	for _, entry := range registry {
+		ids[entry.ID] = true
+	}
+	if !ids["pep"] || !ids["foo"] || len(ids) != 2 {
+		t.Fatalf("concurrent creates lost registry entries: %#v", registry)
+	}
+}
+
+func TestCreateServerOperationIDRecoversAmbiguousPostWithoutSecondMutation(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+
+	firstDockerCall := make(chan struct{})
+	releaseFirstDockerCall := make(chan struct{})
+	var blockFirstDockerCall sync.Once
+	var releaseFirstDockerOnce sync.Once
+	releaseDocker := func() {
+		releaseFirstDockerOnce.Do(func() { close(releaseFirstDockerCall) })
+	}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		blockFirstDockerCall.Do(func() {
+			close(firstDockerCall)
+			<-releaseFirstDockerCall
+		})
+		return "ok\n", nil
+	}
+	defer releaseDocker()
+
+	operationID := "0123456789abcdef0123456789abcdef"
+	body := `{"id":"pep","name":"첫 서버","gameApiPort":"8101","webGamePort":"3101","operationId":"` + operationID + `"}`
+	first := envRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create", body)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first create status = %d body=%s", first.Code, first.Body.String())
+	}
+	var firstBody createServerResponse
+	if err := json.NewDecoder(first.Body).Decode(&firstBody); err != nil {
+		t.Fatalf("decode first create response: %v", err)
+	}
+	select {
+	case <-firstDockerCall:
+	case <-time.After(time.Second):
+		t.Fatal("first create did not enter Docker work")
+	}
+
+	retry := envRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create", body)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("ambiguous POST retry status = %d body=%s", retry.Code, retry.Body.String())
+	}
+	var retryBody createServerResponse
+	if err := json.NewDecoder(retry.Body).Decode(&retryBody); err != nil {
+		t.Fatalf("decode retry create response: %v", err)
+	}
+	if retryBody.JobID != firstBody.JobID {
+		t.Fatalf("ambiguous POST retry returned job %q, want %q", retryBody.JobID, firstBody.JobID)
+	}
+	if got := strings.Count(readFile(t, filepath.Join(cfg.composeDir, ".env")), `"id":"pep"`); got != 1 {
+		t.Fatalf("ambiguous POST mutated registry %d times", got)
+	}
+	releaseDocker()
+	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, firstBody.JobID, lifecycleJobSucceeded); completed.Status != lifecycleJobSucceeded {
+		t.Fatalf("idempotent create completion = %#v", completed)
+	}
+}
+
+func TestLifecycleCancelDrainsDockerWorkBeforeReleasingOperationLock(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `COOKIE_SECURE=false
+SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
+`)
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "IMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\n")
+
+	dockerStarted := make(chan struct{})
+	dockerCanceled := make(chan struct{})
+	var startOnce sync.Once
+	var cancelOnce sync.Once
+	cfg.dockerRunnerContext = func(ctx context.Context, args ...string) (string, error) {
+		startOnce.Do(func() { close(dockerStarted) })
+		<-ctx.Done()
+		cancelOnce.Do(func() { close(dockerCanceled) })
+		return "sensitive docker output", ctx.Err()
+	}
+
+	patch := envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodPatch, "/env/server?id=pep", `{"values":{"IMAGE_TAG":"v2"}}`)
+	if patch.Code != http.StatusOK {
+		t.Fatalf("PATCH status = %d body=%s", patch.Code, patch.Body.String())
+	}
+	patchBody := decodeEnvResponse(t, patch)
+	select {
+	case <-dockerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("lifecycle job did not enter cancellable Docker work")
+	}
+
+	cancel := envRequest(t, cfg.withAuth(cfg.handleLifecycleJob), http.MethodPost, "/jobs/"+patchBody.JobID+"/cancel", "")
+	if cancel.Code != http.StatusOK {
+		t.Fatalf("cancel status = %d body=%s", cancel.Code, cancel.Body.String())
+	}
+	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, patchBody.JobID, lifecycleJobCancelled); completed.Status != lifecycleJobCancelled {
+		t.Fatalf("cancelled job completion = %#v", completed)
+	}
+	select {
+	case <-dockerCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("Docker work did not receive lifecycle cancellation")
+	}
+
+	sharedPatch := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		sharedPatch <- envRequest(t, cfg.withAuth(cfg.handleSharedEnv), http.MethodPatch, "/env/shared", `{"values":{"COOKIE_SECURE":"true"}}`)
+	}()
+	select {
+	case response := <-sharedPatch:
+		if response.Code != http.StatusOK {
+			t.Fatalf("shared PATCH after cancel status = %d body=%s", response.Code, response.Body.String())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("operation lock remained held after cancelled lifecycle job drained")
+	}
+}
+
 func TestLifecycleJobCapacityFailsBeforeCreateMutationAndPrunesTerminal(t *testing.T) {
 	cfg := testConfig(t)
 	original := "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n"
@@ -221,7 +429,7 @@ func TestLifecycleJobCapacityFailsBeforeCreateMutationAndPrunesTerminal(t *testi
 	if err != nil {
 		t.Fatalf("reserve terminal job: %v", err)
 	}
-	if !manager.start(id, func() (string, error) { return "", nil }) {
+	if !manager.start(id, func(context.Context) (string, error) { return "", nil }) {
 		t.Fatal("start terminal job")
 	}
 	waitForLifecycleJob(t, manager, id, lifecycleJobSucceeded)
@@ -838,46 +1046,124 @@ func TestDeployOrchestrationProbesARunningRegisteredServer(t *testing.T) {
 	}
 }
 
-func TestRecreateWorkflowWaitsForLifecycleJobBeforePostconditions(t *testing.T) {
+func TestRecreateWorkflowRetriesIdempotentlyAndDrainsCancellationBeforeUnlock(t *testing.T) {
 	workflow := readFile(t, filepath.Join("..", ".github", "workflows", "recreate-server.yml"))
 	for _, want := range []string{
 		"exec 9>/tmp/opensamguk-production.lock",
 		"flock -w 1800 9",
+		"CLIENT_OPERATION_ID",
+		`"operationId": os.environ["CLIENT_OPERATION_ID"]`,
+		"for create_attempt in 1 2 3",
 		"payload.get(\"jobId\")",
 		"http://localhost:9000/jobs/$1",
+		"http://localhost:9000/jobs/$1/cancel",
+		"cancel_and_await_lifecycle_job",
+		"for attempt in 1 2 3",
 		"--header=\"Authorization: Bearer $DEPLOYER_TOKEN\"",
 		"deadline=$((SECONDS + 1200))",
-		"pending|running)",
+		"pending|running|cancelled)",
 		"failed)",
-		"lifecycle job lookup failed",
-		"lifecycle job returned a malformed response",
+		"lifecycle job lookup remained unavailable",
+		"lifecycle job returned malformed status responses",
+		"lifecycle job cancellation could not be confirmed",
 	} {
 		if !strings.Contains(workflow, want) {
 			t.Fatalf("recreate workflow missing %q", want)
 		}
 	}
-	for _, forbidden := range []string{`echo "$RESPONSE"`, `echo "$JOB_RESPONSE"`, `grep -q '"ok":true'`} {
+	for _, forbidden := range []string{`echo "$RESPONSE"`, `echo "$JOB_RESPONSE"`, `grep -q '"ok":true'`, `echo "$CANCEL_RESPONSE"`} {
 		if strings.Contains(workflow, forbidden) {
 			t.Fatalf("recreate workflow leaks or trusts raw response with %q", forbidden)
 		}
 	}
 
 	lock := strings.Index(workflow, "exec 9>/tmp/opensamguk-production.lock")
+	operationID := strings.Index(workflow, "CLIENT_OPERATION_ID")
 	create := strings.Index(workflow, "http://localhost:9000/servers/create")
 	parse := strings.Index(workflow, "payload.get(\"jobId\")")
-	poll := strings.Index(workflow, "http://localhost:9000/jobs/$1")
+	pollEndpoint := strings.Index(workflow, "http://localhost:9000/jobs/$1")
+	poll := strings.LastIndex(workflow, "$(lifecycle_status \"$JOB_ID\")")
+	cancel := strings.LastIndex(workflow, "cancel_and_await_lifecycle_job \"$JOB_ID\"")
+	deadline := strings.Index(workflow, "if (( SECONDS >= deadline )); then")
 	succeeded := strings.Index(workflow, "succeeded)")
 	failed := strings.Index(workflow, "failed)")
-	sleep := strings.Index(workflow, "sleep 5")
+	sleep := failed + strings.Index(workflow[failed:], "sleep 5")
 	postconditions := strings.Index(workflow, "for i in $(seq 1 90); do")
-	if lock < 0 || create < 0 || parse < 0 || poll < 0 || succeeded < 0 || failed < 0 || sleep < 0 || postconditions < 0 {
-		t.Fatalf("missing lifecycle ordering markers: lock=%d create=%d parse=%d poll=%d succeeded=%d failed=%d sleep=%d postconditions=%d", lock, create, parse, poll, succeeded, failed, sleep, postconditions)
+	if lock < 0 || operationID < 0 || create < 0 || parse < 0 || pollEndpoint < 0 || poll < 0 || cancel < 0 || deadline < 0 || succeeded < 0 || failed < 0 || sleep < 0 || postconditions < 0 {
+		t.Fatalf("missing lifecycle ordering markers: lock=%d operationID=%d create=%d parse=%d pollEndpoint=%d poll=%d cancel=%d deadline=%d succeeded=%d failed=%d sleep=%d postconditions=%d", lock, operationID, create, parse, pollEndpoint, poll, cancel, deadline, succeeded, failed, sleep, postconditions)
 	}
-	if !(lock < create && create < parse && parse < poll && poll < succeeded && succeeded < postconditions && failed < sleep && sleep < postconditions) {
-		t.Fatalf("unexpected lifecycle ordering: lock=%d create=%d parse=%d poll=%d succeeded=%d failed=%d sleep=%d postconditions=%d", lock, create, parse, poll, succeeded, failed, sleep, postconditions)
+	if !(lock < operationID && operationID < pollEndpoint && pollEndpoint < create && create < parse && parse < poll && poll < succeeded && deadline < cancel && cancel < postconditions && failed < sleep && sleep < postconditions) {
+		t.Fatalf("unexpected lifecycle ordering: lock=%d operationID=%d create=%d parse=%d pollEndpoint=%d poll=%d cancel=%d deadline=%d succeeded=%d failed=%d sleep=%d postconditions=%d", lock, operationID, create, parse, pollEndpoint, poll, cancel, deadline, succeeded, failed, sleep, postconditions)
 	}
 	if strings.Contains(workflow[poll:postconditions], "404)") {
 		t.Fatal("recreate workflow must not accept a restarted deployer job 404")
+	}
+}
+
+func TestStartWorkflowRejectsOverlongAndMismatchedCanonicalServerEnvBeforeMutation(t *testing.T) {
+	workflow := readFile(t, filepath.Join("..", ".github", "workflows", "start-server.yml"))
+	for _, want := range []string{
+		"server_id must be at most 48 ASCII alphanumeric characters",
+		`INTERNAL_ID="s${PUBLIC_ID}"`,
+		`ENV_FILE="servers/${INTERNAL_ID}.env"`,
+		"SERVER_ID in $ENV_FILE must exactly match canonical public id $PUBLIC_ID",
+		`ENV_SERVER_ID="$(sudo awk -F= '$1 == "SERVER_ID" && NF == 2 { print $2 }' "$ENV_FILE")"`,
+	} {
+		if !strings.Contains(workflow, want) {
+			t.Fatalf("start workflow missing %q", want)
+		}
+	}
+
+	maxLength := strings.Index(workflow, "server_id must be at most 48 ASCII alphanumeric characters")
+	canonicalEnv := strings.Index(workflow, `ENV_SERVER_ID="$(sudo awk -F= '$1 == "SERVER_ID" && NF == 2 { print $2 }' "$ENV_FILE")"`)
+	imageMutation := strings.Index(workflow, `sudo sed -i "s/^IMAGE_TAG=.*`)
+	compose := strings.Index(workflow, `sudo docker compose -p "$PROJECT"`)
+	if maxLength < 0 || canonicalEnv < 0 || imageMutation < 0 || compose < 0 {
+		t.Fatalf("missing start ordering markers: max=%d canonicalEnv=%d imageMutation=%d compose=%d", maxLength, canonicalEnv, imageMutation, compose)
+	}
+	if !(maxLength < canonicalEnv && canonicalEnv < imageMutation && imageMutation < compose) {
+		t.Fatalf("start validation must precede mutation and compose: max=%d canonicalEnv=%d imageMutation=%d compose=%d", maxLength, canonicalEnv, imageMutation, compose)
+	}
+}
+
+func TestStartWorkflowRejectsOverlongAndMismatchedEnvBeforeMutation(t *testing.T) {
+	overlong := runStartWorkflow(t, strings.Repeat("a", 49), "v2", "", "")
+	if overlong.err == nil {
+		t.Fatalf("overlong start unexpectedly succeeded: %s", overlong.output)
+	}
+	if !strings.Contains(overlong.output, "server_id must be at most 48 ASCII alphanumeric characters") {
+		t.Fatalf("overlong start output = %q", overlong.output)
+	}
+	if overlong.dockerCalls != "" {
+		t.Fatalf("overlong start reached Docker: %q", overlong.dockerCalls)
+	}
+
+	const original = "SERVER_ID=other\nIMAGE_TAG=v1\n"
+	mismatch := runStartWorkflow(t, "PEP", "v2", "spep", original)
+	if mismatch.err == nil {
+		t.Fatalf("mismatched env start unexpectedly succeeded: %s", mismatch.output)
+	}
+	if !strings.Contains(mismatch.output, "SERVER_ID in servers/spep.env must exactly match canonical public id pep") {
+		t.Fatalf("mismatched env output = %q", mismatch.output)
+	}
+	if mismatch.dockerCalls != "" {
+		t.Fatalf("mismatched env start reached Docker: %q", mismatch.dockerCalls)
+	}
+	if got := readFile(t, mismatch.envFile); got != original {
+		t.Fatalf("mismatched env was mutated before validation:\n%s", got)
+	}
+}
+
+func TestStartWorkflowPreservesPublicToInternalServerIDMapping(t *testing.T) {
+	run := runStartWorkflow(t, "S1", "", "ss1", "SERVER_ID=s1\nIMAGE_TAG=v1\n")
+	if run.err != nil {
+		t.Fatalf("s1 start failed: %v output=%s", run.err, run.output)
+	}
+	if !strings.Contains(run.dockerCalls, "compose -p opensamguk-ss1") {
+		t.Fatalf("s1 start Docker project mapping = %q", run.dockerCalls)
+	}
+	if got := readFile(t, run.envFile); !strings.Contains(got, "SERVER_ID=s1\n") || !strings.Contains(got, "IMAGE_TAG=v1\n") {
+		t.Fatalf("s1 env mapping = %q", got)
 	}
 }
 
@@ -1404,6 +1690,99 @@ func fileMode(t *testing.T, path string) os.FileMode {
 		t.Fatal(err)
 	}
 	return info.Mode().Perm()
+}
+
+type startWorkflowRun struct {
+	output      string
+	err         error
+	dockerCalls string
+	envFile     string
+}
+
+func runStartWorkflow(t *testing.T, serverID, imageTag, envFileName, envContent string) startWorkflowRun {
+	t.Helper()
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	stack := filepath.Join(home, "opensamguk-docker")
+	servers := filepath.Join(stack, "servers")
+	bin := filepath.Join(root, "bin")
+	if err := os.MkdirAll(servers, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	envFile := ""
+	if envFileName != "" {
+		envFile = filepath.Join(servers, envFileName+".env")
+		writeEnv(t, envFile, envContent)
+	}
+
+	dockerLog := filepath.Join(root, "docker.calls")
+	writeExecutable(t, filepath.Join(bin, "flock"), "#!/usr/bin/env bash\nexit 0\n")
+	writeExecutable(t, filepath.Join(bin, "git"), "#!/usr/bin/env bash\nexit 0\n")
+	writeExecutable(t, filepath.Join(bin, "sudo"), "#!/usr/bin/env bash\nexec \"$@\"\n")
+	writeExecutable(t, filepath.Join(bin, "sleep"), "#!/usr/bin/env bash\nexit 0\n")
+	writeExecutable(t, filepath.Join(bin, "docker"), "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$WORKFLOW_DOCKER_LOG\"\nif [[ \"${1:-}\" == \"ps\" ]]; then\n  printf '%s\\n' ss1-game-api ss1-game-engine ss1-web-game\nfi\n")
+	writeExecutable(t, filepath.Join(bin, "curl"), "#!/usr/bin/env bash\nurl=\"${!#}\"\nif [[ \"$url\" == *\"/health\" ]]; then\n  printf '{\"status\":\"up\"}\\n'\nfi\n")
+
+	script := workflowRunScript(t, filepath.Join("..", ".github", "workflows", "start-server.yml"))
+	scriptPath := filepath.Join(root, "start-server.sh")
+	writeExecutable(t, scriptPath, script)
+	cmd := exec.Command("bash", scriptPath)
+	cmd.Env = append(os.Environ(),
+		"HOME="+home,
+		"PATH="+bin+":"+os.Getenv("PATH"),
+		"SERVER_ID="+serverID,
+		"IMAGE_TAG="+imageTag,
+		"WORKFLOW_DOCKER_LOG="+dockerLog,
+	)
+	out, err := cmd.CombinedOutput()
+	dockerCalls, readErr := os.ReadFile(dockerLog)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		t.Fatal(readErr)
+	}
+	return startWorkflowRun{
+		output:      string(out),
+		err:         err,
+		dockerCalls: string(dockerCalls),
+		envFile:     envFile,
+	}
+}
+
+func workflowRunScript(t *testing.T, path string) string {
+	t.Helper()
+	lines := strings.Split(readFile(t, path), "\n")
+	const marker = "        run: |"
+	collecting := false
+	var script []string
+	for _, line := range lines {
+		if !collecting {
+			if line == marker {
+				collecting = true
+			}
+			continue
+		}
+		if line == "" {
+			script = append(script, "")
+			continue
+		}
+		if !strings.HasPrefix(line, "          ") {
+			break
+		}
+		script = append(script, strings.TrimPrefix(line, "          "))
+	}
+	if len(script) == 0 {
+		t.Fatalf("workflow %s has no run script", path)
+	}
+	return strings.Join(script, "\n") + "\n"
+}
+
+func writeExecutable(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func waitForCalls(t *testing.T, callCount func() int, want int) {

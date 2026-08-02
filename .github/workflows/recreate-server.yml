@@ -92,53 +92,148 @@ jobs:
           DEPLOYER_TOKEN="$(grep '^DEPLOYER_TOKEN=' .env | cut -d= -f2-)"
           test -n "$DEPLOYER_TOKEN"
 
-          BODY="$(python3 -c 'import json, os; print(json.dumps({"id": os.environ["SERVER_ID"], "name": os.environ["SERVER_NAME"], "generation": os.environ["GENERATION"], "imageTag": os.environ["IMAGE_TAG"], "gameApiPort": os.environ["GAME_API_PORT"], "webGamePort": os.environ["WEB_GAME_PORT"], "scenarioCode": os.environ["SCENARIO_CODE"], "scenarioSeedEnabled": True, "jwtSecret": ""}, ensure_ascii=False))')"
+          export CLIENT_OPERATION_ID="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+          BODY="$(python3 -c 'import json, os; print(json.dumps({"id": os.environ["SERVER_ID"], "name": os.environ["SERVER_NAME"], "generation": os.environ["GENERATION"], "imageTag": os.environ["IMAGE_TAG"], "gameApiPort": os.environ["GAME_API_PORT"], "webGamePort": os.environ["WEB_GAME_PORT"], "scenarioCode": os.environ["SCENARIO_CODE"], "scenarioSeedEnabled": True, "jwtSecret": "", "operationId": os.environ["CLIENT_OPERATION_ID"]}, ensure_ascii=False))')"
 
-          if ! RESPONSE="$(sudo docker exec -i -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
-            cat > /tmp/recreate-server.json
-            wget -qO- \
-              --header="Authorization: Bearer $DEPLOYER_TOKEN" \
-              --header="Content-Type: application/json" \
-              --post-file=/tmp/recreate-server.json \
-              http://localhost:9000/servers/create
-          ' <<<"$BODY")"; then
-            echo "::error::server creation request failed"
-            exit 1
-          fi
-          if ! JOB_ID="$(printf '%s' "$RESPONSE" | python3 -c 'import json, re, sys; payload = json.load(sys.stdin); job_id = payload.get("jobId") if isinstance(payload, dict) else None; (isinstance(job_id, str) and re.fullmatch(r"[a-f0-9]{32}", job_id) is not None) or sys.exit(1); print(job_id)' 2>/dev/null)"; then
-            echo "::error::server creation did not return a valid lifecycle job"
-            exit 1
-          fi
+          lifecycle_status() {
+            local target_job_id="$1"
+            local attempt job_response job_status
+            local malformed=false
+            for attempt in 1 2 3; do
+              if job_response="$(sudo docker exec -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
+                wget -qO- -T 10 -t 1 --header="Authorization: Bearer $DEPLOYER_TOKEN" "http://localhost:9000/jobs/$1"
+              ' job "$target_job_id" 2>/dev/null)"; then
+                if job_status="$(printf '%s' "$job_response" | JOB_ID="$target_job_id" python3 -c 'import json, os, sys; payload = json.load(sys.stdin); valid = isinstance(payload, dict) and set(payload) == {"id", "status"} and payload["id"] == os.environ["JOB_ID"] and payload["status"] in {"pending", "running", "succeeded", "failed", "cancelled"}; valid or sys.exit(1); print(payload["status"])' 2>/dev/null)"; then
+                  printf '%s\n' "$job_status"
+                  return 0
+                fi
+                malformed=true
+              fi
+              sleep 2
+            done
+            if [[ "$malformed" == true ]]; then
+              return 2
+            fi
+            return 1
+          }
+
+          request_lifecycle_cancel() {
+            local target_job_id="$1"
+            local attempt cancel_response cancel_status
+            for attempt in 1 2 3; do
+              if cancel_response="$(sudo docker exec -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
+                wget -qO- -T 10 -t 1 \
+                  --header="Authorization: Bearer $DEPLOYER_TOKEN" \
+                  --post-data="" \
+                  "http://localhost:9000/jobs/$1/cancel"
+              ' job "$target_job_id" 2>/dev/null)" &&
+                cancel_status="$(printf '%s' "$cancel_response" | JOB_ID="$target_job_id" python3 -c 'import json, os, sys; payload = json.load(sys.stdin); valid = isinstance(payload, dict) and set(payload) == {"id", "status"} and payload["id"] == os.environ["JOB_ID"] and payload["status"] in {"pending", "running", "succeeded", "failed", "cancelled"}; valid or sys.exit(1); print(payload["status"])' 2>/dev/null)"; then
+                printf '%s\n' "$cancel_status"
+                return 0
+              fi
+              sleep 2
+            done
+            return 1
+          }
+
+          cancel_and_await_lifecycle_job() {
+            local target_job_id="$1"
+            local cancellation_confirmed=false
+            local cancellation_warning_emitted=false
+            local terminal_status=""
+            while true; do
+              if [[ "$cancellation_confirmed" != true ]]; then
+                if request_lifecycle_cancel "$target_job_id" >/dev/null; then
+                  cancellation_confirmed=true
+                elif [[ "$cancellation_warning_emitted" != true ]]; then
+                  echo "::warning::lifecycle job cancellation could not be confirmed; continuing to drain" >&2
+                  cancellation_warning_emitted=true
+                fi
+              fi
+              if terminal_status="$(lifecycle_status "$target_job_id")"; then
+                case "$terminal_status" in
+                  succeeded|failed|cancelled)
+                    printf '%s\n' "$terminal_status"
+                    return 0
+                    ;;
+                esac
+              fi
+              sleep 5
+            done
+          }
+
+          JOB_ID=""
+          LIFECYCLE_TERMINAL=false
+          LIFECYCLE_DRAINING=false
+          drain_lifecycle_before_unlock() {
+            local exit_status="$?"
+            if [[ -n "$JOB_ID" && "$LIFECYCLE_TERMINAL" != true && "$LIFECYCLE_DRAINING" != true ]]; then
+              LIFECYCLE_DRAINING=true
+              cancel_and_await_lifecycle_job "$JOB_ID" >/dev/null
+              LIFECYCLE_TERMINAL=true
+            fi
+            return "$exit_status"
+          }
+          trap drain_lifecycle_before_unlock EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          while [[ -z "$JOB_ID" ]]; do
+            for create_attempt in 1 2 3; do
+              if RESPONSE="$(sudo docker exec -i -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
+                cat > /tmp/recreate-server.json
+                wget -qO- \
+                  --header="Authorization: Bearer $DEPLOYER_TOKEN" \
+                  --header="Content-Type: application/json" \
+                  --post-file=/tmp/recreate-server.json \
+                  http://localhost:9000/servers/create
+              ' <<<"$BODY" 2>/dev/null)" &&
+                JOB_ID="$(printf '%s' "$RESPONSE" | python3 -c 'import json, re, sys; payload = json.load(sys.stdin); job_id = payload.get("jobId") if isinstance(payload, dict) else None; (isinstance(job_id, str) and re.fullmatch(r"[a-f0-9]{32}", job_id) is not None) or sys.exit(1); print(job_id)' 2>/dev/null)"; then
+                break
+              fi
+              JOB_ID=""
+              sleep 2
+            done
+            if [[ -z "$JOB_ID" ]]; then
+              echo "::warning::server creation response remained unavailable; retrying idempotently"
+              sleep 5
+            fi
+          done
 
           deadline=$((SECONDS + 1200))
           while true; do
-            if ! JOB_RESPONSE="$(sudo docker exec -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
-              wget -qO- -T 10 -t 1 --header="Authorization: Bearer $DEPLOYER_TOKEN" "http://localhost:9000/jobs/$1"
-            ' job "$JOB_ID")"; then
-              echo "::error::lifecycle job lookup failed"
-              exit 1
+            if JOB_STATUS="$(lifecycle_status "$JOB_ID")"; then
+              case "$JOB_STATUS" in
+                succeeded)
+                  LIFECYCLE_TERMINAL=true
+                  break
+                  ;;
+                pending|running|cancelled)
+                  if [[ "$JOB_STATUS" == cancelled ]]; then
+                    LIFECYCLE_TERMINAL=true
+                    echo "::error::lifecycle job cancelled"
+                    exit 1
+                  fi
+                  ;;
+                failed)
+                  LIFECYCLE_TERMINAL=true
+                  echo "::error::lifecycle job failed"
+                  exit 1
+                  ;;
+              esac
+            else
+              lookup_status=$?
+              if (( lookup_status == 2 )); then
+                echo "::warning::lifecycle job returned malformed status responses; retrying"
+              else
+                echo "::warning::lifecycle job lookup remained unavailable; retrying"
+              fi
             fi
-            if ! JOB_STATUS="$(printf '%s' "$JOB_RESPONSE" | JOB_ID="$JOB_ID" python3 -c 'import json, os, sys; payload = json.load(sys.stdin); valid = isinstance(payload, dict) and set(payload) == {"id", "status"} and payload["id"] == os.environ["JOB_ID"] and payload["status"] in {"pending", "running", "succeeded", "failed"}; valid or sys.exit(1); print(payload["status"])' 2>/dev/null)"; then
-              echo "::error::lifecycle job returned a malformed response"
-              exit 1
-            fi
-            case "$JOB_STATUS" in
-              succeeded)
-                break
-                ;;
-              pending|running)
-                ;;
-              failed)
-                echo "::error::lifecycle job failed"
-                exit 1
-                ;;
-              *)
-                echo "::error::lifecycle job returned an invalid status"
-                exit 1
-                ;;
-            esac
             if (( SECONDS >= deadline )); then
-              echo "::error::lifecycle job did not succeed within 20 minutes"
+              echo "::error::lifecycle job did not succeed within 20 minutes; requesting cancellation"
+              terminal_status="$(cancel_and_await_lifecycle_job "$JOB_ID")"
+              LIFECYCLE_TERMINAL=true
+              echo "::error::lifecycle job reached terminal status ${terminal_status} after deadline"
               exit 1
             fi
             sleep 5
