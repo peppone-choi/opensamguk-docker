@@ -21,7 +21,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Sync orchestration repo on box
+      - name: Synchronize, validate, replace, and verify orchestration
         run: |
           set -euo pipefail
           exec 9>/tmp/opensamguk-production.lock
@@ -40,18 +40,7 @@ jobs:
           fi
           git merge --ff-only origin/main
 
-      - name: Validate registry, recreate deployer, and reload nginx
-        run: |
-          set -euo pipefail
-          exec 9>/tmp/opensamguk-production.lock
-          if ! flock -w 1800 9; then
-            echo "::error::Timed out acquiring /tmp/opensamguk-production.lock after 1800 seconds"
-            exit 1
-          fi
-          STACK="$HOME/opensamguk-docker"
-          cd "$STACK"
           COMPOSE="sudo docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env"
-
           $COMPOSE build deployer
           sudo docker run --rm --read-only --network none \
             -e COMPOSE_DIR=/workspace \
@@ -74,11 +63,6 @@ jobs:
           fi
 
           $COMPOSE up -d --force-recreate --no-deps nginx
-
-      - name: Verify orchestration endpoints
-        run: |
-          set -euo pipefail
-          STACK="$HOME/opensamguk-docker"
           sudo docker exec opensamguk-deployer wget -qO- http://localhost:9000/healthz | grep -q '"status":"up"'
           sudo docker exec opensamguk-deployer wget -qO- http://localhost:9000/readyz | grep -q '"status":"ready"'
           curl -fsS http://localhost/health | grep -q '"status":"up"'

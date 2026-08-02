@@ -22,7 +22,10 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Sync orchestration repo on box
+      - name: Synchronize, start, and verify server lifecycle
+        env:
+          SERVER_ID: ${{ inputs.server_id }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
           set -euo pipefail
           exec 9>/tmp/opensamguk-production.lock
@@ -40,20 +43,6 @@ jobs:
             exit 1
           fi
           git merge --ff-only origin/main
-
-      - name: Start existing server stack
-        env:
-          SERVER_ID: ${{ inputs.server_id }}
-          IMAGE_TAG: ${{ inputs.image_tag }}
-        run: |
-          set -euo pipefail
-          exec 9>/tmp/opensamguk-production.lock
-          if ! flock -w 1800 9; then
-            echo "::error::Timed out acquiring /tmp/opensamguk-production.lock after 1800 seconds"
-            exit 1
-          fi
-          STACK="$HOME/opensamguk-docker"
-          cd "$STACK"
 
           RAW_SERVER_ID="$SERVER_ID"
           if [[ ! "$RAW_SERVER_ID" =~ ^[A-Za-z0-9]+$ ]]; then
@@ -95,24 +84,6 @@ jobs:
             --env-file .env \
             up -d --force-recreate --no-deps nginx
 
-      - name: Wait for server and route
-        env:
-          SERVER_ID: ${{ inputs.server_id }}
-        run: |
-          set -euo pipefail
-          RAW_SERVER_ID="$SERVER_ID"
-          if [[ ! "$RAW_SERVER_ID" =~ ^[A-Za-z0-9]+$ ]]; then
-            echo "::error::invalid server_id; use non-empty ASCII alphanumeric public id"
-            exit 1
-          fi
-          PUBLIC_ID="$(printf '%s' "$RAW_SERVER_ID" | tr '[:upper:]' '[:lower:]')"
-          case "$PUBLIC_ID" in
-            all|admin1|admin2|admin5|admin7|admin8|auction|betting|board|city|diplomacy|generals|history|inherit|join|mailbox|main|map|my|nation|rankings|register|simulator|tournament|troop|vote)
-              echo "::error::server_id ${PUBLIC_ID} is reserved for a game route or all-server operation"
-              exit 1
-              ;;
-          esac
-          INTERNAL_ID="s${PUBLIC_ID}"
           for i in $(seq 1 90); do
             if sudo docker ps --format '{{.Names}}' | grep -q "^${INTERNAL_ID}-game-api$" &&
                sudo docker ps --format '{{.Names}}' | grep -q "^${INTERNAL_ID}-game-engine$" &&
