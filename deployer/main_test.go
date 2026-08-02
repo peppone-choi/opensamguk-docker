@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -68,6 +69,205 @@ func TestServerCloseRejectsWhitespaceAroundPublicID(t *testing.T) {
 	}
 }
 
+func TestLifecycleJobEndpointAuthenticationAndBoundaries(t *testing.T) {
+	cfg := testConfig(t)
+	id, err := cfg.lifecycleJobs.reserve()
+	if err != nil {
+		t.Fatalf("reserve lifecycle job: %v", err)
+	}
+	handler := cfg.withAuth(cfg.handleLifecycleJob)
+
+	unauthorizedRequest := httptest.NewRequest(http.MethodGet, "/jobs/"+id, nil)
+	unauthorizedResponse := httptest.NewRecorder()
+	handler(unauthorizedResponse, unauthorizedRequest)
+	if unauthorizedResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d body=%s", unauthorizedResponse.Code, unauthorizedResponse.Body.String())
+	}
+
+	method := envRequest(t, handler, http.MethodPost, "/jobs/"+id, "")
+	if method.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("method status = %d body=%s", method.Code, method.Body.String())
+	}
+	for _, target := range []string{"/jobs", "/jobs/", "/jobs/not-a-job", "/jobs/ABCDEF0123456789ABCDEF0123456789", "/jobs/" + id + "/extra"} {
+		res := envRequest(t, handler, http.MethodGet, target, "")
+		if res.Code != http.StatusBadRequest {
+			t.Fatalf("malformed %s status = %d body=%s", target, res.Code, res.Body.String())
+		}
+	}
+	unknown := envRequest(t, handler, http.MethodGet, "/jobs/00000000000000000000000000000000", "")
+	if unknown.Code != http.StatusNotFound {
+		t.Fatalf("unknown status = %d body=%s", unknown.Code, unknown.Body.String())
+	}
+
+	res := envRequest(t, handler, http.MethodGet, "/jobs/"+id, "")
+	if res.Code != http.StatusOK {
+		t.Fatalf("status lookup = %d body=%s", res.Code, res.Body.String())
+	}
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(res.Body).Decode(&raw); err != nil {
+		t.Fatalf("decode job response: %v", err)
+	}
+	if len(raw) != 2 || raw["id"] == nil || raw["status"] == nil {
+		t.Fatalf("job response leaked fields: %#v", raw)
+	}
+	var body lifecycleJobResponse
+	if err := json.Unmarshal(mustMarshal(t, raw), &body); err != nil {
+		t.Fatalf("decode lifecycle response: %v", err)
+	}
+	if body.ID != id || body.Status != lifecycleJobPending {
+		t.Fatalf("lifecycle response = %#v", body)
+	}
+
+	restarted := cfg
+	restarted.lifecycleJobs = newLifecycleJobManager()
+	afterRestart := envRequest(t, restarted.withAuth(restarted.handleLifecycleJob), http.MethodGet, "/jobs/"+id, "")
+	if afterRestart.Code != http.StatusNotFound {
+		t.Fatalf("restart lookup status = %d body=%s", afterRestart.Code, afterRestart.Body.String())
+	}
+}
+
+func TestLifecycleJobStatusTracksReloadAndRedactsFailure(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
+JWT_SECRET=shared-secret
+SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
+`)
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "IMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\n")
+	enteredReload := make(chan struct{})
+	releaseReload := make(chan struct{})
+	var enteredOnce sync.Once
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		if strings.Contains(strings.Join(args, " "), "gateway-api web-gateway") {
+			enteredOnce.Do(func() { close(enteredReload) })
+			<-releaseReload
+		}
+		return "sensitive docker output", nil
+	}
+
+	patch := envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodPatch, "/env/server?id=pep", `{"values":{"IMAGE_TAG":"v2"}}`)
+	if patch.Code != http.StatusOK {
+		t.Fatalf("PATCH status = %d body=%s", patch.Code, patch.Body.String())
+	}
+	body := decodeEnvResponse(t, patch)
+	if !lifecycleJobIDRe.MatchString(body.JobID) {
+		t.Fatalf("PATCH job id = %q", body.JobID)
+	}
+	select {
+	case <-enteredReload:
+	case <-time.After(time.Second):
+		t.Fatal("shared registry reload did not start")
+	}
+	running := lifecycleJobLookup(t, cfg, body.JobID)
+	if running.Status != lifecycleJobRunning {
+		t.Fatalf("reload job status while blocked = %q", running.Status)
+	}
+	close(releaseReload)
+	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, body.JobID, lifecycleJobSucceeded); completed.Status != lifecycleJobSucceeded {
+		t.Fatalf("reload completion = %#v", completed)
+	}
+
+	failing := testConfig(t)
+	writeEnv(t, filepath.Join(failing.composeDir, ".env"), `IMAGE_TAG=v1
+JWT_SECRET=shared-secret
+SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
+`)
+	writeEnv(t, filepath.Join(failing.serversDir, "spep.env"), "IMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\n")
+	failing.dockerRunner = func(args ...string) (string, error) {
+		return "sensitive docker output", errors.New("sensitive docker failure")
+	}
+	failedPatch := envRequest(t, failing.withAuth(failing.handleServerEnv), http.MethodPatch, "/env/server?id=pep", `{"values":{"IMAGE_TAG":"v2"}}`)
+	if failedPatch.Code != http.StatusOK {
+		t.Fatalf("failed PATCH status = %d body=%s", failedPatch.Code, failedPatch.Body.String())
+	}
+	failedBody := decodeEnvResponse(t, failedPatch)
+	failed := waitForLifecycleJob(t, failing.lifecycleJobs, failedBody.JobID, lifecycleJobFailed)
+	if failed.Status != lifecycleJobFailed {
+		t.Fatalf("failed job = %#v", failed)
+	}
+	response := envRequest(t, failing.withAuth(failing.handleLifecycleJob), http.MethodGet, "/jobs/"+failedBody.JobID, "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("failed job endpoint = %d body=%s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "sensitive docker") || strings.Contains(response.Body.String(), "failure") {
+		t.Fatalf("failed job leaked docker detail: %s", response.Body.String())
+	}
+}
+
+func TestLifecycleJobCapacityFailsBeforeCreateMutationAndPrunesTerminal(t *testing.T) {
+	cfg := testConfig(t)
+	original := "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n"
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), original)
+	for i := 0; i < lifecycleJobMaxEntries; i++ {
+		if _, err := cfg.lifecycleJobs.reserve(); err != nil {
+			t.Fatalf("reserve %d: %v", i, err)
+		}
+	}
+	res := envRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create", `{"id":"pep","name":"통일 서버","gameApiPort":"8101","webGamePort":"3101"}`)
+	if res.Code != http.StatusServiceUnavailable {
+		t.Fatalf("capacity create status = %d body=%s", res.Code, res.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(cfg.serversDir, "spep.env")); !os.IsNotExist(err) {
+		t.Fatalf("server env mutated on capacity failure: %v", err)
+	}
+	if got := readFile(t, filepath.Join(cfg.composeDir, ".env")); got != original {
+		t.Fatalf("registry mutated on capacity failure:\n%s", got)
+	}
+
+	now := time.Date(2026, time.August, 2, 0, 0, 0, 0, time.UTC)
+	manager := newLifecycleJobManager()
+	manager.maxEntries = 1
+	manager.now = func() time.Time { return now }
+	id, err := manager.reserve()
+	if err != nil {
+		t.Fatalf("reserve terminal job: %v", err)
+	}
+	if !manager.start(id, func() (string, error) { return "", nil }) {
+		t.Fatal("start terminal job")
+	}
+	waitForLifecycleJob(t, manager, id, lifecycleJobSucceeded)
+	now = now.Add(lifecycleJobTerminalRetention)
+	secondID, err := manager.reserve()
+	if err != nil {
+		t.Fatalf("expired terminal job was not pruned: %v", err)
+	}
+	if secondID == id {
+		t.Fatalf("new lifecycle id reused expired id: %q", secondID)
+	}
+	if _, exists := manager.lookup(id); exists {
+		t.Fatalf("expired terminal job %q still exists", id)
+	}
+}
+
+func TestServerEnvPatchCancelsLifecycleReservationWithoutReloadOrOnSetupFailure(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep","env":{"IMAGE_TAG":"v1","SERVER_NAME":"통일 서버","SERVER_GENERATION":"1","GAME_API_URL":"http://spep-game-api:8081"}}]
+`)
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "IMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\nJWT_SECRET=old-secret\n")
+	noReload := envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodPatch, "/env/server?id=pep", `{"values":{"JWT_SECRET":"new-secret"}}`)
+	if noReload.Code != http.StatusOK {
+		t.Fatalf("no-reload PATCH status = %d body=%s", noReload.Code, noReload.Body.String())
+	}
+	if body := decodeEnvResponse(t, noReload); body.JobID != "" {
+		t.Fatalf("no-reload PATCH retained job id %q", body.JobID)
+	}
+	for i := 0; i < lifecycleJobMaxEntries; i++ {
+		if _, err := cfg.lifecycleJobs.reserve(); err != nil {
+			t.Fatalf("no-reload PATCH leaked reservation at %d: %v", i, err)
+		}
+	}
+
+	setupFailure := testConfig(t)
+	failed := envRequest(t, setupFailure.withAuth(setupFailure.handleServerEnv), http.MethodPatch, "/env/server?id=pep", `{"values":{"IMAGE_TAG":"v2"}}`)
+	if failed.Code != http.StatusInternalServerError {
+		t.Fatalf("setup-failure PATCH status = %d body=%s", failed.Code, failed.Body.String())
+	}
+	for i := 0; i < lifecycleJobMaxEntries; i++ {
+		if _, err := setupFailure.lifecycleJobs.reserve(); err != nil {
+			t.Fatalf("setup-failure PATCH leaked reservation at %d: %v", i, err)
+		}
+	}
+}
+
 func TestReadyzRequiresCanonicalRegistry(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","deployProject":"opensamguk-spep"}]
@@ -115,9 +315,9 @@ func TestDeployPromotesApiAndWebGameTags(t *testing.T) {
 	cfg := testConfig(t)
 	envFile := filepath.Join(cfg.serversDir, "s1.env")
 	writeEnv(t, envFile, "# server\nIMAGE_TAG=v1\nWEB_GAME_TAG=v-old\nJWT_SECRET=old-secret\n")
-	calls := []string{}
+	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
-		calls = append(calls, strings.Join(args, " "))
+		calls.record(args...)
 		return "ok\n", nil
 	}
 
@@ -139,14 +339,15 @@ func TestDeployPromotesApiAndWebGameTags(t *testing.T) {
 			t.Fatalf("env missing %q:\n%s", want, data)
 		}
 	}
-	if len(calls) != 2 {
-		t.Fatalf("docker calls = %#v", calls)
+	recorded := calls.snapshot()
+	if len(recorded) != 2 {
+		t.Fatalf("docker calls = %#v", recorded)
 	}
-	if !strings.Contains(calls[0], "pull game-api web-game") {
-		t.Fatalf("pull call = %q", calls[0])
+	if !strings.Contains(recorded[0], "pull game-api web-game") {
+		t.Fatalf("pull call = %q", recorded[0])
 	}
-	if !strings.Contains(calls[1], "up -d --force-recreate --no-deps game-api web-game") {
-		t.Fatalf("up call = %q", calls[1])
+	if !strings.Contains(recorded[1], "up -d --force-recreate --no-deps game-api web-game") {
+		t.Fatalf("up call = %q", recorded[1])
 	}
 }
 
@@ -202,9 +403,9 @@ JWT_SECRET=shared-secret
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "IMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\nJWT_SECRET=old-secret\n")
-	calls := []string{}
+	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
-		calls = append(calls, strings.Join(args, " "))
+		calls.record(args...)
 		return "ok\n", nil
 	}
 
@@ -219,6 +420,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 		t.Fatalf("PATCH status = %d body=%s", res.Code, res.Body.String())
 	}
 	body := decodeEnvResponse(t, res)
+	if !lifecycleJobIDRe.MatchString(body.JobID) {
+		t.Fatalf("PATCH job id = %q", body.JobID)
+	}
 	affected := strings.Join(body.AffectedServices, ",")
 	for _, want := range []string{"game-api", "web-game", "gateway-api", "web-gateway", "nginx"} {
 		if !strings.Contains(affected, want) {
@@ -254,15 +458,16 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	if strings.Contains(readFile(t, filepath.Join(cfg.composeDir, ".env")), "new-secret") {
 		t.Fatalf("shared registry leaked secret:\n%s", readFile(t, filepath.Join(cfg.composeDir, ".env")))
 	}
-	waitForCalls(t, func() int { return len(calls) }, 2)
-	if len(calls) != 2 {
-		t.Fatalf("docker calls = %#v", calls)
+	waitForCalls(t, calls.count, 2)
+	recorded := calls.snapshot()
+	if len(recorded) != 2 {
+		t.Fatalf("docker calls = %#v", recorded)
 	}
-	if !strings.Contains(calls[0], "gateway-api web-gateway") || strings.Contains(calls[0], " nginx") {
-		t.Fatalf("shared reload call = %q", calls[0])
+	if !strings.Contains(recorded[0], "gateway-api web-gateway") || strings.Contains(recorded[0], " nginx") {
+		t.Fatalf("shared reload call = %q", recorded[0])
 	}
-	if !strings.Contains(calls[1], "--force-recreate --no-deps nginx") {
-		t.Fatalf("nginx reload call = %q", calls[1])
+	if !strings.Contains(recorded[1], "--force-recreate --no-deps nginx") {
+		t.Fatalf("nginx reload call = %q", recorded[1])
 	}
 }
 
@@ -315,9 +520,9 @@ func TestServerEnvMasksWriteOnlySecrets(t *testing.T) {
 func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
-	calls := []string{}
+	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
-		calls = append(calls, strings.Join(args, " "))
+		calls.record(args...)
 		return "ok\n", nil
 	}
 
@@ -329,7 +534,7 @@ func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if !body.OK || body.ID != "pep" || body.Project != "opensamguk-spep" {
+	if !body.OK || body.ID != "pep" || body.Project != "opensamguk-spep" || !lifecycleJobIDRe.MatchString(body.JobID) {
 		t.Fatalf("create response = %#v", body)
 	}
 
@@ -356,29 +561,30 @@ func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 		!strings.Contains(sharedEnv, `"deployProject":"opensamguk-spep"`) {
 		t.Fatalf("registry not updated:\n%s", sharedEnv)
 	}
-	waitForCalls(t, func() int { return len(calls) }, 3)
-	if len(calls) != 3 {
-		t.Fatalf("docker calls = %#v", calls)
+	waitForCalls(t, calls.count, 3)
+	recorded := calls.snapshot()
+	if len(recorded) != 3 {
+		t.Fatalf("docker calls = %#v", recorded)
 	}
-	if !strings.Contains(calls[0], "compose -p opensamguk-spep") ||
-		!strings.Contains(calls[0], "--env-file "+filepath.Join(cfg.serversDir, "spep.env")) ||
-		strings.Contains(calls[0], "--no-deps") {
-		t.Fatalf("server compose call = %q", calls[0])
+	if !strings.Contains(recorded[0], "compose -p opensamguk-spep") ||
+		!strings.Contains(recorded[0], "--env-file "+filepath.Join(cfg.serversDir, "spep.env")) ||
+		strings.Contains(recorded[0], "--no-deps") {
+		t.Fatalf("server compose call = %q", recorded[0])
 	}
-	if !strings.Contains(calls[1], "gateway-api web-gateway") || strings.Contains(calls[1], " nginx") {
-		t.Fatalf("shared reload call = %q", calls[1])
+	if !strings.Contains(recorded[1], "gateway-api web-gateway") || strings.Contains(recorded[1], " nginx") {
+		t.Fatalf("shared reload call = %q", recorded[1])
 	}
-	if !strings.Contains(calls[2], "--force-recreate --no-deps nginx") {
-		t.Fatalf("nginx reload call = %q", calls[2])
+	if !strings.Contains(recorded[2], "--force-recreate --no-deps nginx") {
+		t.Fatalf("nginx reload call = %q", recorded[2])
 	}
 }
 
 func TestCreateServerCanonicalizesUppercaseIDAndPreventsCaseCollision(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
-	calls := []string{}
+	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
-		calls = append(calls, strings.Join(args, " "))
+		calls.record(args...)
 		return "ok\n", nil
 	}
 
@@ -400,9 +606,10 @@ func TestCreateServerCanonicalizesUppercaseIDAndPreventsCaseCollision(t *testing
 	if !strings.Contains(readFile(t, filepath.Join(cfg.composeDir, ".env")), `"id":"a1"`) {
 		t.Fatalf("registry did not persist canonical id")
 	}
-	waitForCalls(t, func() int { return len(calls) }, 1)
-	if len(calls) == 0 || !strings.Contains(calls[0], "compose -p opensamguk-sa1") {
-		t.Fatalf("compose call = %#v", calls)
+	waitForCalls(t, calls.count, 1)
+	recorded := calls.snapshot()
+	if len(recorded) == 0 || !strings.Contains(recorded[0], "compose -p opensamguk-sa1") {
+		t.Fatalf("compose call = %#v", recorded)
 	}
 
 	res = envRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create", `{"id":"a1","name":"중복 서버","gameApiPort":"8111","webGamePort":"3111"}`)
@@ -433,11 +640,14 @@ func TestPublicServerIDContract(t *testing.T) {
 	}
 }
 
-func TestPublicServerIDLengthFitsDockerDNSLabelAndCanonicalizesMixedCase(t *testing.T) {
-	raw := strings.Repeat("aB", 25)
+func TestPublicServerIDLengthFitsLongestDockerDNSLabelAndCanonicalizesMixedCase(t *testing.T) {
+	if maxPublicServerIDLength != 48 {
+		t.Fatalf("max public id length = %d, want 48", maxPublicServerIDLength)
+	}
+	raw := strings.Repeat("aB", 24)
 	publicID, internalKey, err := normalizeCreateServerID(raw)
 	if err != nil {
-		t.Fatalf("normalize 50-character mixed-case id: %v", err)
+		t.Fatalf("normalize 48-character mixed-case id: %v", err)
 	}
 	if want := strings.ToLower(raw); publicID != want {
 		t.Fatalf("canonical public id = %q, want %q", publicID, want)
@@ -445,17 +655,17 @@ func TestPublicServerIDLengthFitsDockerDNSLabelAndCanonicalizesMixedCase(t *test
 	if internalKey != "s"+publicID {
 		t.Fatalf("internal key = %q, want s+public id", internalKey)
 	}
-	if got := len(internalKey + "-game-engine"); got != 63 {
-		t.Fatalf("game-engine Docker DNS label length = %d, want 63", got)
+	if got := len(internalKey + "-game-postgres"); got != 63 {
+		t.Fatalf("game-postgres Docker DNS label length = %d, want 63", got)
 	}
-	if _, _, err := normalizeCreateServerID(strings.Repeat("a", 51)); err == nil {
-		t.Fatal("normalize 51-character id unexpectedly succeeded")
+	if _, _, err := normalizeCreateServerID(strings.Repeat("a", 49)); err == nil {
+		t.Fatal("normalize 49-character id unexpectedly succeeded")
 	}
 }
 
 func TestProjectBoundariesRejectOverlongCanonicalPublicID(t *testing.T) {
 	cfg := testConfig(t)
-	publicID := strings.Repeat("a", 51)
+	publicID := strings.Repeat("a", 49)
 	project := "opensamguk-s" + publicID
 
 	status := envRequest(t, cfg.withAuth(cfg.handleStatus), http.MethodGet, "/status?project="+project, "")
@@ -570,15 +780,6 @@ func TestNginxRouteReservationsAndApiProxyContract(t *testing.T) {
 
 func TestDeployOrchestrationValidatesCandidateBeforeControlPlaneMutation(t *testing.T) {
 	workflow := readFile(t, filepath.Join("..", ".github", "workflows", "deploy-orchestration.yml"))
-	stepStart := strings.Index(workflow, "      - name: Validate registry, recreate deployer, and reload nginx\n")
-	if stepStart < 0 {
-		t.Fatal("control-plane deployment step not found")
-	}
-	nextStep := strings.Index(workflow[stepStart:], "\n      - name: Verify orchestration endpoints\n")
-	if nextStep < 0 {
-		t.Fatal("unlocked endpoint postcondition step not found")
-	}
-	step := workflow[stepStart : stepStart+nextStep]
 
 	for _, want := range []string{
 		"exec 9>/tmp/opensamguk-production.lock",
@@ -588,28 +789,29 @@ func TestDeployOrchestrationValidatesCandidateBeforeControlPlaneMutation(t *test
 		`-v "$STACK/.env:/workspace/.env:ro"`,
 		"opensamguk-deployer:local --check-registry",
 	} {
-		if !strings.Contains(step, want) {
-			t.Fatalf("control-plane deployment step missing %q", want)
+		if !strings.Contains(workflow, want) {
+			t.Fatalf("control-plane deployment missing %q", want)
 		}
 	}
 
-	build := strings.Index(step, "$COMPOSE build deployer")
-	check := strings.Index(step, "opensamguk-deployer:local --check-registry")
-	deployer := strings.Index(step, "$COMPOSE up -d --force-recreate --no-deps deployer")
-	healthz := strings.Index(step, "http://localhost:9000/healthz")
-	readyz := strings.Index(step, "http://localhost:9000/readyz")
-	nginx := strings.Index(step, "$COMPOSE up -d --force-recreate --no-deps nginx")
+	build := strings.Index(workflow, "$COMPOSE build deployer")
+	check := strings.Index(workflow, "opensamguk-deployer:local --check-registry")
+	deployer := strings.Index(workflow, "$COMPOSE up -d --force-recreate --no-deps deployer")
+	healthz := strings.Index(workflow, "http://localhost:9000/healthz")
+	readyz := strings.Index(workflow, "http://localhost:9000/readyz")
+	nginxMarker := "$COMPOSE up -d --force-recreate --no-deps nginx"
+	nginx := strings.Index(workflow, nginxMarker)
 	if build < 0 || check < 0 || deployer < 0 || healthz < 0 || readyz < 0 || nginx < 0 {
 		t.Fatalf("missing deployment ordering markers: build=%d check=%d deployer=%d healthz=%d readyz=%d nginx=%d", build, check, deployer, healthz, readyz, nginx)
 	}
 	if !(build < check && check < deployer && deployer < healthz && healthz < readyz && readyz < nginx) {
 		t.Fatalf("unexpected deployment ordering: build=%d check=%d deployer=%d healthz=%d readyz=%d nginx=%d", build, check, deployer, healthz, readyz, nginx)
 	}
-	if strings.Contains(step[check:deployer], "--env-file") {
+	if strings.Contains(workflow[check:deployer], "--env-file") {
 		t.Fatal("candidate registry check must not receive the shared env through command-line injection")
 	}
 
-	postcondition := workflow[stepStart+nextStep:]
+	postcondition := workflow[nginx+len(nginxMarker):]
 	for _, want := range []string{"http://localhost:9000/healthz", "http://localhost:9000/readyz"} {
 		if !strings.Contains(postcondition, want) {
 			t.Fatalf("unlocked endpoint postcondition missing %q", want)
@@ -619,25 +821,63 @@ func TestDeployOrchestrationValidatesCandidateBeforeControlPlaneMutation(t *test
 
 func TestDeployOrchestrationProbesARunningRegisteredServer(t *testing.T) {
 	workflow := readFile(t, filepath.Join("..", ".github", "workflows", "deploy-orchestration.yml"))
-	stepStart := strings.Index(workflow, "      - name: Verify orchestration endpoints\n")
-	if stepStart < 0 {
-		t.Fatal("endpoint verification step not found")
-	}
-	step := workflow[stepStart:]
-	if strings.Contains(step, "print(server_id)\n                  break") {
+	if strings.Contains(workflow, "print(server_id)\n                  break") {
 		t.Fatal("route probe must not stop at the first registry entry before checking whether it is running")
 	}
 
-	candidates := strings.Index(step, `SERVER_IDS="$(python3 - "$STACK/.env" <<'PY'`)
-	loop := strings.Index(step, "for SERVER_ID in $SERVER_IDS; do")
-	running := strings.Index(step, `grep -Fxq "${INTERNAL_ID}-web-game"`)
-	checked := strings.Index(step, "route_checked=true")
-	skip := strings.Index(step, "no running registered server; game route check skipped")
+	candidates := strings.Index(workflow, `SERVER_IDS="$(python3 - "$STACK/.env" <<'PY'`)
+	loop := strings.Index(workflow, "for SERVER_ID in $SERVER_IDS; do")
+	running := strings.Index(workflow, `grep -Fxq "${INTERNAL_ID}-web-game"`)
+	checked := strings.Index(workflow, "route_checked=true")
+	skip := strings.Index(workflow, "no running registered server; game route check skipped")
 	if candidates < 0 || loop < 0 || running < 0 || checked < 0 || skip < 0 {
 		t.Fatalf("missing route-probe markers: candidates=%d loop=%d running=%d checked=%d skip=%d", candidates, loop, running, checked, skip)
 	}
 	if !(candidates < loop && loop < running && running < checked && checked < skip) {
 		t.Fatalf("unexpected route-probe order: candidates=%d loop=%d running=%d checked=%d skip=%d", candidates, loop, running, checked, skip)
+	}
+}
+
+func TestRecreateWorkflowWaitsForLifecycleJobBeforePostconditions(t *testing.T) {
+	workflow := readFile(t, filepath.Join("..", ".github", "workflows", "recreate-server.yml"))
+	for _, want := range []string{
+		"exec 9>/tmp/opensamguk-production.lock",
+		"flock -w 1800 9",
+		"payload.get(\"jobId\")",
+		"http://localhost:9000/jobs/$1",
+		"--header=\"Authorization: Bearer $DEPLOYER_TOKEN\"",
+		"deadline=$((SECONDS + 1200))",
+		"pending|running)",
+		"failed)",
+		"lifecycle job lookup failed",
+		"lifecycle job returned a malformed response",
+	} {
+		if !strings.Contains(workflow, want) {
+			t.Fatalf("recreate workflow missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{`echo "$RESPONSE"`, `echo "$JOB_RESPONSE"`, `grep -q '"ok":true'`} {
+		if strings.Contains(workflow, forbidden) {
+			t.Fatalf("recreate workflow leaks or trusts raw response with %q", forbidden)
+		}
+	}
+
+	lock := strings.Index(workflow, "exec 9>/tmp/opensamguk-production.lock")
+	create := strings.Index(workflow, "http://localhost:9000/servers/create")
+	parse := strings.Index(workflow, "payload.get(\"jobId\")")
+	poll := strings.Index(workflow, "http://localhost:9000/jobs/$1")
+	succeeded := strings.Index(workflow, "succeeded)")
+	failed := strings.Index(workflow, "failed)")
+	sleep := strings.Index(workflow, "sleep 5")
+	postconditions := strings.Index(workflow, "for i in $(seq 1 90); do")
+	if lock < 0 || create < 0 || parse < 0 || poll < 0 || succeeded < 0 || failed < 0 || sleep < 0 || postconditions < 0 {
+		t.Fatalf("missing lifecycle ordering markers: lock=%d create=%d parse=%d poll=%d succeeded=%d failed=%d sleep=%d postconditions=%d", lock, create, parse, poll, succeeded, failed, sleep, postconditions)
+	}
+	if !(lock < create && create < parse && parse < poll && poll < succeeded && succeeded < postconditions && failed < sleep && sleep < postconditions) {
+		t.Fatalf("unexpected lifecycle ordering: lock=%d create=%d parse=%d poll=%d succeeded=%d failed=%d sleep=%d postconditions=%d", lock, create, parse, poll, succeeded, failed, sleep, postconditions)
+	}
+	if strings.Contains(workflow[poll:postconditions], "404)") {
+		t.Fatal("recreate workflow must not accept a restarted deployer job 404")
 	}
 }
 
@@ -815,9 +1055,9 @@ JWT_SECRET=shared-secret
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"},{"id":"keep","name":"빼섭","gameApiUrl":"http://skeep-game-api:8081","gameEngineUrl":"http://skeep-game-engine:8082","deployProject":"opensamguk-skeep"}]
 `)
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "GAME_API_PORT=8101\nWEB_GAME_PORT=3101\n")
-	calls := []string{}
+	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
-		calls = append(calls, strings.Join(args, " "))
+		calls.record(args...)
 		return "ok\n", nil
 	}
 
@@ -829,10 +1069,10 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if !body.OK || body.ID != "pep" || body.Project != "opensamguk-spep" {
+	if !body.OK || body.ID != "pep" || body.Project != "opensamguk-spep" || !lifecycleJobIDRe.MatchString(body.JobID) {
 		t.Fatalf("delete response = %#v", body)
 	}
-	waitForCalls(t, func() int { return len(calls) }, 3)
+	waitForCalls(t, calls.count, 3)
 	waitForMissing(t, filepath.Join(cfg.serversDir, "spep.env"))
 	if _, err := os.Stat(filepath.Join(cfg.serversDir, "spep.env")); !os.IsNotExist(err) {
 		t.Fatalf("server env still exists or unexpected error: %v", err)
@@ -842,17 +1082,18 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	if strings.Contains(sharedEnv, `"id":"pep"`) || !strings.Contains(sharedEnv, `"id":"keep"`) {
 		t.Fatalf("registry not pruned correctly:\n%s", sharedEnv)
 	}
-	if len(calls) != 3 {
-		t.Fatalf("docker calls = %#v", calls)
+	recorded := calls.snapshot()
+	if len(recorded) != 3 {
+		t.Fatalf("docker calls = %#v", recorded)
 	}
-	if !strings.Contains(calls[0], "compose -p opensamguk-spep") || !strings.Contains(calls[0], "down --volumes --remove-orphans") {
-		t.Fatalf("delete compose call = %q", calls[0])
+	if !strings.Contains(recorded[0], "compose -p opensamguk-spep") || !strings.Contains(recorded[0], "down --volumes --remove-orphans") {
+		t.Fatalf("delete compose call = %q", recorded[0])
 	}
-	if !strings.Contains(calls[1], "gateway-api web-gateway") || strings.Contains(calls[1], " nginx") {
-		t.Fatalf("shared reload call = %q", calls[1])
+	if !strings.Contains(recorded[1], "gateway-api web-gateway") || strings.Contains(recorded[1], " nginx") {
+		t.Fatalf("shared reload call = %q", recorded[1])
 	}
-	if !strings.Contains(calls[2], "--force-recreate --no-deps nginx") {
-		t.Fatalf("nginx reload call = %q", calls[2])
+	if !strings.Contains(recorded[2], "--force-recreate --no-deps nginx") {
+		t.Fatalf("nginx reload call = %q", recorded[2])
 	}
 }
 
@@ -888,9 +1129,9 @@ JWT_SECRET=shared-secret
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n")
-	calls := []string{}
+	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
-		calls = append(calls, strings.Join(args, " "))
+		calls.record(args...)
 		return "ok\n", nil
 	}
 
@@ -908,24 +1149,25 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if !body.OK || body.ID != "pep" || body.Project != "opensamguk-spep" {
+	if !body.OK || body.ID != "pep" || body.Project != "opensamguk-spep" || !lifecycleJobIDRe.MatchString(body.JobID) {
 		t.Fatalf("reset response = %#v", body)
 	}
-	waitForCalls(t, func() int { return len(calls) }, 4)
-	if len(calls) != 4 {
-		t.Fatalf("docker calls = %#v", calls)
+	waitForCalls(t, calls.count, 4)
+	recorded := calls.snapshot()
+	if len(recorded) != 4 {
+		t.Fatalf("docker calls = %#v", recorded)
 	}
-	if !strings.Contains(calls[0], "down --volumes --remove-orphans") {
-		t.Fatalf("reset down call = %q", calls[0])
+	if !strings.Contains(recorded[0], "down --volumes --remove-orphans") {
+		t.Fatalf("reset down call = %q", recorded[0])
 	}
-	if !strings.Contains(calls[1], "up -d") {
-		t.Fatalf("reset up call = %q", calls[1])
+	if !strings.Contains(recorded[1], "up -d") {
+		t.Fatalf("reset up call = %q", recorded[1])
 	}
-	if !strings.Contains(calls[2], "gateway-api web-gateway") || strings.Contains(calls[2], " nginx") {
-		t.Fatalf("shared reload call = %q", calls[2])
+	if !strings.Contains(recorded[2], "gateway-api web-gateway") || strings.Contains(recorded[2], " nginx") {
+		t.Fatalf("shared reload call = %q", recorded[2])
 	}
-	if !strings.Contains(calls[3], "--force-recreate --no-deps nginx") {
-		t.Fatalf("nginx reload call = %q", calls[3])
+	if !strings.Contains(recorded[3], "--force-recreate --no-deps nginx") {
+		t.Fatalf("nginx reload call = %q", recorded[3])
 	}
 	serverEnv := readFile(t, filepath.Join(cfg.serversDir, "spep.env"))
 	for _, want := range []string{
@@ -995,9 +1237,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 `)
 	original := "SCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n"
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), original)
-	calls := []string{}
+	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
-		calls = append(calls, strings.Join(args, " "))
+		calls.record(args...)
 		return "down failed\n", errors.New("compose down failed")
 	}
 
@@ -1011,9 +1253,10 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	if res.Code != http.StatusOK {
 		t.Fatalf("RESET status = %d body=%s", res.Code, res.Body.String())
 	}
-	waitForCalls(t, func() int { return len(calls) }, 1)
-	if len(calls) != 1 || !strings.Contains(calls[0], "down --volumes --remove-orphans") {
-		t.Fatalf("reset should stop after failed down, calls=%#v", calls)
+	waitForCalls(t, calls.count, 1)
+	recorded := calls.snapshot()
+	if len(recorded) != 1 || !strings.Contains(recorded[0], "down --volumes --remove-orphans") {
+		t.Fatalf("reset should stop after failed down, calls=%#v", recorded)
 	}
 	waitForContent(t, filepath.Join(cfg.serversDir, "spep.env"), original)
 	if got := readFile(t, filepath.Join(cfg.serversDir, "spep.env")); got != original {
@@ -1026,6 +1269,29 @@ func TestStatelessServicesExcludeGameEngine(t *testing.T) {
 	if strings.Contains(joined, "game-engine") {
 		t.Fatalf("stateless services must not include game-engine: %s", joined)
 	}
+}
+
+type dockerCallRecorder struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (r *dockerCallRecorder) record(args ...string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, strings.Join(args, " "))
+}
+
+func (r *dockerCallRecorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.calls)
+}
+
+func (r *dockerCallRecorder) snapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.calls...)
 }
 
 func testConfig(t *testing.T) config {
@@ -1043,6 +1309,7 @@ func testConfig(t *testing.T) config {
 		composeShared:  filepath.Join(root, "docker-compose.shared.yml"),
 		ghcrOwner:      "owner",
 		ghcrAPIBaseURL: "https://api.github.com",
+		lifecycleJobs:  newLifecycleJobManager(),
 	}
 }
 
@@ -1056,6 +1323,41 @@ func envRequest(t *testing.T, handler http.HandlerFunc, method, target, body str
 	res := httptest.NewRecorder()
 	handler(res, req)
 	return res
+}
+
+func mustMarshal(t *testing.T, value any) []byte {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func lifecycleJobLookup(t *testing.T, cfg config, id string) lifecycleJobResponse {
+	t.Helper()
+	res := envRequest(t, cfg.withAuth(cfg.handleLifecycleJob), http.MethodGet, "/jobs/"+id, "")
+	if res.Code != http.StatusOK {
+		t.Fatalf("job lookup status = %d body=%s", res.Code, res.Body.String())
+	}
+	var job lifecycleJobResponse
+	if err := json.NewDecoder(res.Body).Decode(&job); err != nil {
+		t.Fatalf("decode job lookup: %v", err)
+	}
+	return job
+}
+
+func waitForLifecycleJob(t *testing.T, manager *lifecycleJobManager, id string, want lifecycleJobStatus) lifecycleJobResponse {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		if job, exists := manager.lookup(id); exists && job.Status == want {
+			return job
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	job, exists := manager.lookup(id)
+	t.Fatalf("lifecycle job id=%s status=%q exists=%t, want %q", id, job.Status, exists, want)
+	return lifecycleJobResponse{}
 }
 
 func decodeEnvResponse(t *testing.T, res *httptest.ResponseRecorder) envResponse {

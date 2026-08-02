@@ -75,8 +75,12 @@ jobs:
             exit 1
           fi
           PUBLIC_ID="$(printf '%s' "$RAW_SERVER_ID" | tr '[:upper:]' '[:lower:]')"
+          if (( ${#PUBLIC_ID} > 48 )); then
+            echo "::error::server_id must be at most 48 ASCII alphanumeric characters"
+            exit 1
+          fi
           case "$PUBLIC_ID" in
-            all|admin1|admin2|admin5|admin7|admin8|auction|betting|board|city|diplomacy|generals|history|inherit|join|mailbox|main|map|my|nation|rankings|register|simulator|tournament|troop|vote)
+            all|admin1|admin2|admin5|admin7|admin8|auction|battle-center|betting|board|chief-center|city|coming-soon|diplomacy|generals|global-diplomacy|history|inherit|join|mailbox|main|map|my|my-boss|my-cities|my-generals|my-nation|nation|nation-betting|nation-finance|npc-control|rankings|register|select-pool|simulator|tournament|tournament-admin|troop|vote|world-log)
               echo "::error::server_id ${PUBLIC_ID} is reserved for a game route or all-server operation"
               exit 1
               ;;
@@ -90,16 +94,55 @@ jobs:
 
           BODY="$(python3 -c 'import json, os; print(json.dumps({"id": os.environ["SERVER_ID"], "name": os.environ["SERVER_NAME"], "generation": os.environ["GENERATION"], "imageTag": os.environ["IMAGE_TAG"], "gameApiPort": os.environ["GAME_API_PORT"], "webGamePort": os.environ["WEB_GAME_PORT"], "scenarioCode": os.environ["SCENARIO_CODE"], "scenarioSeedEnabled": True, "jwtSecret": ""}, ensure_ascii=False))')"
 
-          RESPONSE="$(sudo docker exec -i -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
+          if ! RESPONSE="$(sudo docker exec -i -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
             cat > /tmp/recreate-server.json
             wget -qO- \
               --header="Authorization: Bearer $DEPLOYER_TOKEN" \
               --header="Content-Type: application/json" \
               --post-file=/tmp/recreate-server.json \
               http://localhost:9000/servers/create
-          ' <<<"$BODY")"
-          echo "$RESPONSE"
-          echo "$RESPONSE" | grep -q '"ok":true'
+          ' <<<"$BODY")"; then
+            echo "::error::server creation request failed"
+            exit 1
+          fi
+          if ! JOB_ID="$(printf '%s' "$RESPONSE" | python3 -c 'import json, re, sys; payload = json.load(sys.stdin); job_id = payload.get("jobId") if isinstance(payload, dict) else None; (isinstance(job_id, str) and re.fullmatch(r"[a-f0-9]{32}", job_id) is not None) or sys.exit(1); print(job_id)' 2>/dev/null)"; then
+            echo "::error::server creation did not return a valid lifecycle job"
+            exit 1
+          fi
+
+          deadline=$((SECONDS + 1200))
+          while true; do
+            if ! JOB_RESPONSE="$(sudo docker exec -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
+              wget -qO- -T 10 -t 1 --header="Authorization: Bearer $DEPLOYER_TOKEN" "http://localhost:9000/jobs/$1"
+            ' job "$JOB_ID")"; then
+              echo "::error::lifecycle job lookup failed"
+              exit 1
+            fi
+            if ! JOB_STATUS="$(printf '%s' "$JOB_RESPONSE" | JOB_ID="$JOB_ID" python3 -c 'import json, os, sys; payload = json.load(sys.stdin); valid = isinstance(payload, dict) and set(payload) == {"id", "status"} and payload["id"] == os.environ["JOB_ID"] and payload["status"] in {"pending", "running", "succeeded", "failed"}; valid or sys.exit(1); print(payload["status"])' 2>/dev/null)"; then
+              echo "::error::lifecycle job returned a malformed response"
+              exit 1
+            fi
+            case "$JOB_STATUS" in
+              succeeded)
+                break
+                ;;
+              pending|running)
+                ;;
+              failed)
+                echo "::error::lifecycle job failed"
+                exit 1
+                ;;
+              *)
+                echo "::error::lifecycle job returned an invalid status"
+                exit 1
+                ;;
+            esac
+            if (( SECONDS >= deadline )); then
+              echo "::error::lifecycle job did not succeed within 20 minutes"
+              exit 1
+            fi
+            sleep 5
+          done
 
           for i in $(seq 1 90); do
             if sudo docker ps --format '{{.Names}}' | grep -q "^${INTERNAL_ID}-game-api$" &&
