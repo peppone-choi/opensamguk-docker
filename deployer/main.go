@@ -73,6 +73,7 @@ var reservedGameRouteIDs = map[string]struct{}{
 	"inherit":          {},
 	"join":             {},
 	"mailbox":          {},
+	"main":             {},
 	"map":              {},
 	"my":               {},
 	"my-boss":          {},

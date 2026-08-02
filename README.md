@@ -60,7 +60,7 @@ scripts/deploy.sh           # (단일서버) 서버 배포 헬퍼
 `servers/sa1.env`, compose 프로젝트 `opensamguk-sa1`, 컨테이너/내부 DNS `sa1-*`, 공개 경로 `/game/a1`로
 대응한다. `pep`은 그대로 `spep`가 되고, public id가 `s`로 시작하면 그 `s`는 public 값의 일부여서 `s1`은
 내부 `ss1`이 된다. 삭제/리셋 확인 문구도 canonical id를 쓴다(`DELETE a1`, `RESET a1`).
-게임 웹의 top-level route(`join`, `map`, `history` 등)는 public id로 예약할 수 없고, create 요청은 경로
+게임 웹의 top-level route(`main`, `join`, `map`, `history` 등)는 public id로 예약할 수 없고, create 요청은 경로
 충돌을 명시한 오류를 반환한다. source-promote의 전체 서버 sentinel `all`도 public id로 예약되어 있다. 이런
 게임 경로는 canonical `sam_server` 쿠키가 있을 때만 해당 게임 웹으로 간다.
 기존 레지스트리의 `id`/`deployProject` 쌍이 이 계약과 맞지 않으면 제어면은 추측해 접두 `s`를 제거하지 않고

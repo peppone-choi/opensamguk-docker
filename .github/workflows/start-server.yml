@@ -61,10 +61,12 @@ jobs:
             exit 1
           fi
           PUBLIC_ID="$(printf '%s' "$RAW_SERVER_ID" | tr '[:upper:]' '[:lower:]')"
-          if [[ "$PUBLIC_ID" == "all" ]]; then
-            echo "::error::server_id all is reserved for all-server operations"
-            exit 1
-          fi
+          case "$PUBLIC_ID" in
+            all|admin1|admin2|admin5|admin7|admin8|auction|betting|board|city|diplomacy|generals|history|inherit|join|mailbox|main|map|my|nation|rankings|register|simulator|tournament|troop|vote)
+              echo "::error::server_id ${PUBLIC_ID} is reserved for a game route or all-server operation"
+              exit 1
+              ;;
+          esac
           INTERNAL_ID="s${PUBLIC_ID}"
           ENV_FILE="servers/${INTERNAL_ID}.env"
           PROJECT="opensamguk-${INTERNAL_ID}"
@@ -104,10 +106,12 @@ jobs:
             exit 1
           fi
           PUBLIC_ID="$(printf '%s' "$RAW_SERVER_ID" | tr '[:upper:]' '[:lower:]')"
-          if [[ "$PUBLIC_ID" == "all" ]]; then
-            echo "::error::server_id all is reserved for all-server operations"
-            exit 1
-          fi
+          case "$PUBLIC_ID" in
+            all|admin1|admin2|admin5|admin7|admin8|auction|betting|board|city|diplomacy|generals|history|inherit|join|mailbox|main|map|my|nation|rankings|register|simulator|tournament|troop|vote)
+              echo "::error::server_id ${PUBLIC_ID} is reserved for a game route or all-server operation"
+              exit 1
+              ;;
+          esac
           INTERNAL_ID="s${PUBLIC_ID}"
           for i in $(seq 1 90); do
             if sudo docker ps --format '{{.Names}}' | grep -q "^${INTERNAL_ID}-game-api$" &&
