@@ -36,11 +36,11 @@ import (
 // 입력 검증용 화이트리스트 정규식.
 var (
 	// 프로젝트명 — opensamguk-s<public id>만 허용. 내부 key의 s는 여기서만 보인다.
-	projectRe = regexp.MustCompile(`^opensamguk-s[A-Za-z0-9]+$`)
+	projectRe = regexp.MustCompile(`^opensamguk-s[a-z0-9]+$`)
 	// Public server id. The Docker-only key is always synthesized as s<public id>.
 	serverIDRe = regexp.MustCompile(`^[A-Za-z0-9]+$`)
 	// Internal server key used only for Docker resources and server env filenames.
-	internalServerKeyRe = regexp.MustCompile(`^s[A-Za-z0-9]+$`)
+	internalServerKeyRe = regexp.MustCompile(`^s[a-z0-9]+$`)
 	// 이미지 태그 — 도커 태그 문자셋(영숫자/점/언더스코어/하이픈).
 	tagRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 )
@@ -50,6 +50,49 @@ var statelessServices = envList("DEPLOYER_STATELESS_SERVICES", []string{"game-ap
 var requiredPromoteImagePrefixes = []string{"game-api-", "game-engine-", "web-game-"}
 var sharedEnvServices = envList("DEPLOYER_SHARED_ENV_SERVICES", []string{"gateway-api", "web-gateway", "nginx", "deployer"})
 var sharedRegistryReloadServices = envList("DEPLOYER_SHARED_REGISTRY_RELOAD_SERVICES", []string{"gateway-api", "web-gateway", "nginx"})
+var reservedPublicServerIDs = map[string]struct{}{
+	"all": {},
+}
+var reservedGameRouteIDs = map[string]struct{}{
+	"admin1":           {},
+	"admin2":           {},
+	"admin5":           {},
+	"admin7":           {},
+	"admin8":           {},
+	"auction":          {},
+	"battle-center":    {},
+	"betting":          {},
+	"board":            {},
+	"chief-center":     {},
+	"city":             {},
+	"coming-soon":      {},
+	"diplomacy":        {},
+	"generals":         {},
+	"global-diplomacy": {},
+	"history":          {},
+	"inherit":          {},
+	"join":             {},
+	"mailbox":          {},
+	"map":              {},
+	"my":               {},
+	"my-boss":          {},
+	"my-cities":        {},
+	"my-generals":      {},
+	"my-nation":        {},
+	"nation":           {},
+	"nation-betting":   {},
+	"nation-finance":   {},
+	"npc-control":      {},
+	"rankings":         {},
+	"register":         {},
+	"select-pool":      {},
+	"simulator":        {},
+	"tournament":       {},
+	"tournament-admin": {},
+	"troop":            {},
+	"vote":             {},
+	"world-log":        {},
+}
 
 var serverEnvAllowlist = map[string]envFieldSpec{
 	"IMAGE_TAG":                  {Description: "게임 서버 이미지 태그"},
@@ -503,7 +546,11 @@ func (c config) handleServerClose(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "JSON 파싱 실패"})
 		return
 	}
-	id := req.ID
+	id, _, err := normalizeCreateServerID(req.ID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, createServerResponse{OK: false, Detail: err.Error()})
+		return
+	}
 	res, status := c.deleteServer(id, "DELETE "+id)
 	writeJSON(w, status, res)
 }
@@ -543,9 +590,9 @@ func (c config) handleSharedEnv(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c config) handleServerEnv(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
-	if !serverIDRe.MatchString(id) {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "잘못된 id — 영문 대소문자와 숫자만 허용"})
+	id, _, err := normalizeCreateServerID(r.URL.Query().Get("id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
 		return
 	}
 	c.handleEnv(w, r, envRequestContext{
@@ -1124,7 +1171,14 @@ func normalizeCreateServerID(raw string) (string, string, error) {
 	if !serverIDRe.MatchString(raw) {
 		return "", "", fmt.Errorf("서버 id는 영문 대소문자와 숫자만 허용합니다.")
 	}
-	return raw, internalServerKey(raw), nil
+	id := strings.ToLower(raw)
+	if _, reserved := reservedGameRouteIDs[id]; reserved {
+		return "", "", fmt.Errorf("서버 id %q는 게임 경로와 충돌해 사용할 수 없습니다.", id)
+	}
+	if _, reserved := reservedPublicServerIDs[id]; reserved {
+		return "", "", fmt.Errorf("서버 id %q는 전체 서버 예약어라 사용할 수 없습니다.", id)
+	}
+	return id, internalServerKey(id), nil
 }
 
 func isPort(value string) bool {
@@ -1263,6 +1317,11 @@ func (c config) registryEntryByID(id string) (registryEntry, error) {
 }
 
 func (c config) syncRegistryEntryFromEnv(id string, envFile string) (bool, error) {
+	canonicalID, _, err := normalizeCreateServerID(id)
+	if err != nil {
+		return false, err
+	}
+	id = canonicalID
 	if _, err := os.Stat(c.sharedEnvFile()); err != nil {
 		if os.IsNotExist(err) {
 			return false, nil
@@ -1286,12 +1345,8 @@ func (c config) syncRegistryEntryFromEnv(id string, envFile string) (bool, error
 
 func (c config) registryEntryFromServerEnv(id string, values map[string]string, current registryEntry) registryEntry {
 	next := current
-	if next.ID == "" {
-		next.ID = id
-	}
-	if next.DeployProject == "" {
-		next.DeployProject = projectForServerID(id)
-	}
+	next.ID = id
+	next.DeployProject = projectForServerID(id)
 	if name := strings.TrimSpace(values["SERVER_NAME"]); name != "" {
 		next.Name = name
 	}
@@ -1439,11 +1494,15 @@ func (c config) readRegistry() ([]registryEntry, error) {
 			}
 		}
 	}
-	return registry, nil
+	return canonicalRegistryEntries(registry)
 }
 
 func (c config) writeRegistry(registry []registryEntry) error {
-	data, err := json.Marshal(registry)
+	canonical, err := canonicalRegistryEntries(registry)
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(canonical)
 	if err != nil {
 		return err
 	}
@@ -1451,6 +1510,29 @@ func (c config) writeRegistry(registry []registryEntry) error {
 		"SERVER_REGISTRY_JSON": {Description: "서버 레지스트리"},
 	}, map[string]string{"SERVER_REGISTRY_JSON": string(data)})
 	return err
+}
+
+func canonicalRegistryEntries(registry []registryEntry) ([]registryEntry, error) {
+	canonical := make([]registryEntry, 0, len(registry))
+	seen := make(map[string]string, len(registry))
+	for index, entry := range registry {
+		id, _, err := normalizeCreateServerID(entry.ID)
+		if err != nil {
+			return nil, fmt.Errorf("SERVER_REGISTRY_JSON[%d]의 서버 id %q가 올바르지 않습니다: %w", index, entry.ID, err)
+		}
+		if previous, exists := seen[id]; exists {
+			return nil, fmt.Errorf("SERVER_REGISTRY_JSON에 정규화 후 중복 서버 id %q가 있습니다 (%q, %q)", id, previous, entry.ID)
+		}
+		expectedProject := projectForServerID(id)
+		if entry.DeployProject != "" && strings.ToLower(entry.DeployProject) != expectedProject {
+			return nil, fmt.Errorf("SERVER_REGISTRY_JSON[%d]의 deployProject %q가 canonical id %q와 일치하지 않습니다. one-time migration이 필요합니다.", index, entry.DeployProject, id)
+		}
+		seen[id] = entry.ID
+		entry.ID = id
+		entry.DeployProject = expectedProject
+		canonical = append(canonical, entry)
+	}
+	return canonical, nil
 }
 
 func (c config) ensurePortsAvailable(newID string, requested map[string]string) error {

@@ -17,19 +17,19 @@ func TestServerEnvGetPatchHappyPath(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "# server\nIMAGE_TAG=v1\nGAME_API_PORT=8101\nJWT_SECRET=old-secret\n")
 
-	res := envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodGet, "/env/server?id=pep", "")
+	res := envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodGet, "/env/server?id=PEP", "")
 	if res.Code != http.StatusOK {
 		t.Fatalf("GET status = %d body=%s", res.Code, res.Body.String())
 	}
 	body := decodeEnvResponse(t, res)
-	if body.Scope != "server" {
-		t.Fatalf("scope = %q", body.Scope)
+	if body.Scope != "server" || body.ID != "pep" {
+		t.Fatalf("response = %#v", body)
 	}
 	if fieldValue(t, body.Fields, "IMAGE_TAG") != "v1" {
 		t.Fatalf("IMAGE_TAG field = %#v", body.Fields["IMAGE_TAG"])
 	}
 
-	res = envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodPatch, "/env/server?id=pep", `{"values":{"IMAGE_TAG":"v2","GAME_API_PORT":"8201","WEB_GAME_TAG":"v3"}}`)
+	res = envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodPatch, "/env/server?id=PEP", `{"values":{"IMAGE_TAG":"v2","GAME_API_PORT":"8201","WEB_GAME_TAG":"v3"}}`)
 	if res.Code != http.StatusOK {
 		t.Fatalf("PATCH status = %d body=%s", res.Code, res.Body.String())
 	}
@@ -168,7 +168,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 		t,
 		cfg.withAuth(cfg.handleServerEnv),
 		http.MethodPatch,
-		"/env/server?id=pep",
+		"/env/server?id=PEP",
 		`{"values":{"IMAGE_TAG":"v2","SERVER_NAME":"새 서버","SERVER_GENERATION":"0","GAME_API_URL":"http://spep-game-api-new:8081","RESET_TURNTERM":"30","JWT_SECRET":"new-secret"}}`,
 	)
 	if res.Code != http.StatusOK {
@@ -329,6 +329,44 @@ func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 	}
 }
 
+func TestCreateServerCanonicalizesUppercaseIDAndPreventsCaseCollision(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+	calls := []string{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		calls = append(calls, strings.Join(args, " "))
+		return "ok\n", nil
+	}
+
+	res := envRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create", `{"id":"A1","name":"대소문자 서버","gameApiPort":"8111","webGamePort":"3111"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("POST status = %d body=%s", res.Code, res.Body.String())
+	}
+	var body createServerResponse
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !body.OK || body.ID != "a1" || body.Project != "opensamguk-sa1" {
+		t.Fatalf("create response = %#v", body)
+	}
+	serverEnv := readFile(t, filepath.Join(cfg.serversDir, "sa1.env"))
+	if !strings.Contains(serverEnv, "SERVER_ID=a1\n") {
+		t.Fatalf("canonical server env missing:\n%s", serverEnv)
+	}
+	if !strings.Contains(readFile(t, filepath.Join(cfg.composeDir, ".env")), `"id":"a1"`) {
+		t.Fatalf("registry did not persist canonical id")
+	}
+	waitForCalls(t, func() int { return len(calls) }, 1)
+	if len(calls) == 0 || !strings.Contains(calls[0], "compose -p opensamguk-sa1") {
+		t.Fatalf("compose call = %#v", calls)
+	}
+
+	res = envRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create", `{"id":"a1","name":"중복 서버","gameApiPort":"8111","webGamePort":"3111"}`)
+	if res.Code != http.StatusConflict {
+		t.Fatalf("case-collision status = %d body=%s", res.Code, res.Body.String())
+	}
+}
+
 func TestPublicServerIDContract(t *testing.T) {
 	publicID, internalKey, err := normalizeCreateServerID("pep")
 	if err != nil {
@@ -341,7 +379,11 @@ func TestPublicServerIDContract(t *testing.T) {
 	if got, want := cfg.serverEnvFileForID(publicID), filepath.Join(cfg.serversDir, "spep.env"); got != want {
 		t.Fatalf("env file = %q, want %q", got, want)
 	}
-	publicID, internalKey, err = normalizeCreateServerID("s1")
+	publicID, internalKey, err = normalizeCreateServerID("A1")
+	if err != nil || publicID != "a1" || internalKey != "sa1" || projectForServerID(publicID) != "opensamguk-sa1" {
+		t.Fatalf("uppercase mapping = public=%q internal=%q err=%v", publicID, internalKey, err)
+	}
+	publicID, internalKey, err = normalizeCreateServerID("S1")
 	if err != nil || publicID != "s1" || internalKey != "ss1" {
 		t.Fatalf("leading s must stay public: public=%q internal=%q err=%v", publicID, internalKey, err)
 	}
@@ -352,6 +394,25 @@ func TestPublicServerIDRejectsNonAlphanumericValues(t *testing.T) {
 		if _, _, err := normalizeCreateServerID(value); err == nil {
 			t.Fatalf("normalizeCreateServerID(%q) unexpectedly succeeded", value)
 		}
+	}
+}
+
+func TestPublicServerIDRejectsReservedGameRoutesAfterCanonicalization(t *testing.T) {
+	for route := range reservedGameRouteIDs {
+		for _, raw := range []string{route, strings.ToUpper(route)} {
+			if _, _, err := normalizeCreateServerID(raw); err == nil {
+				t.Fatalf("normalizeCreateServerID(%q) unexpectedly accepted reserved game route", raw)
+			}
+		}
+	}
+	if _, _, err := normalizeCreateServerID("JOIN"); err == nil || !strings.Contains(err.Error(), `"join"는 게임 경로와 충돌`) {
+		t.Fatalf("reserved-route error = %v", err)
+	}
+}
+
+func TestPublicServerIDRejectsAllServerSentinelAfterCanonicalization(t *testing.T) {
+	if _, _, err := normalizeCreateServerID("ALL"); err == nil || !strings.Contains(err.Error(), `"all"는 전체 서버 예약어`) {
+		t.Fatalf("all-server sentinel error = %v", err)
 	}
 }
 
@@ -440,6 +501,56 @@ SERVER_REGISTRY_JSON=[{"id":"3","name":"테스트 서버","generation":4,"gameAp
 	}
 }
 
+func TestReadRegistryCanonicalizesPublicID(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"A1","name":"대소문자 서버","deployProject":"opensamguk-sA1"}]
+`)
+
+	registry, err := cfg.readRegistry()
+	if err != nil {
+		t.Fatalf("read registry: %v", err)
+	}
+	if len(registry) != 1 || registry[0].ID != "a1" || registry[0].DeployProject != "opensamguk-sa1" {
+		t.Fatalf("canonical registry = %#v", registry)
+	}
+}
+
+func TestReadRegistryRejectsAmbiguousLegacyInternalIDWithoutMutatingSource(t *testing.T) {
+	cfg := testConfig(t)
+	const registryLine = `SERVER_REGISTRY_JSON=[{"id":"spep","name":"레거시 추론 금지","deployProject":"opensamguk-spep"}]`
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), registryLine+"\n")
+
+	if _, err := cfg.readRegistry(); err == nil || !strings.Contains(err.Error(), "one-time migration") {
+		t.Fatalf("legacy registry error = %v", err)
+	}
+	if got := readFile(t, filepath.Join(cfg.composeDir, ".env")); got != registryLine+"\n" {
+		t.Fatalf("legacy registry source mutated:\n%s", got)
+	}
+}
+
+func TestReadRegistryRejectsInvalidEntryWithoutMutatingSource(t *testing.T) {
+	cfg := testConfig(t)
+	const registryLine = `SERVER_REGISTRY_JSON=[{"id":"a1","name":"정상"},{"id":"not-valid","name":"잘못됨"}]`
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), registryLine+"\n")
+
+	if _, err := cfg.readRegistry(); err == nil {
+		t.Fatal("read registry unexpectedly accepted invalid id")
+	}
+	if got := readFile(t, filepath.Join(cfg.composeDir, ".env")); got != registryLine+"\n" {
+		t.Fatalf("read registry mutated invalid source:\n%s", got)
+	}
+}
+
+func TestReadRegistryRejectsCanonicalIDCollision(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"A1","name":"대문자"},{"id":"a1","name":"소문자"}]
+`)
+
+	if _, err := cfg.readRegistry(); err == nil {
+		t.Fatal("read registry unexpectedly accepted A1/a1 collision")
+	}
+}
+
 func TestCreateServerRejectsPortCollisions(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
@@ -501,7 +612,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 		return "ok\n", nil
 	}
 
-	res := envRequest(t, cfg.withAuth(cfg.handleServerClose), http.MethodPost, "/servers/close", `{"id":"pep"}`)
+	res := envRequest(t, cfg.withAuth(cfg.handleServerClose), http.MethodPost, "/servers/close", `{"id":"PEP"}`)
 	if res.Code != http.StatusOK {
 		t.Fatalf("DELETE status = %d body=%s", res.Code, res.Body.String())
 	}
@@ -547,7 +658,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 		return "down failed\n", errors.New("compose down failed")
 	}
 
-	res := envRequest(t, cfg.withAuth(cfg.handleServers), http.MethodDelete, "/servers?id=pep&confirm=DELETE%20pep", "")
+	res := envRequest(t, cfg.withAuth(cfg.handleServers), http.MethodDelete, "/servers?id=PEP&confirm=DELETE%20pep", "")
 	if res.Code != http.StatusOK {
 		t.Fatalf("DELETE status = %d body=%s", res.Code, res.Body.String())
 	}
@@ -579,7 +690,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 		cfg.withAuth(cfg.handleServerReset),
 		http.MethodPost,
 		"/servers/reset",
-		`{"id":"pep","confirm":"RESET pep","generation":"2","scenarioCode":"scenario_1002","turnTerm":"30","sync":"1","fiction":"0","extend":"1","blockGeneralCreate":"2","npcMode":"2","showImgLevel":"3","autorunUserOptions":["develop","battle"],"autorunUserMinutes":"1440","joinMode":"onlyRandom","tournamentTrig":"1","reserveOpen":"2026-06-10 20:00","preReserveOpen":"2026-06-10 19:00"}`,
+		`{"id":"PEP","confirm":"RESET pep","generation":"2","scenarioCode":"scenario_1002","turnTerm":"30","sync":"1","fiction":"0","extend":"1","blockGeneralCreate":"2","npcMode":"2","showImgLevel":"3","autorunUserOptions":["develop","battle"],"autorunUserMinutes":"1440","joinMode":"onlyRandom","tournamentTrig":"1","reserveOpen":"2026-06-10 20:00","preReserveOpen":"2026-06-10 19:00"}`,
 	)
 	if res.Code != http.StatusOK {
 		t.Fatalf("RESET status = %d body=%s", res.Code, res.Body.String())

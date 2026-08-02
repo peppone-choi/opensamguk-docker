@@ -48,17 +48,23 @@ scripts/deploy.sh           # (단일서버) 서버 배포 헬퍼
   + `game-postgres` + `game-redis` + 자기 `IMAGE_TAG`. 서버끼리 월드/버전이 완전히 격리된다.
 - **공유 스택**: `gateway-postgres`(유저/인증) + `gateway-api` + `web-gateway` + `nginx`
   + `deployer` 사이드카 + `socket-proxy`. 전 서버 공통(로그인/로비/어드민/배포).
-- **로비/게임 진입**: nginx는 `/game/<public-id>`를 해당 게임 서버로, `sam_server` 쿠키를 가진
-  `/api/game` 및 `/game/_next/static` 요청을 같은 서버로 프록시한다. 잘못된 path/cookie id는 404로
-  fail-closed 한다.
+- **로비/게임 진입**: nginx는 `/game/<public-id>`를 해당 게임 서버로 보낸다. `/api/game`은 httpOnly
+  `sam_access` 쿠키를 Bearer로 바꾸는 `web-gateway`를 항상 통과하고, `sam_server` 쿠키를 가진
+  `/game/_next/static`은 같은 게임 웹으로 프록시한다. 잘못된 path/cookie id는 404로 fail-closed 한다.
 
 ### 공개 서버 ID 계약
 
-운영자가 입력하는 `SERVER_ID`, deployer API id, 레지스트리 `id`, 공개 경로는 모두 비어 있지 않은 ASCII
-영숫자(`[A-Za-z0-9]+`)인 **public id**다. Docker에만 내부 key `s<public-id>`를 쓴다. 예를 들어 public
-`pep`은 `servers/spep.env`, compose 프로젝트 `opensamguk-spep`, 컨테이너/내부 DNS `spep-*`, 공개 경로
-`/game/pep`로 대응한다. public id가 `s`로 시작하더라도 그 `s`는 public 값의 일부이며 내부 key는 한 번만
-앞에 붙인다.
+운영자가 입력하는 raw `SERVER_ID`와 deployer API id는 비어 있지 않은 ASCII 영숫자(`[A-Za-z0-9]+`)를
+받는다. control plane은 즉시 소문자로 정규화하고, 레지스트리 `id`, env, 응답, 공개 경로는 모두 canonical
+`[a-z0-9]+`만 쓴다. Docker에만 내부 key `s<public-id>`를 쓴다. 예를 들어 raw `A1`은 public `a1`,
+`servers/sa1.env`, compose 프로젝트 `opensamguk-sa1`, 컨테이너/내부 DNS `sa1-*`, 공개 경로 `/game/a1`로
+대응한다. `pep`은 그대로 `spep`가 되고, public id가 `s`로 시작하면 그 `s`는 public 값의 일부여서 `s1`은
+내부 `ss1`이 된다. 삭제/리셋 확인 문구도 canonical id를 쓴다(`DELETE a1`, `RESET a1`).
+게임 웹의 top-level route(`join`, `map`, `history` 등)는 public id로 예약할 수 없고, create 요청은 경로
+충돌을 명시한 오류를 반환한다. source-promote의 전체 서버 sentinel `all`도 public id로 예약되어 있다. 이런
+게임 경로는 canonical `sam_server` 쿠키가 있을 때만 해당 게임 웹으로 간다.
+기존 레지스트리의 `id`/`deployProject` 쌍이 이 계약과 맞지 않으면 제어면은 추측해 접두 `s`를 제거하지 않고
+one-time migration 필요 오류로 fail-close한다.
 
 ### least-privilege 배포 경로
 

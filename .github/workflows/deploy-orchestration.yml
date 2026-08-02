@@ -79,7 +79,7 @@ jobs:
 
           for entry in registry if isinstance(registry, list) else []:
               server_id = entry.get("id") if isinstance(entry, dict) else None
-              if isinstance(server_id, str) and re.fullmatch(r"[A-Za-z0-9]+", server_id):
+              if isinstance(server_id, str) and server_id != "all" and re.fullmatch(r"[a-z0-9]+", server_id):
                   print(server_id)
                   break
           PY

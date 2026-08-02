@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       server_id:
-        description: "Public server id, e.g. pep"
+        description: "Public server id (mixed case accepted, stored lowercase), e.g. pep"
         required: true
         default: "pep"
       server_name:
@@ -80,12 +80,19 @@ jobs:
           STACK="$HOME/opensamguk-docker"
           cd "$STACK"
 
-          if [[ ! "$SERVER_ID" =~ ^[A-Za-z0-9]+$ ]]; then
+          RAW_SERVER_ID="$SERVER_ID"
+          if [[ ! "$RAW_SERVER_ID" =~ ^[A-Za-z0-9]+$ ]]; then
             echo "::error::invalid server_id; use non-empty ASCII alphanumeric public id"
             exit 1
           fi
-          INTERNAL_ID="s${SERVER_ID}"
-          echo "creating public server ${SERVER_ID} with internal Docker key ${INTERNAL_ID}"
+          PUBLIC_ID="$(printf '%s' "$RAW_SERVER_ID" | tr '[:upper:]' '[:lower:]')"
+          if [[ "$PUBLIC_ID" == "all" ]]; then
+            echo "::error::server_id all is reserved for all-server operations"
+            exit 1
+          fi
+          export SERVER_ID="$PUBLIC_ID"
+          INTERNAL_ID="s${PUBLIC_ID}"
+          echo "creating public server ${PUBLIC_ID} with internal Docker key ${INTERNAL_ID}"
 
           DEPLOYER_TOKEN="$(grep '^DEPLOYER_TOKEN=' .env | cut -d= -f2-)"
           test -n "$DEPLOYER_TOKEN"
@@ -108,11 +115,16 @@ jobs:
           SERVER_ID: ${{ inputs.server_id }}
         run: |
           set -euo pipefail
-          if [[ ! "$SERVER_ID" =~ ^[A-Za-z0-9]+$ ]]; then
+          RAW_SERVER_ID="$SERVER_ID"
+          if [[ ! "$RAW_SERVER_ID" =~ ^[A-Za-z0-9]+$ ]]; then
             echo "::error::invalid server_id; use non-empty ASCII alphanumeric public id"
             exit 1
           fi
-          PUBLIC_ID="$SERVER_ID"
+          PUBLIC_ID="$(printf '%s' "$RAW_SERVER_ID" | tr '[:upper:]' '[:lower:]')"
+          if [[ "$PUBLIC_ID" == "all" ]]; then
+            echo "::error::server_id all is reserved for all-server operations"
+            exit 1
+          fi
           INTERNAL_ID="s${PUBLIC_ID}"
           for i in $(seq 1 90); do
             if sudo docker ps --format '{{.Names}}' | grep -q "^${INTERNAL_ID}-game-api$" &&
@@ -126,6 +138,6 @@ jobs:
             sleep 5
           done
 
-          echo "::error::server ${SERVER_ID} did not become ready"
+          echo "::error::server ${PUBLIC_ID} did not become ready"
           sudo docker ps --format 'table {{.Names}}\t{{.Status}}'
           exit 1
