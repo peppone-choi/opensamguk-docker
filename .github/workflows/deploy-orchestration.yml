@@ -1,4 +1,4 @@
-name: Deploy Orchestration to EC2
+name: Deploy Orchestration to GCP
 
 on:
   push:
@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   deploy:
-    runs-on: [self-hosted, ec2-prod]
+    runs-on: [self-hosted, gcp-prod]
     permissions:
       contents: read
     steps:

@@ -122,7 +122,7 @@ docker compose -p opensamguk-s2 -f docker-compose.server.yml --env-file servers/
 
 ### opensamguk-docker
 
-이 저장소의 `main`에 `deployer/`, compose, nginx, workflow 변경이 들어오면 EC2 self-hosted runner가
+이 저장소의 `main`에 `deployer/`, compose, nginx, workflow 변경이 들어오면 GCP self-hosted runner가
 `~/opensamguk-docker`를 fast-forward하고 다음만 자동 승격한다.
 
 - `deployer`: 로컬 이미지 rebuild 후 컨테이너 recreate
@@ -133,11 +133,11 @@ docker compose -p opensamguk-s2 -f docker-compose.server.yml --env-file servers/
 `s1-web-game`이 실행 중일 때만 `/game/s1`을 확인한다.
 
 게임 서버를 모두 닫은 뒤 public admin/gateway 경로가 아직 복구되지 않았다면 GitHub Actions
-**Recreate Game Server** 워크플로를 수동 실행한다. 이 워크플로는 EC2 self-hosted runner 내부에서
+**Recreate Game Server** 워크플로를 수동 실행한다. 이 워크플로는 GCP self-hosted runner 내부에서
 `DEPLOYER_TOKEN`을 읽어 deployer `/servers/create`를 호출하므로, gateway/nginx public 경로가 내려간
 상태에서도 `s1` 같은 게임 서버를 다시 만들 수 있다. 입력값은 `server_id`, `server_name`,
 `generation`, `image_tag`, `scenario_code`, `game_api_port`, `web_game_port`이며 `jwtSecret`은 비워
-shared `JWT_SECRET`을 복사한다. 실행 후에는 `Deploy Orchestration to EC2`를 한 번 더 실행해 shared
+shared `JWT_SECRET`을 복사한다. 실행 후에는 `Deploy Orchestration to GCP`를 한 번 더 실행해 shared
 stack과 nginx를 재검증한다.
 
 ### opensamguk
@@ -290,7 +290,7 @@ docker compose up -d
 
 ## 대상 환경
 
-AWS EC2 **t3.large**(2 vCPU / 8 GiB) 기준(단일서버). LLM·외부 API 의존 0개.
+GCP Compute Engine **e2-standard-2**(2 vCPU / 8 GiB) 기준(단일서버). LLM·외부 API 의존 0개.
 멀티서버는 서버 수에 비례해 메모리/CPU가 필요하다(서버당 엔진 ~2G + DB ~1.5G).
 
 ---

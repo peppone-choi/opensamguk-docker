@@ -37,7 +37,7 @@ concurrency:
 
 jobs:
   recreate:
-    runs-on: [self-hosted, ec2-prod]
+    runs-on: [self-hosted, gcp-prod]
     permissions:
       contents: read
     steps:
