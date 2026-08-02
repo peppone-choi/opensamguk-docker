@@ -343,6 +343,12 @@ type envLine struct {
 
 func main() {
 	cfg := loadConfig()
+	if len(os.Args) == 2 && os.Args[1] == "--check-registry" {
+		os.Exit(checkRegistryCommand(cfg, os.Stderr))
+	}
+	if len(os.Args) != 1 {
+		log.Fatal("usage: deployer [--check-registry]")
+	}
 	if cfg.token == "" {
 		log.Fatal("DEPLOYER_TOKEN 미설정 — 인증 토큰 필수")
 	}
@@ -370,6 +376,15 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func checkRegistryCommand(c config, output io.Writer) int {
+	if _, err := c.readRegistry(); err != nil {
+		fmt.Fprintln(output, "registry validation failed")
+		return 1
+	}
+	fmt.Fprintln(output, "registry validation passed")
+	return 0
 }
 
 func (c config) handleReady(w http.ResponseWriter, r *http.Request) {

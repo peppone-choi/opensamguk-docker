@@ -86,6 +86,31 @@ func TestReadyzRequiresCanonicalRegistry(t *testing.T) {
 	}
 }
 
+func TestCheckRegistryCommandValidAndLegacyRegistryExitBehavior(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.token = ""
+	var output bytes.Buffer
+
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","deployProject":"opensamguk-spep"}]
+`)
+	if code := checkRegistryCommand(cfg, &output); code != 0 {
+		t.Fatalf("valid registry exit code = %d, want 0", code)
+	}
+	if got := output.String(); got != "registry validation passed\n" {
+		t.Fatalf("valid registry output = %q", got)
+	}
+
+	output.Reset()
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"spep","deployProject":"opensamguk-spep"}]
+`)
+	if code := checkRegistryCommand(cfg, &output); code != 1 {
+		t.Fatalf("legacy registry exit code = %d, want 1", code)
+	}
+	if got := output.String(); got != "registry validation failed\n" {
+		t.Fatalf("legacy registry output = %q", got)
+	}
+}
+
 func TestDeployPromotesApiAndWebGameTags(t *testing.T) {
 	cfg := testConfig(t)
 	envFile := filepath.Join(cfg.serversDir, "s1.env")
@@ -499,6 +524,55 @@ func TestNginxRouteReservationsAndApiProxyContract(t *testing.T) {
 	}
 	if got := strings.Count(nginx, "location /api/ {\n            proxy_pass http://web_gateway/api/;"); got != 2 {
 		t.Fatalf("web-gateway API proxy count = %d, want 2", got)
+	}
+}
+
+func TestDeployOrchestrationValidatesCandidateBeforeControlPlaneMutation(t *testing.T) {
+	workflow := readFile(t, filepath.Join("..", ".github", "workflows", "deploy-orchestration.yml"))
+	stepStart := strings.Index(workflow, "      - name: Validate registry, recreate deployer, and reload nginx\n")
+	if stepStart < 0 {
+		t.Fatal("control-plane deployment step not found")
+	}
+	nextStep := strings.Index(workflow[stepStart:], "\n      - name: Verify orchestration endpoints\n")
+	if nextStep < 0 {
+		t.Fatal("unlocked endpoint postcondition step not found")
+	}
+	step := workflow[stepStart : stepStart+nextStep]
+
+	for _, want := range []string{
+		"exec 9>/tmp/opensamguk-production.lock",
+		"flock -w 1800 9",
+		"sudo docker run --rm --read-only --network none",
+		"-e COMPOSE_DIR=/workspace",
+		`-v "$STACK/.env:/workspace/.env:ro"`,
+		"opensamguk-deployer:local --check-registry",
+	} {
+		if !strings.Contains(step, want) {
+			t.Fatalf("control-plane deployment step missing %q", want)
+		}
+	}
+
+	build := strings.Index(step, "$COMPOSE build deployer")
+	check := strings.Index(step, "opensamguk-deployer:local --check-registry")
+	deployer := strings.Index(step, "$COMPOSE up -d --force-recreate --no-deps deployer")
+	healthz := strings.Index(step, "http://localhost:9000/healthz")
+	readyz := strings.Index(step, "http://localhost:9000/readyz")
+	nginx := strings.Index(step, "$COMPOSE up -d --force-recreate --no-deps nginx")
+	if build < 0 || check < 0 || deployer < 0 || healthz < 0 || readyz < 0 || nginx < 0 {
+		t.Fatalf("missing deployment ordering markers: build=%d check=%d deployer=%d healthz=%d readyz=%d nginx=%d", build, check, deployer, healthz, readyz, nginx)
+	}
+	if !(build < check && check < deployer && deployer < healthz && healthz < readyz && readyz < nginx) {
+		t.Fatalf("unexpected deployment ordering: build=%d check=%d deployer=%d healthz=%d readyz=%d nginx=%d", build, check, deployer, healthz, readyz, nginx)
+	}
+	if strings.Contains(step[check:deployer], "--env-file") {
+		t.Fatal("candidate registry check must not receive the shared env through command-line injection")
+	}
+
+	postcondition := workflow[stepStart+nextStep:]
+	for _, want := range []string{"http://localhost:9000/healthz", "http://localhost:9000/readyz"} {
+		if !strings.Contains(postcondition, want) {
+			t.Fatalf("unlocked endpoint postcondition missing %q", want)
+		}
 	}
 }
 

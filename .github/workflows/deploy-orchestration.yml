@@ -40,7 +40,7 @@ jobs:
           fi
           git merge --ff-only origin/main
 
-      - name: Rebuild deployer and reload nginx
+      - name: Validate registry, recreate deployer, and reload nginx
         run: |
           set -euo pipefail
           exec 9>/tmp/opensamguk-production.lock
@@ -53,7 +53,26 @@ jobs:
           COMPOSE="sudo docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env"
 
           $COMPOSE build deployer
-          $COMPOSE up -d --no-deps deployer
+          sudo docker run --rm --read-only --network none \
+            -e COMPOSE_DIR=/workspace \
+            -v "$STACK/.env:/workspace/.env:ro" \
+            opensamguk-deployer:local --check-registry
+
+          $COMPOSE up -d --force-recreate --no-deps deployer
+          deployer_ready=false
+          for _ in $(seq 1 30); do
+            if sudo docker exec opensamguk-deployer wget -qO- http://localhost:9000/healthz | grep -q '"status":"up"' && \
+              sudo docker exec opensamguk-deployer wget -qO- http://localhost:9000/readyz | grep -q '"status":"ready"'; then
+              deployer_ready=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$deployer_ready" != true ]; then
+            echo "::error::deployer did not become healthz+readyz ready before nginx reload"
+            exit 1
+          fi
+
           $COMPOSE up -d --force-recreate --no-deps nginx
 
       - name: Verify orchestration endpoints
