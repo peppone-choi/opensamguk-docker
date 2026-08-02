@@ -158,6 +158,11 @@ nginx `/health`를 항상 확인하고,
 있으면 새 deployer 프로세스도 closed 상태로 부팅하며, 새 mutation은 `503`과 `Retry-After`를 받고, 진행 중인
 mutation은 취소된 context가 Docker runner에서 실제 반환할 때까지 drain한다.
 
+create/delete/reset/deploy는 영속 상태를 바꾸기 전에 `servers/.deployer-lifecycle-journal`도 기록한다. journal이
+남은 채로 프로세스가 죽으면 deployer는 closed 상태와 `/readyz` `503`을 유지하고, leave로 다시 열 수 없다. loopback
+maintenance repair가 해당 서버의 forward recovery를 검증한 뒤 journal을 지우고, 별도 maintenance marker도 없을 때만
+mutation을 다시 허용한다.
+
 workflow는 deployer 컨테이너의 loopback에서만 다음 Bearer API를 호출한다. `DEPLOYER_TOKEN`은 호스트에서
 읽거나 `docker exec -e`로 주입하지 않고 deployer 컨테이너 자신의 환경에서만 사용한다. gateway/API caller는 같은
 토큰을 알아도 maintenance barrier를 열거나 닫을 수 없다.
@@ -166,6 +171,7 @@ workflow는 deployer 컨테이너의 loopback에서만 다음 Bearer API를 호�
 GET  /maintenance        -> {"capability":"maintenance-v1","state":"open|draining|drained"}
 POST /maintenance/enter  -> drained 후 32-hex 단발 lease를 포함해 반환
 POST /maintenance/leave  -> 성공한 workflow가 마지막에만 open
+POST /maintenance/repair -> 남은 lifecycle journal의 forward recovery를 검증하고 지움 (marker가 없을 때만 open)
 ```
 
 **처음 설치되어 deployer 컨테이너가 전혀 없는 경우**에는 workflow가 marker를 먼저 만들고 deployer를 closed로

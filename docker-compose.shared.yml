@@ -152,6 +152,7 @@ services:
       COMPOSE_SERVER_FILE: /workspace/docker-compose.server.yml
       COMPOSE_SHARED_FILE: /workspace/docker-compose.shared.yml
       DEPLOYER_MAINTENANCE_FILE: /workspace/servers/.deployer-maintenance
+      DEPLOYER_LIFECYCLE_JOURNAL_FILE: /workspace/servers/.deployer-lifecycle-journal
       COMPOSE_HOST_DIR: ${COMPOSE_HOST_DIR:-${PWD:-.}}
       # GHCR 태그 조회용(공개 패키지면 익명, private면 토큰 필요 — 미해결 가정 참고).
       GHCR_OWNER: ${GHCR_OWNER:-peppone-choi}

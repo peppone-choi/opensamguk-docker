@@ -203,6 +203,9 @@ type config struct {
 	gatewayAPIURL          string
 	lifecycleJobs          *lifecycleJobManager
 	maintenanceFile        string
+	lifecycleJournalFile   string
+	sharedEnvMu            *sync.Mutex
+	registryRewriteHook    func()
 	operations             *operationCoordinator
 }
 
@@ -254,9 +257,11 @@ type operationCoordinator struct {
 	mu               sync.Mutex
 	cond             *sync.Cond
 	closed           bool
+	journalPending   bool
 	active           *operationLease
 	maintenanceLease *maintenanceAdmissionLease
 	markerPath       string
+	journalPath      string
 	jobs             *lifecycleJobManager
 }
 
@@ -275,20 +280,28 @@ type operationLease struct {
 	done        sync.Once
 }
 
-func newOperationCoordinator(markerPath string, jobs *lifecycleJobManager) *operationCoordinator {
+func newOperationCoordinator(markerPath string, journalPath string, jobs *lifecycleJobManager) *operationCoordinator {
 	coordinator := &operationCoordinator{
-		markerPath: markerPath,
-		jobs:       jobs,
+		markerPath:  markerPath,
+		journalPath: journalPath,
+		jobs:        jobs,
 	}
 	coordinator.cond = sync.NewCond(&coordinator.mu)
-	if markerPath != "" {
-		if _, err := os.Stat(markerPath); err == nil || !os.IsNotExist(err) {
-			// An unreadable marker is treated as present. Starting fail-closed is
-			// safer than admitting mutations while its persisted state is unknown.
-			coordinator.closed = true
-		}
+	if stateFilePresent(markerPath) || stateFilePresent(journalPath) {
+		// An unreadable marker/journal is treated as present. Starting fail-closed
+		// is safer than admitting mutations while persisted lifecycle state is unknown.
+		coordinator.closed = true
+		coordinator.journalPending = stateFilePresent(journalPath)
 	}
 	return coordinator
+}
+
+func stateFilePresent(path string) bool {
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil || !os.IsNotExist(err)
 }
 
 func (c *operationCoordinator) begin(jobID string) (*operationLease, error) {
@@ -302,6 +315,15 @@ func (c *operationCoordinator) beginWithMaintenanceLease(jobID, token, operation
 	c.mu.Lock()
 	for c.active != nil && !c.closed {
 		c.cond.Wait()
+	}
+	if c.journalPending || stateFilePresent(c.journalPath) {
+		c.closed = true
+		c.journalPending = true
+		c.mu.Unlock()
+		if jobID != "" && c.jobs != nil {
+			c.jobs.requestCancel(jobID)
+		}
+		return nil, errMaintenanceClosed
 	}
 	if c.closed {
 		lease := c.maintenanceLease
@@ -336,6 +358,66 @@ func (c *operationCoordinator) beginWithMaintenanceLease(jobID, token, operation
 	c.active = lease
 	c.mu.Unlock()
 	return lease, nil
+}
+
+func (c *operationCoordinator) beginRecovery() (*operationLease, error) {
+	if c == nil {
+		return nil, errors.New("operation coordinator unavailable")
+	}
+	c.mu.Lock()
+	for c.active != nil {
+		c.cond.Wait()
+	}
+	if !c.journalPending && !stateFilePresent(c.journalPath) {
+		c.mu.Unlock()
+		return nil, errors.New("lifecycle recovery journal is unavailable")
+	}
+	c.closed = true
+	c.journalPending = true
+	ctx, cancel := context.WithCancel(context.Background())
+	lease := &operationLease{coordinator: c, ctx: ctx, cancel: cancel}
+	c.active = lease
+	c.mu.Unlock()
+	return lease, nil
+}
+
+func (c *operationCoordinator) markLifecycleJournalPending() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.journalPending = true
+	if c.active == nil {
+		c.closed = true
+	}
+	c.cond.Broadcast()
+	c.mu.Unlock()
+}
+
+func (c *operationCoordinator) clearLifecycleJournalPending() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.journalPending = false
+	if !stateFilePresent(c.markerPath) {
+		c.closed = false
+	}
+	c.cond.Broadcast()
+	c.mu.Unlock()
+}
+
+func (c *operationCoordinator) lifecycleRecoveryPending() bool {
+	if c == nil {
+		return true
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.journalPending || stateFilePresent(c.journalPath) {
+		c.journalPending = true
+		return true
+	}
+	return false
 }
 
 func (c *operationCoordinator) claimLifecycleJob(lease *operationLease, jobID string) error {
@@ -379,6 +461,9 @@ func (l *operationLease) Done() {
 		coordinator := l.coordinator
 		coordinator.mu.Lock()
 		if coordinator.active == l {
+			if coordinator.journalPending || stateFilePresent(coordinator.journalPath) {
+				coordinator.closed = true
+			}
 			coordinator.active = nil
 			coordinator.cond.Broadcast()
 		}
@@ -410,13 +495,13 @@ func (c *operationCoordinator) enterMaintenance() (maintenanceState, string, err
 		return maintenanceStateDrained, "", errors.New("operation coordinator unavailable")
 	}
 	c.mu.Lock()
-	if !c.closed {
+	if !stateFilePresent(c.markerPath) {
 		if err := writeMaintenanceMarkerAtomic(c.markerPath); err != nil {
 			c.mu.Unlock()
 			return maintenanceStateOpen, "", err
 		}
-		c.closed = true
 	}
+	c.closed = true
 	active := c.active
 	if active != nil {
 		active.cancel()
@@ -463,6 +548,11 @@ func (c *operationCoordinator) leaveMaintenance() (maintenanceState, error) {
 	if c.active != nil {
 		return maintenanceStateDraining, errors.New("maintenance operation is not drained")
 	}
+	if c.journalPending || stateFilePresent(c.journalPath) {
+		c.closed = true
+		c.journalPending = true
+		return maintenanceStateDrained, errors.New("lifecycle recovery is required before maintenance can open")
+	}
 	if c.markerPath == "" {
 		return maintenanceStateDrained, errors.New("maintenance marker path is unavailable")
 	}
@@ -483,6 +573,193 @@ func writeMaintenanceMarkerAtomic(path string) error {
 		return err
 	}
 	return writeFileAtomic(path, []byte("{\"capability\":\"maintenance-v1\"}\n"))
+}
+
+type lifecycleJournal struct {
+	Version   int    `json:"version"`
+	Operation string `json:"operation"`
+	ServerID  string `json:"serverId"`
+	Project   string `json:"project"`
+}
+
+func (c config) writeLifecycleJournal(operation string, target serverTarget) error {
+	if c.lifecycleJournalFile == "" {
+		return errors.New("lifecycle journal path is unavailable")
+	}
+	if stateFilePresent(c.lifecycleJournalFile) {
+		return errors.New("lifecycle recovery journal is already present")
+	}
+	if operation != "create" && operation != "delete" && operation != "deploy" && operation != "reset" {
+		return errors.New("unsupported lifecycle journal operation")
+	}
+	payload, err := json.Marshal(lifecycleJournal{
+		Version:   1,
+		Operation: operation,
+		ServerID:  target.ID,
+		Project:   target.Project,
+	})
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(c.lifecycleJournalFile), 0o755); err != nil {
+		return err
+	}
+	if err := writeFileAtomic(c.lifecycleJournalFile, append(payload, '\n')); err != nil {
+		return err
+	}
+	if c.operations != nil {
+		c.operations.markLifecycleJournalPending()
+	}
+	return nil
+}
+
+func (c config) readLifecycleJournal() (lifecycleJournal, bool, error) {
+	if c.lifecycleJournalFile == "" {
+		return lifecycleJournal{}, false, errors.New("lifecycle journal path is unavailable")
+	}
+	data, err := os.ReadFile(c.lifecycleJournalFile)
+	if os.IsNotExist(err) {
+		return lifecycleJournal{}, false, nil
+	}
+	if err != nil {
+		return lifecycleJournal{}, false, err
+	}
+	var journal lifecycleJournal
+	if err := json.Unmarshal(data, &journal); err != nil {
+		return lifecycleJournal{}, false, err
+	}
+	if journal.Version != 1 || (journal.Operation != "create" && journal.Operation != "delete" && journal.Operation != "deploy" && journal.Operation != "reset") {
+		return lifecycleJournal{}, false, errors.New("lifecycle journal is invalid")
+	}
+	target, err := c.serverTargetForID(journal.ServerID)
+	if err != nil || target.Project != journal.Project {
+		return lifecycleJournal{}, false, errors.New("lifecycle journal target is invalid")
+	}
+	journal.ServerID = target.ID
+	journal.Project = target.Project
+	return journal, true, nil
+}
+
+func (c config) clearLifecycleJournal() error {
+	if c.lifecycleJournalFile == "" {
+		return errors.New("lifecycle journal path is unavailable")
+	}
+	if err := os.Remove(c.lifecycleJournalFile); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if c.operations != nil {
+		c.operations.clearLifecycleJournalPending()
+	}
+	return nil
+}
+
+func (c config) repairLifecycleJournal() error {
+	if c.operations == nil {
+		return errors.New("operation coordinator unavailable")
+	}
+	lease, err := c.operations.beginRecovery()
+	if err != nil {
+		return err
+	}
+	defer lease.Done()
+	journal, exists, err := c.readLifecycleJournal()
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return errors.New("lifecycle recovery journal is unavailable")
+	}
+	target, err := c.serverTargetForID(journal.ServerID)
+	if err != nil || target.Project != journal.Project {
+		return errors.New("lifecycle recovery target is invalid")
+	}
+
+	switch journal.Operation {
+	case "create":
+		_, envErr := os.Stat(target.EnvFile)
+		entry, entryErr := c.registryEntryByID(target.ID)
+		if entryErr != nil {
+			return entryErr
+		}
+		if os.IsNotExist(envErr) && entry.ID == "" {
+			// The journal is durable before the atomic env-file creation. A crash
+			// in that narrow interval left no lifecycle state to recover.
+			return c.clearLifecycleJournal()
+		}
+		if envErr != nil {
+			return envErr
+		}
+		if _, err := c.validateServerTarget(target); err != nil {
+			return err
+		}
+		if entry.ID == "" {
+			if _, err := c.syncRegistryEntryFromEnv(target.ID, target.EnvFile); err != nil {
+				return err
+			}
+		}
+		if _, err := c.upServerStack(lease.Context(), target.Project, target.EnvFile); err != nil {
+			return err
+		}
+		if _, err := c.reloadSharedRegistry(lease.Context()); err != nil {
+			return err
+		}
+	case "reset":
+		if _, err := c.validateServerTarget(target); err != nil {
+			return err
+		}
+		if current, err := c.registryEntryByID(target.ID); err != nil {
+			return err
+		} else if current.ID == "" {
+			if _, err := c.syncRegistryEntryFromEnv(target.ID, target.EnvFile); err != nil {
+				return err
+			}
+		}
+		if _, err := c.upServerStack(lease.Context(), target.Project, target.EnvFile); err != nil {
+			return err
+		}
+		if _, err := c.reloadSharedRegistry(lease.Context()); err != nil {
+			return err
+		}
+		if err := c.setRegistryRepairRequired(target.ID, false); err != nil {
+			return err
+		}
+	case "deploy":
+		if _, err := c.validateServerTarget(target); err != nil {
+			return err
+		}
+		if _, err := c.upStateless(lease.Context(), target.Project, target.EnvFile); err != nil {
+			return err
+		}
+	case "delete":
+		_, envErr := os.Stat(target.EnvFile)
+		entry, entryErr := c.registryEntryByID(target.ID)
+		if entryErr != nil {
+			return entryErr
+		}
+		if envErr == nil {
+			if _, err := c.validateServerTarget(target); err != nil {
+				return err
+			}
+			if entry.ID == "" {
+				if _, err := c.syncRegistryEntryFromEnv(target.ID, target.EnvFile); err != nil {
+					return err
+				}
+			}
+			if _, err := c.upServerStack(lease.Context(), target.Project, target.EnvFile); err != nil {
+				return err
+			}
+			if _, err := c.reloadSharedRegistry(lease.Context()); err != nil {
+				return err
+			}
+		} else if os.IsNotExist(envErr) && entry.ID == "" {
+			if _, err := c.reloadSharedRegistry(lease.Context()); err != nil {
+				return err
+			}
+		} else {
+			return errors.New("delete recovery state is inconsistent")
+		}
+	}
+	return c.clearLifecycleJournal()
 }
 
 func newLifecycleJobManager() *lifecycleJobManager {
@@ -683,10 +960,11 @@ func isTerminalLifecycleJob(status lifecycleJobStatus) bool {
 
 func loadConfig() config {
 	jobs := newLifecycleJobManager()
+	serversDir := envOr("SERVERS_DIR", "/workspace/servers")
 	c := config{
 		token:                  os.Getenv("DEPLOYER_TOKEN"),
 		composeDir:             envOr("COMPOSE_DIR", "/workspace"),
-		serversDir:             envOr("SERVERS_DIR", "/workspace/servers"),
+		serversDir:             serversDir,
 		composeServer:          envOr("COMPOSE_SERVER_FILE", "/workspace/docker-compose.server.yml"),
 		composeShared:          envOr("COMPOSE_SHARED_FILE", "/workspace/docker-compose.shared.yml"),
 		ghcrOwner:              envOr("GHCR_OWNER", "peppone-choi"),
@@ -697,8 +975,10 @@ func loadConfig() config {
 		gatewayAPIURL:          envOr("DEPLOYER_GATEWAY_API_URL", "http://gateway-api:8080"),
 		lifecycleJobs:          jobs,
 		maintenanceFile:        envOr("DEPLOYER_MAINTENANCE_FILE", "/workspace/servers/.deployer-maintenance"),
+		lifecycleJournalFile:   envOr("DEPLOYER_LIFECYCLE_JOURNAL_FILE", filepath.Join(serversDir, ".deployer-lifecycle-journal")),
+		sharedEnvMu:            &sync.Mutex{},
 	}
-	c.operations = newOperationCoordinator(c.maintenanceFile, jobs)
+	c.operations = newOperationCoordinator(c.maintenanceFile, c.lifecycleJournalFile, jobs)
 	return c
 }
 
@@ -766,6 +1046,23 @@ func (c config) envFileFor(project string) string {
 
 func (c config) sharedEnvFile() string {
 	return filepath.Join(c.composeDir, ".env")
+}
+
+func (c config) lockSharedEnv() func() {
+	if c.sharedEnvMu == nil {
+		return func() {}
+	}
+	c.sharedEnvMu.Lock()
+	return c.sharedEnvMu.Unlock
+}
+
+func (c config) patchManagedEnvFile(path string, allowlist map[string]envFieldSpec, updates map[string]string) (map[string]envField, error) {
+	if filepath.Clean(path) != filepath.Clean(c.sharedEnvFile()) {
+		return patchEnvFile(path, allowlist, updates)
+	}
+	unlock := c.lockSharedEnv()
+	defer unlock()
+	return patchEnvFile(path, allowlist, updates)
 }
 
 func (c config) serverEnvFileForID(publicID string) string {
@@ -1048,6 +1345,10 @@ func main() {
 }
 
 func checkRegistryCommand(c config, output io.Writer) int {
+	if c.operations != nil && c.operations.lifecycleRecoveryPending() {
+		fmt.Fprintln(output, "lifecycle recovery is required")
+		return 1
+	}
 	if err := c.validateRegisteredServerTargets(); err != nil {
 		fmt.Fprintln(output, "registry validation failed")
 		return 1
@@ -1059,6 +1360,10 @@ func checkRegistryCommand(c config, output io.Writer) int {
 func (c config) handleReady(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "GET only"})
+		return
+	}
+	if c.operations != nil && c.operations.lifecycleRecoveryPending() {
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "lifecycle recovery is required"})
 		return
 	}
 	if err := c.validateRegisteredServerTargets(); err != nil {
@@ -1171,6 +1476,12 @@ func (c config) handleMaintenance(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		respond(state, "")
+	case r.Method == http.MethodPost && r.URL.Path == "/maintenance/repair":
+		if err := c.repairLifecycleJournal(); err != nil {
+			writeJSON(w, http.StatusConflict, errorResponse{Error: "lifecycle recovery failed"})
+			return
+		}
+		respond(c.operations.maintenanceState(), "")
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "maintenance endpoint unavailable"})
 	}
@@ -1279,6 +1590,10 @@ func (c config) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "deployment cancelled"})
 		return
 	}
+	if err := c.writeLifecycleJournal("deploy", target); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "lifecycle recovery journal could not be created"})
+		return
+	}
 	if err := c.writeImageTag(req.Project, req.Tag); err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("IMAGE_TAG/WEB_GAME_TAG 치환 실패: %v", err)})
 		return
@@ -1287,6 +1602,12 @@ func (c config) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	upDetail, err := c.upStateless(lease.Context(), req.Project, envFile)
 	detail += "\n" + upDetail
 	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, deployResponse{
+			Project: req.Project, Tag: req.Tag, OK: false, Detail: detail,
+		})
+		return
+	}
+	if err := c.clearLifecycleJournal(); err != nil {
 		writeJSON(w, http.StatusInternalServerError, deployResponse{
 			Project: req.Project, Tag: req.Tag, OK: false, Detail: detail,
 		})
@@ -1518,7 +1839,7 @@ func (c config) handleEnv(w http.ResponseWriter, r *http.Request, ctx envRequest
 			writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "mutation cancelled"})
 			return
 		}
-		fields, err := patchEnvFile(ctx.path, ctx.allowlist, req.Values)
+		fields, err := c.patchManagedEnvFile(ctx.path, ctx.allowlist, req.Values)
 		if err != nil {
 			if jobID != "" {
 				c.finishClaimedLifecycleJob(lease, jobID, "reload registry "+ctx.id, err)
@@ -1853,7 +2174,12 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 			setupComplete <- err
 			return "", err
 		}
+		if err := c.writeLifecycleJournal("create", target); err != nil {
+			setupComplete <- err
+			return "", err
+		}
 		if err := writeEnvLinesAtomic(envFile, envLines); err != nil {
+			_ = c.clearLifecycleJournal()
 			setupComplete <- err
 			return "", err
 		}
@@ -1874,7 +2200,13 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 		if serverErr != nil {
 			return detail, serverErr
 		}
-		return detail, reloadErr
+		if reloadErr != nil {
+			return detail, reloadErr
+		}
+		if err := c.clearLifecycleJournal(); err != nil {
+			return detail, err
+		}
+		return detail, nil
 	})
 	if err := <-setupComplete; err != nil {
 		return createServerResponse{OK: false, ID: id, Name: name, Project: entry.DeployProject, Detail: fmt.Sprintf("서버 생성 준비 실패: %v", err)}, http.StatusInternalServerError
@@ -1926,6 +2258,9 @@ func (c config) deleteServer(rawID string, confirm string) (createServerResponse
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: detail}, status
 	}
 	c.startClaimedLifecycleJob(lease, jobID, "delete "+id, func(ctx context.Context) (string, error) {
+		if err := c.writeLifecycleJournal("delete", target); err != nil {
+			return "", err
+		}
 		detail, downErr := c.downServerStack(ctx, target.Project, envFile)
 		if downErr != nil {
 			return detail, downErr
@@ -1950,7 +2285,13 @@ func (c config) deleteServer(rawID string, confirm string) (createServerResponse
 		if reloadDetail != "" {
 			detail += "\n=== shared reload ===\n" + reloadDetail
 		}
-		return detail, reloadErr
+		if reloadErr != nil {
+			return detail, reloadErr
+		}
+		if err := c.clearLifecycleJournal(); err != nil {
+			return detail, err
+		}
+		return detail, nil
 	})
 	return createServerResponse{
 		OK:               true,
@@ -2064,10 +2405,27 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 			restorePreDown()
 			return "", err
 		}
+		if err := c.writeLifecycleJournal("reset", target); err != nil {
+			restorePreDown()
+			return "", err
+		}
 		irreversible = true
 		detail, downErr := c.downServerStack(ctx, updatedEntry.DeployProject, envFile)
 		if downErr != nil {
-			return failAfterIrreversible(detail, downErr)
+			recoveryDetail, recoveryErr := c.forwardRecoveryServerStack(updatedEntry.DeployProject, envFile)
+			if recoveryDetail != "" {
+				detail += "\n=== server forward recovery ===\n" + recoveryDetail
+			}
+			if recoveryErr != nil {
+				return failAfterIrreversible(detail, fmt.Errorf("server down failed: %v; forward recovery failed: %w", downErr, recoveryErr))
+			}
+			if err := c.setRegistryRepairRequired(id, false); err != nil {
+				return detail, fmt.Errorf("reset forward recovery completed but could not clear repair-required state: %w", err)
+			}
+			if err := c.clearLifecycleJournal(); err != nil {
+				return detail, err
+			}
+			return detail, fmt.Errorf("reset down failed after the irreversible boundary; forward recovery succeeded: %w", downErr)
 		}
 		if err := ctx.Err(); err != nil {
 			return failAfterIrreversible(detail, err)
@@ -2094,6 +2452,9 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 		}
 		if err := c.setRegistryRepairRequired(id, false); err != nil {
 			return detail, fmt.Errorf("reset completed but could not clear repair-required state: %w", err)
+		}
+		if err := c.clearLifecycleJournal(); err != nil {
+			return detail, err
 		}
 		return detail, nil
 	})
@@ -2513,6 +2874,8 @@ func randomHex(bytes int) (string, error) {
 }
 
 func (c config) sharedEnvValue(key string) string {
+	unlock := c.lockSharedEnv()
+	defer unlock()
 	lines, err := readEnvLines(c.sharedEnvFile())
 	if err != nil {
 		return ""
@@ -2526,7 +2889,9 @@ func (c config) sharedEnvValue(key string) string {
 }
 
 func (c config) upsertRegistryEntry(entry registryEntry) error {
-	registry, err := c.readRegistry()
+	unlock := c.lockSharedEnv()
+	defer unlock()
+	registry, err := c.readRegistryLocked()
 	if err != nil {
 		return err
 	}
@@ -2541,11 +2906,13 @@ func (c config) upsertRegistryEntry(entry registryEntry) error {
 	if !found {
 		registry = append(registry, entry)
 	}
-	return c.writeRegistry(registry)
+	return c.writeRegistryLocked(registry)
 }
 
 func (c config) setRegistryRepairRequired(id string, repairRequired bool) error {
-	registry, err := c.readRegistry()
+	unlock := c.lockSharedEnv()
+	defer unlock()
+	registry, err := c.readRegistryLocked()
 	if err != nil {
 		return err
 	}
@@ -2557,13 +2924,15 @@ func (c config) setRegistryRepairRequired(id string, repairRequired bool) error 
 			return nil
 		}
 		registry[index].RepairRequired = repairRequired
-		return c.writeRegistry(registry)
+		return c.writeRegistryLocked(registry)
 	}
 	return errors.New("updated server registry entry is unavailable")
 }
 
 func (c config) removeRegistryEntry(id string) (registryEntry, error) {
-	registry, err := c.readRegistry()
+	unlock := c.lockSharedEnv()
+	defer unlock()
+	registry, err := c.readRegistryLocked()
 	if err != nil {
 		return registryEntry{}, err
 	}
@@ -2579,7 +2948,7 @@ func (c config) removeRegistryEntry(id string) (registryEntry, error) {
 	if removed.ID == "" {
 		return registryEntry{}, nil
 	}
-	return removed, c.writeRegistry(next)
+	return removed, c.writeRegistryLocked(next)
 }
 
 func (c config) registryEntryByID(id string) (registryEntry, error) {
@@ -2611,15 +2980,35 @@ func (c config) syncRegistryEntryFromEnv(id string, envFile string) (bool, error
 	if err != nil {
 		return false, err
 	}
-	current, err := c.registryEntryByID(id)
+	unlock := c.lockSharedEnv()
+	defer unlock()
+	registry, err := c.readRegistryLocked()
 	if err != nil {
 		return false, err
+	}
+	current := registryEntry{}
+	for _, entry := range registry {
+		if entry.ID == id {
+			current = entry
+			break
+		}
 	}
 	next := c.registryEntryFromServerEnv(id, values, current)
 	if reflect.DeepEqual(current, next) {
 		return false, nil
 	}
-	return true, c.upsertRegistryEntry(next)
+	found := false
+	for index := range registry {
+		if registry[index].ID == id {
+			registry[index] = next
+			found = true
+			break
+		}
+	}
+	if !found {
+		registry = append(registry, next)
+	}
+	return true, c.writeRegistryLocked(registry)
 }
 
 func (c config) registryEntryFromServerEnv(id string, values map[string]string, current registryEntry) registryEntry {
@@ -2774,47 +3163,125 @@ func applyResetUpdates(envFile string, values map[string]string) error {
 }
 
 func (c config) readRegistry() ([]registryEntry, error) {
+	unlock := c.lockSharedEnv()
+	defer unlock()
+	return c.readRegistryLocked()
+}
+
+func (c config) readRegistryLocked() ([]registryEntry, error) {
 	lines, err := readEnvLines(c.sharedEnvFile())
 	if err != nil {
 		return nil, err
 	}
-	registry := []registryEntry{}
-	for _, line := range lines {
-		if line.IsKV && line.Key == "SERVER_REGISTRY_JSON" && strings.TrimSpace(line.Value) != "" {
-			if err := json.Unmarshal([]byte(line.Value), &registry); err != nil {
-				return nil, fmt.Errorf("SERVER_REGISTRY_JSON 파싱 실패: %w", err)
-			}
-		}
+	registry, rawRewrite, err := parseRawRegistryEntries(lines)
+	if err != nil {
+		return nil, err
 	}
 	canonical, err := canonicalRegistryEntries(registry)
 	if err != nil {
 		return nil, err
 	}
-	if !reflect.DeepEqual(registry, canonical) {
-		if err := c.writeCanonicalRegistry(canonical); err != nil {
+	if rawRewrite || !reflect.DeepEqual(registry, canonical) {
+		if c.registryRewriteHook != nil {
+			c.registryRewriteHook()
+		}
+		if err := c.writeCanonicalRegistryLocked(lines, canonical); err != nil {
 			return nil, err
 		}
 	}
 	return canonical, nil
 }
 
+func parseRawRegistryEntries(lines []envLine) ([]registryEntry, bool, error) {
+	registry := []registryEntry{}
+	assignments := 0
+	rewrite := false
+	for _, line := range lines {
+		if !line.IsKV || line.Key != "SERVER_REGISTRY_JSON" {
+			continue
+		}
+		assignments++
+		if strings.TrimSpace(line.Value) == "" {
+			continue
+		}
+		var rawEntries []json.RawMessage
+		if err := json.Unmarshal([]byte(line.Value), &rawEntries); err != nil {
+			return nil, false, fmt.Errorf("SERVER_REGISTRY_JSON 파싱 실패: %w", err)
+		}
+		parsed := make([]registryEntry, 0, len(rawEntries))
+		for index, rawEntry := range rawEntries {
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(rawEntry, &fields); err != nil {
+				return nil, false, fmt.Errorf("SERVER_REGISTRY_JSON[%d] 파싱 실패: %w", index, err)
+			}
+			for key := range fields {
+				if !isRegistryEntryJSONField(key) {
+					rewrite = true
+				}
+			}
+			var entry registryEntry
+			if err := json.Unmarshal(rawEntry, &entry); err != nil {
+				return nil, false, fmt.Errorf("SERVER_REGISTRY_JSON[%d] 파싱 실패: %w", index, err)
+			}
+			parsed = append(parsed, entry)
+		}
+		registry = parsed
+	}
+	if assignments > 1 {
+		rewrite = true
+	}
+	return registry, rewrite, nil
+}
+
+func isRegistryEntryJSONField(key string) bool {
+	switch key {
+	case "id", "name", "generation", "scenarioCode", "gameApiUrl", "gameEngineUrl", "deployProject", "env", "repairRequired":
+		return true
+	default:
+		return false
+	}
+}
+
 func (c config) writeRegistry(registry []registryEntry) error {
+	unlock := c.lockSharedEnv()
+	defer unlock()
+	return c.writeRegistryLocked(registry)
+}
+
+func (c config) writeRegistryLocked(registry []registryEntry) error {
 	canonical, err := canonicalRegistryEntries(registry)
 	if err != nil {
 		return err
 	}
-	return c.writeCanonicalRegistry(canonical)
+	lines, err := readEnvLines(c.sharedEnvFile())
+	if err != nil {
+		return err
+	}
+	return c.writeCanonicalRegistryLocked(lines, canonical)
 }
 
-func (c config) writeCanonicalRegistry(canonical []registryEntry) error {
+func (c config) writeCanonicalRegistryLocked(lines []envLine, canonical []registryEntry) error {
 	data, err := json.Marshal(canonical)
 	if err != nil {
 		return err
 	}
-	_, err = patchEnvFile(c.sharedEnvFile(), map[string]envFieldSpec{
-		"SERVER_REGISTRY_JSON": {Description: "서버 레지스트리"},
-	}, map[string]string{"SERVER_REGISTRY_JSON": string(data)})
-	return err
+	replacement := envLine{Raw: "SERVER_REGISTRY_JSON=" + string(data), Key: "SERVER_REGISTRY_JSON", Value: string(data), IsKV: true}
+	next := make([]envLine, 0, len(lines)+1)
+	replaced := false
+	for _, line := range lines {
+		if line.IsKV && line.Key == "SERVER_REGISTRY_JSON" {
+			if !replaced {
+				next = append(next, replacement)
+				replaced = true
+			}
+			continue
+		}
+		next = append(next, line)
+	}
+	if !replaced {
+		next = append(next, replacement)
+	}
+	return writeEnvLinesAtomic(c.sharedEnvFile(), next)
 }
 
 func canonicalRegistryEntries(registry []registryEntry) ([]registryEntry, error) {
@@ -2909,6 +3376,12 @@ func (c config) upServerStack(ctx context.Context, project, envFile string) (str
 		"-f", c.composeServer,
 		"up", "-d",
 	)
+}
+
+func (c config) forwardRecoveryServerStack(project, envFile string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	return c.upServerStack(ctx, project, envFile)
 }
 
 func (c config) downServerStack(ctx context.Context, project, envFile string) (string, error) {
