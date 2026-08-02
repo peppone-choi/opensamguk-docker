@@ -129,6 +129,8 @@ docker compose -p opensamguk-salpha -f docker-compose.server.yml --env-file serv
 > 레지스트리 `id`는 public id이고, `gameApiUrl`/`gameEngineUrl` 호스트명은 내부 `s<id>-game-api` 등과
 > **반드시 일치**한다. `deployProject`도 내부 compose 프로젝트명(`opensamguk-s<id>`)이다.
 > `generation`은 로비/어드민/게임 메인에 표시되는 기수이며, `servers/s<id>.env`의 `SERVER_GENERATION`과 맞춰 둔다. 알파/테스트 서버는 `0`을 쓸 수 있고, 정식 기수는 보통 `1` 이상으로 시작한다.
+> deployer는 Docker 실행, deploy/delete/reset, `/readyz` 전에 `servers/s<id>.env`의 `SERVER_ID`가 canonical public
+> id와 정확히 같은지 다시 확인한다. 누락·중복·불일치는 Docker를 호출하지 않고 fail closed 한다.
 
 ---
 
@@ -156,8 +158,9 @@ nginx `/health`를 항상 확인하고,
 있으면 새 deployer 프로세스도 closed 상태로 부팅하며, 새 mutation은 `503`과 `Retry-After`를 받고, 진행 중인
 mutation은 취소된 context가 Docker runner에서 실제 반환할 때까지 drain한다.
 
-workflow는 deployer 컨테이너의 loopback에서만 다음 Bearer API를 호출한다. gateway/API caller는 같은 토큰을
-알아도 maintenance barrier를 열거나 닫을 수 없다.
+workflow는 deployer 컨테이너의 loopback에서만 다음 Bearer API를 호출한다. `DEPLOYER_TOKEN`은 호스트에서
+읽거나 `docker exec -e`로 주입하지 않고 deployer 컨테이너 자신의 환경에서만 사용한다. gateway/API caller는 같은
+토큰을 알아도 maintenance barrier를 열거나 닫을 수 없다.
 
 ```text
 GET  /maintenance        -> {"capability":"maintenance-v1","state":"open|draining|drained"}
@@ -169,8 +172,11 @@ POST /maintenance/leave  -> 성공한 workflow가 마지막에만 open
 기동한 뒤 확인한다. Deploy Orchestration과 Start Existing Game Server는 성공 검증 뒤에만 leave 한다. Recreate Game
 Server는 marker를 lifecycle job과 서버 postcondition 전체 동안 닫아 둔다. enter가 준 lease는 메모리 안의 단발
 권한이며 loopback + Bearer POST /servers/create에만 전달된다. GET, 로그, create 응답에는 lease를 넣지 않는다.
-동일 operationId의 모호한 재시도는 기존 job만 돌려주며 lease를 다시 소비하지 않는다. deployer 재시작으로
-in-memory job이 사라지거나 어떤 단계가 실패하면 workflow는 bounded abort하고 marker를 남겨 fail-closed 상태를 유지한다.
+enter가 준 lease는 recreate 요청 JSON body로만 전달되고 host Docker argv, HTTP header, 로그, create 응답에는 넣지
+않는다. 동일 operationId의 모호한 재시도는 **정규화된 생성 payload fingerprint까지 같을 때만** 기존 job을 돌려주며
+lease를 다시 소비하지 않는다. 다른 payload로 같은 operationId를 재사용하면 `409`으로 거부한다. deployer 재시작으로
+in-memory job이 사라지거나 어떤 단계가 실패하면 workflow는 절대 deadline, 요청 connect/total timeout, bounded EXIT
+drain 안에서 abort하고 marker를 남겨 fail-closed 상태를 유지한다.
 
 #### 구버전 deployer의 1회 bridge
 
@@ -196,8 +202,8 @@ GCP의 shared/per-server orchestration 배포는 GitHub Actions **Deploy Orchest
    shared/deployer를 복구한다.
 2. 기존 `servers/s<public-id>.env`가 있으면 **Start Existing Game Server** 워크플로를 사용하고 `image_tag`는
    빈 값으로 둔다. 그러면 기존 `IMAGE_TAG`와 `WEB_GAME_TAG` 핀이 그대로 보존된다.
-3. env 파일이 없거나 새 서버를 만들 때만 **Recreate Game Server** 워크플로를 사용한다. 이 워크플로는
-   GCP self-hosted runner 내부에서 `DEPLOYER_TOKEN`을 읽어 deployer `/servers/create`를 호출한다.
+3. env 파일이 없거나 새 서버를 만들 때만 **Recreate Game Server** 워크플로를 사용한다. 이 워크플로는 deployer
+   컨테이너 내부 token으로 loopback `/servers/create`를 호출한다.
    입력값은 `server_id`, `server_name`, `generation`, `image_tag`, `scenario_code`, `game_api_port`,
    `web_game_port`이며 `jwtSecret`은 비워 shared `JWT_SECRET`을 복사한다.
 
@@ -211,6 +217,10 @@ GCP의 shared/per-server orchestration 배포는 GitHub Actions **Deploy Orchest
 
 진행 중 서버 승격은 어드민/deployer에서 서버별로 하거나, 시즌 경계/재시드 같은 명시 운영 시점에 수동으로 한다.
 이 경계가 깨지면 게임 도중 로직/프론트가 갑자기 바뀌어 패러티와 UX가 같이 흔들릴 수 있다.
+
+서버 reset은 `docker compose down --volumes` 호출 직전까지의 실패만 이전 env/registry snapshot으로 복구한다. 해당
+호출을 지난 뒤에는 볼륨이 일부라도 제거되었을 수 있으므로 이전 desired state를 되살리지 않는다. 새 desired state를
+유지하고 한 번 forward re-up을 시도하며, 실패하면 registry의 `repairRequired=true`를 남겨 명시적 복구가 필요함을 표시한다.
 
 ---
 
@@ -244,8 +254,9 @@ POST deployer/deploy  {"project":"opensamguk-spep","tag":"v1.3.0"}
 환경변수 관리 API도 같은 Bearer 토큰 인증을 사용한다. 임의 raw editor가 아니라 명시 allowlist만 수정한다.
 `DEPLOYER_TOKEN`은 서버 내부 권한 토큰이므로 API 수정 대상에서 제외한다. `JWT_SECRET`, `ADMIN_PASSWORD`,
 `GHCR_TOKEN` 같은 민감값은 PATCH로만 쓰고 GET/PATCH 응답에는 원문 값을 반환하지 않는다.
-서버별 env PATCH는 `JWT_SECRET` 같은 write-only 비밀값을 제외한 서버 env 전체를 `SERVER_REGISTRY_JSON`
-의 해당 서버 `env` 스냅샷으로 동기화한다. `SERVER_NAME`, `SERVER_GENERATION`, `GAME_API_URL`처럼 로비와
+서버별 env PATCH는 명시된 non-secret allowlist만 `SERVER_REGISTRY_JSON`의 해당 서버 `env` 스냅샷으로 동기화한다.
+레거시 registry에 남은 임의 키나 JWT/password/token 값도 read 시 제거되어 atomically 다시 저장되며 `GET /servers`에는
+반환되지 않는다. `SERVER_NAME`, `SERVER_GENERATION`, `GAME_API_URL`처럼 로비와
 어드민이 직접 쓰는 값은 registry의 top-level 필드도 함께 갱신하고, 공유 스택 registry reload 대상
 (`gateway-api`, `web-gateway`, `nginx`)을 `affectedServices`에 포함한다.
 

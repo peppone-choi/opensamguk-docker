@@ -39,6 +39,7 @@ concurrency:
 jobs:
   recreate:
     runs-on: [self-hosted, gcp-prod]
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -53,15 +54,48 @@ jobs:
           WEB_GAME_PORT: ${{ inputs.web_game_port }}
         run: |
           set -euo pipefail
+          WORKFLOW_DEADLINE=$((SECONDS + 2400))
+          deadline_remaining() {
+            local deadline="$1"
+            local remaining=$((deadline - SECONDS))
+            if (( remaining <= 0 )); then
+              return 1
+            fi
+            printf '%s\n' "$remaining"
+          }
+          bounded_sleep() {
+            local deadline="$1"
+            local requested="$2"
+            local remaining
+            if ! remaining="$(deadline_remaining "$deadline")"; then
+              return 1
+            fi
+            if (( requested > remaining )); then
+              requested="$remaining"
+            fi
+            sleep "$requested"
+          }
+          docker_exec_bounded() {
+            local deadline="$1"
+            local requested="$2"
+            shift 2
+            local remaining
+            if ! remaining="$(deadline_remaining "$deadline")"; then
+              return 124
+            fi
+            if (( requested > remaining )); then
+              requested="$remaining"
+            fi
+            timeout --foreground "$requested" sudo docker exec "$@"
+          }
           exec 9>/tmp/opensamguk-production.lock
-          if ! flock -w 1800 9; then
-            echo "::error::Timed out acquiring /tmp/opensamguk-production.lock after 1800 seconds"
+          if ! flock -w 300 9; then
+            echo "::error::Timed out acquiring /tmp/opensamguk-production.lock after 300 seconds"
             exit 1
           fi
           STACK="$HOME/opensamguk-docker"
           cd "$STACK"
 
-          DEPLOYER_TOKEN="$(grep '^DEPLOYER_TOKEN=' .env | cut -d= -f2-)"
           maintenance_response_state() {
             printf '%s' "$1" | python3 -c 'import json, re, sys; payload = json.load(sys.stdin); keys = set(payload) if isinstance(payload, dict) else set(); valid = keys in ({"capability", "state"}, {"capability", "state", "lease"}) and payload.get("capability") == "maintenance-v1" and payload.get("state") in {"open", "draining", "drained"} and ("lease" not in payload or re.fullmatch(r"[a-f0-9]{32}", payload["lease"]) is not None); valid or sys.exit(1); print(payload["state"])'
           }
@@ -69,19 +103,19 @@ jobs:
             printf '%s' "$1" | python3 -c 'import json, re, sys; payload = json.load(sys.stdin); valid = isinstance(payload, dict) and set(payload) == {"capability", "state", "lease"} and payload["capability"] == "maintenance-v1" and payload["state"] == "drained" and re.fullmatch(r"[a-f0-9]{32}", payload["lease"]) is not None; valid or sys.exit(1); print(payload["state"] + ":" + payload["lease"])'
           }
           maintenance_get() {
-            sudo docker exec -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
-              wget -qO- -T 10 -t 1 --header="Authorization: Bearer $DEPLOYER_TOKEN" http://localhost:9000/maintenance
+            docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c '
+              timeout -k 2 10 wget -qO- -T 5 --header="Authorization: Bearer $DEPLOYER_TOKEN" http://localhost:9000/maintenance
             ' 2>/dev/null
           }
           maintenance_post() {
-            sudo docker exec -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
-              wget -qO- -T 10 -t 1 --header="Authorization: Bearer $DEPLOYER_TOKEN" --post-data="" "http://localhost:9000$1"
+            docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c '
+              timeout -k 2 10 wget -qO- -T 5 --header="Authorization: Bearer $DEPLOYER_TOKEN" --post-data="" "http://localhost:9000$1"
             ' maintenance "$1" 2>/dev/null
           }
           DEPLOYER_FRESH=false
           MAINTENANCE_LEASE=""
           if sudo docker ps -a --format '{{.Names}}' | grep -Fxq opensamguk-deployer; then
-            if [ -z "$DEPLOYER_TOKEN" ] || ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_get)")"; then
+            if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_get)")"; then
               echo "::error::running deployer lacks a valid maintenance-v1 capability; aborting before control-plane mutation"
               exit 1
             fi
@@ -114,11 +148,16 @@ jobs:
             $COMPOSE up -d --no-deps deployer
             deployer_closed=false
             for _ in $(seq 1 30); do
+              if ! deadline_remaining "$WORKFLOW_DEADLINE" >/dev/null; then
+                break
+              fi
               if MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_get)")" && [ "$MAINTENANCE_STATE" = drained ]; then
                 deployer_closed=true
                 break
               fi
-              sleep 2
+              if ! bounded_sleep "$WORKFLOW_DEADLINE" 2; then
+                break
+              fi
             done
             if [ "$deployer_closed" != true ]; then
               echo "::error::fresh deployer did not boot closed with maintenance-v1"
@@ -155,18 +194,21 @@ jobs:
           INTERNAL_ID="s${PUBLIC_ID}"
           echo "creating public server ${PUBLIC_ID} with internal Docker key ${INTERNAL_ID}"
 
-          test -n "$DEPLOYER_TOKEN"
-
           export CLIENT_OPERATION_ID="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
-          BODY="$(python3 -c 'import json, os; print(json.dumps({"id": os.environ["SERVER_ID"], "name": os.environ["SERVER_NAME"], "generation": os.environ["GENERATION"], "imageTag": os.environ["IMAGE_TAG"], "gameApiPort": os.environ["GAME_API_PORT"], "webGamePort": os.environ["WEB_GAME_PORT"], "scenarioCode": os.environ["SCENARIO_CODE"], "scenarioSeedEnabled": True, "jwtSecret": "", "operationId": os.environ["CLIENT_OPERATION_ID"]}, ensure_ascii=False))')"
+          export MAINTENANCE_LEASE
+          BODY="$(python3 -c 'import json, os; print(json.dumps({"id": os.environ["SERVER_ID"], "name": os.environ["SERVER_NAME"], "generation": os.environ["GENERATION"], "imageTag": os.environ["IMAGE_TAG"], "gameApiPort": os.environ["GAME_API_PORT"], "webGamePort": os.environ["WEB_GAME_PORT"], "scenarioCode": os.environ["SCENARIO_CODE"], "scenarioSeedEnabled": True, "jwtSecret": "", "operationId": os.environ["CLIENT_OPERATION_ID"], "maintenanceLease": os.environ["MAINTENANCE_LEASE"]}, ensure_ascii=False))')"
 
           lifecycle_status() {
             local target_job_id="$1"
+            local deadline="$2"
             local attempt job_response job_status request_status
             local malformed=false
             for attempt in 1 2 3; do
-              if job_response="$(sudo docker exec -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
-                wget -qO- -T 10 -t 1 --header="Authorization: Bearer $DEPLOYER_TOKEN" "http://localhost:9000/jobs/$1"
+              if ! deadline_remaining "$deadline" >/dev/null; then
+                return 4
+              fi
+              if job_response="$(docker_exec_bounded "$deadline" 15 opensamguk-deployer sh -c '
+                timeout -k 2 10 wget -qO- -T 5 --header="Authorization: Bearer $DEPLOYER_TOKEN" "http://localhost:9000/jobs/$1"
               ' job "$target_job_id" 2>/dev/null)"; then
                 if job_status="$(printf '%s' "$job_response" | JOB_ID="$target_job_id" python3 -c 'import json, os, sys; payload = json.load(sys.stdin); valid = isinstance(payload, dict) and set(payload) == {"id", "status"} and payload["id"] == os.environ["JOB_ID"] and payload["status"] in {"pending", "running", "succeeded", "failed", "cancelled"}; valid or sys.exit(1); print(payload["status"])' 2>/dev/null)"; then
                   printf '%s\n' "$job_status"
@@ -179,7 +221,9 @@ jobs:
                   return 3
                 fi
               fi
-              sleep 2
+              if ! bounded_sleep "$deadline" 2; then
+                return 4
+              fi
             done
             if [[ "$malformed" == true ]]; then
               return 2
@@ -189,10 +233,14 @@ jobs:
 
           request_lifecycle_cancel() {
             local target_job_id="$1"
+            local deadline="$2"
             local attempt cancel_response cancel_status request_status
             for attempt in 1 2 3; do
-              if cancel_response="$(sudo docker exec -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
-                wget -qO- -T 10 -t 1 \
+              if ! deadline_remaining "$deadline" >/dev/null; then
+                return 4
+              fi
+              if cancel_response="$(docker_exec_bounded "$deadline" 15 opensamguk-deployer sh -c '
+                timeout -k 2 10 wget -qO- -T 5 \
                   --header="Authorization: Bearer $DEPLOYER_TOKEN" \
                   --post-data="" \
                   "http://localhost:9000/jobs/$1/cancel"
@@ -207,15 +255,18 @@ jobs:
                   return 2
                 fi
               fi
-              sleep 2
+              if ! bounded_sleep "$deadline" 2; then
+                return 4
+              fi
             done
             return 1
           }
 
           cancel_and_await_lifecycle_job() {
             local target_job_id="$1"
+            local deadline="$2"
             local attempt cancellation_status cancellation_exit terminal_status lookup_status
-            if cancellation_status="$(request_lifecycle_cancel "$target_job_id")"; then
+            if cancellation_status="$(request_lifecycle_cancel "$target_job_id" "$deadline")"; then
               :
             else
               cancellation_exit=$?
@@ -228,7 +279,10 @@ jobs:
                 ;;
             esac
             for attempt in $(seq 1 12); do
-              if terminal_status="$(lifecycle_status "$target_job_id")"; then
+              if ! deadline_remaining "$deadline" >/dev/null; then
+                return 4
+              fi
+              if terminal_status="$(lifecycle_status "$target_job_id" "$deadline")"; then
                 case "$terminal_status" in
                   succeeded|failed|cancelled)
                     printf '%s\n' "$terminal_status"
@@ -241,7 +295,9 @@ jobs:
                   return "$lookup_status"
                 fi
               fi
-              sleep 2
+              if ! bounded_sleep "$deadline" 2; then
+                return 4
+              fi
             done
             return 1
           }
@@ -253,7 +309,11 @@ jobs:
             local exit_status="$?"
             if [[ -n "$JOB_ID" && "$LIFECYCLE_TERMINAL" != true && "$LIFECYCLE_DRAINING" != true ]]; then
               LIFECYCLE_DRAINING=true
-              if ! cancel_and_await_lifecycle_job "$JOB_ID"; then
+              local drain_deadline=$((SECONDS + 60))
+              if (( drain_deadline > WORKFLOW_DEADLINE )); then
+                drain_deadline="$WORKFLOW_DEADLINE"
+              fi
+              if ! cancel_and_await_lifecycle_job "$JOB_ID" "$drain_deadline"; then
                 echo "::warning::bounded lifecycle cancellation/drain could not be confirmed; leaving maintenance marker closed" >&2
               fi
               LIFECYCLE_TERMINAL=true
@@ -265,11 +325,13 @@ jobs:
           trap 'exit 143' TERM
 
           for create_attempt in 1 2 3; do
-            if RESPONSE="$(sudo docker exec -i -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" -e MAINTENANCE_LEASE="$MAINTENANCE_LEASE" opensamguk-deployer sh -c '
+            if ! deadline_remaining "$WORKFLOW_DEADLINE" >/dev/null; then
+              break
+            fi
+            if RESPONSE="$(docker_exec_bounded "$WORKFLOW_DEADLINE" 20 -i opensamguk-deployer sh -c '
                 cat > /tmp/recreate-server.json
-                wget -qO- \
+                timeout -k 2 10 wget -qO- -T 5 \
                   --header="Authorization: Bearer $DEPLOYER_TOKEN" \
-                  --header="X-Maintenance-Lease: $MAINTENANCE_LEASE" \
                   --header="Content-Type: application/json" \
                   --post-file=/tmp/recreate-server.json \
                   http://localhost:9000/servers/create
@@ -287,7 +349,9 @@ jobs:
               exit 1
             fi
             echo "::warning::transient server creation attempt ${create_attempt}/3 failed"
-            sleep 2
+            if ! bounded_sleep "$WORKFLOW_DEADLINE" 2; then
+              break
+            fi
           done
           if [[ -z "$JOB_ID" ]]; then
             echo "::error::server creation did not return a lifecycle job after 3 bounded attempts; leaving maintenance marker closed"
@@ -296,7 +360,10 @@ jobs:
 
           JOB_SUCCEEDED=false
           for poll_attempt in $(seq 1 240); do
-            if JOB_STATUS="$(lifecycle_status "$JOB_ID")"; then
+            if ! deadline_remaining "$WORKFLOW_DEADLINE" >/dev/null; then
+              break
+            fi
+            if JOB_STATUS="$(lifecycle_status "$JOB_ID" "$WORKFLOW_DEADLINE")"; then
               case "$JOB_STATUS" in
                 succeeded)
                   LIFECYCLE_TERMINAL=true
@@ -332,11 +399,13 @@ jobs:
                   ;;
               esac
             fi
-            sleep 5
+            if ! bounded_sleep "$WORKFLOW_DEADLINE" 5; then
+              break
+            fi
           done
           if [[ "$JOB_SUCCEEDED" != true ]]; then
             echo "::error::lifecycle job did not succeed within 20 minutes; requesting bounded cancellation"
-            if terminal_status="$(cancel_and_await_lifecycle_job "$JOB_ID")"; then
+            if terminal_status="$(cancel_and_await_lifecycle_job "$JOB_ID" "$WORKFLOW_DEADLINE")"; then
               LIFECYCLE_TERMINAL=true
               echo "::error::lifecycle job reached terminal status $terminal_status after deadline"
             else
@@ -349,15 +418,20 @@ jobs:
 
           server_ready=false
           for i in $(seq 1 90); do
+            if ! deadline_remaining "$WORKFLOW_DEADLINE" >/dev/null; then
+              break
+            fi
             if sudo docker ps --format '{{.Names}}' | grep -q "^${INTERNAL_ID}-game-api$" &&
                sudo docker ps --format '{{.Names}}' | grep -q "^${INTERNAL_ID}-game-engine$" &&
                sudo docker ps --format '{{.Names}}' | grep -q "^${INTERNAL_ID}-web-game$" &&
-               curl -fsS http://localhost/health | grep -q '"status":"up"' &&
-               curl -fsS "http://localhost/game/${PUBLIC_ID}" >/dev/null; then
+               curl -fsS --connect-timeout 5 --max-time 10 http://localhost/health | grep -q '"status":"up"' &&
+               curl -fsS --connect-timeout 5 --max-time 10 "http://localhost/game/${PUBLIC_ID}" >/dev/null; then
               server_ready=true
               break
             fi
-            sleep 5
+            if ! bounded_sleep "$WORKFLOW_DEADLINE" 5; then
+              break
+            fi
           done
 
           if [[ "$server_ready" != true ]]; then

@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -62,7 +63,11 @@ var (
 	tagRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 )
 
-var errLifecycleJobCapacity = errors.New("lifecycle job capacity reached")
+var (
+	errLifecycleJobCapacity       = errors.New("lifecycle job capacity reached")
+	errLifecycleOperationConflict = errors.New("lifecycle operation id is already bound to a different request")
+	errCreatePortsEqual           = errors.New("game-api와 web-game 포트는 서로 달라야 합니다.")
+)
 
 // 스테이트리스 bounce 대상 — game-engine은 의도적으로 제외.
 var statelessServices = envList("DEPLOYER_STATELESS_SERVICES", []string{"game-api", "web-game"})
@@ -142,6 +147,33 @@ var serverEnvAllowlist = map[string]envFieldSpec{
 	"RESET_PRE_RESERVE_OPEN":     {Description: "리셋: 가오픈 예약"},
 }
 
+var registryEnvAllowlist = map[string]struct{}{
+	"IMAGE_TAG":                  {},
+	"GAME_API_PORT":              {},
+	"WEB_GAME_PORT":              {},
+	"WEB_GAME_TAG":               {},
+	"TURN_PROFILE_NAME":          {},
+	"SCENARIO_SEED_ENABLED":      {},
+	"SCENARIO_CODE":              {},
+	"SERVER_NAME":                {},
+	"SERVER_GENERATION":          {},
+	"GAME_API_URL":               {},
+	"GATEWAY_API_URL":            {},
+	"RESET_TURNTERM":             {},
+	"RESET_SYNC":                 {},
+	"RESET_FICTION":              {},
+	"RESET_EXTEND":               {},
+	"RESET_BLOCK_GENERAL_CREATE": {},
+	"RESET_NPCMODE":              {},
+	"RESET_SHOW_IMG_LEVEL":       {},
+	"RESET_AUTORUN_USER_OPTIONS": {},
+	"RESET_AUTORUN_USER_MINUTES": {},
+	"RESET_JOIN_MODE":            {},
+	"RESET_TOURNAMENT_TRIG":      {},
+	"RESET_RESERVE_OPEN":         {},
+	"RESET_PRE_RESERVE_OPEN":     {},
+}
+
 var sharedEnvAllowlist = map[string]envFieldSpec{
 	"IMAGE_TAG":               {Description: "공유 스택 이미지 태그"},
 	"NGINX_HTTP_PORT":         {Description: "nginx HTTP 호스트 포트"},
@@ -185,12 +217,13 @@ const (
 )
 
 type lifecycleJob struct {
-	id              string
-	status          lifecycleJobStatus
-	finishedAt      time.Time
-	operationID     string
-	cancel          context.CancelFunc
-	cancelRequested bool
+	id                   string
+	status               lifecycleJobStatus
+	finishedAt           time.Time
+	operationID          string
+	operationFingerprint string
+	cancel               context.CancelFunc
+	cancelRequested      bool
 }
 
 type lifecycleJobResponse struct {
@@ -463,11 +496,11 @@ func newLifecycleJobManager() *lifecycleJobManager {
 }
 
 func (m *lifecycleJobManager) reserve() (string, error) {
-	id, _, err := m.reserveWithOperation("")
+	id, _, err := m.reserveWithOperation("", "")
 	return id, err
 }
 
-func (m *lifecycleJobManager) reserveWithOperation(operationID string) (string, bool, error) {
+func (m *lifecycleJobManager) reserveWithOperation(operationID string, operationFingerprint string) (string, bool, error) {
 	if m == nil {
 		return "", false, errors.New("lifecycle job manager unavailable")
 	}
@@ -482,7 +515,10 @@ func (m *lifecycleJobManager) reserveWithOperation(operationID string) (string, 
 	m.pruneExpiredTerminalLocked(m.currentTimeLocked())
 	if operationID != "" {
 		if existingID, exists := m.operationJobs[operationID]; exists {
-			if _, exists := m.jobs[existingID]; exists {
+			if existing, exists := m.jobs[existingID]; exists {
+				if existing.operationFingerprint != operationFingerprint {
+					return "", false, errLifecycleOperationConflict
+				}
 				return existingID, true, nil
 			}
 			delete(m.operationJobs, operationID)
@@ -499,7 +535,7 @@ func (m *lifecycleJobManager) reserveWithOperation(operationID string) (string, 
 		if _, exists := m.jobs[id]; exists {
 			continue
 		}
-		m.jobs[id] = lifecycleJob{id: id, status: lifecycleJobPending, operationID: operationID}
+		m.jobs[id] = lifecycleJob{id: id, status: lifecycleJobPending, operationID: operationID, operationFingerprint: operationFingerprint}
 		if operationID != "" {
 			m.operationJobs[operationID] = id
 		}
@@ -736,6 +772,109 @@ func (c config) serverEnvFileForID(publicID string) string {
 	return filepath.Join(c.serversDir, internalServerKey(publicID)+".env")
 }
 
+// serverTarget is the single authoritative mapping between a public server id,
+// its compose project, and its env file. Docker-facing operations must validate
+// this mapping again immediately before invoking compose because a host file can
+// be changed after request admission.
+type serverTarget struct {
+	ID          string
+	InternalKey string
+	Project     string
+	EnvFile     string
+}
+
+func (c config) serverTargetForID(rawID string) (serverTarget, error) {
+	id, internalKey, err := normalizeCreateServerID(rawID)
+	if err != nil {
+		return serverTarget{}, err
+	}
+	return serverTarget{
+		ID:          id,
+		InternalKey: internalKey,
+		Project:     projectForServerID(id),
+		EnvFile:     filepath.Join(c.serversDir, internalKey+".env"),
+	}, nil
+}
+
+func (c config) serverTargetForProject(project string) (serverTarget, error) {
+	if !isCanonicalServerProject(project) {
+		return serverTarget{}, errors.New("잘못된 project — opensamguk-s<id> 형식만 허용")
+	}
+	target, err := c.serverTargetForID(strings.TrimPrefix(project, "opensamguk-s"))
+	if err != nil {
+		return serverTarget{}, err
+	}
+	if target.Project != project {
+		return serverTarget{}, errors.New("project와 public server id 매핑이 일치하지 않습니다.")
+	}
+	return target, nil
+}
+
+func (c config) serverEnvDisplayPath(target serverTarget) string {
+	return filepath.Join("servers", target.InternalKey+".env")
+}
+
+func (c config) validateServerTarget(target serverTarget) (map[string]string, error) {
+	return c.validateServerEnvFile(target, target.EnvFile)
+}
+
+func (c config) validateServerEnvFile(target serverTarget, envFile string) (map[string]string, error) {
+	lines, err := readEnvLines(envFile)
+	if err != nil {
+		return nil, err
+	}
+	serverIDCount := 0
+	declaredID := ""
+	for _, line := range lines {
+		if line.IsKV && line.Key == "SERVER_ID" {
+			serverIDCount++
+			declaredID = line.Value
+		}
+	}
+	if serverIDCount != 1 || declaredID != target.ID {
+		envLabel := c.serverEnvDisplayPath(target)
+		if filepath.Clean(envFile) != filepath.Clean(target.EnvFile) {
+			envLabel = "staged server env"
+		}
+		return nil, fmt.Errorf("SERVER_ID in %s must exactly match canonical public id %s", envLabel, target.ID)
+	}
+	return envValuesFromLines(lines), nil
+}
+
+func (c config) validateDockerServerTarget(project string, envFile string, allowStagedEnv bool) (serverTarget, error) {
+	target, err := c.serverTargetForProject(project)
+	if err != nil {
+		return serverTarget{}, err
+	}
+	if !allowStagedEnv && filepath.Clean(envFile) != filepath.Clean(target.EnvFile) {
+		return serverTarget{}, errors.New("server env file does not match canonical project mapping")
+	}
+	if _, err := c.validateServerEnvFile(target, envFile); err != nil {
+		return serverTarget{}, err
+	}
+	return target, nil
+}
+
+func (c config) validateRegisteredServerTargets() error {
+	registry, err := c.readRegistry()
+	if err != nil {
+		return err
+	}
+	for _, entry := range registry {
+		target, err := c.serverTargetForID(entry.ID)
+		if err != nil {
+			return err
+		}
+		if entry.DeployProject != target.Project {
+			return fmt.Errorf("registry project %q does not match server id %q", entry.DeployProject, target.ID)
+		}
+		if _, err := c.validateServerTarget(target); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // --- 응답 타입 ---
 
 type statusResponse struct {
@@ -781,6 +920,7 @@ type envPatchRequest struct {
 type createServerRequest struct {
 	ID                  string `json:"id"`
 	OperationID         string `json:"operationId"`
+	MaintenanceLease    string `json:"maintenanceLease,omitempty"`
 	Name                string `json:"name"`
 	Generation          string `json:"generation"`
 	ImageTag            string `json:"imageTag"`
@@ -824,14 +964,15 @@ type createServerResponse struct {
 }
 
 type registryEntry struct {
-	ID            string            `json:"id"`
-	Name          string            `json:"name"`
-	Generation    int               `json:"generation"`
-	ScenarioCode  string            `json:"scenarioCode,omitempty"`
-	GameAPIURL    string            `json:"gameApiUrl"`
-	GameEngineURL string            `json:"gameEngineUrl"`
-	DeployProject string            `json:"deployProject"`
-	Env           map[string]string `json:"env,omitempty"`
+	ID             string            `json:"id"`
+	Name           string            `json:"name"`
+	Generation     int               `json:"generation"`
+	ScenarioCode   string            `json:"scenarioCode,omitempty"`
+	GameAPIURL     string            `json:"gameApiUrl"`
+	GameEngineURL  string            `json:"gameEngineUrl"`
+	DeployProject  string            `json:"deployProject"`
+	Env            map[string]string `json:"env,omitempty"`
+	RepairRequired bool              `json:"repairRequired,omitempty"`
 }
 
 type envResponse struct {
@@ -907,7 +1048,7 @@ func main() {
 }
 
 func checkRegistryCommand(c config, output io.Writer) int {
-	if _, err := c.readRegistry(); err != nil {
+	if err := c.validateRegisteredServerTargets(); err != nil {
 		fmt.Fprintln(output, "registry validation failed")
 		return 1
 	}
@@ -920,7 +1061,7 @@ func (c config) handleReady(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "GET only"})
 		return
 	}
-	if _, err := c.readRegistry(); err != nil {
+	if err := c.validateRegisteredServerTargets(); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: fmt.Sprintf("레지스트리 준비 실패: %v", err)})
 		return
 	}
@@ -1054,7 +1195,7 @@ func (c config) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	project := r.URL.Query().Get("project")
-	if !isCanonicalServerProject(project) {
+	if _, err := c.serverTargetForProject(project); err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "잘못된 project — opensamguk-s<id> 형식만 허용"})
 		return
 	}
@@ -1093,12 +1234,17 @@ func (c config) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 주입 방지 — project/tag 둘 다 화이트리스트 통과해야 함.
-	if !isCanonicalServerProject(req.Project) {
+	target, err := c.serverTargetForProject(req.Project)
+	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "잘못된 project — opensamguk-s<id> 형식만 허용"})
 		return
 	}
 	if !tagRe.MatchString(req.Tag) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "잘못된 tag — [A-Za-z0-9._-]만 허용"})
+		return
+	}
+	if _, err := c.validateServerTarget(target); err != nil {
+		writeJSON(w, http.StatusConflict, errorResponse{Error: fmt.Sprintf("서버 env 식별자 검증 실패: %v", err)})
 		return
 	}
 	lease, err := c.beginMutation("")
@@ -1108,7 +1254,7 @@ func (c config) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 	defer lease.Done()
 
-	envFile := c.envFileFor(req.Project)
+	envFile := target.EnvFile
 	if _, err := os.Stat(envFile); err != nil {
 		writeJSON(w, http.StatusNotFound, errorResponse{Error: fmt.Sprintf("env 파일 없음: %s", envFile)})
 		return
@@ -1176,11 +1322,7 @@ func (c config) handleServerCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "POST only"})
 		return
 	}
-	maintenanceLease := r.Header.Get(maintenanceLeaseHeader)
-	if maintenanceLease != "" && !isLoopbackRequest(r) {
-		writeJSON(w, http.StatusForbidden, errorResponse{Error: "maintenance lease requires a loopback request"})
-		return
-	}
+	headerLease := r.Header.Get(maintenanceLeaseHeader)
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<16))
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "body 읽기 실패"})
@@ -1191,6 +1333,19 @@ func (c config) handleServerCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "JSON 파싱 실패"})
 		return
 	}
+	if headerLease != "" && req.MaintenanceLease != "" && headerLease != req.MaintenanceLease {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "maintenance lease 전달값이 일치하지 않습니다."})
+		return
+	}
+	maintenanceLease := req.MaintenanceLease
+	if headerLease != "" {
+		maintenanceLease = headerLease
+	}
+	if maintenanceLease != "" && !isLoopbackRequest(r) {
+		writeJSON(w, http.StatusForbidden, errorResponse{Error: "maintenance lease requires a loopback request"})
+		return
+	}
+	req.MaintenanceLease = ""
 	res, status := c.createServerWithMaintenanceLease(req, maintenanceLease)
 	writeCreateServerResponse(w, status, res)
 }
@@ -1263,15 +1418,19 @@ func (c config) handleSharedEnv(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c config) handleServerEnv(w http.ResponseWriter, r *http.Request) {
-	id, _, err := normalizeCreateServerID(r.URL.Query().Get("id"))
+	target, err := c.serverTargetForID(r.URL.Query().Get("id"))
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
 		return
 	}
+	if _, err := c.validateServerTarget(target); err != nil {
+		writeJSON(w, http.StatusConflict, errorResponse{Error: fmt.Sprintf("서버 env 식별자 검증 실패: %v", err)})
+		return
+	}
 	c.handleEnv(w, r, envRequestContext{
 		scope:            "server",
-		id:               id,
-		path:             c.serverEnvFileForID(id),
+		id:               target.ID,
+		path:             target.EnvFile,
 		allowlist:        serverEnvAllowlist,
 		affectedServices: statelessServices,
 	})
@@ -1391,7 +1550,16 @@ func (c config) handleEnv(w http.ResponseWriter, r *http.Request, ctx envRequest
 					return
 				}
 				affectedServices = appendUnique(affectedServices, sharedRegistryReloadServices)
-				c.startClaimedLifecycleJob(lease, jobID, "reload registry "+ctx.id, c.reloadSharedRegistry)
+				c.startClaimedLifecycleJob(lease, jobID, "reload registry "+ctx.id, func(jobContext context.Context) (string, error) {
+					target, err := c.serverTargetForID(ctx.id)
+					if err != nil {
+						return "", err
+					}
+					if _, err := c.validateServerTarget(target); err != nil {
+						return "", err
+					}
+					return c.reloadSharedRegistry(jobContext)
+				})
 				responseJobID = jobID
 				leaseTransferred = true
 			} else if jobID != "" {
@@ -1437,31 +1605,142 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 	return c.createServerWithMaintenanceLease(req, "")
 }
 
+type normalizedCreateServerRequest struct {
+	ID                  string
+	InternalKey         string
+	Name                string
+	Generation          int
+	ImageTag            string
+	GameAPIPort         string
+	WebGamePort         string
+	ScenarioCode        string
+	ScenarioSeedEnabled bool
+	JWTSecret           string
+}
+
+func (c config) normalizeCreateServerRequest(req createServerRequest) (normalizedCreateServerRequest, error) {
+	id, internalKey, err := normalizeCreateServerID(req.ID)
+	if err != nil {
+		return normalizedCreateServerRequest{}, err
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" || strings.ContainsAny(name, "\r\n") {
+		return normalizedCreateServerRequest{}, errors.New("서버 이름이 올바르지 않습니다.")
+	}
+	generation, err := parseGeneration(req.Generation, 1)
+	if err != nil {
+		return normalizedCreateServerRequest{}, err
+	}
+	imageTag := strings.TrimSpace(req.ImageTag)
+	if imageTag == "" {
+		imageTag = c.sharedEnvValue("IMAGE_TAG")
+	}
+	if imageTag == "" {
+		imageTag = "latest"
+	}
+	if !tagRe.MatchString(imageTag) {
+		return normalizedCreateServerRequest{}, errors.New("이미지 태그가 올바르지 않습니다.")
+	}
+	gameAPIPort := strings.TrimSpace(req.GameAPIPort)
+	webGamePort := strings.TrimSpace(req.WebGamePort)
+	if !isPort(gameAPIPort) || !isPort(webGamePort) {
+		return normalizedCreateServerRequest{}, errors.New("포트는 1-65535 숫자여야 합니다.")
+	}
+	if gameAPIPort == webGamePort {
+		return normalizedCreateServerRequest{}, errCreatePortsEqual
+	}
+	scenarioCode := strings.TrimSpace(req.ScenarioCode)
+	if scenarioCode == "" {
+		scenarioCode = "scenario_1010"
+	}
+	if !isSafeToken(scenarioCode) {
+		return normalizedCreateServerRequest{}, errors.New("시나리오 코드가 올바르지 않습니다.")
+	}
+	seedEnabled := true
+	if req.ScenarioSeedEnabled != nil {
+		seedEnabled = *req.ScenarioSeedEnabled
+	}
+	jwtSecret := strings.TrimSpace(req.JWTSecret)
+	if jwtSecret == "" {
+		jwtSecret = c.sharedEnvValue("JWT_SECRET")
+	}
+	if jwtSecret == "" || strings.ContainsAny(jwtSecret, "\r\n") {
+		return normalizedCreateServerRequest{}, errors.New("공유 JWT_SECRET이 필요합니다.")
+	}
+	return normalizedCreateServerRequest{
+		ID:                  id,
+		InternalKey:         internalKey,
+		Name:                name,
+		Generation:          generation,
+		ImageTag:            imageTag,
+		GameAPIPort:         gameAPIPort,
+		WebGamePort:         webGamePort,
+		ScenarioCode:        scenarioCode,
+		ScenarioSeedEnabled: seedEnabled,
+		JWTSecret:           jwtSecret,
+	}, nil
+}
+
+func createRequestFingerprint(req normalizedCreateServerRequest) string {
+	payload, _ := json.Marshal(struct {
+		ID                  string `json:"id"`
+		Name                string `json:"name"`
+		Generation          int    `json:"generation"`
+		ImageTag            string `json:"imageTag"`
+		GameAPIPort         string `json:"gameApiPort"`
+		WebGamePort         string `json:"webGamePort"`
+		ScenarioCode        string `json:"scenarioCode"`
+		ScenarioSeedEnabled bool   `json:"scenarioSeedEnabled"`
+		JWTSecret           string `json:"jwtSecret"`
+	}{
+		ID:                  req.ID,
+		Name:                req.Name,
+		Generation:          req.Generation,
+		ImageTag:            req.ImageTag,
+		GameAPIPort:         req.GameAPIPort,
+		WebGamePort:         req.WebGamePort,
+		ScenarioCode:        req.ScenarioCode,
+		ScenarioSeedEnabled: req.ScenarioSeedEnabled,
+		JWTSecret:           req.JWTSecret,
+	})
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
+}
+
 func (c config) createServerWithMaintenanceLease(req createServerRequest, maintenanceLease string) (createServerResponse, int) {
 	operationID, err := normalizeLifecycleOperationID(req.OperationID)
 	if err != nil {
 		return createServerResponse{OK: false, Detail: err.Error()}, http.StatusBadRequest
 	}
-	id, internalKey, err := normalizeCreateServerID(req.ID)
+	normalized, err := c.normalizeCreateServerRequest(req)
 	if err != nil {
-		return createServerResponse{OK: false, Detail: err.Error()}, http.StatusBadRequest
+		status := http.StatusBadRequest
+		if errors.Is(err, errCreatePortsEqual) {
+			status = http.StatusConflict
+		}
+		return createServerResponse{OK: false, Detail: err.Error()}, status
 	}
-	name := strings.TrimSpace(req.Name)
-	if name == "" || strings.ContainsAny(name, "\r\n") {
-		return createServerResponse{OK: false, ID: id, Detail: "서버 이름이 올바르지 않습니다."}, http.StatusBadRequest
-	}
-	generation, err := parseGeneration(req.Generation, 1)
-	if err != nil {
-		return createServerResponse{OK: false, ID: id, Detail: err.Error()}, http.StatusBadRequest
-	}
+	id := normalized.ID
+	internalKey := normalized.InternalKey
+	name := normalized.Name
+	generation := normalized.Generation
+	imageTag := normalized.ImageTag
+	gameAPIPort := normalized.GameAPIPort
+	webGamePort := normalized.WebGamePort
+	scenarioCode := normalized.ScenarioCode
+	seedEnabled := normalized.ScenarioSeedEnabled
+	jwtSecret := normalized.JWTSecret
 	jobID := ""
 	newReservation := false
 	reservationClaimed := false
 	admissionAttempted := false
 	if operationID != "" {
 		var existing bool
-		jobID, existing, err = c.lifecycleJobs.reserveWithOperation(operationID)
+		jobID, existing, err = c.lifecycleJobs.reserveWithOperation(operationID, createRequestFingerprint(normalized))
 		if err != nil {
+			if errors.Is(err, errLifecycleOperationConflict) {
+				return createServerResponse{OK: false, ID: id, Detail: "operationId는 다른 서버 생성 요청에 이미 사용되었습니다."}, http.StatusConflict
+			}
 			detail, status := lifecycleJobReservationFailure(err)
 			return createServerResponse{OK: false, ID: id, Detail: detail}, status
 		}
@@ -1487,49 +1766,19 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 			c.lifecycleJobs.discard(jobID)
 		}
 	}()
-	imageTag := strings.TrimSpace(req.ImageTag)
-	if imageTag == "" {
-		imageTag = c.sharedEnvValue("IMAGE_TAG")
-	}
-	if imageTag == "" {
-		imageTag = "latest"
-	}
-	if !tagRe.MatchString(imageTag) {
-		return createServerResponse{OK: false, ID: id, Detail: "이미지 태그가 올바르지 않습니다."}, http.StatusBadRequest
-	}
-	gameAPIPort := strings.TrimSpace(req.GameAPIPort)
-	webGamePort := strings.TrimSpace(req.WebGamePort)
-	if !isPort(gameAPIPort) || !isPort(webGamePort) {
-		return createServerResponse{OK: false, ID: id, Detail: "포트는 1-65535 숫자여야 합니다."}, http.StatusBadRequest
-	}
-	if gameAPIPort == webGamePort {
-		return createServerResponse{OK: false, ID: id, Detail: "game-api와 web-game 포트는 서로 달라야 합니다."}, http.StatusConflict
-	}
 	if err := c.ensurePortsAvailable(id, map[string]string{
 		"GAME_API_PORT": gameAPIPort,
 		"WEB_GAME_PORT": webGamePort,
 	}); err != nil {
 		return createServerResponse{OK: false, ID: id, Detail: err.Error()}, http.StatusConflict
 	}
-	scenarioCode := strings.TrimSpace(req.ScenarioCode)
-	if scenarioCode == "" {
-		scenarioCode = "scenario_1010"
+	target := serverTarget{
+		ID:          id,
+		InternalKey: internalKey,
+		Project:     projectForServerID(id),
+		EnvFile:     c.serverEnvFileForID(id),
 	}
-	if !isSafeToken(scenarioCode) {
-		return createServerResponse{OK: false, ID: id, Detail: "시나리오 코드가 올바르지 않습니다."}, http.StatusBadRequest
-	}
-	seedEnabled := true
-	if req.ScenarioSeedEnabled != nil {
-		seedEnabled = *req.ScenarioSeedEnabled
-	}
-	jwtSecret := strings.TrimSpace(req.JWTSecret)
-	if jwtSecret == "" {
-		jwtSecret = c.sharedEnvValue("JWT_SECRET")
-	}
-	if jwtSecret == "" || strings.ContainsAny(jwtSecret, "\r\n") {
-		return createServerResponse{OK: false, ID: id, Detail: "공유 JWT_SECRET이 필요합니다."}, http.StatusBadRequest
-	}
-	envFile := filepath.Join(c.serversDir, internalKey+".env")
+	envFile := target.EnvFile
 	if _, err := os.Stat(envFile); err == nil {
 		return createServerResponse{OK: false, ID: id, Detail: "이미 존재하는 서버입니다."}, http.StatusConflict
 	} else if !os.IsNotExist(err) {
@@ -1565,7 +1814,7 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 		ScenarioCode:  scenarioCode,
 		GameAPIURL:    c.gameAPIURLFor(id),
 		GameEngineURL: c.gameEngineURLFor(id),
-		DeployProject: projectForServerID(id),
+		DeployProject: target.Project,
 		Env:           registryEnvSnapshot(envValuesFromLines(envLines)),
 	}
 	admissionAttempted = true
@@ -1643,10 +1892,11 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 }
 
 func (c config) deleteServer(rawID string, confirm string) (createServerResponse, int) {
-	id, _, err := normalizeCreateServerID(rawID)
+	target, err := c.serverTargetForID(rawID)
 	if err != nil {
 		return createServerResponse{OK: false, Detail: err.Error()}, http.StatusBadRequest
 	}
+	id := target.ID
 	if confirm != "DELETE "+id {
 		return createServerResponse{OK: false, ID: id, Detail: "삭제 확인 문구가 일치하지 않습니다."}, http.StatusBadRequest
 	}
@@ -1657,7 +1907,13 @@ func (c config) deleteServer(rawID string, confirm string) (createServerResponse
 	if entry.ID == "" {
 		return createServerResponse{OK: false, ID: id, Detail: "알 수 없는 서버입니다."}, http.StatusNotFound
 	}
-	envFile := c.serverEnvFileForID(id)
+	if entry.DeployProject != target.Project {
+		return createServerResponse{OK: false, ID: id, Detail: "레지스트리 project와 서버 id가 일치하지 않습니다."}, http.StatusConflict
+	}
+	if _, err := c.validateServerTarget(target); err != nil {
+		return createServerResponse{OK: false, ID: id, Detail: fmt.Sprintf("서버 env 식별자 검증 실패: %v", err)}, http.StatusConflict
+	}
+	envFile := target.EnvFile
 	jobID, err := c.lifecycleJobs.reserve()
 	if err != nil {
 		detail, status := lifecycleJobReservationFailure(err)
@@ -1670,7 +1926,7 @@ func (c config) deleteServer(rawID string, confirm string) (createServerResponse
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: detail}, status
 	}
 	c.startClaimedLifecycleJob(lease, jobID, "delete "+id, func(ctx context.Context) (string, error) {
-		detail, downErr := c.downServerStack(ctx, entry.DeployProject, envFile)
+		detail, downErr := c.downServerStack(ctx, target.Project, envFile)
 		if downErr != nil {
 			return detail, downErr
 		}
@@ -1709,10 +1965,11 @@ func (c config) deleteServer(rawID string, confirm string) (createServerResponse
 }
 
 func (c config) resetServer(rawID string, req resetServerRequest) (createServerResponse, int) {
-	id, _, err := normalizeCreateServerID(rawID)
+	target, err := c.serverTargetForID(rawID)
 	if err != nil {
 		return createServerResponse{OK: false, Detail: err.Error()}, http.StatusBadRequest
 	}
+	id := target.ID
 	if req.Confirm != "RESET "+id {
 		return createServerResponse{OK: false, ID: id, Detail: "리셋 확인 문구가 일치하지 않습니다."}, http.StatusBadRequest
 	}
@@ -1741,7 +1998,13 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 	if entry.ID == "" {
 		return createServerResponse{OK: false, ID: id, Detail: "알 수 없는 서버입니다."}, http.StatusNotFound
 	}
-	envFile := c.serverEnvFileForID(id)
+	if entry.DeployProject != target.Project {
+		return createServerResponse{OK: false, ID: id, Detail: "레지스트리 project와 서버 id가 일치하지 않습니다."}, http.StatusConflict
+	}
+	if _, err := c.validateServerTarget(target); err != nil {
+		return createServerResponse{OK: false, ID: id, Detail: fmt.Sprintf("서버 env 식별자 검증 실패: %v", err)}, http.StatusConflict
+	}
+	envFile := target.EnvFile
 	if _, err := os.Stat(envFile); err != nil {
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: fmt.Sprintf("서버 env 확인 실패: %v", err)}, http.StatusInternalServerError
 	}
@@ -1765,9 +2028,19 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 	leaseTransferred = true
 	originalEntry := entry
 	c.startClaimedLifecycleJob(lease, jobID, "reset "+id, func(ctx context.Context) (string, error) {
-		restore := func() {
+		irreversible := false
+		restorePreDown := func() {
+			if irreversible {
+				return
+			}
 			_ = writeFileAtomic(envFile, originalEnv)
 			_ = c.upsertRegistryEntry(originalEntry)
+		}
+		failAfterIrreversible := func(detail string, cause error) (string, error) {
+			if markerErr := c.setRegistryRepairRequired(id, true); markerErr != nil {
+				return detail, fmt.Errorf("reset crossed irreversible volume-removal boundary and could not persist repair-required state: %v (original failure: %w)", markerErr, cause)
+			}
+			return detail, fmt.Errorf("reset crossed irreversible volume-removal boundary; new desired state was retained and marked repair-required: %w", cause)
 		}
 		if err := ctx.Err(); err != nil {
 			return "", err
@@ -1776,41 +2049,51 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 			return "", err
 		}
 		if _, err := c.syncRegistryEntryFromEnv(id, envFile); err != nil {
-			restore()
+			restorePreDown()
 			return "", err
 		}
 		updatedEntry, err := c.registryEntryByID(id)
 		if err != nil || updatedEntry.ID == "" {
-			restore()
+			restorePreDown()
 			if err != nil {
 				return "", err
 			}
 			return "", errors.New("updated server registry entry is unavailable")
 		}
 		if err := ctx.Err(); err != nil {
-			restore()
+			restorePreDown()
 			return "", err
 		}
+		irreversible = true
 		detail, downErr := c.downServerStack(ctx, updatedEntry.DeployProject, envFile)
 		if downErr != nil {
-			restore()
-			return detail, downErr
+			return failAfterIrreversible(detail, downErr)
+		}
+		if err := ctx.Err(); err != nil {
+			return failAfterIrreversible(detail, err)
 		}
 		upDetail, upErr := c.upServerStack(ctx, updatedEntry.DeployProject, envFile)
 		if upDetail != "" {
 			detail += "\n=== server up ===\n" + upDetail
 		}
+		if upErr != nil {
+			retryDetail, retryErr := c.upServerStack(ctx, updatedEntry.DeployProject, envFile)
+			if retryDetail != "" {
+				detail += "\n=== server forward recovery ===\n" + retryDetail
+			}
+			if retryErr != nil {
+				return failAfterIrreversible(detail, fmt.Errorf("server up failed: %v; forward recovery failed: %w", upErr, retryErr))
+			}
+		}
 		reloadDetail, reloadErr := c.reloadSharedRegistry(ctx)
 		if reloadDetail != "" {
 			detail += "\n=== shared reload ===\n" + reloadDetail
 		}
-		if upErr != nil {
-			restore()
-			return detail, upErr
-		}
 		if reloadErr != nil {
-			restore()
-			return detail, reloadErr
+			return failAfterIrreversible(detail, reloadErr)
+		}
+		if err := c.setRegistryRepairRequired(id, false); err != nil {
+			return detail, fmt.Errorf("reset completed but could not clear repair-required state: %w", err)
 		}
 		return detail, nil
 	})
@@ -1905,7 +2188,11 @@ func (c config) finishClaimedLifecycleJob(lease *operationLease, id string, name
 
 // 서버 env 파일에서 IMAGE_TAG= 값을 읽는다.
 func (c config) readImageTag(project string) (string, error) {
-	envFile := c.envFileFor(project)
+	target, err := c.validateDockerServerTarget(project, c.envFileFor(project), false)
+	if err != nil {
+		return "", err
+	}
+	envFile := target.EnvFile
 	data, err := os.ReadFile(envFile)
 	if err != nil {
 		return "", err
@@ -2257,6 +2544,24 @@ func (c config) upsertRegistryEntry(entry registryEntry) error {
 	return c.writeRegistry(registry)
 }
 
+func (c config) setRegistryRepairRequired(id string, repairRequired bool) error {
+	registry, err := c.readRegistry()
+	if err != nil {
+		return err
+	}
+	for index := range registry {
+		if registry[index].ID != id {
+			continue
+		}
+		if registry[index].RepairRequired == repairRequired {
+			return nil
+		}
+		registry[index].RepairRequired = repairRequired
+		return c.writeRegistry(registry)
+	}
+	return errors.New("updated server registry entry is unavailable")
+}
+
 func (c config) removeRegistryEntry(id string) (registryEntry, error) {
 	registry, err := c.readRegistry()
 	if err != nil {
@@ -2349,11 +2654,12 @@ func (c config) registryEntryFromServerEnv(id string, values map[string]string, 
 }
 
 func registryEnvSnapshot(values map[string]string) map[string]string {
+	return sanitizeRegistryEnv(values)
+}
+
+func sanitizeRegistryEnv(values map[string]string) map[string]string {
 	out := map[string]string{}
-	for key, spec := range serverEnvAllowlist {
-		if spec.WriteOnly {
-			continue
-		}
+	for key := range registryEnvAllowlist {
 		if value, ok := values[key]; ok {
 			out[key] = value
 		}
@@ -2480,7 +2786,16 @@ func (c config) readRegistry() ([]registryEntry, error) {
 			}
 		}
 	}
-	return canonicalRegistryEntries(registry)
+	canonical, err := canonicalRegistryEntries(registry)
+	if err != nil {
+		return nil, err
+	}
+	if !reflect.DeepEqual(registry, canonical) {
+		if err := c.writeCanonicalRegistry(canonical); err != nil {
+			return nil, err
+		}
+	}
+	return canonical, nil
 }
 
 func (c config) writeRegistry(registry []registryEntry) error {
@@ -2488,6 +2803,10 @@ func (c config) writeRegistry(registry []registryEntry) error {
 	if err != nil {
 		return err
 	}
+	return c.writeCanonicalRegistry(canonical)
+}
+
+func (c config) writeCanonicalRegistry(canonical []registryEntry) error {
 	data, err := json.Marshal(canonical)
 	if err != nil {
 		return err
@@ -2516,6 +2835,7 @@ func canonicalRegistryEntries(registry []registryEntry) ([]registryEntry, error)
 		seen[id] = entry.ID
 		entry.ID = id
 		entry.DeployProject = expectedProject
+		entry.Env = sanitizeRegistryEnv(entry.Env)
 		canonical = append(canonical, entry)
 	}
 	return canonical, nil
@@ -2580,6 +2900,9 @@ func (c config) sharedOccupiedPorts() map[string]string {
 }
 
 func (c config) upServerStack(ctx context.Context, project, envFile string) (string, error) {
+	if _, err := c.validateDockerServerTarget(project, envFile, false); err != nil {
+		return "", err
+	}
 	return c.runDockerContext(ctx,
 		"compose", "-p", project,
 		"--env-file", envFile,
@@ -2589,6 +2912,9 @@ func (c config) upServerStack(ctx context.Context, project, envFile string) (str
 }
 
 func (c config) downServerStack(ctx context.Context, project, envFile string) (string, error) {
+	if _, err := c.validateDockerServerTarget(project, envFile, false); err != nil {
+		return "", err
+	}
 	return c.runDockerContext(ctx,
 		"compose", "-p", project,
 		"--env-file", envFile,
@@ -2655,8 +2981,12 @@ func appendUnique(values []string, additions ...[]string) []string {
 
 // 서버 env 파일의 app 핀을 새 태그로 치환. game-engine은 실행 중 월드 보호를 위해 bounce하지 않는다.
 func (c config) writeImageTag(project, tag string) error {
-	envFile := c.envFileFor(project)
-	_, err := patchEnvFile(envFile, serverEnvAllowlist, map[string]string{
+	target, err := c.validateDockerServerTarget(project, c.envFileFor(project), false)
+	if err != nil {
+		return err
+	}
+	envFile := target.EnvFile
+	_, err = patchEnvFile(envFile, serverEnvAllowlist, map[string]string{
 		"IMAGE_TAG":    tag,
 		"WEB_GAME_TAG": tag,
 	})
@@ -2710,6 +3040,9 @@ func (c config) bounceStateless(ctx context.Context, project, envFile string) (s
 }
 
 func (c config) pullStateless(ctx context.Context, project, envFile string) (string, error) {
+	if _, err := c.validateDockerServerTarget(project, envFile, true); err != nil {
+		return "", err
+	}
 	var sb strings.Builder
 
 	// docker compose -p <project> --env-file <env> -f <server.yml> pull <svc...>
@@ -2731,6 +3064,9 @@ func (c config) pullStateless(ctx context.Context, project, envFile string) (str
 }
 
 func (c config) upStateless(ctx context.Context, project, envFile string) (string, error) {
+	if _, err := c.validateDockerServerTarget(project, envFile, false); err != nil {
+		return "", err
+	}
 	var sb strings.Builder
 
 	// docker compose -p <project> --env-file <env> -f <server.yml> up -d --force-recreate --no-deps <svc...>

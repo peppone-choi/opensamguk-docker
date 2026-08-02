@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -20,7 +21,7 @@ import (
 
 func TestServerEnvGetPatchHappyPath(t *testing.T) {
 	cfg := testConfig(t)
-	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "# server\nIMAGE_TAG=v1\nGAME_API_PORT=8101\nJWT_SECRET=old-secret\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "# server\nSERVER_ID=pep\nIMAGE_TAG=v1\nGAME_API_PORT=8101\nJWT_SECRET=old-secret\n")
 
 	res := envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodGet, "/env/server?id=PEP", "")
 	if res.Code != http.StatusOK {
@@ -47,7 +48,7 @@ func TestServerEnvGetPatchHappyPath(t *testing.T) {
 	}
 
 	data := readFile(t, filepath.Join(cfg.serversDir, "spep.env"))
-	if !strings.Contains(data, "# server\nIMAGE_TAG=v2\nGAME_API_PORT=8201\nJWT_SECRET=old-secret\nWEB_GAME_TAG=v3\n") {
+	if !strings.Contains(data, "# server\nSERVER_ID=pep\nIMAGE_TAG=v2\nGAME_API_PORT=8201\nJWT_SECRET=old-secret\nWEB_GAME_TAG=v3\n") {
 		t.Fatalf("env comments/order not preserved:\n%s", data)
 	}
 	mode := fileMode(t, filepath.Join(cfg.serversDir, "spep.env"))
@@ -135,7 +136,7 @@ func TestLifecycleJobStatusTracksReloadAndRedactsFailure(t *testing.T) {
 JWT_SECRET=shared-secret
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
-	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "IMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nIMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\n")
 	enteredReload := make(chan struct{})
 	releaseReload := make(chan struct{})
 	var enteredOnce sync.Once
@@ -174,7 +175,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 JWT_SECRET=shared-secret
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
-	writeEnv(t, filepath.Join(failing.serversDir, "spep.env"), "IMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\n")
+	writeEnv(t, filepath.Join(failing.serversDir, "spep.env"), "SERVER_ID=pep\nIMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\n")
 	failing.dockerRunner = func(args ...string) (string, error) {
 		return "sensitive docker output", errors.New("sensitive docker failure")
 	}
@@ -346,12 +347,72 @@ func TestCreateServerOperationIDRecoversAmbiguousPostWithoutSecondMutation(t *te
 	}
 }
 
+func TestCreateServerOperationIDBindsNormalizedPayloadBeforeRetryResolution(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+	dockerStarted := make(chan struct{})
+	releaseDocker := make(chan struct{})
+	var started sync.Once
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		started.Do(func() {
+			close(dockerStarted)
+			<-releaseDocker
+		})
+		return "ok\n", nil
+	}
+	defer close(releaseDocker)
+
+	operationID := "fedcba9876543210fedcba9876543210"
+	first := envRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create", `{"id":"PEP","name":" 첫 서버 ","generation":"01","imageTag":" v1 ","gameApiPort":"8101","webGamePort":"3101","scenarioCode":" scenario_1010 ","operationId":"`+operationID+`"}`)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first create = %d body=%s", first.Code, first.Body.String())
+	}
+	var firstBody createServerResponse
+	if err := json.NewDecoder(first.Body).Decode(&firstBody); err != nil {
+		t.Fatalf("decode first create: %v", err)
+	}
+	select {
+	case <-dockerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first create did not enter Docker")
+	}
+
+	retry := envRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create", `{"id":"pep","name":"첫 서버","generation":"1","imageTag":"v1","gameApiPort":"8101","webGamePort":"3101","scenarioCode":"scenario_1010","operationId":"`+operationID+`"}`)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("normalized retry = %d body=%s", retry.Code, retry.Body.String())
+	}
+	var retryBody createServerResponse
+	if err := json.NewDecoder(retry.Body).Decode(&retryBody); err != nil {
+		t.Fatalf("decode normalized retry: %v", err)
+	}
+	if retryBody.JobID != firstBody.JobID || retryBody.ID != "pep" {
+		t.Fatalf("normalized retry response = %#v first=%#v", retryBody, firstBody)
+	}
+
+	different := envRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create", `{"id":"foo","name":"다른 서버","gameApiPort":"8102","webGamePort":"3102","operationId":"`+operationID+`"}`)
+	if different.Code != http.StatusConflict {
+		t.Fatalf("different operation payload = %d body=%s", different.Code, different.Body.String())
+	}
+	var differentBody createServerResponse
+	if err := json.NewDecoder(different.Body).Decode(&differentBody); err != nil {
+		t.Fatalf("decode different payload response: %v", err)
+	}
+	if differentBody.OK || differentBody.JobID != "" {
+		t.Fatalf("different payload reused lifecycle response: %#v", differentBody)
+	}
+
+	invalid := envRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create", `{"id":"pep","name":"첫 서버","gameApiPort":"bad","webGamePort":"3101","operationId":"`+operationID+`"}`)
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid retry bypassed validation = %d body=%s", invalid.Code, invalid.Body.String())
+	}
+}
+
 func TestLifecycleCancelDrainsDockerWorkBeforeReleasingOperationLock(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `COOKIE_SECURE=false
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
-	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "IMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nIMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\n")
 
 	dockerStarted := make(chan struct{})
 	dockerCanceled := make(chan struct{})
@@ -574,6 +635,31 @@ func TestMaintenanceLeasePermitsOnlyOneLoopbackIdempotentCreate(t *testing.T) {
 	}
 }
 
+func TestMaintenanceLeaseAcceptedFromCreateBodyAndNeverReturned(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+	cfg.dockerRunner = func(args ...string) (string, error) { return "ok\n", nil }
+	maintenance := cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance))
+	enter := loopbackRequest(t, maintenance, http.MethodPost, "/maintenance/enter", "")
+	entered := decodeMaintenanceResponse(t, enter)
+	if enter.Code != http.StatusOK || !lifecycleJobIDRe.MatchString(entered.Lease) {
+		t.Fatalf("maintenance enter = %d body=%s", enter.Code, enter.Body.String())
+	}
+	body := `{"id":"pep","name":"첫 서버","gameApiPort":"8101","webGamePort":"3101","operationId":"0123456789abcdef0123456789abcdef","maintenanceLease":"` + entered.Lease + `"}`
+	request := httptest.NewRequest(http.MethodPost, "/servers/create", bytes.NewBufferString(body))
+	request.Header.Set("Authorization", "Bearer test-token")
+	request.Header.Set("Content-Type", "application/json")
+	request.RemoteAddr = "127.0.0.1:31000"
+	response := httptest.NewRecorder()
+	cfg.withAuth(cfg.handleServerCreate)(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("body lease create = %d body=%s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), entered.Lease) {
+		t.Fatalf("create response leaked maintenance lease: %s", response.Body.String())
+	}
+}
+
 func TestPersistedMaintenanceMarkerStartsClosedUntilLeave(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "COOKIE_SECURE=false\n")
@@ -652,7 +738,7 @@ func TestMaintenanceEnterCancelsActiveWorkAndRejectsNewMutationUntilRunnerReturn
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `COOKIE_SECURE=false
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
-	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "IMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nIMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\n")
 	enteredDocker := make(chan struct{})
 	cancelObserved := make(chan struct{})
 	releaseDocker := make(chan struct{})
@@ -938,7 +1024,7 @@ func TestServerEnvPatchCancelsLifecycleReservationWithoutReloadOrOnSetupFailure(
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep","env":{"IMAGE_TAG":"v1","SERVER_NAME":"통일 서버","SERVER_GENERATION":"1","GAME_API_URL":"http://spep-game-api:8081"}}]
 `)
-	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "IMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\nJWT_SECRET=old-secret\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nIMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\nJWT_SECRET=old-secret\n")
 	noReload := envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodPatch, "/env/server?id=pep", `{"values":{"JWT_SECRET":"new-secret"}}`)
 	if noReload.Code != http.StatusOK {
 		t.Fatalf("no-reload PATCH status = %d body=%s", noReload.Code, noReload.Body.String())
@@ -954,7 +1040,7 @@ func TestServerEnvPatchCancelsLifecycleReservationWithoutReloadOrOnSetupFailure(
 
 	setupFailure := testConfig(t)
 	failed := envRequest(t, setupFailure.withAuth(setupFailure.handleServerEnv), http.MethodPatch, "/env/server?id=pep", `{"values":{"IMAGE_TAG":"v2"}}`)
-	if failed.Code != http.StatusInternalServerError {
+	if failed.Code != http.StatusConflict {
 		t.Fatalf("setup-failure PATCH status = %d body=%s", failed.Code, failed.Body.String())
 	}
 	for i := 0; i < lifecycleJobMaxEntries; i++ {
@@ -968,6 +1054,7 @@ func TestReadyzRequiresCanonicalRegistry(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","deployProject":"opensamguk-spep"}]
 `)
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\n")
 
 	res := envRequest(t, cfg.handleReady, http.MethodGet, "/readyz", "")
 	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"status":"ready"`) {
@@ -989,6 +1076,7 @@ func TestCheckRegistryCommandValidAndLegacyRegistryExitBehavior(t *testing.T) {
 
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","deployProject":"opensamguk-spep"}]
 `)
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\n")
 	if code := checkRegistryCommand(cfg, &output); code != 0 {
 		t.Fatalf("valid registry exit code = %d, want 0", code)
 	}
@@ -1010,7 +1098,7 @@ func TestCheckRegistryCommandValidAndLegacyRegistryExitBehavior(t *testing.T) {
 func TestDeployPromotesApiAndWebGameTags(t *testing.T) {
 	cfg := testConfig(t)
 	envFile := filepath.Join(cfg.serversDir, "s1.env")
-	writeEnv(t, envFile, "# server\nIMAGE_TAG=v1\nWEB_GAME_TAG=v-old\nJWT_SECRET=old-secret\n")
+	writeEnv(t, envFile, "# server\nSERVER_ID=1\nIMAGE_TAG=v1\nWEB_GAME_TAG=v-old\nJWT_SECRET=old-secret\n")
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
 		calls.record(args...)
@@ -1050,7 +1138,7 @@ func TestDeployPromotesApiAndWebGameTags(t *testing.T) {
 func TestDeployDoesNotMutateEnvWhenPullFails(t *testing.T) {
 	cfg := testConfig(t)
 	envFile := filepath.Join(cfg.serversDir, "s1.env")
-	original := "# server\nIMAGE_TAG=v1\nWEB_GAME_TAG=v-old\nJWT_SECRET=old-secret\n"
+	original := "# server\nSERVER_ID=1\nIMAGE_TAG=v1\nWEB_GAME_TAG=v-old\nJWT_SECRET=old-secret\n"
 	writeEnv(t, envFile, original)
 	cfg.dockerRunner = func(args ...string) (string, error) {
 		return "web-game Error not found\n", errors.New("pull failed")
@@ -1098,7 +1186,7 @@ func TestServerEnvPatchSyncsRegistrySnapshotAndReloadsShared(t *testing.T) {
 JWT_SECRET=shared-secret
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
-	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "IMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\nJWT_SECRET=old-secret\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nIMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\nJWT_SECRET=old-secret\n")
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
 		calls.record(args...)
@@ -1183,7 +1271,7 @@ func TestSharedEnvRejectsUnknownKey(t *testing.T) {
 func TestServerEnvMasksWriteOnlySecrets(t *testing.T) {
 	cfg := testConfig(t)
 	envFile := filepath.Join(cfg.serversDir, "spep.env")
-	writeEnv(t, envFile, "IMAGE_TAG=v1\nJWT_SECRET=old-secret\n")
+	writeEnv(t, envFile, "SERVER_ID=pep\nIMAGE_TAG=v1\nJWT_SECRET=old-secret\n")
 
 	res := envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodGet, "/env/server?id=pep", "")
 	if res.Code != http.StatusOK {
@@ -1380,6 +1468,56 @@ func TestProjectBoundariesRejectOverlongCanonicalPublicID(t *testing.T) {
 	}
 }
 
+func TestServerTargetIdentityMismatchFailsBeforeReadinessAndDockerMutation(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","deployProject":"opensamguk-spep"}]
+`)
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=other\nIMAGE_TAG=v1\n")
+	calls := &dockerCallRecorder{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		calls.record(args...)
+		return "", nil
+	}
+
+	if response := envRequest(t, cfg.withAuth(cfg.handleDeploy), http.MethodPost, "/deploy", `{"project":"opensamguk-spep","tag":"v2"}`); response.Code != http.StatusConflict {
+		t.Fatalf("mismatched deploy = %d body=%s", response.Code, response.Body.String())
+	}
+	if response := envRequest(t, cfg.withAuth(cfg.handleServers), http.MethodDelete, "/servers?id=pep&confirm=DELETE%20pep", ""); response.Code != http.StatusConflict {
+		t.Fatalf("mismatched delete = %d body=%s", response.Code, response.Body.String())
+	}
+	if response := envRequest(t, cfg.withAuth(cfg.handleServerReset), http.MethodPost, "/servers/reset?id=pep", `{"confirm":"RESET pep"}`); response.Code != http.StatusConflict {
+		t.Fatalf("mismatched reset = %d body=%s", response.Code, response.Body.String())
+	}
+	if response := envRequest(t, cfg.handleReady, http.MethodGet, "/readyz", ""); response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("mismatched readiness = %d body=%s", response.Code, response.Body.String())
+	}
+	if _, err := cfg.upServerStack(context.Background(), "opensamguk-spep", filepath.Join(cfg.serversDir, "spep.env")); err == nil {
+		t.Fatal("mismatched target reached compose up")
+	}
+	if calls.count() != 0 {
+		t.Fatalf("mismatched target reached Docker: %#v", calls.snapshot())
+	}
+}
+
+func TestStagedDockerEnvMustMatchTargetIdentity(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nIMAGE_TAG=v1\n")
+	stagedEnv := filepath.Join(cfg.serversDir, ".deploy-mismatch.env")
+	writeEnv(t, stagedEnv, "SERVER_ID=other\nIMAGE_TAG=v2\n")
+	calls := &dockerCallRecorder{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		calls.record(args...)
+		return "", nil
+	}
+
+	if _, err := cfg.pullStateless(context.Background(), "opensamguk-spep", stagedEnv); err == nil {
+		t.Fatal("mismatched staged env reached compose pull")
+	}
+	if calls.count() != 0 {
+		t.Fatalf("mismatched staged env reached Docker: %#v", calls.snapshot())
+	}
+}
+
 func TestPublicServerIDRejectsNonAlphanumericValues(t *testing.T) {
 	for _, value := range []string{"", " pep", "pep ", "pep-1", "pep_1", "pep.1", "pep/1", "한글"} {
 		if _, _, err := normalizeCreateServerID(value); err == nil {
@@ -1463,6 +1601,39 @@ func TestNginxRouteReservationsAndApiProxyContract(t *testing.T) {
 			t.Fatalf("nginx cookie route reservations = %v, want %v", routes, gameRoutes)
 		}
 	}
+	cookieStart := strings.Index(nginx, `~^(?:`)
+	if cookieStart < 0 {
+		t.Fatal("nginx cookie reservation map is missing")
+	}
+	cookieEnd := strings.Index(nginx[cookieStart:], `)$ "";`)
+	if cookieEnd < 0 {
+		t.Fatal("nginx cookie reservation map is malformed")
+	}
+	cookieRoutes := strings.Split(nginx[cookieStart+len(`~^(?:`):cookieStart+cookieEnd], "|")
+	sort.Strings(cookieRoutes)
+	if strings.Join(cookieRoutes, ",") != strings.Join(pathRoutes, ",") {
+		t.Fatalf("nginx cookie reservation map = %v, want %v", cookieRoutes, pathRoutes)
+	}
+	for _, forbidden := range []string{"[a-z0-9]+", "location ~ ^/game/[a-z0-9]+"} {
+		if strings.Contains(nginx, forbidden) {
+			t.Fatalf("nginx permits unbounded public server ids with %q", forbidden)
+		}
+	}
+	for _, want := range []string{
+		`"~^/game/(?<path_public_server_id>[a-z0-9]{1,48})(?:/|$)"`,
+		`"~^(?<cookie_web_public_server_id>[a-z0-9]{1,48})$"`,
+		`location ~ "^/game/[a-z0-9]{1,48}(?:/|$)"`,
+	} {
+		if !strings.Contains(nginx, want) {
+			t.Fatalf("nginx bounded route is missing %q", want)
+		}
+	}
+	if got := strings.Count(nginx, `location ~ "^/game/[a-z0-9]{1,48}(?:/|$)"`); got != 2 {
+		t.Fatalf("nginx bounded route locations = %d, want HTTP and TLS", got)
+	}
+	if got := strings.Count(nginx, `location ~ "^/game/[a-z0-9]{1,48}/_next/static(?:/|$)"`); got != 2 {
+		t.Fatalf("nginx bounded static locations = %d, want HTTP and TLS", got)
+	}
 
 	for _, forbidden := range []string{"game_cookie_api_upstream", "location /api/admin/", "location = /api/game", "location ^~ /api/game/"} {
 		if strings.Contains(nginx, forbidden) {
@@ -1483,6 +1654,7 @@ func TestDeployOrchestrationValidatesCandidateBeforeControlPlaneMutation(t *test
 		"sudo docker run --rm --read-only --network none",
 		"-e COMPOSE_DIR=/workspace",
 		`-v "$STACK/.env:/workspace/.env:ro"`,
+		`-v "$STACK/servers:/workspace/servers:ro"`,
 		"opensamguk-deployer:local --check-registry",
 	} {
 		if !strings.Contains(workflow, want) {
@@ -1537,12 +1709,17 @@ func TestDeployOrchestrationProbesARunningRegisteredServer(t *testing.T) {
 func TestRecreateWorkflowRetriesIdempotentlyAndDrainsCancellationBeforeUnlock(t *testing.T) {
 	workflow := readFile(t, filepath.Join("..", ".github", "workflows", "recreate-server.yml"))
 	for _, want := range []string{
+		"timeout-minutes: 45",
+		"WORKFLOW_DEADLINE=$((SECONDS + 2400))",
+		"deadline_remaining",
+		"docker_exec_bounded",
 		"exec 9>/tmp/opensamguk-production.lock",
-		"flock -w 1800 9",
+		"flock -w 300 9",
 		"CLIENT_OPERATION_ID",
 		`"operationId": os.environ["CLIENT_OPERATION_ID"]`,
+		`"maintenanceLease": os.environ["MAINTENANCE_LEASE"]`,
+		"export MAINTENANCE_LEASE",
 		"maintenance_enter_fields",
-		"--header=\"X-Maintenance-Lease: $MAINTENANCE_LEASE\"",
 		"for create_attempt in 1 2 3",
 		"payload.get(\"jobId\")",
 		"http://localhost:9000/jobs/$1",
@@ -1552,6 +1729,10 @@ func TestRecreateWorkflowRetriesIdempotentlyAndDrainsCancellationBeforeUnlock(t 
 		"--header=\"Authorization: Bearer $DEPLOYER_TOKEN\"",
 		"for attempt in $(seq 1 12)",
 		"for poll_attempt in $(seq 1 240)",
+		"local drain_deadline=$((SECONDS + 60))",
+		"timeout -k 2 10 wget",
+		"-T 5",
+		"--max-time 10",
 		"pending|running|cancelled)",
 		"failed)",
 		"lifecycle job returned an HTTP error or was lost after deployer restart",
@@ -1574,7 +1755,7 @@ func TestRecreateWorkflowRetriesIdempotentlyAndDrainsCancellationBeforeUnlock(t 
 	operationID := strings.Index(workflow, "CLIENT_OPERATION_ID")
 	create := strings.Index(workflow, "http://localhost:9000/servers/create")
 	parse := strings.Index(workflow, "payload.get(\"jobId\")")
-	poll := strings.LastIndex(workflow, "$(lifecycle_status \"$JOB_ID\")")
+	poll := strings.LastIndex(workflow, "$(lifecycle_status \"$JOB_ID\" \"$WORKFLOW_DEADLINE\")")
 	succeeded := strings.Index(workflow, "succeeded)")
 	postconditions := strings.Index(workflow, "for i in $(seq 1 90); do")
 	leave := strings.LastIndex(workflow, "maintenance_post /maintenance/leave")
@@ -1607,6 +1788,50 @@ func TestRecreateWorkflowLostJobAbortsBoundedAndKeepsMarkerClosed(t *testing.T) 
 	}
 	if strings.Contains(run.dockerCalls, "leave") {
 		t.Fatalf("lost-job recreate workflow reopened maintenance: %s", run.dockerCalls)
+	}
+}
+
+func TestRecreateWorkflowAcceptAndStallPathsAreBoundedAndFailClosed(t *testing.T) {
+	run := runRecreateWorkflowWithCreateTimeout(t)
+	if run.err == nil {
+		t.Fatalf("stalled-create recreate workflow unexpectedly succeeded: %s", run.output)
+	}
+	if !strings.Contains(run.output, "server creation did not return a lifecycle job after 3 bounded attempts") {
+		t.Fatalf("stalled-create workflow did not report its bounded failure: %s", run.output)
+	}
+	if strings.Contains(run.dockerCalls, "leave") {
+		t.Fatalf("stalled-create workflow reopened maintenance: %s", run.dockerCalls)
+	}
+}
+
+func TestMaintenanceWorkflowsKeepCredentialsOutOfHostDockerArguments(t *testing.T) {
+	workflows := map[string]string{
+		"deploy":   readFile(t, filepath.Join("..", ".github", "workflows", "deploy-orchestration.yml")),
+		"recreate": readFile(t, filepath.Join("..", ".github", "workflows", "recreate-server.yml")),
+		"start":    readFile(t, filepath.Join("..", ".github", "workflows", "start-server.yml")),
+	}
+	for name, workflow := range workflows {
+		t.Run(name, func(t *testing.T) {
+			for _, forbidden := range []string{
+				`DEPLOYER_TOKEN="$(grep`,
+				"docker exec -e",
+				"-e DEPLOYER_TOKEN=",
+				"-e MAINTENANCE_LEASE=",
+			} {
+				if strings.Contains(workflow, forbidden) {
+					t.Fatalf("%s workflow exposes a credential in host Docker argv with %q", name, forbidden)
+				}
+			}
+		})
+	}
+	recreate := workflows["recreate"]
+	for _, want := range []string{`"maintenanceLease": os.environ["MAINTENANCE_LEASE"]`, `<<<"$BODY"`, "cat > /tmp/recreate-server.json"} {
+		if !strings.Contains(recreate, want) {
+			t.Fatalf("recreate workflow is missing stdin/body lease transport %q", want)
+		}
+	}
+	if strings.Contains(recreate, "X-Maintenance-Lease") {
+		t.Fatal("recreate workflow still carries the maintenance lease in an HTTP/Docker command argument")
 	}
 }
 
@@ -1802,6 +2027,42 @@ SERVER_REGISTRY_JSON=[{"id":"3","name":"테스트 서버","generation":4,"gameAp
 	}
 }
 
+func TestRegistryReadSanitizesLegacyEnvSecretsBeforePersistingOrResponding(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `COOKIE_SECURE=false
+SERVER_REGISTRY_JSON=[{"id":"pep","deployProject":"opensamguk-spep","env":{"IMAGE_TAG":"v1","RESET_SYNC":"1","JWT_SECRET":"jwt-should-never-return","ADMIN_PASSWORD":"password-should-never-return","API_TOKEN":"token-should-never-return","CUSTOM_VALUE":"custom-should-never-return"}}]
+`)
+
+	registry, err := cfg.readRegistry()
+	if err != nil {
+		t.Fatalf("read registry: %v", err)
+	}
+	if len(registry) != 1 || registry[0].Env["IMAGE_TAG"] != "v1" || registry[0].Env["RESET_SYNC"] != "1" {
+		t.Fatalf("sanitized registry = %#v", registry)
+	}
+	for _, key := range []string{"JWT_SECRET", "ADMIN_PASSWORD", "API_TOKEN", "CUSTOM_VALUE"} {
+		if _, found := registry[0].Env[key]; found {
+			t.Fatalf("registry retained secret or arbitrary env key %q: %#v", key, registry[0].Env)
+		}
+	}
+	persisted := readFile(t, filepath.Join(cfg.composeDir, ".env"))
+	for _, secret := range []string{"jwt-should-never-return", "password-should-never-return", "token-should-never-return", "custom-should-never-return"} {
+		if strings.Contains(persisted, secret) {
+			t.Fatalf("legacy registry secret remained persisted: %s", persisted)
+		}
+	}
+
+	response := envRequest(t, cfg.withAuth(cfg.handleServers), http.MethodGet, "/servers", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET servers = %d body=%s", response.Code, response.Body.String())
+	}
+	for _, secret := range []string{"jwt-should-never-return", "password-should-never-return", "token-should-never-return", "custom-should-never-return"} {
+		if strings.Contains(response.Body.String(), secret) {
+			t.Fatalf("GET servers leaked legacy registry secret: %s", response.Body.String())
+		}
+	}
+}
+
 func TestReadRegistryCanonicalizesPublicID(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"A1","name":"대소문자 서버","deployProject":"opensamguk-sA1"}]
@@ -1855,7 +2116,7 @@ func TestReadRegistryRejectsCanonicalIDCollision(t *testing.T) {
 func TestCreateServerRejectsPortCollisions(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
-	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "GAME_API_PORT=8101\nWEB_GAME_PORT=3101\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nGAME_API_PORT=8101\nWEB_GAME_PORT=3101\n")
 	cfg.dockerRunner = func(args ...string) (string, error) {
 		t.Fatalf("docker should not be called for a port collision: %#v", args)
 		return "", nil
@@ -1906,7 +2167,7 @@ func TestDeleteServerStopsStackRemovesEnvAndRegistry(t *testing.T) {
 JWT_SECRET=shared-secret
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"},{"id":"keep","name":"빼섭","gameApiUrl":"http://skeep-game-api:8081","gameEngineUrl":"http://skeep-game-engine:8082","deployProject":"opensamguk-skeep"}]
 `)
-	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "GAME_API_PORT=8101\nWEB_GAME_PORT=3101\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nGAME_API_PORT=8101\nWEB_GAME_PORT=3101\n")
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
 		calls.record(args...)
@@ -1955,7 +2216,7 @@ func TestDeleteServerKeepsRegistryWhenDownFails(t *testing.T) {
 JWT_SECRET=shared-secret
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
-	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "GAME_API_PORT=8101\nWEB_GAME_PORT=3101\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nGAME_API_PORT=8101\nWEB_GAME_PORT=3101\n")
 	cfg.dockerRunner = func(args ...string) (string, error) {
 		return "down failed\n", errors.New("compose down failed")
 	}
@@ -1980,7 +2241,7 @@ func TestResetServerRecreatesStackWithVolumes(t *testing.T) {
 JWT_SECRET=shared-secret
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
-	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n")
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
 		calls.record(args...)
@@ -2058,7 +2319,7 @@ func TestResetServerAllowsGenerationZeroForAlpha(t *testing.T) {
 JWT_SECRET=shared-secret
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
-	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n")
 	cfg.dockerRunner = func(args ...string) (string, error) {
 		return "ok\n", nil
 	}
@@ -2081,13 +2342,13 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	}
 }
 
-func TestResetServerStopsBeforeUpWhenDownFails(t *testing.T) {
+func TestResetServerRetainsDesiredStateAndMarksRepairRequiredWhenDownFails(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
 JWT_SECRET=shared-secret
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
-	original := "SCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n"
+	original := "SERVER_ID=pep\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n"
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), original)
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
@@ -2105,14 +2366,66 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	if res.Code != http.StatusOK {
 		t.Fatalf("RESET status = %d body=%s", res.Code, res.Body.String())
 	}
+	var resetBody createServerResponse
+	if err := json.NewDecoder(res.Body).Decode(&resetBody); err != nil {
+		t.Fatalf("decode reset response: %v", err)
+	}
+	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, resetBody.JobID, lifecycleJobFailed); completed.Status != lifecycleJobFailed {
+		t.Fatalf("failed reset lifecycle result = %#v", completed)
+	}
 	waitForCalls(t, calls.count, 1)
 	recorded := calls.snapshot()
 	if len(recorded) != 1 || !strings.Contains(recorded[0], "down --volumes --remove-orphans") {
 		t.Fatalf("reset should stop after failed down, calls=%#v", recorded)
 	}
-	waitForContent(t, filepath.Join(cfg.serversDir, "spep.env"), original)
-	if got := readFile(t, filepath.Join(cfg.serversDir, "spep.env")); got != original {
-		t.Fatalf("env was not restored after failed reset:\n%s", got)
+	if got := readFile(t, filepath.Join(cfg.serversDir, "spep.env")); !strings.Contains(got, "SCENARIO_CODE=scenario_1002\n") || !strings.Contains(got, "RESET_TURNTERM=30\n") || strings.Contains(got, "SCENARIO_CODE=scenario_1010\n") {
+		t.Fatalf("failed reset did not retain new desired env after irreversible down:\n%s", got)
+	}
+	if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); !strings.Contains(shared, `"scenarioCode":"scenario_1002"`) || !strings.Contains(shared, `"repairRequired":true`) {
+		t.Fatalf("failed reset did not retain and mark repair-required registry state:\n%s", shared)
+	}
+}
+
+func TestResetServerRetriesForwardRecoveryAfterFirstUpFailure(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
+JWT_SECRET=shared-secret
+SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
+`)
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSCENARIO_CODE=scenario_1010\n")
+	calls := &dockerCallRecorder{}
+	serverUpAttempts := 0
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		calls.record(args...)
+		call := strings.Join(args, " ")
+		if strings.Contains(call, "compose -p opensamguk-spep") && strings.Contains(call, " up -d") {
+			serverUpAttempts++
+			if serverUpAttempts == 1 {
+				return "first up failed\n", errors.New("compose up failed")
+			}
+		}
+		return "ok\n", nil
+	}
+
+	res := envRequest(t, cfg.withAuth(cfg.handleServerReset), http.MethodPost, "/servers/reset", `{"id":"pep","confirm":"RESET pep","scenarioCode":"scenario_1002"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("RESET status = %d body=%s", res.Code, res.Body.String())
+	}
+	var resetBody createServerResponse
+	if err := json.NewDecoder(res.Body).Decode(&resetBody); err != nil {
+		t.Fatalf("decode reset response: %v", err)
+	}
+	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, resetBody.JobID, lifecycleJobSucceeded); completed.Status != lifecycleJobSucceeded {
+		t.Fatalf("forward recovery completion = %#v", completed)
+	}
+	if serverUpAttempts != 2 {
+		t.Fatalf("server up attempts = %d, want 2; calls=%#v", serverUpAttempts, calls.snapshot())
+	}
+	if got := readFile(t, filepath.Join(cfg.serversDir, "spep.env")); !strings.Contains(got, "SCENARIO_CODE=scenario_1002\n") {
+		t.Fatalf("forward recovery did not retain new desired env:\n%s", got)
+	}
+	if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); strings.Contains(shared, `"repairRequired":true`) {
+		t.Fatalf("successful forward recovery retained repair-required marker:\n%s", shared)
 	}
 }
 
@@ -2122,7 +2435,7 @@ func TestConcurrentServerPatchThenResetFailurePreservesPatchSnapshot(t *testing.
 JWT_SECRET=shared-secret
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"before","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep","env":{"IMAGE_TAG":"v1","SERVER_NAME":"before","SERVER_GENERATION":"1","GAME_API_URL":"http://spep-game-api:8081"}}]
 `)
-	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "IMAGE_TAG=v1\nSERVER_NAME=before\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\nSCENARIO_CODE=scenario_1010\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nIMAGE_TAG=v1\nSERVER_NAME=before\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\nSCENARIO_CODE=scenario_1010\n")
 	patchReloadStarted := make(chan struct{})
 	releasePatchReload := make(chan struct{})
 	var patchReloadOnce sync.Once
@@ -2196,11 +2509,11 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"before","generation":1,"gameApiUrl":"h
 	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, resetBody.JobID, lifecycleJobFailed); completed.Status != lifecycleJobFailed {
 		t.Fatalf("reset completion = %#v", completed)
 	}
-	if got := readFile(t, filepath.Join(cfg.serversDir, "spep.env")); !strings.Contains(got, "SERVER_NAME=patched\n") || strings.Contains(got, "SCENARIO_CODE=scenario_1002\n") {
-		t.Fatalf("failed reset did not restore PATCH snapshot:\n%s", got)
+	if got := readFile(t, filepath.Join(cfg.serversDir, "spep.env")); !strings.Contains(got, "SERVER_NAME=patched\n") || !strings.Contains(got, "SCENARIO_CODE=scenario_1002\n") {
+		t.Fatalf("failed reset did not retain patched new desired env:\n%s", got)
 	}
-	if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); !strings.Contains(shared, `"name":"patched"`) || strings.Contains(shared, `"scenarioCode":"scenario_1002"`) {
-		t.Fatalf("failed reset did not restore patched registry snapshot:\n%s", shared)
+	if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); !strings.Contains(shared, `"name":"patched"`) || !strings.Contains(shared, `"scenarioCode":"scenario_1002"`) || !strings.Contains(shared, `"repairRequired":true`) {
+		t.Fatalf("failed reset did not retain and mark patched registry state:\n%s", shared)
 	}
 }
 
@@ -2482,6 +2795,14 @@ func runStartWorkflow(t *testing.T, serverID, imageTag, envFileName, envContent 
 }
 
 func runRecreateWorkflowWithLostJob(t *testing.T) startWorkflowRun {
+	return runRecreateWorkflowWithScenario(t, false)
+}
+
+func runRecreateWorkflowWithCreateTimeout(t *testing.T) startWorkflowRun {
+	return runRecreateWorkflowWithScenario(t, true)
+}
+
+func runRecreateWorkflowWithScenario(t *testing.T, stallCreate bool) startWorkflowRun {
 	t.Helper()
 	root := t.TempDir()
 	home := filepath.Join(root, "home")
@@ -2499,6 +2820,7 @@ func runRecreateWorkflowWithLostJob(t *testing.T) startWorkflowRun {
 	writeExecutable(t, filepath.Join(bin, "git"), "#!/usr/bin/env bash\nexit 0\n")
 	writeExecutable(t, filepath.Join(bin, "sudo"), "#!/usr/bin/env bash\nexec \"$@\"\n")
 	writeExecutable(t, filepath.Join(bin, "sleep"), "#!/usr/bin/env bash\nexit 0\n")
+	writeExecutable(t, filepath.Join(bin, "timeout"), "#!/usr/bin/env bash\nset -euo pipefail\nargs=\"$*\"\nif [[ \"${WORKFLOW_TIMEOUT_STALL_CREATE:-false}\" == true && \"$args\" == *\"/servers/create\"* ]]; then\n  exit 124\nfi\nif [[ \"${1:-}\" == \"--foreground\" ]]; then\n  shift\nfi\nshift\nexec \"$@\"\n")
 	writeExecutable(t, filepath.Join(bin, "python3"), "#!/usr/bin/env bash\nargs=\"$*\"\nif [[ \"$args\" == *\"state\\\"] + \\\":\\\"\"* ]]; then\n  printf 'drained:0123456789abcdef0123456789abcdef\\n'\nelif [[ \"$args\" == *\"payload.get(\\\"jobId\\\")\"* ]]; then\n  printf 'abcdef0123456789abcdef0123456789\\n'\nelif [[ \"$args\" == *\"import secrets\"* ]]; then\n  printf 'abcdef0123456789abcdef0123456789\\n'\nelif [[ \"$args\" == *\"json.dumps\"* ]]; then\n  printf '{}\\n'\nelse\n  printf 'drained\\n'\nfi\n")
 	dockerScript := `#!/usr/bin/env bash
 set -euo pipefail
@@ -2548,6 +2870,7 @@ fi
 		"GAME_API_PORT=8101",
 		"WEB_GAME_PORT=3101",
 		"WORKFLOW_DOCKER_LOG="+dockerLog,
+		"WORKFLOW_TIMEOUT_STALL_CREATE="+strconv.FormatBool(stallCreate),
 	)
 	output, err := cmd.CombinedOutput()
 	dockerCalls, readErr := os.ReadFile(dockerLog)
