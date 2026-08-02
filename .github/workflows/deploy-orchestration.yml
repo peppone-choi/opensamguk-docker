@@ -83,7 +83,7 @@ jobs:
           sudo docker exec opensamguk-deployer wget -qO- http://localhost:9000/readyz | grep -q '"status":"ready"'
           curl -fsS http://localhost/health | grep -q '"status":"up"'
 
-          SERVER_ID="$(python3 - "$STACK/.env" <<'PY'
+          SERVER_IDS="$(python3 - "$STACK/.env" <<'PY'
           import json
           import re
           import sys
@@ -101,15 +101,20 @@ jobs:
               server_id = entry.get("id") if isinstance(entry, dict) else None
               if isinstance(server_id, str) and server_id != "all" and re.fullmatch(r"[a-z0-9]+", server_id):
                   print(server_id)
-                  break
           PY
           )"
-          if [ -n "$SERVER_ID" ]; then
-            INTERNAL_ID="s${SERVER_ID}"
-            if sudo docker ps --format '{{.Names}}' | grep -Fxq "${INTERNAL_ID}-web-game"; then
-              curl -fsS "http://localhost/game/${SERVER_ID}" >/dev/null
-            else
-              echo "registered server ${SERVER_ID} is not running; game route check skipped"
+          if [ -n "$SERVER_IDS" ]; then
+            route_checked=false
+            for SERVER_ID in $SERVER_IDS; do
+              INTERNAL_ID="s${SERVER_ID}"
+              if sudo docker ps --format '{{.Names}}' | grep -Fxq "${INTERNAL_ID}-web-game"; then
+                curl -fsS "http://localhost/game/${SERVER_ID}" >/dev/null
+                route_checked=true
+                break
+              fi
+            done
+            if [ "$route_checked" != true ]; then
+              echo "no running registered server; game route check skipped"
             fi
           else
             echo "no valid registered server; game route check skipped"

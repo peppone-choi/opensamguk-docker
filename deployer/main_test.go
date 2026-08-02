@@ -433,6 +433,47 @@ func TestPublicServerIDContract(t *testing.T) {
 	}
 }
 
+func TestPublicServerIDLengthFitsDockerDNSLabelAndCanonicalizesMixedCase(t *testing.T) {
+	raw := strings.Repeat("aB", 25)
+	publicID, internalKey, err := normalizeCreateServerID(raw)
+	if err != nil {
+		t.Fatalf("normalize 50-character mixed-case id: %v", err)
+	}
+	if want := strings.ToLower(raw); publicID != want {
+		t.Fatalf("canonical public id = %q, want %q", publicID, want)
+	}
+	if internalKey != "s"+publicID {
+		t.Fatalf("internal key = %q, want s+public id", internalKey)
+	}
+	if got := len(internalKey + "-game-engine"); got != 63 {
+		t.Fatalf("game-engine Docker DNS label length = %d, want 63", got)
+	}
+	if _, _, err := normalizeCreateServerID(strings.Repeat("a", 51)); err == nil {
+		t.Fatal("normalize 51-character id unexpectedly succeeded")
+	}
+}
+
+func TestProjectBoundariesRejectOverlongCanonicalPublicID(t *testing.T) {
+	cfg := testConfig(t)
+	publicID := strings.Repeat("a", 51)
+	project := "opensamguk-s" + publicID
+
+	status := envRequest(t, cfg.withAuth(cfg.handleStatus), http.MethodGet, "/status?project="+project, "")
+	if status.Code != http.StatusBadRequest {
+		t.Fatalf("overlong status project = %d body=%s", status.Code, status.Body.String())
+	}
+
+	deploy := envRequest(t, cfg.withAuth(cfg.handleDeploy), http.MethodPost, "/deploy", `{"project":"`+project+`","tag":"v1"}`)
+	if deploy.Code != http.StatusBadRequest {
+		t.Fatalf("overlong deploy project = %d body=%s", deploy.Code, deploy.Body.String())
+	}
+
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"`+publicID+`","deployProject":"`+project+`"}]`+"\n")
+	if _, err := cfg.readRegistry(); err == nil {
+		t.Fatal("overlong registry public id unexpectedly succeeded")
+	}
+}
+
 func TestPublicServerIDRejectsNonAlphanumericValues(t *testing.T) {
 	for _, value := range []string{"", " pep", "pep ", "pep-1", "pep_1", "pep.1", "pep/1", "한글"} {
 		if _, _, err := normalizeCreateServerID(value); err == nil {
@@ -573,6 +614,30 @@ func TestDeployOrchestrationValidatesCandidateBeforeControlPlaneMutation(t *test
 		if !strings.Contains(postcondition, want) {
 			t.Fatalf("unlocked endpoint postcondition missing %q", want)
 		}
+	}
+}
+
+func TestDeployOrchestrationProbesARunningRegisteredServer(t *testing.T) {
+	workflow := readFile(t, filepath.Join("..", ".github", "workflows", "deploy-orchestration.yml"))
+	stepStart := strings.Index(workflow, "      - name: Verify orchestration endpoints\n")
+	if stepStart < 0 {
+		t.Fatal("endpoint verification step not found")
+	}
+	step := workflow[stepStart:]
+	if strings.Contains(step, "print(server_id)\n                  break") {
+		t.Fatal("route probe must not stop at the first registry entry before checking whether it is running")
+	}
+
+	candidates := strings.Index(step, `SERVER_IDS="$(python3 - "$STACK/.env" <<'PY'`)
+	loop := strings.Index(step, "for SERVER_ID in $SERVER_IDS; do")
+	running := strings.Index(step, `grep -Fxq "${INTERNAL_ID}-web-game"`)
+	checked := strings.Index(step, "route_checked=true")
+	skip := strings.Index(step, "no running registered server; game route check skipped")
+	if candidates < 0 || loop < 0 || running < 0 || checked < 0 || skip < 0 {
+		t.Fatalf("missing route-probe markers: candidates=%d loop=%d running=%d checked=%d skip=%d", candidates, loop, running, checked, skip)
+	}
+	if !(candidates < loop && loop < running && running < checked && checked < skip) {
+		t.Fatalf("unexpected route-probe order: candidates=%d loop=%d running=%d checked=%d skip=%d", candidates, loop, running, checked, skip)
 	}
 }
 

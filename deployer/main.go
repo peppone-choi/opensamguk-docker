@@ -33,6 +33,13 @@ import (
 	"time"
 )
 
+const (
+	maxDockerDNSLabelLength        = 63
+	internalServerKeyPrefix        = "s"
+	longestServerDockerLabelSuffix = "-game-engine"
+	maxPublicServerIDLength        = maxDockerDNSLabelLength - len(internalServerKeyPrefix) - len(longestServerDockerLabelSuffix)
+)
+
 // 입력 검증용 화이트리스트 정규식.
 var (
 	// 프로젝트명 — opensamguk-s<public id>만 허용. 내부 key의 s는 여기서만 보인다.
@@ -195,7 +202,7 @@ func envList(key string, def []string) []string {
 }
 
 func internalServerKey(publicID string) string {
-	return "s" + publicID
+	return internalServerKeyPrefix + publicID
 }
 
 func projectForServerID(publicID string) string {
@@ -207,7 +214,16 @@ func (c config) gameAPIURLFor(publicID string) string {
 }
 
 func (c config) gameEngineURLFor(publicID string) string {
-	return "http://" + internalServerKey(publicID) + "-game-engine:" + envOrValue(c.gameEngineInternalPort, "8082")
+	return "http://" + internalServerKey(publicID) + longestServerDockerLabelSuffix + ":" + envOrValue(c.gameEngineInternalPort, "8082")
+}
+
+func isCanonicalServerProject(project string) bool {
+	if !projectRe.MatchString(project) {
+		return false
+	}
+	publicID := strings.TrimPrefix(project, "opensamguk-s")
+	canonicalID, _, err := normalizeCreateServerID(publicID)
+	return err == nil && project == projectForServerID(canonicalID)
 }
 
 func (c config) defaultGatewayAPIURL() string {
@@ -432,7 +448,7 @@ func (c config) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	project := r.URL.Query().Get("project")
-	if !projectRe.MatchString(project) {
+	if !isCanonicalServerProject(project) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "잘못된 project — opensamguk-s<id> 형식만 허용"})
 		return
 	}
@@ -471,7 +487,7 @@ func (c config) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 주입 방지 — project/tag 둘 다 화이트리스트 통과해야 함.
-	if !projectRe.MatchString(req.Project) {
+	if !isCanonicalServerProject(req.Project) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "잘못된 project — opensamguk-s<id> 형식만 허용"})
 		return
 	}
@@ -1201,6 +1217,9 @@ func normalizeCreateServerID(raw string) (string, string, error) {
 		return "", "", fmt.Errorf("서버 id는 영문 대소문자와 숫자만 허용합니다.")
 	}
 	id := strings.ToLower(raw)
+	if len(id) > maxPublicServerIDLength {
+		return "", "", fmt.Errorf("서버 id는 최대 %d자여야 합니다.", maxPublicServerIDLength)
+	}
 	if _, reserved := reservedGameRouteIDs[id]; reserved {
 		return "", "", fmt.Errorf("서버 id %q는 게임 경로와 충돌해 사용할 수 없습니다.", id)
 	}
