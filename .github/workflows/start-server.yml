@@ -36,6 +36,65 @@ jobs:
           STACK="$HOME/opensamguk-docker"
           cd "$STACK"
 
+          validate_start_input() {
+            RAW_SERVER_ID="$SERVER_ID"
+            if [[ ! "$RAW_SERVER_ID" =~ ^[A-Za-z0-9]+$ ]]; then
+              echo "::error::invalid server_id; use non-empty ASCII alphanumeric public id"
+              exit 1
+            fi
+            PUBLIC_ID="$(printf '%s' "$RAW_SERVER_ID" | tr '[:upper:]' '[:lower:]')"
+            if (( ${#PUBLIC_ID} > 48 )); then
+              echo "::error::server_id must be at most 48 ASCII alphanumeric characters"
+              exit 1
+            fi
+            case "$PUBLIC_ID" in
+              all|admin1|admin2|admin5|admin7|admin8|auction|battle-center|betting|board|chief-center|city|coming-soon|diplomacy|generals|global-diplomacy|history|inherit|join|mailbox|main|map|my|my-boss|my-cities|my-generals|my-nation|nation|nation-betting|nation-finance|npc-control|rankings|register|select-pool|simulator|tournament|tournament-admin|troop|vote|world-log)
+                echo "::error::server_id ${PUBLIC_ID} is reserved for a game route or all-server operation"
+                exit 1
+                ;;
+            esac
+            INTERNAL_ID="s${PUBLIC_ID}"
+            ENV_FILE="servers/${INTERNAL_ID}.env"
+            PROJECT="opensamguk-${INTERNAL_ID}"
+            test -f "$ENV_FILE"
+            ENV_SERVER_ID="$(sudo awk -F= '$1 == "SERVER_ID" && NF == 2 { print $2 }' "$ENV_FILE")"
+            if [[ "$ENV_SERVER_ID" != "$PUBLIC_ID" ]]; then
+              echo "::error::SERVER_ID in $ENV_FILE must exactly match canonical public id $PUBLIC_ID"
+              exit 1
+            fi
+          }
+          validate_start_input
+
+          DEPLOYER_TOKEN="$(grep '^DEPLOYER_TOKEN=' .env | cut -d= -f2-)"
+          maintenance_response_state() {
+            printf '%s' "$1" | python3 -c 'import json, sys; payload = json.load(sys.stdin); valid = isinstance(payload, dict) and set(payload) == {"capability", "state"} and payload["capability"] == "maintenance-v1" and payload["state"] in {"open", "draining", "drained"}; valid or sys.exit(1); print(payload["state"])'
+          }
+          maintenance_get() {
+            sudo docker exec -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
+              wget -qO- -T 10 -t 1 --header="Authorization: Bearer $DEPLOYER_TOKEN" http://localhost:9000/maintenance
+            ' 2>/dev/null
+          }
+          maintenance_post() {
+            sudo docker exec -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
+              wget -qO- -T 10 -t 1 --header="Authorization: Bearer $DEPLOYER_TOKEN" --post-data="" "http://localhost:9000$1"
+            ' maintenance "$1" 2>/dev/null
+          }
+          DEPLOYER_FRESH=false
+          if sudo docker ps -a --format '{{.Names}}' | grep -Fxq opensamguk-deployer; then
+            if [ -z "$DEPLOYER_TOKEN" ] || ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_get)")"; then
+              echo "::error::running deployer lacks a valid maintenance-v1 capability; aborting before control-plane mutation"
+              exit 1
+            fi
+            if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_post /maintenance/enter)")" || [ "$MAINTENANCE_STATE" != drained ]; then
+              echo "::error::deployer maintenance drain did not reach drained; aborting before control-plane mutation"
+              exit 1
+            fi
+          else
+            mkdir -p "$STACK/servers"
+            : > "$STACK/servers/.deployer-maintenance"
+            DEPLOYER_FRESH=true
+          fi
+
           git fetch --prune origin main
           if ! git diff --quiet || ! git diff --cached --quiet; then
             echo "::error::opensamguk-docker has local tracked changes; refusing to overwrite prod orchestration files"
@@ -44,31 +103,26 @@ jobs:
           fi
           git merge --ff-only origin/main
 
-          RAW_SERVER_ID="$SERVER_ID"
-          if [[ ! "$RAW_SERVER_ID" =~ ^[A-Za-z0-9]+$ ]]; then
-            echo "::error::invalid server_id; use non-empty ASCII alphanumeric public id"
-            exit 1
-          fi
-          PUBLIC_ID="$(printf '%s' "$RAW_SERVER_ID" | tr '[:upper:]' '[:lower:]')"
-          if (( ${#PUBLIC_ID} > 48 )); then
-            echo "::error::server_id must be at most 48 ASCII alphanumeric characters"
-            exit 1
-          fi
-          case "$PUBLIC_ID" in
-            all|admin1|admin2|admin5|admin7|admin8|auction|battle-center|betting|board|chief-center|city|coming-soon|diplomacy|generals|global-diplomacy|history|inherit|join|mailbox|main|map|my|my-boss|my-cities|my-generals|my-nation|nation|nation-betting|nation-finance|npc-control|rankings|register|select-pool|simulator|tournament|tournament-admin|troop|vote|world-log)
-              echo "::error::server_id ${PUBLIC_ID} is reserved for a game route or all-server operation"
+          if [ "$DEPLOYER_FRESH" = true ]; then
+            sudo docker compose -p opensamguk-shared \
+              -f docker-compose.shared.yml \
+              --env-file .env \
+              up -d --no-deps deployer
+            deployer_closed=false
+            for _ in $(seq 1 30); do
+              if MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_get)")" && [ "$MAINTENANCE_STATE" = drained ]; then
+                deployer_closed=true
+                break
+              fi
+              sleep 2
+            done
+            if [ "$deployer_closed" != true ]; then
+              echo "::error::fresh deployer did not boot closed with maintenance-v1"
               exit 1
-              ;;
-          esac
-          INTERNAL_ID="s${PUBLIC_ID}"
-          ENV_FILE="servers/${INTERNAL_ID}.env"
-          PROJECT="opensamguk-${INTERNAL_ID}"
-          test -f "$ENV_FILE"
-          ENV_SERVER_ID="$(sudo awk -F= '$1 == "SERVER_ID" && NF == 2 { print $2 }' "$ENV_FILE")"
-          if [[ "$ENV_SERVER_ID" != "$PUBLIC_ID" ]]; then
-            echo "::error::SERVER_ID in $ENV_FILE must exactly match canonical public id $PUBLIC_ID"
-            exit 1
+            fi
           fi
+
+          validate_start_input
 
           if [ -n "$IMAGE_TAG" ]; then
             if [[ ! "$IMAGE_TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -93,18 +147,27 @@ jobs:
             --env-file .env \
             up -d --force-recreate --no-deps nginx
 
+          server_ready=false
           for i in $(seq 1 90); do
             if sudo docker ps --format '{{.Names}}' | grep -q "^${INTERNAL_ID}-game-api$" &&
                sudo docker ps --format '{{.Names}}' | grep -q "^${INTERNAL_ID}-game-engine$" &&
                sudo docker ps --format '{{.Names}}' | grep -q "^${INTERNAL_ID}-web-game$" &&
                curl -fsS http://localhost/health | grep -q '"status":"up"' &&
                curl -fsS "http://localhost/game/${PUBLIC_ID}" >/dev/null; then
-              echo "server ${PUBLIC_ID} is ready"
-              exit 0
+              server_ready=true
+              break
             fi
             sleep 5
           done
 
-          echo "::error::server ${PUBLIC_ID} did not become ready"
-          sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
-          exit 1
+          if [ "$server_ready" != true ]; then
+            echo "::error::server ${PUBLIC_ID} did not become ready"
+            sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+            exit 1
+          fi
+
+          if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_post /maintenance/leave)")" || [ "$MAINTENANCE_STATE" != open ]; then
+            echo "::error::deployer maintenance barrier did not reopen after successful server start"
+            exit 1
+          fi
+          echo "server ${PUBLIC_ID} is ready"

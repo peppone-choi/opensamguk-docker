@@ -149,6 +149,42 @@ docker compose -p opensamguk-salpha -f docker-compose.server.yml --env-file serv
 nginx `/health`를 항상 확인하고,
 레지스트리에 있는 실행 중 public 서버가 있을 때만 `/game/<public-id>`를 확인한다.
 
+### control-plane maintenance barrier
+
+호스트 workflow끼리는 `/tmp/opensamguk-production.lock`으로 직렬화하지만, 직접 deployer API 호출까지 이 lock을
+공유하지는 않는다. 그래서 deployer는 `servers/.deployer-maintenance`라는 영속 marker를 별도로 사용한다. marker가
+있으면 새 deployer 프로세스도 closed 상태로 부팅하며, 새 mutation은 `503`과 `Retry-After`를 받고, 진행 중인
+mutation은 취소된 context가 Docker runner에서 실제 반환할 때까지 drain한다.
+
+workflow는 deployer 컨테이너의 loopback에서만 다음 Bearer API를 호출한다. gateway/API caller는 같은 토큰을
+알아도 maintenance barrier를 열거나 닫을 수 없다.
+
+```text
+GET  /maintenance        -> {"capability":"maintenance-v1","state":"open|draining|drained"}
+POST /maintenance/enter  -> drained 후에만 반환
+POST /maintenance/leave  -> 성공한 workflow가 마지막에만 open
+```
+
+**처음 설치되어 deployer 컨테이너가 전혀 없는 경우**에는 workflow가 marker를 먼저 만들고 deployer를 closed로
+기동한 뒤 확인한다. Deploy Orchestration과 Start Existing Game Server는 성공 검증 뒤에만 leave 한다. Recreate Game
+Server는 git sync를 drain 아래에서 끝낸 뒤 create API와 self-deadlock하지 않도록 leave한 후 lifecycle job을 호출한다.
+실패한 workflow는 marker를 남겨 fail-closed 상태를 유지한다.
+
+#### 구버전 deployer의 1회 bridge
+
+기존 deployer에 `/maintenance`가 없거나 404/잘못된 JSON을 반환하면 workflow는 **git merge, build, force-recreate
+전에 중단**한다. unknown in-memory job을 자동으로 drain했다고 간주하거나 marker만 만들어 구버전을 조용히
+업그레이드하면 안 된다. 다음 증거가 있을 때만 계획된 control-plane downtime으로 1회 bridge를 수행한다.
+
+1. gateway가 deployer mutation을 호출하지 못하게 차단한다.
+2. host-lock workflow가 실행 중이 아님을 확인한다.
+3. 알고 있는 lifecycle job ID를 모두 cancel하고 terminal 상태까지 확인한다.
+4. unknown accepted request가 없다는 운영 증거를 확보한 뒤에만 `servers/.deployer-maintenance`를 만들고 deployer-only bridge 교체를 수행한다.
+5. 새 deployer의 loopback `/maintenance`가 `maintenance-v1` + `drained`임을 확인한 뒤 정상 Deploy Orchestration을 다시 실행한다.
+
+unknown job이 없다는 증거를 만들 수 없으면 bridge하지 말고 control-plane downtime을 유지한다. 이 절차는 persistent
+job queue로의 자동 migration이 아니며, 기존 job 상태를 추측하거나 replay하지 않는다.
+
 GCP의 shared/per-server orchestration 배포는 GitHub Actions **Deploy Orchestration to GCP**만 지원한다.
 `scripts/deploy.sh`는 과거 root single-stack 경로를 실행하지 않고 즉시 실패하므로 운영 배포에 사용하지 않는다.
 

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -167,6 +168,8 @@ type config struct {
 	gameEngineInternalPort string
 	gatewayAPIURL          string
 	lifecycleJobs          *lifecycleJobManager
+	maintenanceFile        string
+	operations             *operationCoordinator
 }
 
 type lifecycleJobStatus string
@@ -195,12 +198,220 @@ type lifecycleJobResponse struct {
 
 type lifecycleJobManager struct {
 	mu                sync.Mutex
-	operationMu       sync.Mutex
 	jobs              map[string]lifecycleJob
 	operationJobs     map[string]string
 	maxEntries        int
 	terminalRetention time.Duration
 	now               func() time.Time
+}
+
+var (
+	errMaintenanceClosed      = errors.New("maintenance barrier is closed")
+	errLifecycleJobNotPending = errors.New("lifecycle job is no longer pending")
+)
+
+// operationCoordinator serializes every durable control-plane mutation. Unlike
+// a host flock, it is also visible to direct API callers through its persisted
+// maintenance marker, so a workflow can drain the running deployer before
+// replacing containers or shared files.
+type operationCoordinator struct {
+	mu         sync.Mutex
+	cond       *sync.Cond
+	closed     bool
+	active     *operationLease
+	markerPath string
+	jobs       *lifecycleJobManager
+}
+
+type operationLease struct {
+	coordinator *operationCoordinator
+	jobID       string
+	ctx         context.Context
+	cancel      context.CancelFunc
+	done        sync.Once
+}
+
+func newOperationCoordinator(markerPath string, jobs *lifecycleJobManager) *operationCoordinator {
+	coordinator := &operationCoordinator{
+		markerPath: markerPath,
+		jobs:       jobs,
+	}
+	coordinator.cond = sync.NewCond(&coordinator.mu)
+	if markerPath != "" {
+		if _, err := os.Stat(markerPath); err == nil || !os.IsNotExist(err) {
+			// An unreadable marker is treated as present. Starting fail-closed is
+			// safer than admitting mutations while its persisted state is unknown.
+			coordinator.closed = true
+		}
+	}
+	return coordinator
+}
+
+func (c *operationCoordinator) begin(jobID string) (*operationLease, error) {
+	if c == nil {
+		return nil, errors.New("operation coordinator unavailable")
+	}
+	c.mu.Lock()
+	for c.active != nil && !c.closed {
+		c.cond.Wait()
+	}
+	if c.closed {
+		c.mu.Unlock()
+		if jobID != "" && c.jobs != nil {
+			c.jobs.requestCancel(jobID)
+		}
+		return nil, errMaintenanceClosed
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if jobID != "" {
+		if c.jobs == nil || !c.jobs.claim(jobID, cancel) {
+			c.mu.Unlock()
+			cancel()
+			return nil, errLifecycleJobNotPending
+		}
+	}
+	lease := &operationLease{
+		coordinator: c,
+		jobID:       jobID,
+		ctx:         ctx,
+		cancel:      cancel,
+	}
+	c.active = lease
+	c.mu.Unlock()
+	return lease, nil
+}
+
+func (c *operationCoordinator) claimLifecycleJob(lease *operationLease, jobID string) error {
+	if c == nil || lease == nil || jobID == "" {
+		return errors.New("lifecycle job claim is unavailable")
+	}
+	c.mu.Lock()
+	if c.active != lease {
+		c.mu.Unlock()
+		return errors.New("operation lease is no longer active")
+	}
+	if c.closed || lease.Context().Err() != nil {
+		c.mu.Unlock()
+		if c.jobs != nil {
+			c.jobs.requestCancel(jobID)
+		}
+		return errMaintenanceClosed
+	}
+	if c.jobs == nil || !c.jobs.claim(jobID, lease.cancel) {
+		c.mu.Unlock()
+		return errLifecycleJobNotPending
+	}
+	lease.jobID = jobID
+	c.mu.Unlock()
+	return nil
+}
+
+func (l *operationLease) Context() context.Context {
+	if l == nil || l.ctx == nil {
+		return context.Background()
+	}
+	return l.ctx
+}
+
+func (l *operationLease) Done() {
+	if l == nil || l.coordinator == nil {
+		return
+	}
+	l.done.Do(func() {
+		l.cancel()
+		coordinator := l.coordinator
+		coordinator.mu.Lock()
+		if coordinator.active == l {
+			coordinator.active = nil
+			coordinator.cond.Broadcast()
+		}
+		coordinator.mu.Unlock()
+	})
+}
+
+func (c *operationCoordinator) maintenanceState() maintenanceState {
+	if c == nil {
+		return maintenanceStateDrained
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.maintenanceStateLocked()
+}
+
+func (c *operationCoordinator) maintenanceStateLocked() maintenanceState {
+	if !c.closed {
+		return maintenanceStateOpen
+	}
+	if c.active != nil {
+		return maintenanceStateDraining
+	}
+	return maintenanceStateDrained
+}
+
+func (c *operationCoordinator) enterMaintenance() (maintenanceState, error) {
+	if c == nil {
+		return maintenanceStateDrained, errors.New("operation coordinator unavailable")
+	}
+	c.mu.Lock()
+	if !c.closed {
+		if err := writeMaintenanceMarkerAtomic(c.markerPath); err != nil {
+			c.mu.Unlock()
+			return maintenanceStateOpen, err
+		}
+		c.closed = true
+	}
+	active := c.active
+	if active != nil {
+		active.cancel()
+	}
+	c.cond.Broadcast()
+	c.mu.Unlock()
+
+	if active != nil && active.jobID != "" && c.jobs != nil {
+		c.jobs.requestCancel(active.jobID)
+	}
+
+	c.mu.Lock()
+	for c.active != nil {
+		c.cond.Wait()
+	}
+	state := c.maintenanceStateLocked()
+	c.mu.Unlock()
+	return state, nil
+}
+
+func (c *operationCoordinator) leaveMaintenance() (maintenanceState, error) {
+	if c == nil {
+		return maintenanceStateDrained, errors.New("operation coordinator unavailable")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.closed {
+		return maintenanceStateOpen, nil
+	}
+	if c.active != nil {
+		return maintenanceStateDraining, errors.New("maintenance operation is not drained")
+	}
+	if c.markerPath == "" {
+		return maintenanceStateDrained, errors.New("maintenance marker path is unavailable")
+	}
+	if err := os.Remove(c.markerPath); err != nil && !os.IsNotExist(err) {
+		return maintenanceStateDrained, err
+	}
+	c.closed = false
+	c.cond.Broadcast()
+	return maintenanceStateOpen, nil
+}
+
+func writeMaintenanceMarkerAtomic(path string) error {
+	if path == "" {
+		return errors.New("maintenance marker path is unavailable")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return writeFileAtomic(path, []byte("{\"capability\":\"maintenance-v1\"}\n"))
 }
 
 func newLifecycleJobManager() *lifecycleJobManager {
@@ -259,36 +470,18 @@ func (m *lifecycleJobManager) reserveWithOperation(operationID string) (string, 
 	return "", false, errors.New("lifecycle job id collision")
 }
 
-func (m *lifecycleJobManager) cancel(id string) {
+func (m *lifecycleJobManager) discard(id string) {
 	if m == nil {
 		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if job, exists := m.jobs[id]; exists && job.status == lifecycleJobPending {
+	if job, exists := m.jobs[id]; exists && (job.status == lifecycleJobPending || isTerminalLifecycleJob(job.status)) {
 		delete(m.jobs, id)
 		if job.operationID != "" && m.operationJobs[job.operationID] == id {
 			delete(m.operationJobs, job.operationID)
 		}
 	}
-}
-
-func (m *lifecycleJobManager) isPending(id string) bool {
-	if m == nil {
-		return false
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	job, exists := m.jobs[id]
-	return exists && job.status == lifecycleJobPending
-}
-
-func (m *lifecycleJobManager) lockOperation() (func(), error) {
-	if m == nil {
-		return nil, errors.New("lifecycle job manager unavailable")
-	}
-	m.operationMu.Lock()
-	return m.operationMu.Unlock, nil
 }
 
 func (m *lifecycleJobManager) requestCancel(id string) (lifecycleJobResponse, bool) {
@@ -320,35 +513,38 @@ func (m *lifecycleJobManager) requestCancel(id string) (lifecycleJobResponse, bo
 	return response, true
 }
 
-func (m *lifecycleJobManager) start(id string, work func(context.Context) (string, error)) bool {
+func (m *lifecycleJobManager) claim(id string, cancel context.CancelFunc) bool {
 	if m == nil {
 		return false
 	}
-	ctx, cancel := context.WithCancel(context.Background())
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	job, exists := m.jobs[id]
 	if !exists || job.status != lifecycleJobPending {
-		m.mu.Unlock()
-		cancel()
 		return false
 	}
 	job.status = lifecycleJobRunning
 	job.cancel = cancel
 	m.jobs[id] = job
-	m.mu.Unlock()
+	return true
+}
 
+func (m *lifecycleJobManager) start(id string, work func(context.Context) (string, error)) bool {
+	ctx, cancel := context.WithCancel(context.Background())
+	if !m.claim(id, cancel) {
+		cancel()
+		return false
+	}
 	go func() {
 		defer cancel()
 		_, err := work(ctx)
+		status := lifecycleJobSucceeded
 		if errors.Is(ctx.Err(), context.Canceled) {
-			m.finish(id, lifecycleJobCancelled)
-			return
+			status = lifecycleJobCancelled
+		} else if err != nil {
+			status = lifecycleJobFailed
 		}
-		if err != nil {
-			m.finish(id, lifecycleJobFailed)
-			return
-		}
-		m.finish(id, lifecycleJobSucceeded)
+		m.finish(id, status)
 	}()
 	return true
 }
@@ -412,6 +608,7 @@ func isTerminalLifecycleJob(status lifecycleJobStatus) bool {
 }
 
 func loadConfig() config {
+	jobs := newLifecycleJobManager()
 	c := config{
 		token:                  os.Getenv("DEPLOYER_TOKEN"),
 		composeDir:             envOr("COMPOSE_DIR", "/workspace"),
@@ -424,8 +621,10 @@ func loadConfig() config {
 		gameAPIInternalPort:    envOr("DEPLOYER_GAME_API_INTERNAL_PORT", "8081"),
 		gameEngineInternalPort: envOr("DEPLOYER_GAME_ENGINE_INTERNAL_PORT", "8082"),
 		gatewayAPIURL:          envOr("DEPLOYER_GATEWAY_API_URL", "http://gateway-api:8080"),
-		lifecycleJobs:          newLifecycleJobManager(),
+		lifecycleJobs:          jobs,
+		maintenanceFile:        envOr("DEPLOYER_MAINTENANCE_FILE", "/workspace/servers/.deployer-maintenance"),
 	}
+	c.operations = newOperationCoordinator(c.maintenanceFile, jobs)
 	return c
 }
 
@@ -521,6 +720,19 @@ type deployResponse struct {
 
 type errorResponse struct {
 	Error string `json:"error"`
+}
+
+type maintenanceState string
+
+const (
+	maintenanceStateOpen     maintenanceState = "open"
+	maintenanceStateDraining maintenanceState = "draining"
+	maintenanceStateDrained  maintenanceState = "drained"
+)
+
+type maintenanceResponse struct {
+	Capability string           `json:"capability"`
+	State      maintenanceState `json:"state"`
 }
 
 type envPatchRequest struct {
@@ -641,6 +853,8 @@ func main() {
 	mux.HandleFunc("/env/server", cfg.withAuth(cfg.handleServerEnv))
 	mux.HandleFunc("/jobs", cfg.withAuth(cfg.handleLifecycleJob))
 	mux.HandleFunc("/jobs/", cfg.withAuth(cfg.handleLifecycleJob))
+	mux.HandleFunc("/maintenance", cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance)))
+	mux.HandleFunc("/maintenance/", cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance)))
 
 	srv := &http.Server{
 		Addr:              ":9000",
@@ -729,6 +943,51 @@ func (c config) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func (c config) withLoopback(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			writeJSON(w, http.StatusForbidden, errorResponse{Error: "loopback 요청만 허용"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (c config) handleMaintenance(w http.ResponseWriter, r *http.Request) {
+	respond := func(state maintenanceState) {
+		writeJSON(w, http.StatusOK, maintenanceResponse{Capability: "maintenance-v1", State: state})
+	}
+	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/maintenance":
+		if c.operations == nil {
+			writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "maintenance coordinator unavailable"})
+			return
+		}
+		respond(c.operations.maintenanceState())
+	case r.Method == http.MethodPost && r.URL.Path == "/maintenance/enter":
+		state, err := c.operations.enterMaintenance()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "maintenance enter failed"})
+			return
+		}
+		respond(state)
+	case r.Method == http.MethodPost && r.URL.Path == "/maintenance/leave":
+		state, err := c.operations.leaveMaintenance()
+		if err != nil {
+			writeJSON(w, http.StatusConflict, errorResponse{Error: "maintenance leave failed"})
+			return
+		}
+		respond(state)
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "maintenance endpoint unavailable"})
+	}
+}
+
 // 길이 동일한 두 문자열의 상수시간 비교.
 func secureEqual(a, b string) bool {
 	if len(a) != len(b) {
@@ -795,12 +1054,12 @@ func (c config) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "잘못된 tag — [A-Za-z0-9._-]만 허용"})
 		return
 	}
-	releaseOperation, err := c.lockLifecycleOperation()
+	lease, err := c.beginMutation("")
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "서버 수명주기 잠금을 준비하지 못했습니다."})
+		writeMutationAdmissionError(w, err)
 		return
 	}
-	defer releaseOperation()
+	defer lease.Done()
 
 	envFile := c.envFileFor(req.Project)
 	if _, err := os.Stat(envFile); err != nil {
@@ -815,7 +1074,7 @@ func (c config) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 	defer cleanup()
 
-	detail, err := c.pullStateless(req.Project, tempEnvFile)
+	detail, err := c.pullStateless(lease.Context(), req.Project, tempEnvFile)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, deployResponse{
 			Project: req.Project, Tag: req.Tag, OK: false, Detail: detail,
@@ -823,12 +1082,16 @@ func (c config) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := lease.Context().Err(); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "deployment cancelled"})
+		return
+	}
 	if err := c.writeImageTag(req.Project, req.Tag); err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("IMAGE_TAG/WEB_GAME_TAG 치환 실패: %v", err)})
 		return
 	}
 
-	upDetail, err := c.upStateless(req.Project, envFile)
+	upDetail, err := c.upStateless(lease.Context(), req.Project, envFile)
 	detail += "\n" + upDetail
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, deployResponse{
@@ -855,7 +1118,7 @@ func (c config) handleServers(w http.ResponseWriter, r *http.Request) {
 		c.handleServerCreate(w, r)
 	case http.MethodDelete:
 		res, status := c.deleteServer(r.URL.Query().Get("id"), r.URL.Query().Get("confirm"))
-		writeJSON(w, status, res)
+		writeCreateServerResponse(w, status, res)
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "GET/POST/DELETE only"})
 	}
@@ -877,7 +1140,7 @@ func (c config) handleServerCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, status := c.createServer(req)
-	writeJSON(w, status, res)
+	writeCreateServerResponse(w, status, res)
 }
 
 func (c config) handleServerClose(w http.ResponseWriter, r *http.Request) {
@@ -903,7 +1166,7 @@ func (c config) handleServerClose(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, status := c.deleteServer(id, "DELETE "+id)
-	writeJSON(w, status, res)
+	writeCreateServerResponse(w, status, res)
 }
 
 func (c config) handleServerReset(w http.ResponseWriter, r *http.Request) {
@@ -928,7 +1191,14 @@ func (c config) handleServerReset(w http.ResponseWriter, r *http.Request) {
 		rawID = req.ID
 	}
 	res, status := c.resetServer(rawID, req)
-	writeJSON(w, status, res)
+	writeCreateServerResponse(w, status, res)
+}
+
+func writeCreateServerResponse(w http.ResponseWriter, status int, response createServerResponse) {
+	if status == http.StatusServiceUnavailable {
+		w.Header().Set("Retry-After", "5")
+	}
+	writeJSON(w, status, response)
 }
 
 func (c config) handleSharedEnv(w http.ResponseWriter, r *http.Request) {
@@ -998,55 +1268,82 @@ func (c config) handleEnv(w http.ResponseWriter, r *http.Request, ctx envRequest
 			writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
 			return
 		}
-		releaseOperation, err := c.lockLifecycleOperation()
+		lease, err := c.beginMutation("")
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "서버 수명주기 잠금을 준비하지 못했습니다."})
+			writeMutationAdmissionError(w, err)
 			return
 		}
-		operationTransferred := false
+		leaseTransferred := false
 		defer func() {
-			if !operationTransferred {
-				releaseOperation()
+			if !leaseTransferred {
+				lease.Done()
 			}
 		}()
 		jobID := ""
-		jobStarted := false
 		if ctx.scope == "server" {
-			var reservationErr error
-			jobID, reservationErr = c.lifecycleJobs.reserve()
-			if reservationErr != nil {
-				detail, status := lifecycleJobReservationFailure(reservationErr)
-				writeJSON(w, status, errorResponse{Error: detail})
+			reloadNeeded, preflightErr := c.serverEnvPatchChangesRegistry(ctx.id, ctx.path, req.Values)
+			if preflightErr != nil {
+				writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("레지스트리 동기화 준비 실패: %v", preflightErr)})
 				return
 			}
-			defer func() {
-				if !jobStarted {
-					c.lifecycleJobs.cancel(jobID)
+			if reloadNeeded {
+				jobID, err = c.lifecycleJobs.reserve()
+				if err != nil {
+					detail, status := lifecycleJobReservationFailure(err)
+					writeJSON(w, status, errorResponse{Error: detail})
+					return
 				}
-			}()
+				if err := c.operations.claimLifecycleJob(lease, jobID); err != nil {
+					c.lifecycleJobs.discard(jobID)
+					writeMutationAdmissionError(w, err)
+					return
+				}
+			}
+		}
+		if err := lease.Context().Err(); err != nil {
+			if jobID != "" {
+				c.finishClaimedLifecycleJob(lease, jobID, "reload registry "+ctx.id, err)
+			}
+			writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "mutation cancelled"})
+			return
 		}
 		fields, err := patchEnvFile(ctx.path, ctx.allowlist, req.Values)
 		if err != nil {
+			if jobID != "" {
+				c.finishClaimedLifecycleJob(lease, jobID, "reload registry "+ctx.id, err)
+			}
 			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("env 파일 쓰기 실패: %v", err)})
 			return
 		}
 		affectedServices := append([]string{}, ctx.affectedServices...)
 		responseJobID := ""
 		if ctx.scope == "server" {
+			if err := lease.Context().Err(); err != nil {
+				if jobID != "" {
+					c.finishClaimedLifecycleJob(lease, jobID, "reload registry "+ctx.id, err)
+				}
+				writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "mutation cancelled"})
+				return
+			}
 			changed, err := c.syncRegistryEntryFromEnv(ctx.id, ctx.path)
 			if err != nil {
+				if jobID != "" {
+					c.finishClaimedLifecycleJob(lease, jobID, "reload registry "+ctx.id, err)
+				}
 				writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("레지스트리 동기화 실패: %v", err)})
 				return
 			}
 			if changed {
-				affectedServices = appendUnique(affectedServices, sharedRegistryReloadServices)
-				if !c.startLifecycleJob(jobID, "reload registry "+ctx.id, releaseOperation, c.reloadSharedRegistry) {
-					writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "서버 수명주기 작업을 시작하지 못했습니다."})
+				if jobID == "" {
+					writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "레지스트리 reload 작업을 준비하지 못했습니다."})
 					return
 				}
-				operationTransferred = true
-				jobStarted = true
+				affectedServices = appendUnique(affectedServices, sharedRegistryReloadServices)
+				c.startClaimedLifecycleJob(lease, jobID, "reload registry "+ctx.id, c.reloadSharedRegistry)
 				responseJobID = jobID
+				leaseTransferred = true
+			} else if jobID != "" {
+				c.finishClaimedLifecycleJob(lease, jobID, "reload registry "+ctx.id, nil)
 			}
 		}
 		writeJSON(w, http.StatusOK, envResponse{
@@ -1061,6 +1358,27 @@ func (c config) handleEnv(w http.ResponseWriter, r *http.Request, ctx envRequest
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "GET/PATCH only"})
 	}
+}
+
+func (c config) serverEnvPatchChangesRegistry(id string, path string, updates map[string]string) (bool, error) {
+	if _, err := os.Stat(c.sharedEnvFile()); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	values, err := readEnvValues(path)
+	if err != nil {
+		return false, err
+	}
+	for key, value := range updates {
+		values[key] = value
+	}
+	current, err := c.registryEntryByID(id)
+	if err != nil {
+		return false, err
+	}
+	return !reflect.DeepEqual(current, c.registryEntryFromServerEnv(id, values, current)), nil
 }
 
 func (c config) createServer(req createServerRequest) (createServerResponse, int) {
@@ -1081,6 +1399,9 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 		return createServerResponse{OK: false, ID: id, Detail: err.Error()}, http.StatusBadRequest
 	}
 	jobID := ""
+	newReservation := false
+	reservationClaimed := false
+	admissionAttempted := false
 	if operationID != "" {
 		var existing bool
 		jobID, existing, err = c.lifecycleJobs.reserveWithOperation(operationID)
@@ -1096,26 +1417,20 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 				Detail: "동일한 서버 생성 요청이 이미 접수되었습니다.",
 			}, http.StatusOK
 		}
+		newReservation = true
+	} else {
+		jobID, err = c.lifecycleJobs.reserve()
+		if err != nil {
+			detail, status := lifecycleJobReservationFailure(err)
+			return createServerResponse{OK: false, ID: id, Detail: detail}, status
+		}
+		newReservation = true
 	}
-	jobStarted := false
 	defer func() {
-		if jobID != "" && !jobStarted {
-			c.lifecycleJobs.cancel(jobID)
+		if newReservation && !reservationClaimed && (operationID == "" || !admissionAttempted) {
+			c.lifecycleJobs.discard(jobID)
 		}
 	}()
-	releaseOperation, err := c.lockLifecycleOperation()
-	if err != nil {
-		return createServerResponse{OK: false, ID: id, Detail: "서버 수명주기 잠금을 준비하지 못했습니다."}, http.StatusInternalServerError
-	}
-	operationTransferred := false
-	defer func() {
-		if !operationTransferred {
-			releaseOperation()
-		}
-	}()
-	if jobID != "" && !c.lifecycleJobs.isPending(jobID) {
-		return createServerResponse{OK: false, ID: id, Detail: "서버 수명주기 작업이 취소되었습니다."}, http.StatusConflict
-	}
 	imageTag := strings.TrimSpace(req.ImageTag)
 	if imageTag == "" {
 		imageTag = c.sharedEnvValue("IMAGE_TAG")
@@ -1168,16 +1483,6 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 	if err != nil {
 		return createServerResponse{OK: false, ID: id, Detail: fmt.Sprintf("비밀번호 생성 실패: %v", err)}, http.StatusInternalServerError
 	}
-	if jobID == "" {
-		jobID, err = c.lifecycleJobs.reserve()
-		if err != nil {
-			detail, status := lifecycleJobReservationFailure(err)
-			return createServerResponse{OK: false, ID: id, Detail: detail}, status
-		}
-	}
-	if err := os.MkdirAll(c.serversDir, 0o755); err != nil {
-		return createServerResponse{OK: false, ID: id, Detail: fmt.Sprintf("servers 디렉터리 생성 실패: %v", err)}, http.StatusInternalServerError
-	}
 	envLines := []envLine{
 		{Raw: "SERVER_ID=" + id, Key: "SERVER_ID", Value: id, IsKV: true},
 		{Raw: "GHCR_REGISTRY=ghcr.io", Key: "GHCR_REGISTRY", Value: "ghcr.io", IsKV: true},
@@ -1197,9 +1502,6 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 		{Raw: "GAME_API_URL=" + c.gameAPIURLFor(id), Key: "GAME_API_URL", Value: c.gameAPIURLFor(id), IsKV: true},
 		{Raw: "GATEWAY_API_URL=" + envOrValue(c.sharedEnvValue("GATEWAY_API_URL"), c.defaultGatewayAPIURL()), Key: "GATEWAY_API_URL", Value: envOrValue(c.sharedEnvValue("GATEWAY_API_URL"), c.defaultGatewayAPIURL()), IsKV: true},
 	}
-	if err := writeEnvLinesAtomic(envFile, envLines); err != nil {
-		return createServerResponse{OK: false, ID: id, Detail: fmt.Sprintf("서버 env 쓰기 실패: %v", err)}, http.StatusInternalServerError
-	}
 	entry := registryEntry{
 		ID:            id,
 		Name:          name,
@@ -1210,10 +1512,55 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 		DeployProject: projectForServerID(id),
 		Env:           registryEnvSnapshot(envValuesFromLines(envLines)),
 	}
-	if err := c.upsertRegistryEntry(entry); err != nil {
-		return createServerResponse{OK: false, ID: id, Name: name, Project: entry.DeployProject, Detail: fmt.Sprintf("레지스트리 갱신 실패: %v", err)}, http.StatusInternalServerError
+	admissionAttempted = true
+	lease, err := c.beginMutation(jobID)
+	if err != nil {
+		detail, status := mutationAdmissionFailure(err)
+		return createServerResponse{OK: false, ID: id, Detail: detail}, status
 	}
-	if !c.startLifecycleJob(jobID, "create "+id, releaseOperation, func(ctx context.Context) (string, error) {
+	reservationClaimed = true
+	setupComplete := make(chan error, 1)
+	c.startClaimedLifecycleJob(lease, jobID, "create "+id, func(ctx context.Context) (string, error) {
+		if err := ctx.Err(); err != nil {
+			setupComplete <- err
+			return "", err
+		}
+		if err := os.MkdirAll(c.serversDir, 0o755); err != nil {
+			setupComplete <- err
+			return "", err
+		}
+		if _, err := os.Stat(envFile); err == nil {
+			err = errors.New("server env already exists")
+			setupComplete <- err
+			return "", err
+		} else if !os.IsNotExist(err) {
+			setupComplete <- err
+			return "", err
+		}
+		if err := c.ensurePortsAvailable(id, map[string]string{
+			"GAME_API_PORT": gameAPIPort,
+			"WEB_GAME_PORT": webGamePort,
+		}); err != nil {
+			setupComplete <- err
+			return "", err
+		}
+		if err := ctx.Err(); err != nil {
+			setupComplete <- err
+			return "", err
+		}
+		if err := writeEnvLinesAtomic(envFile, envLines); err != nil {
+			setupComplete <- err
+			return "", err
+		}
+		if err := ctx.Err(); err != nil {
+			setupComplete <- err
+			return "", err
+		}
+		if err := c.upsertRegistryEntry(entry); err != nil {
+			setupComplete <- err
+			return "", err
+		}
+		setupComplete <- nil
 		detail, serverErr := c.upServerStack(ctx, entry.DeployProject, envFile)
 		reloadDetail, reloadErr := c.reloadSharedRegistry(ctx)
 		if reloadDetail != "" {
@@ -1223,11 +1570,10 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 			return detail, serverErr
 		}
 		return detail, reloadErr
-	}) {
-		return createServerResponse{OK: false, ID: id, Name: name, Project: entry.DeployProject, Detail: "서버 수명주기 작업을 시작하지 못했습니다."}, http.StatusInternalServerError
+	})
+	if err := <-setupComplete; err != nil {
+		return createServerResponse{OK: false, ID: id, Name: name, Project: entry.DeployProject, Detail: fmt.Sprintf("서버 생성 준비 실패: %v", err)}, http.StatusInternalServerError
 	}
-	operationTransferred = true
-	jobStarted = true
 	return createServerResponse{
 		OK:               true,
 		ID:               id,
@@ -1248,16 +1594,6 @@ func (c config) deleteServer(rawID string, confirm string) (createServerResponse
 	if confirm != "DELETE "+id {
 		return createServerResponse{OK: false, ID: id, Detail: "삭제 확인 문구가 일치하지 않습니다."}, http.StatusBadRequest
 	}
-	releaseOperation, err := c.lockLifecycleOperation()
-	if err != nil {
-		return createServerResponse{OK: false, ID: id, Detail: "서버 수명주기 잠금을 준비하지 못했습니다."}, http.StatusInternalServerError
-	}
-	operationTransferred := false
-	defer func() {
-		if !operationTransferred {
-			releaseOperation()
-		}
-	}()
 	entry, err := c.registryEntryByID(id)
 	if err != nil {
 		return createServerResponse{OK: false, ID: id, Detail: fmt.Sprintf("레지스트리 조회 실패: %v", err)}, http.StatusInternalServerError
@@ -1271,22 +1607,31 @@ func (c config) deleteServer(rawID string, confirm string) (createServerResponse
 		detail, status := lifecycleJobReservationFailure(err)
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: detail}, status
 	}
-	jobStarted := false
-	defer func() {
-		if !jobStarted {
-			c.lifecycleJobs.cancel(jobID)
-		}
-	}()
-	if !c.startLifecycleJob(jobID, "delete "+id, releaseOperation, func(ctx context.Context) (string, error) {
+	lease, err := c.beginMutation(jobID)
+	if err != nil {
+		c.lifecycleJobs.discard(jobID)
+		detail, status := mutationAdmissionFailure(err)
+		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: detail}, status
+	}
+	c.startClaimedLifecycleJob(lease, jobID, "delete "+id, func(ctx context.Context) (string, error) {
 		detail, downErr := c.downServerStack(ctx, entry.DeployProject, envFile)
 		if downErr != nil {
 			return detail, downErr
+		}
+		if err := ctx.Err(); err != nil {
+			return detail, err
 		}
 		removeErr := os.Remove(envFile)
 		if removeErr != nil && !os.IsNotExist(removeErr) {
 			return detail, removeErr
 		}
+		if err := ctx.Err(); err != nil {
+			return detail, err
+		}
 		if _, err := c.removeRegistryEntry(id); err != nil {
+			return detail, err
+		}
+		if err := ctx.Err(); err != nil {
 			return detail, err
 		}
 		reloadDetail, reloadErr := c.reloadSharedRegistry(ctx)
@@ -1294,11 +1639,7 @@ func (c config) deleteServer(rawID string, confirm string) (createServerResponse
 			detail += "\n=== shared reload ===\n" + reloadDetail
 		}
 		return detail, reloadErr
-	}) {
-		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: "서버 수명주기 작업을 시작하지 못했습니다."}, http.StatusInternalServerError
-	}
-	operationTransferred = true
-	jobStarted = true
+	})
 	return createServerResponse{
 		OK:               true,
 		ID:               id,
@@ -1319,16 +1660,9 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 	if req.Confirm != "RESET "+id {
 		return createServerResponse{OK: false, ID: id, Detail: "리셋 확인 문구가 일치하지 않습니다."}, http.StatusBadRequest
 	}
-	releaseOperation, err := c.lockLifecycleOperation()
-	if err != nil {
-		return createServerResponse{OK: false, ID: id, Detail: "서버 수명주기 잠금을 준비하지 못했습니다."}, http.StatusInternalServerError
+	if _, err := resetEnvUpdates(req); err != nil {
+		return createServerResponse{OK: false, ID: id, Detail: err.Error()}, http.StatusBadRequest
 	}
-	operationTransferred := false
-	defer func() {
-		if !operationTransferred {
-			releaseOperation()
-		}
-	}()
 	entry, err := c.registryEntryByID(id)
 	if err != nil {
 		return createServerResponse{OK: false, ID: id, Detail: fmt.Sprintf("레지스트리 조회 실패: %v", err)}, http.StatusInternalServerError
@@ -1349,43 +1683,46 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 		detail, status := lifecycleJobReservationFailure(err)
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: detail}, status
 	}
-	jobStarted := false
-	defer func() {
-		if !jobStarted {
-			c.lifecycleJobs.cancel(jobID)
-		}
-	}()
+	lease, err := c.beginMutation(jobID)
+	if err != nil {
+		c.lifecycleJobs.discard(jobID)
+		detail, status := mutationAdmissionFailure(err)
+		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: detail}, status
+	}
 	originalEntry := entry
-	if strings.TrimSpace(req.Generation) != "" {
-		generation, err := parseGeneration(req.Generation, 1)
-		if err != nil {
-			return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: err.Error()}, http.StatusBadRequest
-		}
-		entry.Generation = generation
-		if err := c.upsertRegistryEntry(entry); err != nil {
-			return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: fmt.Sprintf("레지스트리 기수 갱신 실패: %v", err)}, http.StatusInternalServerError
-		}
-	}
-	if err := c.applyResetOptions(envFile, req); err != nil {
-		_ = c.upsertRegistryEntry(originalEntry)
-		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: fmt.Sprintf("리셋 옵션 저장 실패: %v", err)}, http.StatusBadRequest
-	}
-	if _, err := c.syncRegistryEntryFromEnv(id, envFile); err != nil {
-		_ = writeFileAtomic(envFile, originalEnv)
-		_ = c.upsertRegistryEntry(originalEntry)
-		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: fmt.Sprintf("레지스트리 동기화 실패: %v", err)}, http.StatusInternalServerError
-	}
-	if updatedEntry, err := c.registryEntryByID(id); err == nil && updatedEntry.ID != "" {
-		entry = updatedEntry
-	}
-	if !c.startLifecycleJob(jobID, "reset "+id, releaseOperation, func(ctx context.Context) (string, error) {
-		detail, downErr := c.downServerStack(ctx, entry.DeployProject, envFile)
-		if downErr != nil {
+	c.startClaimedLifecycleJob(lease, jobID, "reset "+id, func(ctx context.Context) (string, error) {
+		restore := func() {
 			_ = writeFileAtomic(envFile, originalEnv)
 			_ = c.upsertRegistryEntry(originalEntry)
+		}
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		if err := c.applyResetOptions(envFile, req); err != nil {
+			return "", err
+		}
+		if _, err := c.syncRegistryEntryFromEnv(id, envFile); err != nil {
+			restore()
+			return "", err
+		}
+		updatedEntry, err := c.registryEntryByID(id)
+		if err != nil || updatedEntry.ID == "" {
+			restore()
+			if err != nil {
+				return "", err
+			}
+			return "", errors.New("updated server registry entry is unavailable")
+		}
+		if err := ctx.Err(); err != nil {
+			restore()
+			return "", err
+		}
+		detail, downErr := c.downServerStack(ctx, updatedEntry.DeployProject, envFile)
+		if downErr != nil {
+			restore()
 			return detail, downErr
 		}
-		upDetail, upErr := c.upServerStack(ctx, entry.DeployProject, envFile)
+		upDetail, upErr := c.upServerStack(ctx, updatedEntry.DeployProject, envFile)
 		if upDetail != "" {
 			detail += "\n=== server up ===\n" + upDetail
 		}
@@ -1394,21 +1731,15 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 			detail += "\n=== shared reload ===\n" + reloadDetail
 		}
 		if upErr != nil {
-			_ = writeFileAtomic(envFile, originalEnv)
-			_ = c.upsertRegistryEntry(originalEntry)
+			restore()
 			return detail, upErr
 		}
 		if reloadErr != nil {
-			_ = writeFileAtomic(envFile, originalEnv)
-			_ = c.upsertRegistryEntry(originalEntry)
+			restore()
 			return detail, reloadErr
 		}
 		return detail, nil
-	}) {
-		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: "서버 수명주기 작업을 시작하지 못했습니다."}, http.StatusInternalServerError
-	}
-	operationTransferred = true
-	jobStarted = true
+	})
 	return createServerResponse{
 		OK:               true,
 		ID:               id,
@@ -1428,26 +1759,67 @@ func lifecycleJobReservationFailure(err error) (string, int) {
 	return "서버 수명주기 작업을 준비하지 못했습니다.", http.StatusInternalServerError
 }
 
-func (c config) lockLifecycleOperation() (func(), error) {
-	if c.lifecycleJobs == nil {
-		return nil, errors.New("lifecycle job manager unavailable")
+func (c config) beginMutation(jobID string) (*operationLease, error) {
+	if c.operations == nil {
+		return nil, errors.New("operation coordinator unavailable")
 	}
-	return c.lifecycleJobs.lockOperation()
+	return c.operations.begin(jobID)
 }
 
-func (c config) startLifecycleJob(id string, name string, releaseOperation func(), job func(context.Context) (string, error)) bool {
-	return c.lifecycleJobs.start(id, func(ctx context.Context) (string, error) {
-		if releaseOperation != nil {
-			defer releaseOperation()
+func writeMutationAdmissionError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errMaintenanceClosed) {
+		w.Header().Set("Retry-After", "5")
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "maintenance in progress"})
+		return
+	}
+	if errors.Is(err, errLifecycleJobNotPending) {
+		writeJSON(w, http.StatusConflict, errorResponse{Error: "server lifecycle job was cancelled"})
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "mutation coordinator unavailable"})
+}
+
+func mutationAdmissionFailure(err error) (string, int) {
+	if errors.Is(err, errMaintenanceClosed) {
+		return "maintenance in progress", http.StatusServiceUnavailable
+	}
+	if errors.Is(err, errLifecycleJobNotPending) {
+		return "서버 수명주기 작업이 취소되었습니다.", http.StatusConflict
+	}
+	return "서버 수명주기 잠금을 준비하지 못했습니다.", http.StatusInternalServerError
+}
+
+func (c config) startClaimedLifecycleJob(lease *operationLease, id string, name string, job func(context.Context) (string, error)) {
+	go func() {
+		defer lease.Done()
+		_, err := job(lease.Context())
+		status := lifecycleJobSucceeded
+		if errors.Is(lease.Context().Err(), context.Canceled) {
+			status = lifecycleJobCancelled
+		} else if err != nil {
+			status = lifecycleJobFailed
 		}
-		detail, err := job(ctx)
+		c.lifecycleJobs.finish(id, status)
 		if err != nil {
 			log.Printf("server lifecycle job failed name=%s err=%v", name, err)
-			return detail, err
+			return
 		}
 		log.Printf("server lifecycle job completed name=%s", name)
-		return detail, nil
-	})
+	}()
+}
+
+func (c config) finishClaimedLifecycleJob(lease *operationLease, id string, name string, err error) {
+	status := lifecycleJobSucceeded
+	if errors.Is(lease.Context().Err(), context.Canceled) {
+		status = lifecycleJobCancelled
+	} else if err != nil {
+		status = lifecycleJobFailed
+	}
+	c.lifecycleJobs.finish(id, status)
+	lease.Done()
+	if err != nil {
+		log.Printf("server lifecycle job failed name=%s err=%v", name, err)
+	}
 }
 
 // 서버 env 파일에서 IMAGE_TAG= 값을 읽는다.
@@ -1929,7 +2301,7 @@ func envValuesFromLines(lines []envLine) map[string]string {
 	return values
 }
 
-func (c config) applyResetOptions(envFile string, req resetServerRequest) error {
+func resetEnvUpdates(req resetServerRequest) (map[string]string, error) {
 	values := map[string]string{}
 	putSafe := func(key, value string) error {
 		value = strings.TrimSpace(value)
@@ -1944,7 +2316,7 @@ func (c config) applyResetOptions(envFile string, req resetServerRequest) error 
 	}
 	if req.ScenarioCode != "" {
 		if !isSafeToken(req.ScenarioCode) {
-			return fmt.Errorf("시나리오 코드가 올바르지 않습니다.")
+			return nil, fmt.Errorf("시나리오 코드가 올바르지 않습니다.")
 		}
 		values["SCENARIO_CODE"] = strings.TrimSpace(req.ScenarioCode)
 		values["SCENARIO_SEED_ENABLED"] = "true"
@@ -1955,7 +2327,7 @@ func (c config) applyResetOptions(envFile string, req resetServerRequest) error 
 	if strings.TrimSpace(req.Generation) != "" {
 		generation, err := parseGeneration(req.Generation, 1)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		values["SERVER_GENERATION"] = strconv.Itoa(generation)
 	}
@@ -1974,7 +2346,7 @@ func (c config) applyResetOptions(envFile string, req resetServerRequest) error 
 		"RESET_PRE_RESERVE_OPEN":     req.PreReserveOpen,
 	} {
 		if err := putSafe(key, value); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if len(req.AutorunUserOptions) > 0 {
@@ -1985,11 +2357,19 @@ func (c config) applyResetOptions(envFile string, req resetServerRequest) error 
 				continue
 			}
 			if !isSafeToken(option) {
-				return fmt.Errorf("자동 행동 옵션이 올바르지 않습니다.")
+				return nil, fmt.Errorf("자동 행동 옵션이 올바르지 않습니다.")
 			}
 			clean = append(clean, option)
 		}
 		values["RESET_AUTORUN_USER_OPTIONS"] = strings.Join(clean, ",")
+	}
+	return values, nil
+}
+
+func (c config) applyResetOptions(envFile string, req resetServerRequest) error {
+	values, err := resetEnvUpdates(req)
+	if err != nil {
+		return err
 	}
 	if len(values) == 0 {
 		return nil
@@ -1998,7 +2378,7 @@ func (c config) applyResetOptions(envFile string, req resetServerRequest) error 
 	for key := range values {
 		spec[key] = envFieldSpec{Description: "리셋 옵션"}
 	}
-	_, err := patchEnvFile(envFile, spec, values)
+	_, err = patchEnvFile(envFile, spec, values)
 	return err
 }
 
@@ -2235,16 +2615,16 @@ func (c config) tempImageTagEnvFile(envFile, tag string) (string, func(), error)
 }
 
 // 스테이트리스 서비스만 pull 후 up -d --no-deps. game-engine은 절대 미포함.
-func (c config) bounceStateless(project, envFile string) (string, error) {
-	pullDetail, err := c.pullStateless(project, envFile)
+func (c config) bounceStateless(ctx context.Context, project, envFile string) (string, error) {
+	pullDetail, err := c.pullStateless(ctx, project, envFile)
 	if err != nil {
 		return pullDetail, err
 	}
-	upDetail, err := c.upStateless(project, envFile)
+	upDetail, err := c.upStateless(ctx, project, envFile)
 	return pullDetail + "\n" + upDetail, err
 }
 
-func (c config) pullStateless(project, envFile string) (string, error) {
+func (c config) pullStateless(ctx context.Context, project, envFile string) (string, error) {
 	var sb strings.Builder
 
 	// docker compose -p <project> --env-file <env> -f <server.yml> pull <svc...>
@@ -2254,7 +2634,7 @@ func (c config) pullStateless(project, envFile string) (string, error) {
 		"-f", c.composeServer,
 		"pull",
 	}, statelessServices...)
-	if out, err := c.runDocker(pullArgs...); err != nil {
+	if out, err := c.runDockerContext(ctx, pullArgs...); err != nil {
 		sb.WriteString("=== pull 실패 ===\n")
 		sb.WriteString(out)
 		return sb.String(), err
@@ -2265,7 +2645,7 @@ func (c config) pullStateless(project, envFile string) (string, error) {
 	return sb.String(), nil
 }
 
-func (c config) upStateless(project, envFile string) (string, error) {
+func (c config) upStateless(ctx context.Context, project, envFile string) (string, error) {
 	var sb strings.Builder
 
 	// docker compose -p <project> --env-file <env> -f <server.yml> up -d --force-recreate --no-deps <svc...>
@@ -2275,7 +2655,7 @@ func (c config) upStateless(project, envFile string) (string, error) {
 		"-f", c.composeServer,
 		"up", "-d", "--force-recreate", "--no-deps",
 	}, statelessServices...)
-	if out, err := c.runDocker(upArgs...); err != nil {
+	if out, err := c.runDockerContext(ctx, upArgs...); err != nil {
 		sb.WriteString("\n=== up 실패 ===\n")
 		sb.WriteString(out)
 		return sb.String(), err

@@ -61,6 +61,36 @@ jobs:
           STACK="$HOME/opensamguk-docker"
           cd "$STACK"
 
+          DEPLOYER_TOKEN="$(grep '^DEPLOYER_TOKEN=' .env | cut -d= -f2-)"
+          maintenance_response_state() {
+            printf '%s' "$1" | python3 -c 'import json, sys; payload = json.load(sys.stdin); valid = isinstance(payload, dict) and set(payload) == {"capability", "state"} and payload["capability"] == "maintenance-v1" and payload["state"] in {"open", "draining", "drained"}; valid or sys.exit(1); print(payload["state"])'
+          }
+          maintenance_get() {
+            sudo docker exec -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
+              wget -qO- -T 10 -t 1 --header="Authorization: Bearer $DEPLOYER_TOKEN" http://localhost:9000/maintenance
+            ' 2>/dev/null
+          }
+          maintenance_post() {
+            sudo docker exec -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
+              wget -qO- -T 10 -t 1 --header="Authorization: Bearer $DEPLOYER_TOKEN" --post-data="" "http://localhost:9000$1"
+            ' maintenance "$1" 2>/dev/null
+          }
+          DEPLOYER_FRESH=false
+          if sudo docker ps -a --format '{{.Names}}' | grep -Fxq opensamguk-deployer; then
+            if [ -z "$DEPLOYER_TOKEN" ] || ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_get)")"; then
+              echo "::error::running deployer lacks a valid maintenance-v1 capability; aborting before control-plane mutation"
+              exit 1
+            fi
+            if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_post /maintenance/enter)")" || [ "$MAINTENANCE_STATE" != drained ]; then
+              echo "::error::deployer maintenance drain did not reach drained; aborting before control-plane mutation"
+              exit 1
+            fi
+          else
+            mkdir -p "$STACK/servers"
+            : > "$STACK/servers/.deployer-maintenance"
+            DEPLOYER_FRESH=true
+          fi
+
           git fetch --prune origin main
           if ! git diff --quiet || ! git diff --cached --quiet; then
             echo "::error::opensamguk-docker has local tracked changes; refusing to overwrite prod orchestration files"
@@ -68,6 +98,29 @@ jobs:
             exit 1
           fi
           git merge --ff-only origin/main
+
+          if [ "$DEPLOYER_FRESH" = true ]; then
+            COMPOSE="sudo docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env"
+            $COMPOSE build deployer
+            $COMPOSE up -d --no-deps deployer
+            deployer_closed=false
+            for _ in $(seq 1 30); do
+              if MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_get)")" && [ "$MAINTENANCE_STATE" = drained ]; then
+                deployer_closed=true
+                break
+              fi
+              sleep 2
+            done
+            if [ "$deployer_closed" != true ]; then
+              echo "::error::fresh deployer did not boot closed with maintenance-v1"
+              exit 1
+            fi
+          fi
+
+          if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_post /maintenance/leave)")" || [ "$MAINTENANCE_STATE" != open ]; then
+            echo "::error::deployer maintenance barrier did not reopen before lifecycle create"
+            exit 1
+          fi
 
           RAW_SERVER_ID="$SERVER_ID"
           if [[ ! "$RAW_SERVER_ID" =~ ^[A-Za-z0-9]+$ ]]; then
@@ -89,7 +142,6 @@ jobs:
           INTERNAL_ID="s${PUBLIC_ID}"
           echo "creating public server ${PUBLIC_ID} with internal Docker key ${INTERNAL_ID}"
 
-          DEPLOYER_TOKEN="$(grep '^DEPLOYER_TOKEN=' .env | cut -d= -f2-)"
           test -n "$DEPLOYER_TOKEN"
 
           export CLIENT_OPERATION_ID="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"

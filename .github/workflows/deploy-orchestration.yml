@@ -32,6 +32,36 @@ jobs:
           STACK="$HOME/opensamguk-docker"
           cd "$STACK"
 
+          DEPLOYER_TOKEN="$(grep '^DEPLOYER_TOKEN=' .env | cut -d= -f2-)"
+          maintenance_response_state() {
+            printf '%s' "$1" | python3 -c 'import json, sys; payload = json.load(sys.stdin); valid = isinstance(payload, dict) and set(payload) == {"capability", "state"} and payload["capability"] == "maintenance-v1" and payload["state"] in {"open", "draining", "drained"}; valid or sys.exit(1); print(payload["state"])'
+          }
+          maintenance_get() {
+            sudo docker exec -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
+              wget -qO- -T 10 -t 1 --header="Authorization: Bearer $DEPLOYER_TOKEN" http://localhost:9000/maintenance
+            ' 2>/dev/null
+          }
+          maintenance_post() {
+            sudo docker exec -e DEPLOYER_TOKEN="$DEPLOYER_TOKEN" opensamguk-deployer sh -c '
+              wget -qO- -T 10 -t 1 --header="Authorization: Bearer $DEPLOYER_TOKEN" --post-data="" "http://localhost:9000$1"
+            ' maintenance "$1" 2>/dev/null
+          }
+          DEPLOYER_FRESH=false
+          if sudo docker ps -a --format '{{.Names}}' | grep -Fxq opensamguk-deployer; then
+            if [ -z "$DEPLOYER_TOKEN" ] || ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_get)")"; then
+              echo "::error::running deployer lacks a valid maintenance-v1 capability; aborting before control-plane mutation"
+              exit 1
+            fi
+            if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_post /maintenance/enter)")" || [ "$MAINTENANCE_STATE" != drained ]; then
+              echo "::error::deployer maintenance drain did not reach drained; aborting before control-plane mutation"
+              exit 1
+            fi
+          else
+            mkdir -p "$STACK/servers"
+            : > "$STACK/servers/.deployer-maintenance"
+            DEPLOYER_FRESH=true
+          fi
+
           git fetch --prune origin main
           if ! git diff --quiet || ! git diff --cached --quiet; then
             echo "::error::opensamguk-docker has local tracked changes; refusing to overwrite prod orchestration files"
@@ -59,6 +89,10 @@ jobs:
           done
           if [ "$deployer_ready" != true ]; then
             echo "::error::deployer did not become healthz+readyz ready before nginx reload"
+            exit 1
+          fi
+          if [ -z "$DEPLOYER_TOKEN" ] || ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_get)")" || [ "$MAINTENANCE_STATE" != drained ]; then
+            echo "::error::recreated deployer did not boot with the persisted maintenance barrier drained"
             exit 1
           fi
 
@@ -102,4 +136,9 @@ jobs:
             fi
           else
             echo "no valid registered server; game route check skipped"
+          fi
+
+          if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_post /maintenance/leave)")" || [ "$MAINTENANCE_STATE" != open ]; then
+            echo "::error::deployer maintenance barrier did not reopen after successful orchestration verification"
+            exit 1
           fi

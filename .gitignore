@@ -6,6 +6,7 @@
 # 서버별 env(실제 비밀값) — *.example만 커밋
 servers/*.env
 !servers/*.env.example
+servers/.deployer-maintenance
 
 # 런타임 TLS 인증서 — 운영 호스트에서만 생성·갱신, 절대 커밋 금지
 infra/nginx/certs/
