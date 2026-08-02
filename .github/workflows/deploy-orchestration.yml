@@ -24,6 +24,11 @@ jobs:
       - name: Sync orchestration repo on box
         run: |
           set -euo pipefail
+          exec 9>/tmp/opensamguk-production.lock
+          if ! flock -w 1800 9; then
+            echo "::error::Timed out acquiring /tmp/opensamguk-production.lock after 1800 seconds"
+            exit 1
+          fi
           STACK="$HOME/opensamguk-docker"
           cd "$STACK"
 
@@ -38,6 +43,11 @@ jobs:
       - name: Rebuild deployer and reload nginx
         run: |
           set -euo pipefail
+          exec 9>/tmp/opensamguk-production.lock
+          if ! flock -w 1800 9; then
+            echo "::error::Timed out acquiring /tmp/opensamguk-production.lock after 1800 seconds"
+            exit 1
+          fi
           STACK="$HOME/opensamguk-docker"
           cd "$STACK"
           COMPOSE="sudo docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env"
@@ -49,10 +59,38 @@ jobs:
       - name: Verify orchestration endpoints
         run: |
           set -euo pipefail
+          STACK="$HOME/opensamguk-docker"
           sudo docker exec opensamguk-deployer wget -qO- http://localhost:9000/healthz | grep -q '"status":"up"'
           curl -fsS http://localhost/health | grep -q '"status":"up"'
-          if sudo docker ps --format '{{.Names}}' | grep -q '^s1-web-game$'; then
-            curl -fsS http://localhost/game/s1 >/dev/null
+
+          SERVER_ID="$(python3 - "$STACK/.env" <<'PY'
+          import json
+          import re
+          import sys
+
+          registry = []
+          for line in open(sys.argv[1], encoding="utf-8"):
+              if line.startswith("SERVER_REGISTRY_JSON="):
+                  try:
+                      registry = json.loads(line.split("=", 1)[1])
+                  except json.JSONDecodeError:
+                      registry = []
+                  break
+
+          for entry in registry if isinstance(registry, list) else []:
+              server_id = entry.get("id") if isinstance(entry, dict) else None
+              if isinstance(server_id, str) and re.fullmatch(r"[A-Za-z0-9]+", server_id):
+                  print(server_id)
+                  break
+          PY
+          )"
+          if [ -n "$SERVER_ID" ]; then
+            INTERNAL_ID="s${SERVER_ID}"
+            if sudo docker ps --format '{{.Names}}' | grep -Fxq "${INTERNAL_ID}-web-game"; then
+              curl -fsS "http://localhost/game/${SERVER_ID}" >/dev/null
+            else
+              echo "registered server ${SERVER_ID} is not running; game route check skipped"
+            fi
           else
-            echo "s1 is not running; game route check skipped"
+            echo "no valid registered server; game route check skipped"
           fi

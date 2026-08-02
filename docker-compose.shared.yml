@@ -70,8 +70,8 @@ services:
       REDIS_PORT: 6379
       # --- 멀티서버 fan-out / 버전 배포 ---
       # 게임 서버 레지스트리(JSON 배열). 로비·어드민이 각 서버 game-api/엔진을 알기 위한 표.
-      # 예: [{"id":"s1","name":"통일 서버","generation":1,"gameApiUrl":"http://s1-game-api:8081",
-      #       "gameEngineUrl":"http://s1-game-engine:8082","deployProject":"opensamguk-s1"}]
+      # 예: [{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081",
+      #       "gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
       # 어드민 버전 패널 → deployer 사이드카(내부망 + 토큰)로 bounce 배포 위임.
       SERVER_REGISTRY_JSON: ${SERVER_REGISTRY_JSON:-[]}
       DEPLOYER_URL: ${DEPLOYER_URL:-http://deployer:9000}

@@ -35,10 +35,12 @@ import (
 
 // 입력 검증용 화이트리스트 정규식.
 var (
-	// 프로젝트명 — opensamguk-s<id>만 허용. <id>는 영숫자/언더스코어/하이픈.
-	projectRe = regexp.MustCompile(`^opensamguk-s[a-zA-Z0-9_-]+$`)
-	// 서버 id — servers/<id>.env만 허용. 경로 조작 문자는 금지.
-	serverIDRe = regexp.MustCompile(`^s[a-zA-Z0-9_-]+$`)
+	// 프로젝트명 — opensamguk-s<public id>만 허용. 내부 key의 s는 여기서만 보인다.
+	projectRe = regexp.MustCompile(`^opensamguk-s[A-Za-z0-9]+$`)
+	// Public server id. The Docker-only key is always synthesized as s<public id>.
+	serverIDRe = regexp.MustCompile(`^[A-Za-z0-9]+$`)
+	// Internal server key used only for Docker resources and server env filenames.
+	internalServerKeyRe = regexp.MustCompile(`^s[A-Za-z0-9]+$`)
 	// 이미지 태그 — 도커 태그 문자셋(영숫자/점/언더스코어/하이픈).
 	tagRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 )
@@ -148,31 +150,39 @@ func envList(key string, def []string) []string {
 	return values
 }
 
-func (c config) gameAPIURLFor(id string) string {
-	return "http://" + id + "-game-api:" + envOrValue(c.gameAPIInternalPort, "8081")
+func internalServerKey(publicID string) string {
+	return "s" + publicID
 }
 
-func (c config) gameEngineURLFor(id string) string {
-	return "http://" + id + "-game-engine:" + envOrValue(c.gameEngineInternalPort, "8082")
+func projectForServerID(publicID string) string {
+	return "opensamguk-" + internalServerKey(publicID)
+}
+
+func (c config) gameAPIURLFor(publicID string) string {
+	return "http://" + internalServerKey(publicID) + "-game-api:" + envOrValue(c.gameAPIInternalPort, "8081")
+}
+
+func (c config) gameEngineURLFor(publicID string) string {
+	return "http://" + internalServerKey(publicID) + "-game-engine:" + envOrValue(c.gameEngineInternalPort, "8082")
 }
 
 func (c config) defaultGatewayAPIURL() string {
 	return envOrValue(c.gatewayAPIURL, "http://gateway-api:8080")
 }
 
-// 서버 env 파일 절대경로 — project명에서 servers/<id>.env 로 매핑.
-// 예: opensamguk-s1 → servers/s1.env
+// 서버 env 파일 절대경로 — internal project명에서 servers/s<public id>.env 로 매핑.
+// 예: opensamguk-spep → servers/spep.env
 func (c config) envFileFor(project string) string {
-	id := strings.TrimPrefix(project, "opensamguk-")
-	return filepath.Join(c.serversDir, id+".env")
+	internalKey := strings.TrimPrefix(project, "opensamguk-")
+	return filepath.Join(c.serversDir, internalKey+".env")
 }
 
 func (c config) sharedEnvFile() string {
 	return filepath.Join(c.composeDir, ".env")
 }
 
-func (c config) serverEnvFileForID(id string) string {
-	return filepath.Join(c.serversDir, id+".env")
+func (c config) serverEnvFileForID(publicID string) string {
+	return filepath.Join(c.serversDir, internalServerKey(publicID)+".env")
 }
 
 // --- 응답 타입 ---
@@ -493,7 +503,7 @@ func (c config) handleServerClose(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "JSON 파싱 실패"})
 		return
 	}
-	id := strings.TrimSpace(req.ID)
+	id := req.ID
 	res, status := c.deleteServer(id, "DELETE "+id)
 	writeJSON(w, status, res)
 }
@@ -535,7 +545,7 @@ func (c config) handleSharedEnv(w http.ResponseWriter, r *http.Request) {
 func (c config) handleServerEnv(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	if !serverIDRe.MatchString(id) {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "잘못된 id — s<id> 형식만 허용"})
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "잘못된 id — 영문 대소문자와 숫자만 허용"})
 		return
 	}
 	c.handleEnv(w, r, envRequestContext{
@@ -621,7 +631,7 @@ func (c config) handleEnv(w http.ResponseWriter, r *http.Request, ctx envRequest
 }
 
 func (c config) createServer(req createServerRequest) (createServerResponse, int) {
-	id, serverNumber, err := normalizeCreateServerID(req.ID)
+	id, internalKey, err := normalizeCreateServerID(req.ID)
 	if err != nil {
 		return createServerResponse{OK: false, Detail: err.Error()}, http.StatusBadRequest
 	}
@@ -675,7 +685,7 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 	if jwtSecret == "" || strings.ContainsAny(jwtSecret, "\r\n") {
 		return createServerResponse{OK: false, ID: id, Detail: "공유 JWT_SECRET이 필요합니다."}, http.StatusBadRequest
 	}
-	envFile := c.serverEnvFileForID(id)
+	envFile := filepath.Join(c.serversDir, internalKey+".env")
 	if _, err := os.Stat(envFile); err == nil {
 		return createServerResponse{OK: false, ID: id, Detail: "이미 존재하는 서버입니다."}, http.StatusConflict
 	} else if !os.IsNotExist(err) {
@@ -689,7 +699,7 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 		return createServerResponse{OK: false, ID: id, Detail: fmt.Sprintf("비밀번호 생성 실패: %v", err)}, http.StatusInternalServerError
 	}
 	envLines := []envLine{
-		{Raw: "SERVER_ID=" + serverNumber, Key: "SERVER_ID", Value: serverNumber, IsKV: true},
+		{Raw: "SERVER_ID=" + id, Key: "SERVER_ID", Value: id, IsKV: true},
 		{Raw: "GHCR_REGISTRY=ghcr.io", Key: "GHCR_REGISTRY", Value: "ghcr.io", IsKV: true},
 		{Raw: "GHCR_OWNER=" + c.ghcrOwner, Key: "GHCR_OWNER", Value: c.ghcrOwner, IsKV: true},
 		{Raw: "IMAGE_TAG=" + imageTag, Key: "IMAGE_TAG", Value: imageTag, IsKV: true},
@@ -717,7 +727,7 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 		ScenarioCode:  scenarioCode,
 		GameAPIURL:    c.gameAPIURLFor(id),
 		GameEngineURL: c.gameEngineURLFor(id),
-		DeployProject: "opensamguk-" + id,
+		DeployProject: projectForServerID(id),
 		Env:           registryEnvSnapshot(envValuesFromLines(envLines)),
 	}
 	if err := c.upsertRegistryEntry(entry); err != nil {
@@ -746,9 +756,9 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 }
 
 func (c config) deleteServer(rawID string, confirm string) (createServerResponse, int) {
-	id := strings.TrimSpace(rawID)
-	if !serverIDRe.MatchString(id) {
-		return createServerResponse{OK: false, Detail: "잘못된 id — s<id> 형식만 허용"}, http.StatusBadRequest
+	id, _, err := normalizeCreateServerID(rawID)
+	if err != nil {
+		return createServerResponse{OK: false, Detail: err.Error()}, http.StatusBadRequest
 	}
 	if confirm != "DELETE "+id {
 		return createServerResponse{OK: false, ID: id, Detail: "삭제 확인 문구가 일치하지 않습니다."}, http.StatusBadRequest
@@ -791,9 +801,9 @@ func (c config) deleteServer(rawID string, confirm string) (createServerResponse
 }
 
 func (c config) resetServer(rawID string, req resetServerRequest) (createServerResponse, int) {
-	id := strings.TrimSpace(rawID)
-	if !serverIDRe.MatchString(id) {
-		return createServerResponse{OK: false, Detail: "잘못된 id — s<id> 형식만 허용"}, http.StatusBadRequest
+	id, _, err := normalizeCreateServerID(rawID)
+	if err != nil {
+		return createServerResponse{OK: false, Detail: err.Error()}, http.StatusBadRequest
 	}
 	if req.Confirm != "RESET "+id {
 		return createServerResponse{OK: false, ID: id, Detail: "리셋 확인 문구가 일치하지 않습니다."}, http.StatusBadRequest
@@ -1108,25 +1118,13 @@ func isEnvKey(key string) bool {
 }
 
 func normalizeCreateServerID(raw string) (string, string, error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
+	if raw == "" {
 		return "", "", fmt.Errorf("서버 id가 필요합니다.")
 	}
-	if strings.ContainsAny(trimmed, "/\\.\r\n") {
-		return "", "", fmt.Errorf("서버 id가 올바르지 않습니다.")
+	if !serverIDRe.MatchString(raw) {
+		return "", "", fmt.Errorf("서버 id는 영문 대소문자와 숫자만 허용합니다.")
 	}
-	id := trimmed
-	if !strings.HasPrefix(id, "s") {
-		id = "s" + id
-	}
-	if !serverIDRe.MatchString(id) {
-		return "", "", fmt.Errorf("서버 id는 s<영숫자> 형식이어야 합니다.")
-	}
-	serverNumber := strings.TrimPrefix(id, "s")
-	if serverNumber == "" {
-		return "", "", fmt.Errorf("서버 id는 s<영숫자> 형식이어야 합니다.")
-	}
-	return id, serverNumber, nil
+	return raw, internalServerKey(raw), nil
 }
 
 func isPort(value string) bool {
@@ -1292,7 +1290,7 @@ func (c config) registryEntryFromServerEnv(id string, values map[string]string, 
 		next.ID = id
 	}
 	if next.DeployProject == "" {
-		next.DeployProject = "opensamguk-" + id
+		next.DeployProject = projectForServerID(id)
 	}
 	if name := strings.TrimSpace(values["SERVER_NAME"]); name != "" {
 		next.Name = name
@@ -1474,8 +1472,11 @@ func (c config) ensurePortsAvailable(newID string, requested map[string]string) 
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".env") {
 			continue
 		}
-		id := strings.TrimSuffix(entry.Name(), ".env")
-		if id == newID {
+		internalKey := strings.TrimSuffix(entry.Name(), ".env")
+		if !internalServerKeyRe.MatchString(internalKey) {
+			continue
+		}
+		if internalKey == internalServerKey(newID) {
 			continue
 		}
 		lines, err := readEnvLines(filepath.Join(c.serversDir, entry.Name()))
@@ -1491,7 +1492,7 @@ func (c config) ensurePortsAvailable(newID string, requested map[string]string) 
 			}
 			for key, port := range requested {
 				if line.Value == port {
-					return fmt.Errorf("%s=%s 는 이미 %s 서버의 %s가 사용 중입니다.", key, port, id, line.Key)
+					return fmt.Errorf("%s=%s 는 이미 %s 서버의 %s가 사용 중입니다.", key, port, strings.TrimPrefix(internalKey, "s"), line.Key)
 				}
 			}
 		}

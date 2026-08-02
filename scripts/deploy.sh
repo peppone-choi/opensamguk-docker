@@ -17,16 +17,17 @@ fi
 
 echo "=== Deploying opensamguk to ${DEPLOY_USER}@${DEPLOY_HOST} ==="
 
-# Ensure remote directory exists and has compose file
 ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
-    "${DEPLOY_USER}@${DEPLOY_HOST}" "mkdir -p ~/opensamguk"
+    "${DEPLOY_USER}@${DEPLOY_HOST}" "mkdir -p ~/opensamguk/infra/nginx"
 
-# Sync compose + nginx config + env template
 rsync -avz -e "ssh -i ${SSH_KEY} -o StrictHostKeyChecking=accept-new" \
     --exclude='.git' \
     "${COMPOSE_FILE}" \
+    "${DEPLOY_USER}@${DEPLOY_HOST}:~/opensamguk/docker-compose.yml"
+rsync -avz -e "ssh -i ${SSH_KEY} -o StrictHostKeyChecking=accept-new" \
+    --exclude='.git' \
     "infra/nginx/nginx.conf" \
-    "${DEPLOY_USER}@${DEPLOY_HOST}:~/opensamguk/"
+    "${DEPLOY_USER}@${DEPLOY_HOST}:~/opensamguk/infra/nginx/nginx.conf"
 
 # Pull latest images and restart
 ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
