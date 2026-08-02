@@ -7,7 +7,7 @@ set -euo pipefail
 DEPLOY_HOST="${1:-${DEPLOY_HOST:-}}"
 DEPLOY_USER="${2:-${DEPLOY_USER:-peppone_choi}}"
 SSH_KEY="${SSH_KEY:-${HOME}/.ssh/id_ed25519}"
-COMPOSE_FILE="docker-compose.production.yml"
+COMPOSE_FILE="docker-compose.yml"
 
 if [[ -z "$DEPLOY_HOST" ]]; then
     echo "Usage: $0 <DEPLOY_HOST> [DEPLOY_USER]"
@@ -42,18 +42,18 @@ ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
     fi
 
     echo "=== Pulling images ==="
-    docker compose -f docker-compose.production.yml pull
+    docker compose -f docker-compose.yml pull
 
     echo "=== Restarting services ==="
     # Restart non-engine services first
-    docker compose -f docker-compose.production.yml up -d --no-deps \
+    docker compose -f docker-compose.yml up -d --no-deps \
         gateway-api game-api web-gateway web-game nginx
 
     # Brief pause for DB/redis readiness
     sleep 5
 
     # Restart engine last (it owns the in-memory turn state)
-    docker compose -f docker-compose.production.yml up -d --no-deps game-engine
+    docker compose -f docker-compose.yml up -d --no-deps game-engine
 
     # Prune old images (keep 7 days)
     docker image prune -af --filter "until=168h" || true
