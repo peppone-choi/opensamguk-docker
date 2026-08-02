@@ -188,25 +188,26 @@ var sharedEnvAllowlist = map[string]envFieldSpec{
 
 // 환경변수 묶음.
 type config struct {
-	token                  string // Bearer 인증 토큰
-	composeDir             string // compose 파일 디렉터리(/workspace)
-	serversDir             string // 서버 env 파일 디렉터리(/workspace/servers)
-	composeServer          string // 서버 compose 파일 절대경로
-	composeShared          string
-	ghcrOwner              string // GHCR 패키지 소유자(태그 조회)
-	ghcrToken              string // GHCR 조회 토큰(private면 필요, 없으면 익명)
-	ghcrAPIBaseURL         string
-	dockerRunner           func(args ...string) (string, error)
-	dockerRunnerContext    func(context.Context, ...string) (string, error)
-	gameAPIInternalPort    string
-	gameEngineInternalPort string
-	gatewayAPIURL          string
-	lifecycleJobs          *lifecycleJobManager
-	maintenanceFile        string
-	lifecycleJournalFile   string
-	sharedEnvMu            *sync.Mutex
-	registryRewriteHook    func()
-	operations             *operationCoordinator
+	token                     string // Bearer 인증 토큰
+	composeDir                string // compose 파일 디렉터리(/workspace)
+	serversDir                string // 서버 env 파일 디렉터리(/workspace/servers)
+	composeServer             string // 서버 compose 파일 절대경로
+	composeShared             string
+	ghcrOwner                 string // GHCR 패키지 소유자(태그 조회)
+	ghcrToken                 string // GHCR 조회 토큰(private면 필요, 없으면 익명)
+	ghcrAPIBaseURL            string
+	dockerRunner              func(args ...string) (string, error)
+	dockerRunnerContext       func(context.Context, ...string) (string, error)
+	gameAPIInternalPort       string
+	gameEngineInternalPort    string
+	gatewayAPIURL             string
+	lifecycleJobs             *lifecycleJobManager
+	maintenanceFile           string
+	lifecycleJournalFile      string
+	sharedEnvMu               *sync.Mutex
+	registryRewriteHook       func()
+	lifecycleJournalWriteHook func(lifecycleJournal)
+	operations                *operationCoordinator
 }
 
 type lifecycleJobStatus string
@@ -578,9 +579,18 @@ func writeMaintenanceMarkerAtomic(path string) error {
 type lifecycleJournal struct {
 	Version   int    `json:"version"`
 	Operation string `json:"operation"`
+	Stage     string `json:"stage,omitempty"`
 	ServerID  string `json:"serverId"`
 	Project   string `json:"project"`
 }
+
+const (
+	lifecycleJournalVersion       = 1
+	lifecycleJournalStagePrepared = "prepared"
+	lifecycleJournalStageEnv      = "env-updated"
+	lifecycleJournalStageRegistry = "registry-synced"
+	lifecycleJournalStageDown     = "down-pending"
+)
 
 func (c config) writeLifecycleJournal(operation string, target serverTarget) error {
 	if c.lifecycleJournalFile == "" {
@@ -589,26 +599,76 @@ func (c config) writeLifecycleJournal(operation string, target serverTarget) err
 	if stateFilePresent(c.lifecycleJournalFile) {
 		return errors.New("lifecycle recovery journal is already present")
 	}
-	if operation != "create" && operation != "delete" && operation != "deploy" && operation != "reset" {
+	if !isLifecycleJournalOperation(operation) {
 		return errors.New("unsupported lifecycle journal operation")
 	}
-	payload, err := json.Marshal(lifecycleJournal{
-		Version:   1,
+	if err := c.writeLifecycleJournalRecord(lifecycleJournal{
+		Version:   lifecycleJournalVersion,
 		Operation: operation,
+		Stage:     lifecycleJournalStagePrepared,
 		ServerID:  target.ID,
 		Project:   target.Project,
-	})
+	}); err != nil {
+		return err
+	}
+	if c.operations != nil {
+		c.operations.markLifecycleJournalPending()
+	}
+	return nil
+}
+
+func (c config) advanceLifecycleJournal(stage string) error {
+	if !isLifecycleJournalStage(stage) {
+		return errors.New("unsupported lifecycle journal stage")
+	}
+	journal, exists, err := c.readLifecycleJournal()
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return errors.New("lifecycle recovery journal is unavailable")
+	}
+	journal.Stage = stage
+	if err := c.writeLifecycleJournalRecord(journal); err != nil {
+		return err
+	}
+	if c.operations != nil {
+		c.operations.markLifecycleJournalPending()
+	}
+	return nil
+}
+
+func isLifecycleJournalOperation(operation string) bool {
+	switch operation {
+	case "create", "delete", "deploy", "patch", "reset":
+		return true
+	default:
+		return false
+	}
+}
+
+func isLifecycleJournalStage(stage string) bool {
+	switch stage {
+	case "", lifecycleJournalStagePrepared, lifecycleJournalStageEnv, lifecycleJournalStageRegistry, lifecycleJournalStageDown:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c config) writeLifecycleJournalRecord(journal lifecycleJournal) error {
+	payload, err := json.Marshal(journal)
 	if err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(c.lifecycleJournalFile), 0o755); err != nil {
 		return err
 	}
-	if err := writeFileAtomic(c.lifecycleJournalFile, append(payload, '\n')); err != nil {
+	if err := writeFileAtomicDurable(c.lifecycleJournalFile, append(payload, '\n')); err != nil {
 		return err
 	}
-	if c.operations != nil {
-		c.operations.markLifecycleJournalPending()
+	if c.lifecycleJournalWriteHook != nil {
+		c.lifecycleJournalWriteHook(journal)
 	}
 	return nil
 }
@@ -628,7 +688,7 @@ func (c config) readLifecycleJournal() (lifecycleJournal, bool, error) {
 	if err := json.Unmarshal(data, &journal); err != nil {
 		return lifecycleJournal{}, false, err
 	}
-	if journal.Version != 1 || (journal.Operation != "create" && journal.Operation != "delete" && journal.Operation != "deploy" && journal.Operation != "reset") {
+	if journal.Version != lifecycleJournalVersion || !isLifecycleJournalOperation(journal.Operation) || !isLifecycleJournalStage(journal.Stage) {
 		return lifecycleJournal{}, false, errors.New("lifecycle journal is invalid")
 	}
 	target, err := c.serverTargetForID(journal.ServerID)
@@ -644,7 +704,11 @@ func (c config) clearLifecycleJournal() error {
 	if c.lifecycleJournalFile == "" {
 		return errors.New("lifecycle journal path is unavailable")
 	}
-	if err := os.Remove(c.lifecycleJournalFile); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(c.lifecycleJournalFile); err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+	} else if err := syncDirectory(filepath.Dir(c.lifecycleJournalFile)); err != nil {
 		return err
 	}
 	if c.operations != nil {
@@ -704,23 +768,26 @@ func (c config) repairLifecycleJournal() error {
 			return err
 		}
 	case "reset":
-		if _, err := c.validateServerTarget(target); err != nil {
+		if _, err := c.downServerStack(lease.Context(), target.Project, target.EnvFile); err != nil {
 			return err
-		}
-		if current, err := c.registryEntryByID(target.ID); err != nil {
-			return err
-		} else if current.ID == "" {
-			if _, err := c.syncRegistryEntryFromEnv(target.ID, target.EnvFile); err != nil {
-				return err
-			}
 		}
 		if _, err := c.upServerStack(lease.Context(), target.Project, target.EnvFile); err != nil {
+			return err
+		}
+		if err := c.reconcileServerRegistry(target); err != nil {
 			return err
 		}
 		if _, err := c.reloadSharedRegistry(lease.Context()); err != nil {
 			return err
 		}
 		if err := c.setRegistryRepairRequired(target.ID, false); err != nil {
+			return err
+		}
+	case "patch":
+		if err := c.reconcileServerRegistry(target); err != nil {
+			return err
+		}
+		if _, err := c.reloadSharedRegistry(lease.Context()); err != nil {
 			return err
 		}
 	case "deploy":
@@ -732,31 +799,24 @@ func (c config) repairLifecycleJournal() error {
 		}
 	case "delete":
 		_, envErr := os.Stat(target.EnvFile)
-		entry, entryErr := c.registryEntryByID(target.ID)
-		if entryErr != nil {
-			return entryErr
-		}
 		if envErr == nil {
 			if _, err := c.validateServerTarget(target); err != nil {
 				return err
 			}
-			if entry.ID == "" {
-				if _, err := c.syncRegistryEntryFromEnv(target.ID, target.EnvFile); err != nil {
-					return err
-				}
-			}
-			if _, err := c.upServerStack(lease.Context(), target.Project, target.EnvFile); err != nil {
+			if _, err := c.downServerStack(lease.Context(), target.Project, target.EnvFile); err != nil {
 				return err
 			}
-			if _, err := c.reloadSharedRegistry(lease.Context()); err != nil {
+			if err := os.Remove(target.EnvFile); err != nil && !os.IsNotExist(err) {
 				return err
 			}
-		} else if os.IsNotExist(envErr) && entry.ID == "" {
-			if _, err := c.reloadSharedRegistry(lease.Context()); err != nil {
-				return err
-			}
-		} else {
-			return errors.New("delete recovery state is inconsistent")
+		} else if !os.IsNotExist(envErr) {
+			return envErr
+		}
+		if _, err := c.removeRegistryEntry(target.ID); err != nil {
+			return err
+		}
+		if _, err := c.reloadSharedRegistry(lease.Context()); err != nil {
+			return err
 		}
 	}
 	return c.clearLifecycleJournal()
@@ -1812,12 +1872,14 @@ func (c config) handleEnv(w http.ResponseWriter, r *http.Request, ctx envRequest
 			}
 		}()
 		jobID := ""
+		registryReloadNeeded := false
 		if ctx.scope == "server" {
 			reloadNeeded, preflightErr := c.serverEnvPatchChangesRegistry(ctx.id, ctx.path, req.Values)
 			if preflightErr != nil {
 				writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("레지스트리 동기화 준비 실패: %v", preflightErr)})
 				return
 			}
+			registryReloadNeeded = reloadNeeded
 			if reloadNeeded {
 				jobID, err = c.lifecycleJobs.reserve()
 				if err != nil {
@@ -1839,6 +1901,19 @@ func (c config) handleEnv(w http.ResponseWriter, r *http.Request, ctx envRequest
 			writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "mutation cancelled"})
 			return
 		}
+		if registryReloadNeeded {
+			target, err := c.serverTargetForID(ctx.id)
+			if err != nil {
+				c.finishClaimedLifecycleJob(lease, jobID, "reload registry "+ctx.id, err)
+				writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "레지스트리 recovery journal을 준비하지 못했습니다."})
+				return
+			}
+			if err := c.writeLifecycleJournal("patch", target); err != nil {
+				c.finishClaimedLifecycleJob(lease, jobID, "reload registry "+ctx.id, err)
+				writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "레지스트리 recovery journal을 준비하지 못했습니다."})
+				return
+			}
+		}
 		fields, err := c.patchManagedEnvFile(ctx.path, ctx.allowlist, req.Values)
 		if err != nil {
 			if jobID != "" {
@@ -1846,6 +1921,13 @@ func (c config) handleEnv(w http.ResponseWriter, r *http.Request, ctx envRequest
 			}
 			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("env 파일 쓰기 실패: %v", err)})
 			return
+		}
+		if registryReloadNeeded {
+			if err := c.advanceLifecycleJournal(lifecycleJournalStageEnv); err != nil {
+				c.finishClaimedLifecycleJob(lease, jobID, "reload registry "+ctx.id, err)
+				writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "레지스트리 recovery journal을 갱신하지 못했습니다."})
+				return
+			}
 		}
 		affectedServices := append([]string{}, ctx.affectedServices...)
 		responseJobID := ""
@@ -1865,6 +1947,13 @@ func (c config) handleEnv(w http.ResponseWriter, r *http.Request, ctx envRequest
 				writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("레지스트리 동기화 실패: %v", err)})
 				return
 			}
+			if registryReloadNeeded {
+				if err := c.advanceLifecycleJournal(lifecycleJournalStageRegistry); err != nil {
+					c.finishClaimedLifecycleJob(lease, jobID, "reload registry "+ctx.id, err)
+					writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "레지스트리 recovery journal을 갱신하지 못했습니다."})
+					return
+				}
+			}
 			if changed {
 				if jobID == "" {
 					writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "레지스트리 reload 작업을 준비하지 못했습니다."})
@@ -1876,14 +1965,26 @@ func (c config) handleEnv(w http.ResponseWriter, r *http.Request, ctx envRequest
 					if err != nil {
 						return "", err
 					}
-					if _, err := c.validateServerTarget(target); err != nil {
+					if err := c.reconcileServerRegistry(target); err != nil {
 						return "", err
 					}
-					return c.reloadSharedRegistry(jobContext)
+					detail, err := c.reloadSharedRegistry(jobContext)
+					if err != nil {
+						return detail, err
+					}
+					if err := c.clearLifecycleJournal(); err != nil {
+						return detail, err
+					}
+					return detail, nil
 				})
 				responseJobID = jobID
 				leaseTransferred = true
 			} else if jobID != "" {
+				if err := c.clearLifecycleJournal(); err != nil {
+					c.finishClaimedLifecycleJob(lease, jobID, "reload registry "+ctx.id, err)
+					writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "레지스트리 recovery journal을 정리하지 못했습니다."})
+					return
+				}
 				c.finishClaimedLifecycleJob(lease, jobID, "reload registry "+ctx.id, nil)
 			}
 		}
@@ -2261,6 +2362,9 @@ func (c config) deleteServer(rawID string, confirm string) (createServerResponse
 		if err := c.writeLifecycleJournal("delete", target); err != nil {
 			return "", err
 		}
+		if err := c.advanceLifecycleJournal(lifecycleJournalStageDown); err != nil {
+			return "", err
+		}
 		detail, downErr := c.downServerStack(ctx, target.Project, envFile)
 		if downErr != nil {
 			return detail, downErr
@@ -2349,10 +2453,6 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 	if _, err := os.Stat(envFile); err != nil {
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: fmt.Sprintf("서버 env 확인 실패: %v", err)}, http.StatusInternalServerError
 	}
-	originalEnv, err := os.ReadFile(envFile)
-	if err != nil {
-		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: fmt.Sprintf("서버 env 백업 실패: %v", err)}, http.StatusInternalServerError
-	}
 	if err := lease.Context().Err(); err != nil {
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: "maintenance in progress"}, http.StatusServiceUnavailable
 	}
@@ -2367,16 +2467,7 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: detail}, status
 	}
 	leaseTransferred = true
-	originalEntry := entry
 	c.startClaimedLifecycleJob(lease, jobID, "reset "+id, func(ctx context.Context) (string, error) {
-		irreversible := false
-		restorePreDown := func() {
-			if irreversible {
-				return
-			}
-			_ = writeFileAtomic(envFile, originalEnv)
-			_ = c.upsertRegistryEntry(originalEntry)
-		}
 		failAfterIrreversible := func(detail string, cause error) (string, error) {
 			if markerErr := c.setRegistryRepairRequired(id, true); markerErr != nil {
 				return detail, fmt.Errorf("reset crossed irreversible volume-removal boundary and could not persist repair-required state: %v (original failure: %w)", markerErr, cause)
@@ -2386,46 +2477,37 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
+		if err := c.writeLifecycleJournal("reset", target); err != nil {
+			return "", err
+		}
 		if err := applyResetUpdates(envFile, updates); err != nil {
 			return "", err
 		}
+		if err := c.advanceLifecycleJournal(lifecycleJournalStageEnv); err != nil {
+			return "", err
+		}
 		if _, err := c.syncRegistryEntryFromEnv(id, envFile); err != nil {
-			restorePreDown()
+			return "", err
+		}
+		if err := c.advanceLifecycleJournal(lifecycleJournalStageRegistry); err != nil {
 			return "", err
 		}
 		updatedEntry, err := c.registryEntryByID(id)
 		if err != nil || updatedEntry.ID == "" {
-			restorePreDown()
 			if err != nil {
 				return "", err
 			}
 			return "", errors.New("updated server registry entry is unavailable")
 		}
 		if err := ctx.Err(); err != nil {
-			restorePreDown()
 			return "", err
 		}
-		if err := c.writeLifecycleJournal("reset", target); err != nil {
-			restorePreDown()
+		if err := c.advanceLifecycleJournal(lifecycleJournalStageDown); err != nil {
 			return "", err
 		}
-		irreversible = true
 		detail, downErr := c.downServerStack(ctx, updatedEntry.DeployProject, envFile)
 		if downErr != nil {
-			recoveryDetail, recoveryErr := c.forwardRecoveryServerStack(updatedEntry.DeployProject, envFile)
-			if recoveryDetail != "" {
-				detail += "\n=== server forward recovery ===\n" + recoveryDetail
-			}
-			if recoveryErr != nil {
-				return failAfterIrreversible(detail, fmt.Errorf("server down failed: %v; forward recovery failed: %w", downErr, recoveryErr))
-			}
-			if err := c.setRegistryRepairRequired(id, false); err != nil {
-				return detail, fmt.Errorf("reset forward recovery completed but could not clear repair-required state: %w", err)
-			}
-			if err := c.clearLifecycleJournal(); err != nil {
-				return detail, err
-			}
-			return detail, fmt.Errorf("reset down failed after the irreversible boundary; forward recovery succeeded: %w", downErr)
+			return failAfterIrreversible(detail, fmt.Errorf("server down returned an ambiguous result; reset recovery must complete the destructive reset before reopening: %w", downErr))
 		}
 		if err := ctx.Err(); err != nil {
 			return failAfterIrreversible(detail, err)
@@ -2442,6 +2524,9 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 			if retryErr != nil {
 				return failAfterIrreversible(detail, fmt.Errorf("server up failed: %v; forward recovery failed: %w", upErr, retryErr))
 			}
+		}
+		if err := c.reconcileServerRegistry(target); err != nil {
+			return failAfterIrreversible(detail, err)
 		}
 		reloadDetail, reloadErr := c.reloadSharedRegistry(ctx)
 		if reloadDetail != "" {
@@ -2698,6 +2783,14 @@ func atomicWriteAttrs(path string) fileAttrs {
 }
 
 func writeFileAtomic(path string, data []byte) error {
+	return writeFileAtomicWithDurability(path, data, false)
+}
+
+func writeFileAtomicDurable(path string, data []byte) error {
+	return writeFileAtomicWithDurability(path, data, true)
+}
+
+func writeFileAtomicWithDurability(path string, data []byte, durable bool) error {
 	dir := filepath.Dir(path)
 	attrs := atomicWriteAttrs(path)
 	tmp, err := os.CreateTemp(dir, ".env-write-*")
@@ -2726,10 +2819,31 @@ func writeFileAtomic(path string, data []byte) error {
 		_ = tmp.Close()
 		return err
 	}
+	if durable {
+		if err := tmp.Sync(); err != nil {
+			_ = tmp.Close()
+			return err
+		}
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, path)
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	if !durable {
+		return nil
+	}
+	return syncDirectory(dir)
+}
+
+func syncDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 func buildEnvFields(allowlist map[string]envFieldSpec, values map[string]string) map[string]envField {
@@ -3202,6 +3316,8 @@ func parseRawRegistryEntries(lines []envLine) ([]registryEntry, bool, error) {
 		}
 		assignments++
 		if strings.TrimSpace(line.Value) == "" {
+			registry = []registryEntry{}
+			rewrite = true
 			continue
 		}
 		var rawEntries []json.RawMessage
@@ -3378,10 +3494,21 @@ func (c config) upServerStack(ctx context.Context, project, envFile string) (str
 	)
 }
 
-func (c config) forwardRecoveryServerStack(project, envFile string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	return c.upServerStack(ctx, project, envFile)
+func (c config) reconcileServerRegistry(target serverTarget) error {
+	if _, err := c.validateServerTarget(target); err != nil {
+		return err
+	}
+	if _, err := c.syncRegistryEntryFromEnv(target.ID, target.EnvFile); err != nil {
+		return err
+	}
+	entry, err := c.registryEntryByID(target.ID)
+	if err != nil {
+		return err
+	}
+	if entry.ID == "" || entry.DeployProject != target.Project {
+		return errors.New("server registry is inconsistent with its env file")
+	}
+	return nil
 }
 
 func (c config) downServerStack(ctx context.Context, project, envFile string) (string, error) {

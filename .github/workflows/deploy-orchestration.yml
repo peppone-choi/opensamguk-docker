@@ -18,14 +18,55 @@ concurrency:
 jobs:
   deploy:
     runs-on: [self-hosted, gcp-prod]
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
       - name: Synchronize, validate, replace, and verify orchestration
         run: |
           set -euo pipefail
+          WORKFLOW_DEADLINE=$((SECONDS + 2400))
+          deadline_remaining() {
+            local deadline="$1"
+            local remaining=$((deadline - SECONDS))
+            if (( remaining <= 0 )); then
+              return 1
+            fi
+            printf '%s\n' "$remaining"
+          }
+          bounded_sleep() {
+            local deadline="$1"
+            local requested="$2"
+            local remaining
+            if ! remaining="$(deadline_remaining "$deadline")"; then
+              return 1
+            fi
+            if (( requested > remaining )); then
+              requested="$remaining"
+            fi
+            timeout --foreground -k 2 "$requested" sleep "$requested"
+          }
+          run_bounded() {
+            local deadline="$1"
+            local requested="$2"
+            shift 2
+            local remaining
+            if ! remaining="$(deadline_remaining "$deadline")"; then
+              return 124
+            fi
+            if (( requested > remaining )); then
+              requested="$remaining"
+            fi
+            timeout --foreground -k 2 "$requested" "$@"
+          }
+          docker_exec_bounded() {
+            local deadline="$1"
+            local requested="$2"
+            shift 2
+            run_bounded "$deadline" "$requested" sudo docker exec "$@"
+          }
           exec 9>/tmp/opensamguk-production.lock
-          if ! flock -w 1800 9; then
+          if ! run_bounded "$WORKFLOW_DEADLINE" 1800 flock -w 1800 9; then
             echo "::error::Timed out acquiring /tmp/opensamguk-production.lock after 1800 seconds"
             exit 1
           fi
@@ -33,20 +74,20 @@ jobs:
           cd "$STACK"
 
           maintenance_response_state() {
-            printf '%s' "$1" | python3 -c 'import json, re, sys; payload = json.load(sys.stdin); keys = set(payload) if isinstance(payload, dict) else set(); valid = keys in ({"capability", "state"}, {"capability", "state", "lease"}) and payload.get("capability") == "maintenance-v1" and payload.get("state") in {"open", "draining", "drained"} and ("lease" not in payload or re.fullmatch(r"[a-f0-9]{32}", payload["lease"]) is not None); valid or sys.exit(1); print(payload["state"])'
+            printf '%s' "$1" | run_bounded "$WORKFLOW_DEADLINE" 10 python3 -c 'import json, re, sys; payload = json.load(sys.stdin); keys = set(payload) if isinstance(payload, dict) else set(); valid = keys in ({"capability", "state"}, {"capability", "state", "lease"}) and payload.get("capability") == "maintenance-v1" and payload.get("state") in {"open", "draining", "drained"} and ("lease" not in payload or re.fullmatch(r"[a-f0-9]{32}", payload["lease"]) is not None); valid or sys.exit(1); print(payload["state"])'
           }
           maintenance_get() {
-            sudo docker exec opensamguk-deployer sh -c '
+            docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c '
               timeout -k 2 10 wget -qO- -T 5 --header="Authorization: Bearer $DEPLOYER_TOKEN" http://localhost:9000/maintenance
             ' 2>/dev/null
           }
           maintenance_post() {
-            sudo docker exec opensamguk-deployer sh -c '
+            docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c '
               timeout -k 2 10 wget -qO- -T 5 --header="Authorization: Bearer $DEPLOYER_TOKEN" --post-data="" "http://localhost:9000$1"
             ' maintenance "$1" 2>/dev/null
           }
           DEPLOYER_FRESH=false
-          if sudo docker ps -a --format '{{.Names}}' | grep -Fxq opensamguk-deployer; then
+          if run_bounded "$WORKFLOW_DEADLINE" 15 sudo docker ps -a --format '{{.Names}}' | grep -Fxq opensamguk-deployer; then
             if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_get)")"; then
               echo "::error::running deployer lacks a valid maintenance-v1 capability; aborting before control-plane mutation"
               exit 1
@@ -56,36 +97,41 @@ jobs:
               exit 1
             fi
           else
-            mkdir -p "$STACK/servers"
+            run_bounded "$WORKFLOW_DEADLINE" 30 mkdir -p "$STACK/servers"
             : > "$STACK/servers/.deployer-maintenance"
             DEPLOYER_FRESH=true
           fi
 
-          git fetch --prune origin main
-          if ! git diff --quiet || ! git diff --cached --quiet; then
+          run_bounded "$WORKFLOW_DEADLINE" 180 git fetch --prune origin main
+          if ! run_bounded "$WORKFLOW_DEADLINE" 30 git diff --quiet || ! run_bounded "$WORKFLOW_DEADLINE" 30 git diff --cached --quiet; then
             echo "::error::opensamguk-docker has local tracked changes; refusing to overwrite prod orchestration files"
-            git status --short
+            run_bounded "$WORKFLOW_DEADLINE" 30 git status --short
             exit 1
           fi
-          git merge --ff-only origin/main
+          run_bounded "$WORKFLOW_DEADLINE" 180 git merge --ff-only origin/main
 
           COMPOSE="sudo docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env"
-          $COMPOSE build deployer
-          sudo docker run --rm --read-only --network none \
+          run_bounded "$WORKFLOW_DEADLINE" 900 $COMPOSE build deployer
+          run_bounded "$WORKFLOW_DEADLINE" 120 sudo docker run --rm --read-only --network none \
             -e COMPOSE_DIR=/workspace \
             -v "$STACK/.env:/workspace/.env:ro" \
             -v "$STACK/servers:/workspace/servers:ro" \
             opensamguk-deployer:local --check-registry
 
-          $COMPOSE up -d --force-recreate --no-deps deployer
+          run_bounded "$WORKFLOW_DEADLINE" 300 $COMPOSE up -d --force-recreate --no-deps deployer
           deployer_ready=false
           for _ in $(seq 1 30); do
-            if sudo docker exec opensamguk-deployer wget -qO- http://localhost:9000/healthz | grep -q '"status":"up"' && \
-              sudo docker exec opensamguk-deployer wget -qO- http://localhost:9000/readyz | grep -q '"status":"ready"'; then
+            if ! deadline_remaining "$WORKFLOW_DEADLINE" >/dev/null; then
+              break
+            fi
+            if docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c 'timeout -k 2 10 wget -qO- -T 5 http://localhost:9000/healthz' | grep -q '"status":"up"' && \
+              docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c 'timeout -k 2 10 wget -qO- -T 5 http://localhost:9000/readyz' | grep -q '"status":"ready"'; then
               deployer_ready=true
               break
             fi
-            sleep 2
+            if ! bounded_sleep "$WORKFLOW_DEADLINE" 2; then
+              break
+            fi
           done
           if [ "$deployer_ready" != true ]; then
             echo "::error::deployer did not become healthz+readyz ready before nginx reload"
@@ -96,12 +142,12 @@ jobs:
             exit 1
           fi
 
-          $COMPOSE up -d --force-recreate --no-deps nginx
-          sudo docker exec opensamguk-deployer wget -qO- http://localhost:9000/healthz | grep -q '"status":"up"'
-          sudo docker exec opensamguk-deployer wget -qO- http://localhost:9000/readyz | grep -q '"status":"ready"'
-          curl -fsS http://localhost/health | grep -q '"status":"up"'
+          run_bounded "$WORKFLOW_DEADLINE" 300 $COMPOSE up -d --force-recreate --no-deps nginx
+          docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c 'timeout -k 2 10 wget -qO- -T 5 http://localhost:9000/healthz' | grep -q '"status":"up"'
+          docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c 'timeout -k 2 10 wget -qO- -T 5 http://localhost:9000/readyz' | grep -q '"status":"ready"'
+          run_bounded "$WORKFLOW_DEADLINE" 15 curl -fsS --max-time 10 http://localhost/health | grep -q '"status":"up"'
 
-          SERVER_IDS="$(python3 - "$STACK/.env" <<'PY'
+          SERVER_IDS="$(run_bounded "$WORKFLOW_DEADLINE" 15 python3 - "$STACK/.env" <<'PY'
           import json
           import re
           import sys
@@ -125,8 +171,8 @@ jobs:
             route_checked=false
             for SERVER_ID in $SERVER_IDS; do
               INTERNAL_ID="s${SERVER_ID}"
-              if sudo docker ps --format '{{.Names}}' | grep -Fxq "${INTERNAL_ID}-web-game"; then
-                curl -fsS "http://localhost/game/${SERVER_ID}" >/dev/null
+              if run_bounded "$WORKFLOW_DEADLINE" 15 sudo docker ps --format '{{.Names}}' | grep -Fxq "${INTERNAL_ID}-web-game"; then
+                run_bounded "$WORKFLOW_DEADLINE" 15 curl -fsS --max-time 10 "http://localhost/game/${SERVER_ID}" >/dev/null
                 route_checked=true
                 break
               fi
