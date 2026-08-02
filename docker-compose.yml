@@ -1,4 +1,4 @@
-# Production Docker Compose — EC2 t3.large (2 vCPU, 8 GiB RAM)
+# Production Docker Compose — GCP Compute Engine e2-standard-2 (2 vCPU, 8 GiB RAM)
 # Usage: docker compose -f docker-compose.production.yml up -d
 name: opensamguk
 

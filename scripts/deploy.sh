@@ -1,36 +1,36 @@
 #!/usr/bin/env bash
-# Deploy opensamguk to EC2 t3.large
-# Usage: ./scripts/deploy.sh [EC2_HOST] [EC2_USER]
+# Deploy opensamguk to a remote host
+# Usage: ./scripts/deploy.sh [DEPLOY_HOST] [DEPLOY_USER]
 
 set -euo pipefail
 
-EC2_HOST="${1:-${EC2_HOST:-}}"
-EC2_USER="${2:-${EC2_USER:-ubuntu}}"
+DEPLOY_HOST="${1:-${DEPLOY_HOST:-}}"
+DEPLOY_USER="${2:-${DEPLOY_USER:-peppone_choi}}"
 SSH_KEY="${SSH_KEY:-${HOME}/.ssh/id_ed25519}"
 COMPOSE_FILE="docker-compose.production.yml"
 
-if [[ -z "$EC2_HOST" ]]; then
-    echo "Usage: $0 <EC2_HOST> [EC2_USER]"
-    echo "   or: EC2_HOST=... $0"
+if [[ -z "$DEPLOY_HOST" ]]; then
+    echo "Usage: $0 <DEPLOY_HOST> [DEPLOY_USER]"
+    echo "   or: DEPLOY_HOST=... $0"
     exit 1
 fi
 
-echo "=== Deploying opensamguk to ${EC2_USER}@${EC2_HOST} ==="
+echo "=== Deploying opensamguk to ${DEPLOY_USER}@${DEPLOY_HOST} ==="
 
 # Ensure remote directory exists and has compose file
 ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
-    "${EC2_USER}@${EC2_HOST}" "mkdir -p ~/opensamguk"
+    "${DEPLOY_USER}@${DEPLOY_HOST}" "mkdir -p ~/opensamguk"
 
 # Sync compose + nginx config + env template
 rsync -avz -e "ssh -i ${SSH_KEY} -o StrictHostKeyChecking=accept-new" \
     --exclude='.git' \
     "${COMPOSE_FILE}" \
     "infra/nginx/nginx.conf" \
-    "${EC2_USER}@${EC2_HOST}:~/opensamguk/"
+    "${DEPLOY_USER}@${DEPLOY_HOST}:~/opensamguk/"
 
 # Pull latest images and restart
 ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
-    "${EC2_USER}@${EC2_HOST}" << 'REMOTE'
+    "${DEPLOY_USER}@${DEPLOY_HOST}" << 'REMOTE'
     set -euo pipefail
     cd ~/opensamguk
 
@@ -63,7 +63,7 @@ REMOTE
 
 # --- Health check loop ---
 echo "=== Health checks ==="
-BASE_URL="http://${EC2_HOST}"
+BASE_URL="http://${DEPLOY_HOST}"
 
 # nginx health
 for i in $(seq 1 30); do
@@ -108,7 +108,7 @@ done
 
 # game-engine actuator (internal port, check via docker exec)
 for i in $(seq 1 30); do
-    RESP=$(ssh -i "$SSH_KEY" "${EC2_USER}@${EC2_HOST}" \
+    RESP=$(ssh -i "$SSH_KEY" "${DEPLOY_USER}@${DEPLOY_HOST}" \
         "docker exec opensamguk-game-engine curl -sf http://localhost:8082/actuator/health 2>/dev/null || echo '{\"status\":\"DOWN\"}'" 2>/dev/null || echo '{"status":"DOWN"}')
     if echo "$RESP" | grep -q '"status":"UP"'; then
         echo "  game-engine actuator: OK"
