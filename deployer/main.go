@@ -52,6 +52,7 @@ const (
 	resetVerificationPollInterval  = time.Second
 	resetVerificationHTTPTimeout   = 5 * time.Second
 	maxVerificationResponseBytes   = 256 << 10
+	isolatedServerWorldID          = "1"
 )
 
 // 입력 검증용 화이트리스트 정규식.
@@ -2622,6 +2623,7 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 	}
 	envLines := []envLine{
 		{Raw: "SERVER_ID=" + id, Key: "SERVER_ID", Value: id, IsKV: true},
+		{Raw: "OPENSAMGUK_WORLD_ID=" + isolatedServerWorldID, Key: "OPENSAMGUK_WORLD_ID", Value: isolatedServerWorldID, IsKV: true},
 		{Raw: "GHCR_REGISTRY=ghcr.io", Key: "GHCR_REGISTRY", Value: "ghcr.io", IsKV: true},
 		{Raw: "GHCR_OWNER=" + c.ghcrOwner, Key: "GHCR_OWNER", Value: c.ghcrOwner, IsKV: true},
 		{Raw: "IMAGE_TAG=" + imageTag, Key: "IMAGE_TAG", Value: imageTag, IsKV: true},

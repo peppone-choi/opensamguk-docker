@@ -73,6 +73,7 @@ services:
       REDIS_HOST: s${SERVER_ID}-game-redis
       REDIS_PORT: 6379
       TURN_PROFILE_NAME: ${TURN_PROFILE_NAME:-che:scenario_2}
+      OPENSAMGUK_WORLD_ID: ${OPENSAMGUK_WORLD_ID:-1}
       # 시나리오 시드(빈 world_state에서 1회 멱등) — scenario_1010 = 174 generals.
       SCENARIO_SEED_ENABLED: ${SCENARIO_SEED_ENABLED:-true}
       SCENARIO_CODE: ${SCENARIO_CODE:-scenario_1010}
@@ -106,6 +107,7 @@ services:
       SERVER_ID: ${SERVER_ID}
       SERVER_NAME: ${SERVER_NAME:-}
       SERVER_GENERATION: ${SERVER_GENERATION:-1}
+      OPENSAMGUK_WORLD_ID: ${OPENSAMGUK_WORLD_ID:-1}
       # JWT — game-api는 gateway-api가 발급한 토큰을 검증(동일 시크릿, verify-only).
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required — gateway-api와 동일 값}
       JAVA_OPTS: "-XX:+UseG1GC -XX:MaxRAMPercentage=50.0 -XX:InitialRAMPercentage=30.0 -Djava.security.egd=file:/dev/./urandom"

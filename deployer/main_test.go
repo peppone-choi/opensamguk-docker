@@ -1706,6 +1706,7 @@ func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 	serverEnv := readFile(t, filepath.Join(cfg.serversDir, "spep.env"))
 	for _, want := range []string{
 		"SERVER_ID=pep\n",
+		"OPENSAMGUK_WORLD_ID=1\n",
 		"IMAGE_TAG=v2\n",
 		"SERVER_NAME=통일 서버\n",
 		"SERVER_GENERATION=3\n",
@@ -1926,7 +1927,7 @@ func TestPublicServerIDRejectsAllServerSentinelAfterCanonicalization(t *testing.
 	}
 }
 
-func TestServerComposeExportsPublicIDAndSynthesizesInternalNames(t *testing.T) {
+func TestServerComposeExportsPublicIDAndWorldIDToSourceServices(t *testing.T) {
 	compose := readFile(t, filepath.Join("..", "docker-compose.server.yml"))
 	for _, want := range []string{
 		"name: opensamguk-s${SERVER_ID}",
@@ -1939,6 +1940,38 @@ func TestServerComposeExportsPublicIDAndSynthesizesInternalNames(t *testing.T) {
 	}
 	if strings.Contains(compose, "SERVER_ID: s${SERVER_ID}") {
 		t.Fatalf("compose leaked internal key as public SERVER_ID")
+	}
+
+	const worldID = "OPENSAMGUK_WORLD_ID: ${OPENSAMGUK_WORLD_ID:-1}"
+	for _, service := range []struct {
+		name  string
+		until string
+	}{
+		{name: "game-engine", until: "\n  game-api:\n"},
+		{name: "game-api", until: "\n  web-game:\n"},
+	} {
+		start := strings.Index(compose, "\n  "+service.name+":\n")
+		if start < 0 {
+			t.Fatalf("compose missing %s service", service.name)
+		}
+		block := compose[start:]
+		end := strings.Index(block, service.until)
+		if end < 0 {
+			t.Fatalf("compose missing boundary after %s service", service.name)
+		}
+		if !strings.Contains(block[:end], worldID) {
+			t.Fatalf("%s must receive the isolated database world id %q", service.name, worldID)
+		}
+	}
+	if strings.Contains(compose, "OPENSAMGUK_WORLD_ID: ${SERVER_ID}") {
+		t.Fatal("compose used the public server id as the numeric world id")
+	}
+}
+
+func TestServerEnvTemplateSetsIsolatedDatabaseWorldID(t *testing.T) {
+	template := readFile(t, filepath.Join("..", "servers", "s1.env.example"))
+	if !strings.Contains(template, "\nOPENSAMGUK_WORLD_ID=1\n") {
+		t.Fatal("server env template must set the isolated database world id to 1")
 	}
 }
 
