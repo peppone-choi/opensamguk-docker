@@ -727,6 +727,55 @@ func TestMaintenanceLeaseAcceptedFromCreateBodyAndNeverReturned(t *testing.T) {
 	}
 }
 
+func TestRejectedCreateAdmissionDiscardsOperationReservationForRetry(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+	cfg.dockerRunner = func(args ...string) (string, error) { return "ok\n", nil }
+
+	maintenance := cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance))
+	enter := loopbackRequest(t, maintenance, http.MethodPost, "/maintenance/enter", "")
+	entered := decodeMaintenanceResponse(t, enter)
+	if enter.Code != http.StatusOK || entered.State != maintenanceStateDrained {
+		t.Fatalf("maintenance enter = %d body=%s", enter.Code, enter.Body.String())
+	}
+
+	const operationID = "0123456789abcdef0123456789abcdef"
+	staleLeaseBody := `{"id":"pep","name":"첫 서버","gameApiPort":"8101","webGamePort":"3101","operationId":"` + operationID + `","maintenanceLease":"fedcba9876543210fedcba9876543210"}`
+	rejected := loopbackRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create", staleLeaseBody)
+	if rejected.Code != http.StatusServiceUnavailable || rejected.Header().Get("Retry-After") != "5" {
+		t.Fatalf("stale lease create = %d retry=%q body=%s", rejected.Code, rejected.Header().Get("Retry-After"), rejected.Body.String())
+	}
+	cfg.lifecycleJobs.mu.Lock()
+	retainedJobID, retained := cfg.lifecycleJobs.operationJobs[operationID]
+	cfg.lifecycleJobs.mu.Unlock()
+	if retained {
+		t.Fatalf("rejected admission retained operation reservation %q", retainedJobID)
+	}
+
+	leave := loopbackRequest(t, maintenance, http.MethodPost, "/maintenance/leave", "")
+	if leave.Code != http.StatusOK || decodeMaintenanceResponse(t, leave).State != maintenanceStateOpen {
+		t.Fatalf("maintenance leave = %d body=%s", leave.Code, leave.Body.String())
+	}
+	retryBody := `{"id":"pep","name":"첫 서버","gameApiPort":"8101","webGamePort":"3101","operationId":"` + operationID + `"}`
+	retry := loopbackRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create", retryBody)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retry after rejected admission = %d body=%s", retry.Code, retry.Body.String())
+	}
+	var retried createServerResponse
+	if err := json.NewDecoder(retry.Body).Decode(&retried); err != nil {
+		t.Fatalf("decode retry create response: %v", err)
+	}
+	if !lifecycleJobIDRe.MatchString(retried.JobID) {
+		t.Fatalf("retry job id = %q", retried.JobID)
+	}
+	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, retried.JobID, lifecycleJobSucceeded); completed.Status != lifecycleJobSucceeded {
+		t.Fatalf("retry lifecycle completion = %#v", completed)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.serversDir, "spep.env")); err != nil {
+		t.Fatalf("retry did not create server env: %v", err)
+	}
+}
+
 func TestPersistedMaintenanceMarkerStartsClosedUntilLeave(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "COOKIE_SECURE=false\n")
@@ -1379,6 +1428,40 @@ func TestCheckRegistryCommandValidAndLegacyRegistryExitBehavior(t *testing.T) {
 	}
 }
 
+func TestCandidateRegistryTargetCheckDefersLifecycleJournalRecovery(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","deployProject":"opensamguk-spep"}]
+`)
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\n")
+	writeEnv(t, cfg.lifecycleJournalFile, "{}\n")
+
+	var output bytes.Buffer
+	if code := checkRegistryTargetsCommand(cfg, &output); code != 0 {
+		t.Fatalf("candidate registry target check exit code = %d, want 0", code)
+	}
+	if got := output.String(); got != "registry target validation passed\n" {
+		t.Fatalf("candidate registry target check output = %q", got)
+	}
+
+	output.Reset()
+	if code := checkRegistryCommand(cfg, &output); code != 1 {
+		t.Fatalf("full registry check exit code = %d, want 1 while journal recovery is pending", code)
+	}
+	if got := output.String(); got != "lifecycle recovery is required\n" {
+		t.Fatalf("full registry check output = %q", got)
+	}
+
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"spep","deployProject":"opensamguk-spep"}]
+`)
+	output.Reset()
+	if code := checkRegistryTargetsCommand(cfg, &output); code != 1 {
+		t.Fatalf("legacy candidate registry target check exit code = %d, want 1", code)
+	}
+	if got := output.String(); got != "registry target validation failed\n" {
+		t.Fatalf("legacy candidate registry target check output = %q", got)
+	}
+}
+
 func TestDeployPromotesApiAndWebGameTags(t *testing.T) {
 	cfg := testConfig(t)
 	envFile := filepath.Join(cfg.serversDir, "s1.env")
@@ -1929,7 +2012,7 @@ func TestNginxRouteReservationsAndApiProxyContract(t *testing.T) {
 	}
 }
 
-func TestDeployOrchestrationValidatesCandidateBeforeControlPlaneMutation(t *testing.T) {
+func TestDeployOrchestrationValidatesCandidateBeforeReplacementAndFullCheckAfterRecovery(t *testing.T) {
 	workflow := readFile(t, filepath.Join("..", ".github", "workflows", "deploy-orchestration.yml"))
 
 	for _, want := range []string{
@@ -1939,6 +2022,7 @@ func TestDeployOrchestrationValidatesCandidateBeforeControlPlaneMutation(t *test
 		"-e COMPOSE_DIR=/workspace",
 		`-v "$STACK/.env:/workspace/.env:ro"`,
 		`-v "$STACK/servers:/workspace/servers:ro"`,
+		"opensamguk-deployer:local --check-registry-targets",
 		"opensamguk-deployer:local --check-registry",
 	} {
 		if !strings.Contains(workflow, want) {
@@ -1947,19 +2031,21 @@ func TestDeployOrchestrationValidatesCandidateBeforeControlPlaneMutation(t *test
 	}
 
 	build := strings.Index(workflow, "$COMPOSE build deployer")
-	check := strings.Index(workflow, "opensamguk-deployer:local --check-registry")
+	candidateCheck := strings.Index(workflow, "opensamguk-deployer:local --check-registry-targets")
 	deployer := strings.Index(workflow, "$COMPOSE up -d --force-recreate --no-deps deployer")
-	healthz := strings.Index(workflow, "http://localhost:9000/healthz")
-	readyz := strings.Index(workflow, "http://localhost:9000/readyz")
+	recovery := strings.Index(workflow, "if ! ensure_lifecycle_recovery; then")
+	fullCheck := strings.LastIndex(workflow, "opensamguk-deployer:local --check-registry\n")
+	healthz := strings.LastIndex(workflow, "http://localhost:9000/healthz")
+	readyz := strings.LastIndex(workflow, "http://localhost:9000/readyz")
 	nginxMarker := "$COMPOSE up -d --force-recreate --no-deps nginx"
 	nginx := strings.Index(workflow, nginxMarker)
-	if build < 0 || check < 0 || deployer < 0 || healthz < 0 || readyz < 0 || nginx < 0 {
-		t.Fatalf("missing deployment ordering markers: build=%d check=%d deployer=%d healthz=%d readyz=%d nginx=%d", build, check, deployer, healthz, readyz, nginx)
+	if build < 0 || candidateCheck < 0 || deployer < 0 || recovery < 0 || fullCheck < 0 || healthz < 0 || readyz < 0 || nginx < 0 {
+		t.Fatalf("missing deployment ordering markers: build=%d candidate=%d deployer=%d recovery=%d full=%d healthz=%d readyz=%d nginx=%d", build, candidateCheck, deployer, recovery, fullCheck, healthz, readyz, nginx)
 	}
-	if !(build < check && check < deployer && deployer < healthz && healthz < readyz && readyz < nginx) {
-		t.Fatalf("unexpected deployment ordering: build=%d check=%d deployer=%d healthz=%d readyz=%d nginx=%d", build, check, deployer, healthz, readyz, nginx)
+	if !(build < candidateCheck && candidateCheck < deployer && deployer < recovery && recovery < fullCheck && fullCheck < nginx && nginx < healthz && healthz < readyz) {
+		t.Fatalf("unexpected deployment ordering: build=%d candidate=%d deployer=%d recovery=%d full=%d healthz=%d readyz=%d nginx=%d", build, candidateCheck, deployer, recovery, fullCheck, healthz, readyz, nginx)
 	}
-	if strings.Contains(workflow[check:deployer], "--env-file") {
+	if strings.Contains(workflow[candidateCheck:deployer], "--env-file") {
 		t.Fatal("candidate registry check must not receive the shared env through command-line injection")
 	}
 
@@ -2388,8 +2474,11 @@ func TestMaintenanceWorkflowOrderingAndLegacyFailClosedBoundary(t *testing.T) {
 		"exec 9>/tmp/opensamguk-production.lock",
 		"maintenance_post /maintenance/enter",
 		"git merge --ff-only origin/main",
+		"$COMPOSE build deployer",
+		"opensamguk-deployer:local --check-registry-targets",
 		"$COMPOSE up -d --force-recreate --no-deps deployer",
 		"if ! ensure_lifecycle_recovery; then",
+		"opensamguk-deployer:local --check-registry\n",
 		"maintenance_post /maintenance/leave",
 	)
 	assertOrder(t, start,
@@ -2583,10 +2672,11 @@ func TestStartWorkflowBootstrapsStoppedDeployerBeforeAuthenticatedCalls(t *testi
 	if run.err != nil {
 		t.Fatalf("stopped-deployer start failed: %v output=%s calls=%s", run.err, run.output, run.dockerCalls)
 	}
+	build := strings.Index(run.dockerCalls, "build deployer")
 	bootstrap := strings.Index(run.dockerCalls, "up -d --force-recreate --no-deps deployer")
 	maintenance := strings.Index(run.dockerCalls, "exec opensamguk-deployer /usr/local/bin/deployer --authenticated-http")
-	if bootstrap < 0 || maintenance < 0 || bootstrap >= maintenance {
-		t.Fatalf("stopped deployer was not recreated before authenticated helper calls bootstrap=%d maintenance=%d calls=%s", bootstrap, maintenance, run.dockerCalls)
+	if build < 0 || bootstrap < 0 || maintenance < 0 || !(build < bootstrap && bootstrap < maintenance) {
+		t.Fatalf("stopped deployer was not built and recreated before authenticated helper calls build=%d bootstrap=%d maintenance=%d calls=%s", build, bootstrap, maintenance, run.dockerCalls)
 	}
 }
 

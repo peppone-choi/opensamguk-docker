@@ -1684,6 +1684,9 @@ type envLine struct {
 
 func main() {
 	cfg := loadConfig()
+	if len(os.Args) == 2 && os.Args[1] == "--check-registry-targets" {
+		os.Exit(checkRegistryTargetsCommand(cfg, os.Stderr))
+	}
 	if len(os.Args) == 2 && os.Args[1] == "--check-registry" {
 		os.Exit(checkRegistryCommand(cfg, os.Stderr))
 	}
@@ -1691,7 +1694,7 @@ func main() {
 		os.Exit(authenticatedHTTPCommand(cfg, os.Args[2], os.Args[3], os.Stdin, os.Stdout, os.Stderr))
 	}
 	if len(os.Args) != 1 {
-		log.Fatal("usage: deployer [--check-registry|--authenticated-http METHOD PATH]")
+		log.Fatal("usage: deployer [--check-registry-targets|--check-registry|--authenticated-http METHOD PATH]")
 	}
 	if cfg.token == "" {
 		log.Fatal("DEPLOYER_TOKEN 미설정 — 인증 토큰 필수")
@@ -1800,6 +1803,15 @@ func isAuthenticatedHTTPRouteAllowed(method, requestPath string) bool {
 	default:
 		return false
 	}
+}
+
+func checkRegistryTargetsCommand(c config, output io.Writer) int {
+	if err := c.validateRegisteredServerTargets(); err != nil {
+		fmt.Fprintln(output, "registry target validation failed")
+		return 1
+	}
+	fmt.Fprintln(output, "registry target validation passed")
+	return 0
 }
 
 func checkRegistryCommand(c config, output io.Writer) int {
@@ -2553,7 +2565,6 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 	jobID := ""
 	newReservation := false
 	reservationClaimed := false
-	admissionAttempted := false
 	if operationID != "" {
 		var existing bool
 		jobID, existing, err = c.lifecycleJobs.reserveWithOperation(operationID, createRequestFingerprint(normalized))
@@ -2582,7 +2593,7 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 		newReservation = true
 	}
 	defer func() {
-		if newReservation && !reservationClaimed && (operationID == "" || !admissionAttempted) {
+		if newReservation && !reservationClaimed {
 			c.lifecycleJobs.discard(jobID)
 		}
 	}()
@@ -2637,7 +2648,6 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 		DeployProject: target.Project,
 		Env:           registryEnvSnapshot(envValuesFromLines(envLines)),
 	}
-	admissionAttempted = true
 	lease, err := c.beginMaintenanceCreate(jobID, maintenanceLease, operationID)
 	if err != nil {
 		detail, status := mutationAdmissionFailure(err)

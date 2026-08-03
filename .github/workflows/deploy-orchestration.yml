@@ -159,6 +159,11 @@ jobs:
           fi
           COMPOSE="sudo docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env"
           run_bounded "$WORKFLOW_DEADLINE" 900 $COMPOSE build deployer
+          run_bounded "$WORKFLOW_DEADLINE" 120 sudo docker run --rm --read-only --network none \
+            -e COMPOSE_DIR=/workspace \
+            -v "$STACK/.env:/workspace/.env:ro" \
+            -v "$STACK/servers:/workspace/servers:ro" \
+            opensamguk-deployer:local --check-registry-targets
           run_bounded "$WORKFLOW_DEADLINE" 300 $COMPOSE up -d --force-recreate --no-deps deployer
           if ! ensure_lifecycle_recovery; then
             exit 1

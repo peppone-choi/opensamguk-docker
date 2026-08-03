@@ -192,10 +192,9 @@ jobs:
           run_bounded "$WORKFLOW_DEADLINE" 180 git merge --ff-only origin/main
 
           if [ "$DEPLOYER_BOOTSTRAP" = true ]; then
-            run_bounded "$WORKFLOW_DEADLINE" 300 sudo docker compose -p opensamguk-shared \
-              -f docker-compose.shared.yml \
-              --env-file .env \
-              up -d --force-recreate --no-deps deployer
+            DEPLOYER_COMPOSE=(sudo docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env)
+            run_bounded "$WORKFLOW_DEADLINE" 900 "${DEPLOYER_COMPOSE[@]}" build deployer
+            run_bounded "$WORKFLOW_DEADLINE" 300 "${DEPLOYER_COMPOSE[@]}" up -d --force-recreate --no-deps deployer
             deployer_closed=false
             for _ in $(seq 1 30); do
               if ! deadline_remaining "$WORKFLOW_DEADLINE" >/dev/null; then
