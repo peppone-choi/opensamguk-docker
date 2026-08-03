@@ -160,8 +160,11 @@ mutation은 취소된 context가 Docker runner에서 실제 반환할 때까지 
 
 create/delete/reset/deploy는 영속 상태를 바꾸기 전에 `servers/.deployer-lifecycle-journal`도 기록한다. journal이
 남은 채로 프로세스가 죽으면 deployer는 closed 상태와 `/readyz` `503`을 유지하고, leave로 다시 열 수 없다. loopback
-maintenance repair가 해당 서버의 forward recovery를 검증한 뒤 journal을 지우고, 별도 maintenance marker도 없을 때만
-mutation을 다시 허용한다.
+maintenance repair가 journal 종류에 맞는 recovery를 끝까지 검증한 뒤 journal을 지우고, 별도 maintenance marker도 없을 때만
+mutation을 다시 허용한다. 특히 reset repair는 `down --volumes`와 `up`을 다시 수행한 뒤 engine Actuator readiness,
+game-api DB·Redis health, game web HTTP 응답을 제한 시간 안에 확인한다. 이어서 실제 `GET /api/front-info`의
+`global.scenario`와 `global.generation`이 reset env의 시나리오·기수와 일치하는지 확인한다. 이 검증에는 container env나
+시크릿을 읽거나 출력하지 않는다.
 
 workflow는 deployer 컨테이너의 loopback에서만 다음 Bearer API를 호출한다. `DEPLOYER_TOKEN`은 호스트에서
 읽거나 `docker exec -e`로 주입하지 않고 deployer 컨테이너 자신의 환경에서만 사용한다. gateway/API caller는 같은
@@ -171,7 +174,7 @@ workflow는 deployer 컨테이너의 loopback에서만 다음 Bearer API를 호�
 GET  /maintenance        -> {"capability":"maintenance-v1","state":"open|draining|drained"}
 POST /maintenance/enter  -> drained 후 32-hex 단발 lease를 포함해 반환
 POST /maintenance/leave  -> 성공한 workflow가 마지막에만 open
-POST /maintenance/repair -> 남은 lifecycle journal의 forward recovery를 검증하고 지움 (marker가 없을 때만 open)
+POST /maintenance/repair -> 남은 lifecycle journal을 recovery·runtime/data·shared reload까지 검증한 뒤에만 지움 (marker가 없을 때만 open)
 ```
 
 **처음 설치되어 deployer 컨테이너가 전혀 없는 경우**에는 workflow가 marker를 먼저 만들고 deployer를 closed로
@@ -225,8 +228,12 @@ GCP의 shared/per-server orchestration 배포는 GitHub Actions **Deploy Orchest
 이 경계가 깨지면 게임 도중 로직/프론트가 갑자기 바뀌어 패러티와 UX가 같이 흔들릴 수 있다.
 
 서버 reset은 `docker compose down --volumes` 호출 직전까지의 실패만 이전 env/registry snapshot으로 복구한다. 해당
-호출을 지난 뒤에는 볼륨이 일부라도 제거되었을 수 있으므로 이전 desired state를 되살리지 않는다. 새 desired state를
-유지하고 한 번 forward re-up을 시도하며, 실패하면 registry의 `repairRequired=true`를 남겨 명시적 복구가 필요함을 표시한다.
+호출을 지난 뒤에는 볼륨이 일부라도 제거되었을 수 있으므로 이전 desired state를 되살리지 않는다. down 결과가 불확실하면
+원래 job은 임의의 forward re-up을 주장하지 않고 새 desired state와 `repairRequired=true` journal을 남긴다. 명시적
+maintenance repair가 reset을 다시 끝까지 수행해 seeded `world_state`의 시나리오와 game-api 기수를 확인하고,
+`repairRequired`를 durable하게 지운 최종 registry로 `gateway-api`·`web-gateway`·`nginx`를 reload/health-verify한 뒤에만
+journal과 closed barrier를 해제한다. `SCENARIO_SEED_ENABLED=false`인 reset은 fresh world data를 검증할 수 없으므로
+repair 완료로 처리되지 않는다.
 
 ---
 

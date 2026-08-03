@@ -1874,8 +1874,8 @@ func TestRecreateWorkflowRetriesIdempotentlyAndDrainsCancellationBeforeUnlock(t 
 		"cancel_and_await_lifecycle_job",
 		"for attempt in 1 2 3",
 		"--header=\"Authorization: Bearer $DEPLOYER_TOKEN\"",
-		"for attempt in $(seq 1 12)",
-		"for poll_attempt in $(seq 1 240)",
+		"for ((attempt=1; attempt<=12; attempt++)); do",
+		"for ((poll_attempt=1; poll_attempt<=240; poll_attempt++)); do",
 		"local drain_deadline=$((SECONDS + 60))",
 		"timeout --foreground -k 2",
 		"timeout -k 2 10 wget",
@@ -1905,7 +1905,7 @@ func TestRecreateWorkflowRetriesIdempotentlyAndDrainsCancellationBeforeUnlock(t 
 	parse := strings.Index(workflow, "payload.get(\"jobId\")")
 	poll := strings.LastIndex(workflow, "$(lifecycle_status \"$JOB_ID\" \"$WORKFLOW_DEADLINE\")")
 	succeeded := strings.Index(workflow, "succeeded)")
-	postconditions := strings.Index(workflow, "for i in $(seq 1 90); do")
+	postconditions := strings.Index(workflow, "for ((i=1; i<=90; i++)); do")
 	leave := strings.LastIndex(workflow, "maintenance_post /maintenance/leave")
 	if lock < 0 || enter < 0 || merge < 0 || operationID < 0 || create < 0 || parse < 0 || poll < 0 || succeeded < 0 || postconditions < 0 || leave < 0 {
 		t.Fatalf("missing lease lifecycle markers: lock=%d enter=%d merge=%d operationID=%d create=%d parse=%d poll=%d succeeded=%d postconditions=%d leave=%d", lock, enter, merge, operationID, create, parse, poll, succeeded, postconditions, leave)
@@ -1920,6 +1920,60 @@ func TestRecreateWorkflowRetriesIdempotentlyAndDrainsCancellationBeforeUnlock(t 
 		if strings.Contains(workflow, forbidden) {
 			t.Fatalf("recreate workflow retained an unbounded lifecycle path: %q", forbidden)
 		}
+	}
+}
+
+func TestRecreateWorkflowBoundsEveryExternalCommandAfterProductionLock(t *testing.T) {
+	workflow := readFile(t, filepath.Join("..", ".github", "workflows", "recreate-server.yml"))
+	lock := strings.Index(workflow, "exec 9>/tmp/opensamguk-production.lock")
+	if lock < 0 {
+		t.Fatal("recreate workflow has no production lock")
+	}
+	for _, want := range []string{
+		`run_bounded "$WORKFLOW_DEADLINE" 300 flock -w 300 9`,
+		`run_bounded "$WORKFLOW_DEADLINE" 180 git fetch --prune origin main`,
+		`run_bounded "$WORKFLOW_DEADLINE" 180 git merge --ff-only origin/main`,
+		`run_bounded "$WORKFLOW_DEADLINE" 900 "${COMPOSE[@]}" build deployer`,
+		`run_bounded "$WORKFLOW_DEADLINE" 180 "${COMPOSE[@]}" up -d --no-deps deployer`,
+		`run_bounded "$WORKFLOW_DEADLINE" 15 sudo docker ps`,
+		`timeout --foreground -k 2 "$requested" "$@"`,
+		`run_bounded "$deadline" "$requested" sudo docker exec "$@"`,
+	} {
+		if !strings.Contains(workflow, want) {
+			t.Fatalf("recreate workflow is missing bounded critical command %q", want)
+		}
+	}
+	locked := workflow[lock:]
+	if strings.Contains(locked, "$(seq ") {
+		t.Fatal("recreate workflow retained a raw external command after the production lock")
+	}
+	inDockerExecScript := false
+	for _, line := range strings.Split(locked, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.Contains(line, "docker_exec_bounded") && strings.Contains(line, "sh -c '") {
+			inDockerExecScript = true
+		}
+		if strings.Contains(line, "timeout -k 2") && !inDockerExecScript {
+			t.Fatalf("recreate workflow has a BusyBox timeout outside the absolute-deadline docker-exec wrapper: %s", line)
+		}
+		for _, command := range []string{"flock ", "git ", "sudo docker ", "curl ", "python3 ", "grep ", "tr ", "mkdir ", "cat ", "wget ", "sleep "} {
+			if !strings.Contains(line, command) {
+				continue
+			}
+			if strings.Contains(line, "run_bounded") || strings.Contains(line, "bounded_sleep") || strings.Contains(line, "timeout --foreground -k 2") || (inDockerExecScript && strings.Contains(line, "timeout -k 2")) || strings.Contains(line, "COMPOSE=(") {
+				continue
+			}
+			t.Fatalf("recreate workflow has raw unbounded %q command after lock: %s", command, line)
+		}
+		if inDockerExecScript && strings.HasPrefix(line, "'") {
+			inDockerExecScript = false
+		}
+	}
+	if inDockerExecScript {
+		t.Fatal("recreate workflow has an unterminated docker-exec shell script")
 	}
 }
 
@@ -2068,7 +2122,7 @@ func TestMaintenanceWorkflowOrderingAndLegacyFailClosedBoundary(t *testing.T) {
 		"maintenance_post /maintenance/enter",
 		"git merge --ff-only origin/main",
 		"http://localhost:9000/servers/create",
-		"for i in $(seq 1 90); do",
+		"for ((i=1; i<=90; i++)); do",
 		"maintenance_post /maintenance/leave",
 	)
 
@@ -2929,6 +2983,239 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	}
 }
 
+func TestResetRepairVerifiesRuntimeDataAndFinalRegistryBeforeJournalClear(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":2,"scenarioCode":"scenario_1002","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep","repairRequired":true}]
+`)
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSERVER_GENERATION=2\nSCENARIO_CODE=scenario_1002\nSCENARIO_SEED_ENABLED=true\n")
+	target, err := cfg.serverTargetForID("pep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.writeLifecycleJournal("reset", target); err != nil {
+		t.Fatalf("write reset journal: %v", err)
+	}
+	if err := cfg.advanceLifecycleJournal(lifecycleJournalStageDown); err != nil {
+		t.Fatalf("advance reset journal: %v", err)
+	}
+	calls := &dockerCallRecorder{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		calls.record(args...)
+		if strings.Contains(strings.Join(args, " "), "gateway-api web-gateway") {
+			if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); strings.Contains(shared, `"repairRequired":true`) {
+				return "", errors.New("shared reload received a stale repair-required registry")
+			}
+		}
+		return "ok\n", nil
+	}
+	trace := []string{}
+	cfg.httpGet = func(_ context.Context, endpoint string) (int, []byte, error) {
+		switch {
+		case strings.Contains(endpoint, "spep-game-engine:8082/actuator/health/readiness"):
+			trace = append(trace, "engine")
+			return http.StatusOK, []byte(`{"status":"UP"}`), nil
+		case strings.Contains(endpoint, "spep-game-api:8081/health"):
+			trace = append(trace, "api")
+			return http.StatusOK, []byte(`{"status":"up"}`), nil
+		case strings.Contains(endpoint, "spep-web-game:3001/"):
+			trace = append(trace, "web")
+			return http.StatusOK, []byte(`ok`), nil
+		case strings.Contains(endpoint, "spep-game-api:8081/api/front-info"):
+			trace = append(trace, "data")
+			return http.StatusOK, []byte(`{"result":true,"global":{"scenario":"scenario_1002","generation":2}}`), nil
+		case strings.Contains(endpoint, "gateway-api:8080/actuator/health/readiness"):
+			trace = append(trace, "gateway")
+			if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); strings.Contains(shared, `"repairRequired":true`) {
+				return 0, nil, errors.New("gateway was checked before final registry was durable")
+			}
+			return http.StatusOK, []byte(`{"status":"UP"}`), nil
+		case strings.Contains(endpoint, "web-gateway:3000/"):
+			trace = append(trace, "web-gateway")
+			return http.StatusOK, []byte(`ok`), nil
+		case strings.Contains(endpoint, "nginx/health"):
+			trace = append(trace, "nginx")
+			return http.StatusOK, []byte(`{"status":"up"}`), nil
+		default:
+			return 0, nil, fmt.Errorf("unexpected verification endpoint %s", endpoint)
+		}
+	}
+
+	if err := cfg.repairLifecycleJournal(); err != nil {
+		t.Fatalf("verified reset repair: %v", err)
+	}
+	if _, err := os.Stat(cfg.lifecycleJournalFile); !os.IsNotExist(err) {
+		t.Fatalf("verified reset repair retained journal: %v", err)
+	}
+	if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); strings.Contains(shared, `"repairRequired":true`) {
+		t.Fatalf("verified reset repair retained repair marker:\n%s", shared)
+	}
+	if got, want := strings.Join(trace, ","), "engine,api,web,data,gateway,web-gateway,nginx"; got != want {
+		t.Fatalf("verification trace = %q, want %q", got, want)
+	}
+	recorded := calls.snapshot()
+	if len(recorded) != 4 || !strings.Contains(recorded[0], "down --volumes --remove-orphans") || !strings.Contains(recorded[1], "up -d") || !strings.Contains(recorded[2], "gateway-api web-gateway") || !strings.Contains(recorded[3], "--force-recreate --no-deps nginx") {
+		t.Fatalf("repair call order = %#v", recorded)
+	}
+}
+
+func TestResetRepairRetainsBarrierWhenRuntimeVerificationFails(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		body string
+	}{
+		{name: "web readiness", body: `{"status":503}`},
+		{name: "authoritative reset data", body: `{"result":true,"global":{"scenario":"scenario_1010","generation":2}}`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			cfg := testConfig(t)
+			cfg.resetVerifyTimeout = 20 * time.Millisecond
+			cfg.resetVerifyPollInterval = time.Millisecond
+			writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":2,"scenarioCode":"scenario_1002","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep","repairRequired":true}]
+`)
+			writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSERVER_GENERATION=2\nSCENARIO_CODE=scenario_1002\nSCENARIO_SEED_ENABLED=true\n")
+			target, err := cfg.serverTargetForID("pep")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cfg.writeLifecycleJournal("reset", target); err != nil {
+				t.Fatalf("write reset journal: %v", err)
+			}
+			if err := cfg.advanceLifecycleJournal(lifecycleJournalStageDown); err != nil {
+				t.Fatalf("advance reset journal: %v", err)
+			}
+			calls := &dockerCallRecorder{}
+			cfg.dockerRunner = func(args ...string) (string, error) {
+				calls.record(args...)
+				return "ok\n", nil
+			}
+			cfg.httpGet = func(_ context.Context, endpoint string) (int, []byte, error) {
+				switch {
+				case strings.Contains(endpoint, "game-engine"):
+					return http.StatusOK, []byte(`{"status":"UP"}`), nil
+				case strings.Contains(endpoint, "-game-api:8081/health"):
+					return http.StatusOK, []byte(`{"status":"up"}`), nil
+				case strings.Contains(endpoint, "web-game"):
+					if testCase.name == "web readiness" {
+						return http.StatusServiceUnavailable, nil, nil
+					}
+					return http.StatusOK, []byte(`ok`), nil
+				case strings.Contains(endpoint, "/api/front-info"):
+					if testCase.name == "authoritative reset data" {
+						return http.StatusOK, []byte(testCase.body), nil
+					}
+					return http.StatusOK, []byte(`{"result":true,"global":{"scenario":"scenario_1002","generation":2}}`), nil
+				default:
+					return 0, nil, fmt.Errorf("shared reload should not be verified after failed runtime check: %s", endpoint)
+				}
+			}
+
+			if err := cfg.repairLifecycleJournal(); err == nil {
+				t.Fatal("reset repair unexpectedly cleared a failed runtime verification")
+			}
+			if _, err := os.Stat(cfg.lifecycleJournalFile); err != nil {
+				t.Fatalf("failed reset runtime verification lost journal: %v", err)
+			}
+			if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); !strings.Contains(shared, `"repairRequired":true`) {
+				t.Fatalf("failed reset runtime verification cleared repair marker:\n%s", shared)
+			}
+			for _, call := range calls.snapshot() {
+				if strings.Contains(call, "gateway-api web-gateway") {
+					t.Fatalf("failed reset runtime verification reloaded shared consumers: %#v", calls.snapshot())
+				}
+			}
+		})
+	}
+}
+
+func TestResetRepairDurablyMarksBarrierBeforeRepeatingVolumeRemoval(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":2,"scenarioCode":"scenario_1002","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
+`)
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSERVER_GENERATION=2\nSCENARIO_CODE=scenario_1002\nSCENARIO_SEED_ENABLED=true\n")
+	target, err := cfg.serverTargetForID("pep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.writeLifecycleJournal("reset", target); err != nil {
+		t.Fatalf("write reset journal: %v", err)
+	}
+	if err := cfg.advanceLifecycleJournal(lifecycleJournalStageDown); err != nil {
+		t.Fatalf("advance reset journal: %v", err)
+	}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		if strings.Contains(strings.Join(args, " "), "down --volumes --remove-orphans") {
+			if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); !strings.Contains(shared, `"repairRequired":true`) {
+				return "", errors.New("repair attempted volume removal before the durable repair barrier")
+			}
+			return "", errors.New("down remains ambiguous")
+		}
+		return "unexpected docker call", errors.New("repair continued after ambiguous down")
+	}
+
+	if err := cfg.repairLifecycleJournal(); err == nil {
+		t.Fatal("reset repair unexpectedly cleared an ambiguous repeated down")
+	}
+	if _, err := os.Stat(cfg.lifecycleJournalFile); err != nil {
+		t.Fatalf("ambiguous repeated down lost journal: %v", err)
+	}
+	if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); !strings.Contains(shared, `"repairRequired":true`) {
+		t.Fatalf("ambiguous repeated down lost durable repair marker:\n%s", shared)
+	}
+}
+
+func TestResetRepairRetainsBarrierWhenSharedReloadVerificationFails(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.resetVerifyTimeout = 20 * time.Millisecond
+	cfg.resetVerifyPollInterval = time.Millisecond
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":2,"scenarioCode":"scenario_1002","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep","repairRequired":true}]
+`)
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSERVER_GENERATION=2\nSCENARIO_CODE=scenario_1002\nSCENARIO_SEED_ENABLED=true\n")
+	target, err := cfg.serverTargetForID("pep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.writeLifecycleJournal("reset", target); err != nil {
+		t.Fatalf("write reset journal: %v", err)
+	}
+	if err := cfg.advanceLifecycleJournal(lifecycleJournalStageDown); err != nil {
+		t.Fatalf("advance reset journal: %v", err)
+	}
+	calls := &dockerCallRecorder{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		calls.record(args...)
+		return "ok\n", nil
+	}
+	cfg.httpGet = func(_ context.Context, endpoint string) (int, []byte, error) {
+		switch {
+		case strings.Contains(endpoint, "game-engine") || strings.Contains(endpoint, "gateway-api"):
+			return http.StatusOK, []byte(`{"status":"UP"}`), nil
+		case strings.Contains(endpoint, "-game-api:8081/health"):
+			return http.StatusOK, []byte(`{"status":"up"}`), nil
+		case strings.Contains(endpoint, "nginx/health"):
+			return http.StatusServiceUnavailable, nil, nil
+		case strings.Contains(endpoint, "web-game") || strings.Contains(endpoint, "web-gateway"):
+			return http.StatusOK, []byte(`ok`), nil
+		case strings.Contains(endpoint, "/api/front-info"):
+			return http.StatusOK, []byte(`{"result":true,"global":{"scenario":"scenario_1002","generation":2}}`), nil
+		default:
+			return http.StatusServiceUnavailable, nil, nil
+		}
+	}
+
+	if err := cfg.repairLifecycleJournal(); err == nil {
+		t.Fatal("reset repair unexpectedly cleared a failed shared reload verification")
+	}
+	if _, err := os.Stat(cfg.lifecycleJournalFile); err != nil {
+		t.Fatalf("failed shared reload verification lost journal: %v", err)
+	}
+	if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); !strings.Contains(shared, `"repairRequired":true`) {
+		t.Fatalf("failed shared reload verification cleared repair marker:\n%s", shared)
+	}
+	if !strings.Contains(strings.Join(calls.snapshot(), "\n"), "gateway-api web-gateway") {
+		t.Fatalf("shared reload verification failed before reload ran: %#v", calls.snapshot())
+	}
+}
+
 func TestResetDownCancellationKeepsRepairBarrierUntilResetCanBeCompleted(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
@@ -3158,7 +3445,7 @@ func testConfig(t *testing.T) config {
 	jobs := newLifecycleJobManager()
 	maintenanceFile := filepath.Join(serversDir, ".deployer-maintenance")
 	lifecycleJournalFile := filepath.Join(serversDir, ".deployer-lifecycle-journal")
-	return config{
+	cfg := config{
 		token:                "test-token",
 		composeDir:           root,
 		serversDir:           serversDir,
@@ -3172,6 +3459,38 @@ func testConfig(t *testing.T) config {
 		sharedEnvMu:          &sync.Mutex{},
 		operations:           newOperationCoordinator(maintenanceFile, lifecycleJournalFile, jobs),
 	}
+	cfg.httpGet = func(_ context.Context, endpoint string) (int, []byte, error) {
+		switch {
+		case strings.Contains(endpoint, "/actuator/health/readiness"):
+			return http.StatusOK, []byte(`{"status":"UP"}`), nil
+		case strings.Contains(endpoint, "/health"):
+			return http.StatusOK, []byte(`{"status":"up"}`), nil
+		case strings.Contains(endpoint, "/api/front-info"):
+			id := ""
+			if start := strings.Index(endpoint, "://s"); start >= 0 {
+				name := endpoint[start+len("://s"):]
+				if end := strings.Index(name, "-game-api:"); end >= 0 {
+					id = name[:end]
+				}
+			}
+			values, _ := readEnvValues(filepath.Join(serversDir, "s"+id+".env"))
+			expected, err := resetRuntimeExpectationFor(values)
+			if err != nil {
+				return 0, nil, err
+			}
+			body, err := json.Marshal(map[string]any{
+				"result": true,
+				"global": map[string]any{
+					"scenario":   expected.scenarioCode,
+					"generation": expected.generation,
+				},
+			})
+			return http.StatusOK, body, err
+		default:
+			return http.StatusOK, []byte(`{}`), nil
+		}
+	}
+	return cfg
 }
 
 func envRequest(t *testing.T, handler http.HandlerFunc, method, target, body string) *httptest.ResponseRecorder {

@@ -48,6 +48,10 @@ const (
 	lifecycleJobMaxEntries         = 128
 	lifecycleJobTerminalRetention  = time.Hour
 	maintenanceLeaseHeader         = "X-Maintenance-Lease"
+	resetVerificationTimeout       = 2 * time.Minute
+	resetVerificationPollInterval  = time.Second
+	resetVerificationHTTPTimeout   = 5 * time.Second
+	maxVerificationResponseBytes   = 256 << 10
 )
 
 // 입력 검증용 화이트리스트 정규식.
@@ -198,9 +202,12 @@ type config struct {
 	ghcrAPIBaseURL            string
 	dockerRunner              func(args ...string) (string, error)
 	dockerRunnerContext       func(context.Context, ...string) (string, error)
+	httpGet                   func(context.Context, string) (int, []byte, error)
 	gameAPIInternalPort       string
 	gameEngineInternalPort    string
 	gatewayAPIURL             string
+	resetVerifyTimeout        time.Duration
+	resetVerifyPollInterval   time.Duration
 	lifecycleJobs             *lifecycleJobManager
 	maintenanceFile           string
 	lifecycleJournalFile      string
@@ -768,20 +775,32 @@ func (c config) repairLifecycleJournal() error {
 			return err
 		}
 	case "reset":
-		if _, err := c.downServerStack(lease.Context(), target.Project, target.EnvFile); err != nil {
-			return err
-		}
-		if _, err := c.upServerStack(lease.Context(), target.Project, target.EnvFile); err != nil {
-			return err
-		}
 		if err := c.reconcileServerRegistry(target); err != nil {
 			return err
 		}
-		if _, err := c.reloadSharedRegistry(lease.Context()); err != nil {
+		if err := c.setRegistryRepairRequired(target.ID, true); err != nil {
 			return err
 		}
+		if _, err := c.downServerStack(lease.Context(), target.Project, target.EnvFile); err != nil {
+			return c.markResetRepairRequired(target.ID, err)
+		}
+		if _, err := c.upServerStack(lease.Context(), target.Project, target.EnvFile); err != nil {
+			return c.markResetRepairRequired(target.ID, err)
+		}
+		if err := c.verifyResetRuntime(lease.Context(), target); err != nil {
+			return c.markResetRepairRequired(target.ID, err)
+		}
+		if err := c.reconcileServerRegistry(target); err != nil {
+			return c.markResetRepairRequired(target.ID, err)
+		}
 		if err := c.setRegistryRepairRequired(target.ID, false); err != nil {
-			return err
+			return c.markResetRepairRequired(target.ID, err)
+		}
+		if _, err := c.reloadSharedRegistry(lease.Context()); err != nil {
+			return c.markResetRepairRequired(target.ID, err)
+		}
+		if err := c.verifySharedRegistryReload(lease.Context(), target); err != nil {
+			return c.markResetRepairRequired(target.ID, err)
 		}
 	case "patch":
 		if err := c.reconcileServerRegistry(target); err != nil {
@@ -820,6 +839,13 @@ func (c config) repairLifecycleJournal() error {
 		}
 	}
 	return c.clearLifecycleJournal()
+}
+
+func (c config) markResetRepairRequired(id string, cause error) error {
+	if markerErr := c.setRegistryRepairRequired(id, true); markerErr != nil {
+		return fmt.Errorf("could not durably persist reset repair-required state: %v (original failure: %w)", markerErr, cause)
+	}
+	return cause
 }
 
 func newLifecycleJobManager() *lifecycleJobManager {
@@ -1095,6 +1121,209 @@ func isCanonicalServerProject(project string) bool {
 
 func (c config) defaultGatewayAPIURL() string {
 	return envOrValue(c.gatewayAPIURL, "http://gateway-api:8080")
+}
+
+func (c config) webGameURLFor(publicID string) string {
+	return "http://" + internalServerKey(publicID) + "-web-game:3001"
+}
+
+func (c config) resetVerificationDuration() time.Duration {
+	if c.resetVerifyTimeout > 0 {
+		return c.resetVerifyTimeout
+	}
+	return resetVerificationTimeout
+}
+
+func (c config) resetVerificationPoll() time.Duration {
+	if c.resetVerifyPollInterval > 0 {
+		return c.resetVerifyPollInterval
+	}
+	return resetVerificationPollInterval
+}
+
+// getVerificationURL deliberately returns only bounded, non-sensitive response
+// bytes. Reset verification observes public health/read state; it never reads a
+// container's environment or logs response payloads.
+func (c config) getVerificationURL(ctx context.Context, endpoint string) (int, []byte, error) {
+	if c.httpGet != nil {
+		return c.httpGet(ctx, endpoint)
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, resetVerificationHTTPTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	client := &http.Client{
+		Timeout: resetVerificationHTTPTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxVerificationResponseBytes+1))
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(body) > maxVerificationResponseBytes {
+		return 0, nil, errors.New("verification response exceeds the bounded read limit")
+	}
+	return resp.StatusCode, body, nil
+}
+
+type resetRuntimeExpectation struct {
+	scenarioCode string
+	generation   int
+}
+
+func resetRuntimeExpectationFor(values map[string]string) (resetRuntimeExpectation, error) {
+	scenarioCode := strings.TrimSpace(envOrValue(values["SCENARIO_CODE"], "scenario_1010"))
+	if !isSafeToken(scenarioCode) {
+		return resetRuntimeExpectation{}, errors.New("reset scenario code is invalid")
+	}
+	seedEnabled := strings.ToLower(strings.TrimSpace(envOrValue(values["SCENARIO_SEED_ENABLED"], "true")))
+	if seedEnabled != "true" {
+		return resetRuntimeExpectation{}, errors.New("reset requires SCENARIO_SEED_ENABLED=true so seeded world state can be verified")
+	}
+	generation, err := parseGeneration(values["SERVER_GENERATION"], 1)
+	if err != nil {
+		return resetRuntimeExpectation{}, err
+	}
+	return resetRuntimeExpectation{scenarioCode: scenarioCode, generation: generation}, nil
+}
+
+func (c config) awaitVerification(ctx context.Context, name string, check func(context.Context) error) error {
+	verificationCtx, cancel := context.WithTimeout(ctx, c.resetVerificationDuration())
+	defer cancel()
+	var lastErr error
+	for {
+		if err := verificationCtx.Err(); err != nil {
+			if lastErr != nil {
+				return fmt.Errorf("%s did not converge before its bounded deadline: %w", name, lastErr)
+			}
+			return fmt.Errorf("%s verification context ended: %w", name, err)
+		}
+		lastErr = check(verificationCtx)
+		if lastErr == nil {
+			return nil
+		}
+		timer := time.NewTimer(c.resetVerificationPoll())
+		select {
+		case <-verificationCtx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+		}
+	}
+}
+
+func (c config) expectHealth(ctx context.Context, endpoint string, expectedStatus string) error {
+	statusCode, body, err := c.getVerificationURL(ctx, endpoint)
+	if err != nil {
+		return fmt.Errorf("health request failed: %w", err)
+	}
+	if statusCode != http.StatusOK {
+		return fmt.Errorf("health endpoint returned HTTP %d", statusCode)
+	}
+	var health struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(body, &health); err != nil {
+		return errors.New("health endpoint returned an invalid response")
+	}
+	if health.Status != expectedStatus {
+		return fmt.Errorf("health endpoint reported %q", health.Status)
+	}
+	return nil
+}
+
+func (c config) expectHTTPReady(ctx context.Context, endpoint string) error {
+	statusCode, _, err := c.getVerificationURL(ctx, endpoint)
+	if err != nil {
+		return fmt.Errorf("readiness request failed: %w", err)
+	}
+	if statusCode < http.StatusOK || statusCode >= http.StatusBadRequest {
+		return fmt.Errorf("readiness endpoint returned HTTP %d", statusCode)
+	}
+	return nil
+}
+
+func (c config) verifyResetRuntime(ctx context.Context, target serverTarget) error {
+	values, err := c.validateServerTarget(target)
+	if err != nil {
+		return err
+	}
+	expected, err := resetRuntimeExpectationFor(values)
+	if err != nil {
+		return err
+	}
+	return c.awaitVerification(ctx, "reset runtime readiness", func(verificationCtx context.Context) error {
+		if err := c.expectHealth(verificationCtx, c.gameEngineURLFor(target.ID)+"/actuator/health/readiness", "UP"); err != nil {
+			return fmt.Errorf("game-engine: %w", err)
+		}
+		if err := c.expectHealth(verificationCtx, c.gameAPIURLFor(target.ID)+"/health", "up"); err != nil {
+			return fmt.Errorf("game-api: %w", err)
+		}
+		if err := c.expectHTTPReady(verificationCtx, c.webGameURLFor(target.ID)+"/"); err != nil {
+			return fmt.Errorf("web-game: %w", err)
+		}
+		statusCode, body, err := c.getVerificationURL(verificationCtx, c.gameAPIURLFor(target.ID)+"/api/front-info")
+		if err != nil {
+			return fmt.Errorf("reset data request failed: %w", err)
+		}
+		if statusCode != http.StatusOK {
+			return fmt.Errorf("reset data endpoint returned HTTP %d", statusCode)
+		}
+		var frontInfo struct {
+			Result bool `json:"result"`
+			Global struct {
+				Scenario   string `json:"scenario"`
+				Generation *int   `json:"generation"`
+			} `json:"global"`
+		}
+		if err := json.Unmarshal(body, &frontInfo); err != nil {
+			return errors.New("reset data endpoint returned an invalid response")
+		}
+		if !frontInfo.Result || frontInfo.Global.Scenario != expected.scenarioCode || frontInfo.Global.Generation == nil || *frontInfo.Global.Generation != expected.generation {
+			return errors.New("game-api did not expose the reset scenario and generation")
+		}
+		return nil
+	})
+}
+
+func (c config) verifySharedRegistryReload(ctx context.Context, target serverTarget) error {
+	values, err := c.validateServerTarget(target)
+	if err != nil {
+		return err
+	}
+	expected, err := resetRuntimeExpectationFor(values)
+	if err != nil {
+		return err
+	}
+	return c.awaitVerification(ctx, "shared registry reload", func(verificationCtx context.Context) error {
+		entry, err := c.registryEntryByID(target.ID)
+		if err != nil {
+			return err
+		}
+		if entry.ID != target.ID || entry.DeployProject != target.Project || entry.RepairRequired || entry.ScenarioCode != expected.scenarioCode || entry.Generation != expected.generation {
+			return errors.New("shared registry is not the final verified reset state")
+		}
+		if err := c.expectHealth(verificationCtx, strings.TrimRight(c.defaultGatewayAPIURL(), "/")+"/actuator/health/readiness", "UP"); err != nil {
+			return fmt.Errorf("gateway-api: %w", err)
+		}
+		if err := c.expectHTTPReady(verificationCtx, "http://web-gateway:3000/"); err != nil {
+			return fmt.Errorf("web-gateway: %w", err)
+		}
+		if err := c.expectHealth(verificationCtx, "http://nginx/health", "up"); err != nil {
+			return fmt.Errorf("nginx: %w", err)
+		}
+		return nil
+	})
 }
 
 // 서버 env 파일 절대경로 — internal project명에서 servers/s<public id>.env 로 매핑.
@@ -2525,7 +2754,13 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 				return failAfterIrreversible(detail, fmt.Errorf("server up failed: %v; forward recovery failed: %w", upErr, retryErr))
 			}
 		}
+		if err := c.verifyResetRuntime(ctx, target); err != nil {
+			return failAfterIrreversible(detail, err)
+		}
 		if err := c.reconcileServerRegistry(target); err != nil {
+			return failAfterIrreversible(detail, err)
+		}
+		if err := c.setRegistryRepairRequired(id, false); err != nil {
 			return failAfterIrreversible(detail, err)
 		}
 		reloadDetail, reloadErr := c.reloadSharedRegistry(ctx)
@@ -2535,8 +2770,8 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 		if reloadErr != nil {
 			return failAfterIrreversible(detail, reloadErr)
 		}
-		if err := c.setRegistryRepairRequired(id, false); err != nil {
-			return detail, fmt.Errorf("reset completed but could not clear repair-required state: %w", err)
+		if err := c.verifySharedRegistryReload(ctx, target); err != nil {
+			return failAfterIrreversible(detail, err)
 		}
 		if err := c.clearLifecycleJournal(); err != nil {
 			return detail, err
@@ -2752,6 +2987,15 @@ func writeEnvLinesAtomic(path string, lines []envLine) error {
 		sb.WriteByte('\n')
 	}
 	return writeFileAtomic(path, []byte(sb.String()))
+}
+
+func writeEnvLinesAtomicDurable(path string, lines []envLine) error {
+	var sb strings.Builder
+	for _, line := range lines {
+		sb.WriteString(line.Raw)
+		sb.WriteByte('\n')
+	}
+	return writeFileAtomicDurable(path, []byte(sb.String()))
 }
 
 type fileAttrs struct {
@@ -3035,10 +3279,10 @@ func (c config) setRegistryRepairRequired(id string, repairRequired bool) error 
 			continue
 		}
 		if registry[index].RepairRequired == repairRequired {
-			return nil
+			return c.writeRegistryLockedDurable(registry)
 		}
 		registry[index].RepairRequired = repairRequired
-		return c.writeRegistryLocked(registry)
+		return c.writeRegistryLockedDurable(registry)
 	}
 	return errors.New("updated server registry entry is unavailable")
 }
@@ -3265,14 +3509,30 @@ func (c config) applyResetOptions(envFile string, req resetServerRequest) error 
 }
 
 func applyResetUpdates(envFile string, values map[string]string) error {
-	if len(values) == 0 {
-		return nil
+	current, err := readEnvValues(envFile)
+	if err != nil {
+		return err
+	}
+	updates := make(map[string]string, len(values)+3)
+	for key, value := range values {
+		updates[key] = value
+	}
+	for key, value := range map[string]string{
+		"SCENARIO_CODE":         "scenario_1010",
+		"SCENARIO_SEED_ENABLED": "true",
+		"SERVER_GENERATION":     "1",
+	} {
+		if strings.TrimSpace(current[key]) == "" {
+			if _, specified := updates[key]; !specified {
+				updates[key] = value
+			}
+		}
 	}
 	spec := map[string]envFieldSpec{}
-	for key := range values {
+	for key := range updates {
 		spec[key] = envFieldSpec{Description: "리셋 옵션"}
 	}
-	_, err := patchEnvFile(envFile, spec, values)
+	_, err = patchEnvFile(envFile, spec, updates)
 	return err
 }
 
@@ -3365,6 +3625,14 @@ func (c config) writeRegistry(registry []registryEntry) error {
 }
 
 func (c config) writeRegistryLocked(registry []registryEntry) error {
+	return c.writeRegistryLockedWithDurability(registry, false)
+}
+
+func (c config) writeRegistryLockedDurable(registry []registryEntry) error {
+	return c.writeRegistryLockedWithDurability(registry, true)
+}
+
+func (c config) writeRegistryLockedWithDurability(registry []registryEntry, durable bool) error {
 	canonical, err := canonicalRegistryEntries(registry)
 	if err != nil {
 		return err
@@ -3373,10 +3641,14 @@ func (c config) writeRegistryLocked(registry []registryEntry) error {
 	if err != nil {
 		return err
 	}
-	return c.writeCanonicalRegistryLocked(lines, canonical)
+	return c.writeCanonicalRegistryLockedWithDurability(lines, canonical, durable)
 }
 
 func (c config) writeCanonicalRegistryLocked(lines []envLine, canonical []registryEntry) error {
+	return c.writeCanonicalRegistryLockedWithDurability(lines, canonical, false)
+}
+
+func (c config) writeCanonicalRegistryLockedWithDurability(lines []envLine, canonical []registryEntry, durable bool) error {
 	data, err := json.Marshal(canonical)
 	if err != nil {
 		return err
@@ -3396,6 +3668,9 @@ func (c config) writeCanonicalRegistryLocked(lines []envLine, canonical []regist
 	}
 	if !replaced {
 		next = append(next, replacement)
+	}
+	if durable {
+		return writeEnvLinesAtomicDurable(c.sharedEnvFile(), next)
 	}
 	return writeEnvLinesAtomic(c.sharedEnvFile(), next)
 }
