@@ -19,7 +19,7 @@ deployer/                   # 버전 bounce 배포 사이드카(Go stdlib, 외�
 infra/nginx/nginx.conf      # 리버스 프록시(게이트웨이 / 진입점)
 servers/s1.env.example      # 게임 서버 env 예시(서버마다 복제)
 .env.example                # 공유 스택 env 예시(.env로 복사)
-scripts/deploy.sh           # (단일서버) 서버 배포 헬퍼
+scripts/deploy.sh           # GCP 멀티서버 배포에서는 fail-fast (GitHub Actions 사용)
 ```
 
 앱 이미지는 `ghcr.io/${GHCR_OWNER}/opensamguk:<서비스>-${IMAGE_TAG}`에서 받아온다.
@@ -48,9 +48,25 @@ scripts/deploy.sh           # (단일서버) 서버 배포 헬퍼
   + `game-postgres` + `game-redis` + 자기 `IMAGE_TAG`. 서버끼리 월드/버전이 완전히 격리된다.
 - **공유 스택**: `gateway-postgres`(유저/인증) + `gateway-api` + `web-gateway` + `nginx`
   + `deployer` 사이드카 + `socket-proxy`. 전 서버 공통(로그인/로비/어드민/배포).
-- **로비 진입**: nginx는 게이트웨이(`/`)만 프록시한다. 게임 진입은 **서버별 절대 URL**
-  (로비 `servers.json` / `SERVER_REGISTRY_JSON`)이 담당 — 서버별 web-game/game-api 호스트 포트로 직접.
-  (서버별 동적 라우팅을 nginx에 만들지 않는다 — 단순/명료 유지.)
+- **로비/게임 진입**: nginx는 `/game/<public-id>`를 해당 게임 서버로 보낸다. 브라우저의 게임 관리 호출은
+  `/api/game/api/admin/...`을 포함한 `/api/game/...`이며, httpOnly `sam_access` 쿠키를 Bearer로 바꾸는
+  `web-gateway`를 항상 통과한다. direct `/api/admin/...`도 game-api bypass가 없는 `/api/` surface라
+  `web-gateway`가 안전하게 404 처리할 수 있다. `sam_server` 쿠키를 가진
+  `/game/_next/static`은 같은 게임 웹으로 프록시한다. 잘못된 path/cookie id는 404로 fail-closed 한다.
+
+### 공개 서버 ID 계약
+
+운영자가 입력하는 raw `SERVER_ID`와 deployer API id는 비어 있지 않은 ASCII 영숫자(`[A-Za-z0-9]+`)를
+받는다. control plane은 즉시 소문자로 정규화하고, 레지스트리 `id`, env, 응답, 공개 경로는 모두 canonical
+`[a-z0-9]+`만 쓴다. Docker에만 내부 key `s<public-id>`를 쓴다. 예를 들어 raw `A1`은 public `a1`,
+`servers/sa1.env`, compose 프로젝트 `opensamguk-sa1`, 컨테이너/내부 DNS `sa1-*`, 공개 경로 `/game/a1`로
+대응한다. `pep`은 그대로 `spep`가 되고, public id가 `s`로 시작하면 그 `s`는 public 값의 일부여서 `s1`은
+내부 `ss1`이 된다. 삭제/리셋 확인 문구도 canonical id를 쓴다(`DELETE a1`, `RESET a1`).
+게임 웹의 top-level route(`main`, `join`, `map`, `history` 등)는 public id로 예약할 수 없고, create 요청은 경로
+충돌을 명시한 오류를 반환한다. source-promote의 전체 서버 sentinel `all`도 public id로 예약되어 있다. 이런
+게임 경로는 canonical `sam_server` 쿠키가 있을 때만 해당 게임 웹으로 간다.
+기존 레지스트리의 `id`/`deployProject` 쌍이 이 계약과 맞지 않으면 제어면은 추측해 접두 `s`를 제거하지 않고
+one-time migration 필요 오류로 fail-close한다.
 
 ### least-privilege 배포 경로
 
@@ -88,31 +104,33 @@ docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env
 
 ### 2) 게임 서버 N회 기동
 
-서버마다 `servers/<id>.env`를 만들고(예시 복제) 포트/비밀번호/`SERVER_ID`가 겹치지 않게 한다.
+서버마다 `servers/s<public-id>.env`를 만들고(예시 복제) 포트/비밀번호/public `SERVER_ID`가 겹치지 않게 한다.
 
 ```bash
-cp servers/s1.env.example servers/s1.env    # SERVER_ID=1 (접두 s 없이 — compose가 s${SERVER_ID}로 합성),
+cp servers/s1.env.example servers/spep.env  # SERVER_ID=pep (compose가 spep/opensamguk-spep로 합성),
                                             # SERVER_NAME/SERVER_GENERATION, IMAGE_TAG, GAME_API_PORT/WEB_GAME_PORT,
                                             # GAME_POSTGRES_PASSWORD, JWT_SECRET(공유와 동일) 채우기
-docker compose -p opensamguk-s1 -f docker-compose.server.yml --env-file servers/s1.env up -d
+docker compose -p opensamguk-spep -f docker-compose.server.yml --env-file servers/spep.env up -d
 
-# 서버 2개째 — s2.env 복제(SERVER_ID=2, 포트 82xx/32xx 등 충돌 없게)
-cp servers/s1.env.example servers/s2.env    # 편집 후 (파일명은 s2.env, 내부 SERVER_ID=2)
-docker compose -p opensamguk-s2 -f docker-compose.server.yml --env-file servers/s2.env up -d
+# 서버 2개째 — salpha.env 복제(SERVER_ID=alpha, 포트 82xx/32xx 등 충돌 없게)
+cp servers/s1.env.example servers/salpha.env
+docker compose -p opensamguk-salpha -f docker-compose.server.yml --env-file servers/salpha.env up -d
 ```
 
 기동 후 공유 스택의 `SERVER_REGISTRY_JSON`에 그 서버를 등록한다(로비/어드민이 인식하도록):
 
 ```json
 [
-  {"id":"s1","name":"통일 서버","generation":1,"gameApiUrl":"http://s1-game-api:8081","gameEngineUrl":"http://s1-game-engine:8082","deployProject":"opensamguk-s1"},
-  {"id":"s2","name":"군웅 서버","generation":1,"gameApiUrl":"http://s2-game-api:8081","gameEngineUrl":"http://s2-game-engine:8082","deployProject":"opensamguk-s2"}
+  {"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"},
+  {"id":"alpha","name":"군웅 서버","generation":1,"gameApiUrl":"http://salpha-game-api:8081","gameEngineUrl":"http://salpha-game-engine:8082","deployProject":"opensamguk-salpha"}
 ]
 ```
 
-> `gameApiUrl`/`gameEngineUrl` 호스트명은 그 서버 컨테이너 이름(`s<id>-game-api` 등)과 **반드시 일치**.
-> `deployProject`는 그 서버 compose 프로젝트명(`opensamguk-s<id>`) — deployer가 이 값으로 bounce 대상을 찾는다.
-> `generation`은 로비/어드민/게임 메인에 표시되는 기수이며, `servers/<id>.env`의 `SERVER_GENERATION`과 맞춰 둔다. 알파/테스트 서버는 `0`을 쓸 수 있고, 정식 기수는 보통 `1` 이상으로 시작한다.
+> 레지스트리 `id`는 public id이고, `gameApiUrl`/`gameEngineUrl` 호스트명은 내부 `s<id>-game-api` 등과
+> **반드시 일치**한다. `deployProject`도 내부 compose 프로젝트명(`opensamguk-s<id>`)이다.
+> `generation`은 로비/어드민/게임 메인에 표시되는 기수이며, `servers/s<id>.env`의 `SERVER_GENERATION`과 맞춰 둔다. 알파/테스트 서버는 `0`을 쓸 수 있고, 정식 기수는 보통 `1` 이상으로 시작한다.
+> deployer는 Docker 실행, deploy/delete/reset, `/readyz` 전에 `servers/s<id>.env`의 `SERVER_ID`가 canonical public
+> id와 정확히 같은지 다시 확인한다. 누락·중복·불일치는 Docker를 호출하지 않고 fail closed 한다.
 
 ---
 
@@ -122,23 +140,81 @@ docker compose -p opensamguk-s2 -f docker-compose.server.yml --env-file servers/
 
 ### opensamguk-docker
 
-이 저장소의 `main`에 `deployer/`, compose, nginx, workflow 변경이 들어오면 EC2 self-hosted runner가
+이 저장소의 `main`에 `deployer/`, compose, nginx, workflow 변경이 들어오면 GCP self-hosted runner가
 `~/opensamguk-docker`를 fast-forward하고 다음만 자동 승격한다.
 
 - `deployer`: 로컬 이미지 rebuild 후 컨테이너 recreate
 - `nginx`: 설정 reload를 위해 force-recreate
 - compose/nginx/deployer 소스: git main으로 동기화
 
-게임 서버가 아직 하나도 없어도 성공해야 한다. 검증은 deployer `/healthz`와 nginx `/health`를 항상 확인하고,
-`s1-web-game`이 실행 중일 때만 `/game/s1`을 확인한다.
+게임 서버가 아직 하나도 없어도 성공해야 한다. 검증은 deployer `/healthz`와 registry 검증을 수행하는 `/readyz`,
+nginx `/health`를 항상 확인하고,
+레지스트리에 있는 실행 중 public 서버가 있을 때만 `/game/<public-id>`를 확인한다.
 
-게임 서버를 모두 닫은 뒤 public admin/gateway 경로가 아직 복구되지 않았다면 GitHub Actions
-**Recreate Game Server** 워크플로를 수동 실행한다. 이 워크플로는 EC2 self-hosted runner 내부에서
-`DEPLOYER_TOKEN`을 읽어 deployer `/servers/create`를 호출하므로, gateway/nginx public 경로가 내려간
-상태에서도 `s1` 같은 게임 서버를 다시 만들 수 있다. 입력값은 `server_id`, `server_name`,
-`generation`, `image_tag`, `scenario_code`, `game_api_port`, `web_game_port`이며 `jwtSecret`은 비워
-shared `JWT_SECRET`을 복사한다. 실행 후에는 `Deploy Orchestration to EC2`를 한 번 더 실행해 shared
-stack과 nginx를 재검증한다.
+### control-plane maintenance barrier
+
+호스트 workflow끼리는 `/tmp/opensamguk-production.lock`으로 직렬화하지만, 직접 deployer API 호출까지 이 lock을
+공유하지는 않는다. 그래서 deployer는 `servers/.deployer-maintenance`라는 영속 marker를 별도로 사용한다. marker가
+있으면 새 deployer 프로세스도 closed 상태로 부팅하며, 새 mutation은 `503`과 `Retry-After`를 받고, 진행 중인
+mutation은 취소된 context가 Docker runner에서 실제 반환할 때까지 drain한다.
+
+create/delete/reset/deploy는 영속 상태를 바꾸기 전에 `servers/.deployer-lifecycle-journal`도 기록한다. journal이
+남은 채로 프로세스가 죽으면 deployer는 closed 상태와 `/readyz` `503`을 유지하고, leave로 다시 열 수 없다. loopback
+maintenance repair가 journal 종류에 맞는 recovery를 끝까지 검증한 뒤 journal을 지우고, 별도 maintenance marker도 없을 때만
+mutation을 다시 허용한다. 특히 reset repair는 `down --volumes`와 `up`을 다시 수행한 뒤 engine Actuator readiness,
+game-api DB·Redis health, game web HTTP 응답을 제한 시간 안에 확인한다. 이어서 실제 `GET /api/front-info`의
+`global.scenario`와 `global.generation`이 reset env의 시나리오·기수와 일치하는지 확인한다. 이 검증에는 container env나
+시크릿을 읽거나 출력하지 않는다.
+
+workflow는 deployer 컨테이너의 loopback에서만 다음 Bearer API를 호출한다. `DEPLOYER_TOKEN`은 호스트에서
+읽거나 `docker exec -e`로 주입하지 않고 deployer 컨테이너 자신의 환경에서만 사용한다. gateway/API caller는 같은
+토큰을 알아도 maintenance barrier를 열거나 닫을 수 없다.
+
+```text
+GET  /maintenance        -> {"capability":"maintenance-v1","state":"open|draining|drained"}
+POST /maintenance/enter  -> drained 후 32-hex 단발 lease를 포함해 반환
+POST /maintenance/leave  -> 성공한 workflow가 마지막에만 open
+POST /maintenance/repair -> 남은 lifecycle journal을 recovery·runtime/data·shared reload까지 검증한 뒤에만 지움 (marker가 없을 때만 open)
+```
+
+**처음 설치되어 deployer 컨테이너가 전혀 없는 경우**에는 workflow가 marker를 먼저 만들고 deployer를 closed로
+기동한 뒤 확인한다. Deploy Orchestration과 Start Existing Game Server는 성공 검증 뒤에만 leave 한다. Recreate Game
+Server는 marker를 lifecycle job과 서버 postcondition 전체 동안 닫아 둔다. enter가 준 lease는 메모리 안의 단발
+권한이며 loopback + Bearer POST /servers/create에만 전달된다. GET, 로그, create 응답에는 lease를 넣지 않는다.
+enter가 준 lease는 recreate 요청 JSON body로만 전달되고 host Docker argv, HTTP header, 로그, create 응답에는 넣지
+않는다. 동일 operationId의 모호한 재시도는 **정규화된 생성 payload fingerprint까지 같을 때만** 기존 job을 돌려주며
+lease를 다시 소비하지 않는다. 다른 payload로 같은 operationId를 재사용하면 `409`으로 거부한다. deployer 재시작으로
+in-memory job이 사라지거나 어떤 단계가 실패하면 workflow는 절대 deadline, 요청 connect/total timeout, bounded EXIT
+drain 안에서 abort하고 marker를 남겨 fail-closed 상태를 유지한다.
+
+#### 구버전 deployer의 1회 bridge
+
+기존 deployer에 `/maintenance`가 없거나 404/잘못된 JSON을 반환하면 workflow는 **git merge, build, force-recreate
+전에 중단**한다. unknown in-memory job을 자동으로 drain했다고 간주하거나 marker만 만들어 구버전을 조용히
+업그레이드하면 안 된다. 다음 증거가 있을 때만 계획된 control-plane downtime으로 1회 bridge를 수행한다.
+
+1. gateway가 deployer mutation을 호출하지 못하게 차단한다.
+2. host-lock workflow가 실행 중이 아님을 확인한다.
+3. 알고 있는 lifecycle job ID를 모두 cancel하고 terminal 상태까지 확인한다.
+4. unknown accepted request가 없다는 운영 증거를 확보한 뒤에만 `servers/.deployer-maintenance`를 만들고 deployer-only bridge 교체를 수행한다.
+5. 새 deployer의 loopback `/maintenance`가 `maintenance-v1` + `drained`임을 확인한 뒤 정상 Deploy Orchestration을 다시 실행한다.
+
+unknown job이 없다는 증거를 만들 수 없으면 bridge하지 말고 control-plane downtime을 유지한다. 이 절차는 persistent
+job queue로의 자동 migration이 아니며, 기존 job 상태를 추측하거나 replay하지 않는다.
+
+GCP의 shared/per-server orchestration 배포는 GitHub Actions **Deploy Orchestration to GCP**만 지원한다.
+`scripts/deploy.sh`는 과거 root single-stack 경로를 실행하지 않고 즉시 실패하므로 운영 배포에 사용하지 않는다.
+
+게임 서버를 닫았거나 복구해야 할 때에는 다음 순서를 따른다.
+
+1. shared 스택 또는 deployer가 비정상이면 먼저 GitHub Actions **Deploy Orchestration to GCP**를 실행해
+   shared/deployer를 복구한다.
+2. 기존 `servers/s<public-id>.env`가 있으면 **Start Existing Game Server** 워크플로를 사용하고 `image_tag`는
+   빈 값으로 둔다. 그러면 기존 `IMAGE_TAG`와 `WEB_GAME_TAG` 핀이 그대로 보존된다.
+3. env 파일이 없거나 새 서버를 만들 때만 **Recreate Game Server** 워크플로를 사용한다. 이 워크플로는 deployer
+   컨테이너 내부 token으로 loopback `/servers/create`를 호출한다.
+   입력값은 `server_id`, `server_name`, `generation`, `image_tag`, `scenario_code`, `game_api_port`,
+   `web_game_port`이며 `jwtSecret`은 비워 shared `JWT_SECRET`을 복사한다.
 
 ### opensamguk
 
@@ -151,11 +227,19 @@ stack과 nginx를 재검증한다.
 진행 중 서버 승격은 어드민/deployer에서 서버별로 하거나, 시즌 경계/재시드 같은 명시 운영 시점에 수동으로 한다.
 이 경계가 깨지면 게임 도중 로직/프론트가 갑자기 바뀌어 패러티와 UX가 같이 흔들릴 수 있다.
 
+서버 reset은 `docker compose down --volumes` 호출 직전까지의 실패만 이전 env/registry snapshot으로 복구한다. 해당
+호출을 지난 뒤에는 볼륨이 일부라도 제거되었을 수 있으므로 이전 desired state를 되살리지 않는다. down 결과가 불확실하면
+원래 job은 임의의 forward re-up을 주장하지 않고 새 desired state와 `repairRequired=true` journal을 남긴다. 명시적
+maintenance repair가 reset을 다시 끝까지 수행해 seeded `world_state`의 시나리오와 game-api 기수를 확인하고,
+`repairRequired`를 durable하게 지운 최종 registry로 `gateway-api`·`web-gateway`·`nginx`를 reload/health-verify한 뒤에만
+journal과 closed barrier를 해제한다. `SCENARIO_SEED_ENABLED=false`인 reset은 fresh world data를 검증할 수 없으므로
+repair 완료로 처리되지 않는다.
+
 ---
 
 ## 서버별 버전 고정 (중요)
 
-각 서버는 **독립적으로 버전을 고정**한다 — 서버마다 `servers/<id>.env`의 `IMAGE_TAG`가 다를 수 있다.
+각 서버는 **독립적으로 버전을 고정**한다 — 서버마다 `servers/s<public-id>.env`의 `IMAGE_TAG`가 다를 수 있다.
 
 - 서버 A는 `IMAGE_TAG=v1.2.0`, 서버 B는 `IMAGE_TAG=v1.3.0` 식으로 **동시에 서로 다른 버전** 운영 가능.
 - 새 릴리스(새 이미지 태그)가 나와도 **진행 중인 서버에 자동 적용되지 않는다.** 운영자가 그 서버의
@@ -176,15 +260,16 @@ stack과 nginx를 재검증한다.
 4. **`game-engine`은 건드리지 않는다** — 진행 중 월드 desync 방지. (엔진 버전 변경은 아래 수동 절차.)
 
 ```
-GET  deployer/status?project=opensamguk-s1   → {"currentTag":"v1.2.0","availableTags":[...]}
-POST deployer/deploy  {"project":"opensamguk-s1","tag":"v1.3.0"}
+GET  deployer/status?project=opensamguk-spep   → {"currentTag":"v1.2.0","availableTags":[...]}
+POST deployer/deploy  {"project":"opensamguk-spep","tag":"v1.3.0"}
 ```
 
 환경변수 관리 API도 같은 Bearer 토큰 인증을 사용한다. 임의 raw editor가 아니라 명시 allowlist만 수정한다.
 `DEPLOYER_TOKEN`은 서버 내부 권한 토큰이므로 API 수정 대상에서 제외한다. `JWT_SECRET`, `ADMIN_PASSWORD`,
 `GHCR_TOKEN` 같은 민감값은 PATCH로만 쓰고 GET/PATCH 응답에는 원문 값을 반환하지 않는다.
-서버별 env PATCH는 `JWT_SECRET` 같은 write-only 비밀값을 제외한 서버 env 전체를 `SERVER_REGISTRY_JSON`
-의 해당 서버 `env` 스냅샷으로 동기화한다. `SERVER_NAME`, `SERVER_GENERATION`, `GAME_API_URL`처럼 로비와
+서버별 env PATCH는 명시된 non-secret allowlist만 `SERVER_REGISTRY_JSON`의 해당 서버 `env` 스냅샷으로 동기화한다.
+레거시 registry에 남은 임의 키나 JWT/password/token 값도 read 시 제거되어 atomically 다시 저장되며 `GET /servers`에는
+반환되지 않는다. `SERVER_NAME`, `SERVER_GENERATION`, `GAME_API_URL`처럼 로비와
 어드민이 직접 쓰는 값은 registry의 top-level 필드도 함께 갱신하고, 공유 스택 registry reload 대상
 (`gateway-api`, `web-gateway`, `nginx`)을 `affectedServices`에 포함한다.
 
@@ -192,8 +277,8 @@ POST deployer/deploy  {"project":"opensamguk-s1","tag":"v1.3.0"}
 GET   deployer/env/shared
 PATCH deployer/env/shared {"values":{"NEXT_PUBLIC_GATEWAY_URL":"https://sam.example.com"}}
 
-GET   deployer/env/server?id=s1
-PATCH deployer/env/server?id=s1 {"values":{"IMAGE_TAG":"v1.3.0","WEB_GAME_TAG":"v1.3.0","JWT_SECRET":"base64-secret"}}
+GET   deployer/env/server?id=pep
+PATCH deployer/env/server?id=pep {"values":{"IMAGE_TAG":"v1.3.0","WEB_GAME_TAG":"v1.3.0","JWT_SECRET":"base64-secret"}}
 ```
 
 PATCH 응답의 `restartRequired`와 `affectedServices`는 재기동이 필요한 대상을 알려준다. 서버별 env 변경의
@@ -204,11 +289,11 @@ PATCH 응답의 `restartRequired`와 `affectedServices`는 재기동이 필요�
 
 ```bash
 # 그 서버 env의 IMAGE_TAG 교체
-sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=v1.3.0/' servers/s1.env
+sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=v1.3.0/' servers/spep.env
 # 전체 pull
-docker compose -p opensamguk-s1 -f docker-compose.server.yml --env-file servers/s1.env pull
+docker compose -p opensamguk-spep -f docker-compose.server.yml --env-file servers/spep.env pull
 # 엔진 포함 재기동 — 엔진은 부팅 시 DB→InMemory 재수화로 무손실
-docker compose -p opensamguk-s1 -f docker-compose.server.yml --env-file servers/s1.env up -d
+docker compose -p opensamguk-spep -f docker-compose.server.yml --env-file servers/spep.env up -d
 ```
 
 > **무손실 보장**: game-engine은 부팅 시 `world_state`(DB)에서 `InMemoryTurnWorld`를 재수화한다.
@@ -223,7 +308,8 @@ docker compose -p opensamguk-s1 -f docker-compose.server.yml --env-file servers/
 tmp=$(mktemp -d)
 mkdir -p "$tmp/servers"
 cp .env.example "$tmp/.env"
-cp servers/s1.env.example "$tmp/servers/s1.env"
+cp servers/s1.env.example "$tmp/servers/spep.env"
+sed -i 's/^SERVER_ID=.*/SERVER_ID=pep/' "$tmp/servers/spep.env"
 
 DEPLOYER_TOKEN=test-token \
 COMPOSE_DIR="$tmp" \
@@ -232,11 +318,11 @@ COMPOSE_SERVER_FILE="$PWD/docker-compose.server.yml" \
 (cd deployer && go run .)
 
 curl -sS -H 'Authorization: Bearer test-token' \
-  'http://localhost:9000/env/server?id=s1'
+  'http://localhost:9000/env/server?id=pep'
 
 curl -sS -X PATCH -H 'Authorization: Bearer test-token' -H 'Content-Type: application/json' \
   -d '{"values":{"IMAGE_TAG":"v1.3.0","JWT_SECRET":"new-secret"}}' \
-  'http://localhost:9000/env/server?id=s1'
+  'http://localhost:9000/env/server?id=pep'
 
 curl -sS -X PATCH -H 'Authorization: Bearer test-token' -H 'Content-Type: application/json' \
   -d '{"values":{"DEPLOYER_TOKEN":"must-not-write"}}' \
@@ -290,7 +376,7 @@ docker compose up -d
 
 ## 대상 환경
 
-AWS EC2 **t3.large**(2 vCPU / 8 GiB) 기준(단일서버). LLM·외부 API 의존 0개.
+GCP Compute Engine **e2-standard-2**(2 vCPU / 8 GiB) 기준(단일서버). LLM·외부 API 의존 0개.
 멀티서버는 서버 수에 비례해 메모리/CPU가 필요하다(서버당 엔진 ~2G + DB ~1.5G).
 
 ---
