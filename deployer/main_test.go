@@ -1970,23 +1970,42 @@ func TestServerComposeExportsPublicIDAndWorldIDToSourceServices(t *testing.T) {
 
 func TestServerComposeMountsExternalScenarioOverridesReadOnly(t *testing.T) {
 	compose := readFile(t, filepath.Join("..", "docker-compose.server.yml"))
-	start := strings.Index(compose, "\n  game-engine:\n")
-	if start < 0 {
-		t.Fatal("compose missing game-engine service")
-	}
-	engine := compose[start:]
-	if end := strings.Index(engine, "\n  game-api:\n"); end < 0 {
-		t.Fatal("compose missing boundary after game-engine service")
-	} else {
-		engine = engine[:end]
-	}
+	const scenarioDir = "SCENARIO_DIR: ${SCENARIO_DIR:-/data/scenarios}"
+	const scenarioMount = "- ${SCENARIO_HOST_DIR:-./data/scenarios}:${SCENARIO_DIR:-/data/scenarios}:ro"
+	want := strings.Join([]string{scenarioDir, scenarioMount}, "\n")
 
-	for _, want := range []string{
-		"SCENARIO_DIR: ${SCENARIO_DIR:-/data/scenarios}",
-		"- ${SCENARIO_HOST_DIR:-./data/scenarios}:${SCENARIO_DIR:-/data/scenarios}:ro",
+	var canonicalContract string
+	for _, service := range []struct {
+		name  string
+		until string
+	}{
+		{name: "game-engine", until: "\n  game-api:\n"},
+		{name: "game-api", until: "\n  web-game:\n"},
 	} {
-		if !strings.Contains(engine, want) {
-			t.Fatalf("game-engine scenario override contract missing %q", want)
+		start := strings.Index(compose, "\n  "+service.name+":\n")
+		if start < 0 {
+			t.Fatalf("compose missing %s service", service.name)
+		}
+		block := compose[start:]
+		end := strings.Index(block, service.until)
+		if end < 0 {
+			t.Fatalf("compose missing boundary after %s service", service.name)
+		}
+
+		var scenarioLines []string
+		for _, line := range strings.Split(block[:end], "\n") {
+			if strings.Contains(line, "SCENARIO_DIR") || strings.Contains(line, "SCENARIO_HOST_DIR") {
+				scenarioLines = append(scenarioLines, strings.TrimSpace(line))
+			}
+		}
+		contract := strings.Join(scenarioLines, "\n")
+		if canonicalContract == "" {
+			canonicalContract = contract
+		} else if contract != canonicalContract {
+			t.Fatalf("%s scenario override contract = %q, want identical to game-engine %q", service.name, contract, canonicalContract)
+		}
+		if contract != want {
+			t.Fatalf("%s scenario override contract = %q, want exactly read-only %q", service.name, contract, want)
 		}
 	}
 }
