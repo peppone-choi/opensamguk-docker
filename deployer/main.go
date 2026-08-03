@@ -2565,6 +2565,7 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 	jobID := ""
 	newReservation := false
 	reservationClaimed := false
+	admissionAttempted := false
 	if operationID != "" {
 		var existing bool
 		jobID, existing, err = c.lifecycleJobs.reserveWithOperation(operationID, createRequestFingerprint(normalized))
@@ -2593,7 +2594,7 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 		newReservation = true
 	}
 	defer func() {
-		if newReservation && !reservationClaimed {
+		if newReservation && !reservationClaimed && !admissionAttempted {
 			c.lifecycleJobs.discard(jobID)
 		}
 	}()
@@ -2648,8 +2649,12 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 		DeployProject: target.Project,
 		Env:           registryEnvSnapshot(envValuesFromLines(envLines)),
 	}
+	admissionAttempted = true
 	lease, err := c.beginMaintenanceCreate(jobID, maintenanceLease, operationID)
 	if err != nil {
+		if errors.Is(err, errMaintenanceClosed) {
+			c.lifecycleJobs.discard(jobID)
+		}
 		detail, status := mutationAdmissionFailure(err)
 		return createServerResponse{OK: false, ID: id, Detail: detail}, status
 	}

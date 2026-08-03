@@ -1188,6 +1188,20 @@ func TestPendingCreateCancelBeforeClaimHasNoMutation(t *testing.T) {
 	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, jobID, lifecycleJobCancelled); completed.Status != lifecycleJobCancelled {
 		t.Fatalf("pending job after admission release = %#v", completed)
 	}
+	if visible := lifecycleJobLookup(t, cfg, jobID); visible.Status != lifecycleJobCancelled {
+		t.Fatalf("pending job endpoint status after admission release = %#v", visible)
+	}
+	retry := envRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create", secondBody)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("cancelled create operation retry = %d body=%s", retry.Code, retry.Body.String())
+	}
+	var retried createServerResponse
+	if err := json.NewDecoder(retry.Body).Decode(&retried); err != nil {
+		t.Fatalf("decode cancelled create operation retry: %v", err)
+	}
+	if retried.JobID != jobID {
+		t.Fatalf("cancelled create operation retry job = %q, want %q", retried.JobID, jobID)
+	}
 	if _, err := os.Stat(filepath.Join(cfg.serversDir, "sfoo.env")); !os.IsNotExist(err) {
 		t.Fatalf("cancelled pending create wrote env: %v", err)
 	}
