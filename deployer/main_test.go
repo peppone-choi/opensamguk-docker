@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -2005,17 +2006,14 @@ func TestRecreateWorkflowRetriesIdempotentlyAndDrainsCancellationBeforeUnlock(t 
 		"maintenance_enter_fields",
 		"for create_attempt in 1 2 3",
 		"payload.get(\"jobId\")",
-		"http://localhost:9000/jobs/$1",
-		"http://localhost:9000/jobs/$1/cancel",
 		"cancel_and_await_lifecycle_job",
 		"for attempt in 1 2 3",
-		"--header=\"Authorization: Bearer $DEPLOYER_TOKEN\"",
+		`/usr/local/bin/deployer --authenticated-http GET "/jobs/$target_job_id"`,
+		`/usr/local/bin/deployer --authenticated-http POST "/jobs/$target_job_id/cancel"`,
 		"for ((attempt=1; attempt<=12; attempt++)); do",
 		"for ((poll_attempt=1; poll_attempt<=240; poll_attempt++)); do",
 		"local drain_deadline=$((SECONDS + 60))",
 		"timeout --foreground -k 2",
-		"timeout -k 2 10 wget",
-		"-T 5",
 		"--max-time 10",
 		"pending|running|cancelled)",
 		"failed)",
@@ -2037,7 +2035,7 @@ func TestRecreateWorkflowRetriesIdempotentlyAndDrainsCancellationBeforeUnlock(t 
 	enter := strings.Index(workflow, "maintenance_post /maintenance/enter")
 	merge := strings.Index(workflow, "git merge --ff-only origin/main")
 	operationID := strings.Index(workflow, "CLIENT_OPERATION_ID")
-	create := strings.Index(workflow, "http://localhost:9000/servers/create")
+	create := strings.Index(workflow, "/usr/local/bin/deployer --authenticated-http POST /servers/create")
 	parse := strings.Index(workflow, "payload.get(\"jobId\")")
 	poll := strings.LastIndex(workflow, "$(lifecycle_status \"$JOB_ID\" \"$WORKFLOW_DEADLINE\")")
 	succeeded := strings.Index(workflow, "succeeded)")
@@ -2191,7 +2189,71 @@ func TestDeployAndStartWorkflowsBoundCommandsWhileHoldingProductionLock(t *testi
 	}
 }
 
-func TestMaintenanceWorkflowsKeepCredentialsOutOfHostDockerArguments(t *testing.T) {
+func TestAuthenticatedHTTPCommandUsesInheritedTokenWithoutLeakingIt(t *testing.T) {
+	const token = "credential-must-not-appear-in-argv"
+	var method, path, authorization, contentType, body string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method = r.Method
+		path = r.URL.Path
+		authorization = r.Header.Get("Authorization")
+		contentType = r.Header.Get("Content-Type")
+		payload, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read helper request: %v", err)
+		}
+		body = string(payload)
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"accepted":true}`))
+	}))
+	defer server.Close()
+
+	var output, diagnostics bytes.Buffer
+	status := authenticatedHTTPCommand(
+		config{token: token, localHTTPBaseURL: server.URL},
+		http.MethodPost,
+		"/servers/create",
+		strings.NewReader(`{"id":"pep"}`),
+		&output,
+		&diagnostics,
+	)
+	if status != 0 {
+		t.Fatalf("authenticated helper status = %d diagnostics=%q", status, diagnostics.String())
+	}
+	if method != http.MethodPost || path != "/servers/create" || contentType != "application/json" || body != `{"id":"pep"}` || output.String() != `{"accepted":true}` {
+		t.Fatalf("authenticated helper request method=%q path=%q contentType=%q body=%q output=%q", method, path, contentType, body, output.String())
+	}
+	if authorization != "Bearer "+token {
+		t.Fatal("authenticated helper did not apply its inherited token")
+	}
+	if strings.Contains(diagnostics.String(), token) || strings.Contains(output.String(), token) {
+		t.Fatal("authenticated helper exposed its token in diagnostics or output")
+	}
+}
+
+func TestAuthenticatedHTTPCommandRejectsExternalOrErrorRequests(t *testing.T) {
+	var output, diagnostics bytes.Buffer
+	status := authenticatedHTTPCommand(config{token: "test-token"}, http.MethodGet, "//outside.example/maintenance", nil, &output, &diagnostics)
+	if status != 2 {
+		t.Fatalf("external-path helper status = %d diagnostics=%q", status, diagnostics.String())
+	}
+	if strings.Contains(diagnostics.String(), "test-token") {
+		t.Fatal("invalid helper request exposed its token")
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":"denied"}`))
+	}))
+	defer server.Close()
+	output.Reset()
+	diagnostics.Reset()
+	status = authenticatedHTTPCommand(config{token: "test-token", localHTTPBaseURL: server.URL}, http.MethodGet, "/maintenance", nil, &output, &diagnostics)
+	if status != 8 || output.String() != `{"error":"denied"}` {
+		t.Fatalf("HTTP-error helper status=%d output=%q diagnostics=%q", status, output.String(), diagnostics.String())
+	}
+}
+
+func TestMaintenanceWorkflowsKeepCredentialsOutOfEverySpawnedProcessArgument(t *testing.T) {
 	workflows := map[string]string{
 		"deploy":   readFile(t, filepath.Join("..", ".github", "workflows", "deploy-orchestration.yml")),
 		"recreate": readFile(t, filepath.Join("..", ".github", "workflows", "recreate-server.yml")),
@@ -2200,19 +2262,23 @@ func TestMaintenanceWorkflowsKeepCredentialsOutOfHostDockerArguments(t *testing.
 	for name, workflow := range workflows {
 		t.Run(name, func(t *testing.T) {
 			for _, forbidden := range []string{
-				`DEPLOYER_TOKEN="$(grep`,
+				"DEPLOYER_TOKEN",
+				"Authorization: Bearer",
 				"docker exec -e",
 				"-e DEPLOYER_TOKEN=",
 				"-e MAINTENANCE_LEASE=",
 			} {
 				if strings.Contains(workflow, forbidden) {
-					t.Fatalf("%s workflow exposes a credential in host Docker argv with %q", name, forbidden)
+					t.Fatalf("%s workflow exposes a credential in a spawned process argument with %q", name, forbidden)
 				}
+			}
+			if !strings.Contains(workflow, "/usr/local/bin/deployer --authenticated-http") {
+				t.Fatalf("%s workflow does not use the container-side authenticated HTTP helper", name)
 			}
 		})
 	}
 	recreate := workflows["recreate"]
-	for _, want := range []string{`"maintenanceLease": os.environ["MAINTENANCE_LEASE"]`, `<<<"$BODY"`, "cat > /tmp/recreate-server.json"} {
+	for _, want := range []string{`"maintenanceLease": os.environ["MAINTENANCE_LEASE"]`, `<<<"$BODY"`, "/usr/local/bin/deployer --authenticated-http POST /servers/create"} {
 		if !strings.Contains(recreate, want) {
 			t.Fatalf("recreate workflow is missing stdin/body lease transport %q", want)
 		}
@@ -2257,7 +2323,7 @@ func TestMaintenanceWorkflowOrderingAndLegacyFailClosedBoundary(t *testing.T) {
 		"exec 9>/tmp/opensamguk-production.lock",
 		"maintenance_post /maintenance/enter",
 		"git merge --ff-only origin/main",
-		"http://localhost:9000/servers/create",
+		"/usr/local/bin/deployer --authenticated-http POST /servers/create",
 		"for ((i=1; i<=90; i++)); do",
 		"maintenance_post /maintenance/leave",
 	)
@@ -3883,12 +3949,15 @@ func runRecreateWorkflowWithScenario(t *testing.T, stallCreate bool) startWorkfl
 	writeExecutable(t, filepath.Join(bin, "git"), "#!/usr/bin/env bash\nexit 0\n")
 	writeExecutable(t, filepath.Join(bin, "sudo"), "#!/usr/bin/env bash\nexec \"$@\"\n")
 	writeExecutable(t, filepath.Join(bin, "sleep"), "#!/usr/bin/env bash\nexit 0\n")
-	writeExecutable(t, filepath.Join(bin, "timeout"), "#!/usr/bin/env bash\nset -euo pipefail\nargs=\"$*\"\nif [[ \"${WORKFLOW_TIMEOUT_STALL_CREATE:-false}\" == true && \"$args\" == *\"/servers/create\"* ]]; then\n  exit 124\nfi\nif [[ \"${1:-}\" == \"--foreground\" ]]; then\n  shift\nfi\nif [[ \"${1:-}\" == \"-k\" ]]; then\n  shift 2\nfi\nshift\nexec \"$@\"\n")
+	writeExecutable(t, filepath.Join(bin, "timeout"), "#!/usr/bin/env bash\nset -euo pipefail\nif [[ \"${1:-}\" == \"--foreground\" ]]; then\n  shift\nfi\nif [[ \"${1:-}\" == \"-k\" ]]; then\n  shift 2\nfi\nshift\nexec \"$@\"\n")
 	writeExecutable(t, filepath.Join(bin, "python3"), "#!/usr/bin/env bash\nargs=\"$*\"\nif [[ \"$args\" == *\"state\\\"] + \\\":\\\"\"* ]]; then\n  printf 'drained:0123456789abcdef0123456789abcdef\\n'\nelif [[ \"$args\" == *\"payload.get(\\\"jobId\\\")\"* ]]; then\n  printf 'abcdef0123456789abcdef0123456789\\n'\nelif [[ \"$args\" == *\"import secrets\"* ]]; then\n  printf 'abcdef0123456789abcdef0123456789\\n'\nelif [[ \"$args\" == *\"json.dumps\"* ]]; then\n  printf '{}\\n'\nelse\n  printf 'drained\\n'\nfi\n")
 	dockerScript := `#!/usr/bin/env bash
 set -euo pipefail
 if [[ "$1" == "exec" ]]; then
   args="$*"
+	if [[ "${WORKFLOW_TIMEOUT_STALL_CREATE:-false}" == true && "$args" == *"/servers/create"* ]]; then
+	  exit 124
+	fi
   if [[ "$args" == *"/maintenance/enter"* ]]; then
     printf '{"capability":"maintenance-v1","state":"drained","lease":"0123456789abcdef0123456789abcdef"}\n'
     exit 0

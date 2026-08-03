@@ -219,6 +219,7 @@ type config struct {
 	ghcrOwner                 string // GHCR 패키지 소유자(태그 조회)
 	ghcrToken                 string // GHCR 조회 토큰(private면 필요, 없으면 익명)
 	ghcrAPIBaseURL            string
+	localHTTPBaseURL          string
 	dockerRunner              func(args ...string) (string, error)
 	dockerRunnerContext       func(context.Context, ...string) (string, error)
 	httpGet                   func(context.Context, string) (int, []byte, error)
@@ -1144,6 +1145,7 @@ func loadConfig() config {
 		ghcrOwner:              envOr("GHCR_OWNER", "peppone-choi"),
 		ghcrToken:              os.Getenv("GHCR_TOKEN"),
 		ghcrAPIBaseURL:         envOr("DEPLOYER_GHCR_API_BASE_URL", "https://api.github.com"),
+		localHTTPBaseURL:       "http://localhost:9000",
 		gameAPIInternalPort:    envOr("DEPLOYER_GAME_API_INTERNAL_PORT", "8081"),
 		gameEngineInternalPort: envOr("DEPLOYER_GAME_ENGINE_INTERNAL_PORT", "8082"),
 		gatewayAPIURL:          envOr("DEPLOYER_GATEWAY_API_URL", "http://gateway-api:8080"),
@@ -1685,8 +1687,11 @@ func main() {
 	if len(os.Args) == 2 && os.Args[1] == "--check-registry" {
 		os.Exit(checkRegistryCommand(cfg, os.Stderr))
 	}
+	if len(os.Args) == 4 && os.Args[1] == "--authenticated-http" {
+		os.Exit(authenticatedHTTPCommand(cfg, os.Args[2], os.Args[3], os.Stdin, os.Stdout, os.Stderr))
+	}
 	if len(os.Args) != 1 {
-		log.Fatal("usage: deployer [--check-registry]")
+		log.Fatal("usage: deployer [--check-registry|--authenticated-http METHOD PATH]")
 	}
 	if cfg.token == "" {
 		log.Fatal("DEPLOYER_TOKEN 미설정 — 인증 토큰 필수")
@@ -1719,6 +1724,66 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func authenticatedHTTPCommand(c config, method, requestPath string, input io.Reader, output, errOutput io.Writer) int {
+	if c.token == "" {
+		fmt.Fprintln(errOutput, "DEPLOYER_TOKEN is required")
+		return 2
+	}
+	if method != http.MethodGet && method != http.MethodPost {
+		fmt.Fprintln(errOutput, "authenticated HTTP method is invalid")
+		return 2
+	}
+	if !strings.HasPrefix(requestPath, "/") || strings.HasPrefix(requestPath, "//") || strings.ContainsAny(requestPath, "\r\n") {
+		fmt.Fprintln(errOutput, "authenticated HTTP path is invalid")
+		return 2
+	}
+	parsedPath, err := url.ParseRequestURI(requestPath)
+	if err != nil || parsedPath.IsAbs() || parsedPath.Host != "" {
+		fmt.Fprintln(errOutput, "authenticated HTTP path is invalid")
+		return 2
+	}
+	baseURL := strings.TrimRight(c.localHTTPBaseURL, "/")
+	if baseURL == "" {
+		baseURL = "http://localhost:9000"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var body io.Reader
+	if method == http.MethodPost {
+		body = input
+	}
+	req, err := http.NewRequestWithContext(ctx, method, baseURL+requestPath, body)
+	if err != nil {
+		fmt.Fprintln(errOutput, "authenticated HTTP request is invalid")
+		return 2
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	if method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	response, err := client.Do(req)
+	if err != nil {
+		fmt.Fprintln(errOutput, "authenticated HTTP request failed")
+		return 1
+	}
+	defer response.Body.Close()
+	if _, err := io.Copy(output, response.Body); err != nil {
+		fmt.Fprintln(errOutput, "authenticated HTTP response read failed")
+		return 1
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		fmt.Fprintln(errOutput, "authenticated HTTP request returned an error status")
+		return 8
+	}
+	return 0
 }
 
 func checkRegistryCommand(c config, output io.Writer) int {

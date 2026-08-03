@@ -110,14 +110,10 @@ jobs:
             printf '%s' "$1" | run_bounded "$WORKFLOW_DEADLINE" 10 python3 -c 'import json, re, sys; payload = json.load(sys.stdin); keys = set(payload) if isinstance(payload, dict) else set(); valid = keys in ({"capability", "state"}, {"capability", "state", "lease"}) and payload.get("capability") == "maintenance-v1" and payload.get("state") in {"open", "draining", "drained"} and ("lease" not in payload or re.fullmatch(r"[a-f0-9]{32}", payload["lease"]) is not None); valid or sys.exit(1); print(payload["state"])'
           }
           maintenance_get() {
-            docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c '
-              timeout -k 2 10 wget -qO- -T 5 --header="Authorization: Bearer $DEPLOYER_TOKEN" http://localhost:9000/maintenance
-            ' 2>/dev/null
+            docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer /usr/local/bin/deployer --authenticated-http GET /maintenance 2>/dev/null
           }
           maintenance_post() {
-            docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c '
-              timeout -k 2 10 wget -qO- -T 5 --header="Authorization: Bearer $DEPLOYER_TOKEN" --post-data="" "http://localhost:9000$1"
-            ' maintenance "$1" 2>/dev/null
+            docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST "$1" 2>/dev/null
           }
           DEPLOYER_FRESH=false
           if run_bounded "$WORKFLOW_DEADLINE" 15 sudo docker ps -a --format '{{.Names}}' | grep -Fxq opensamguk-deployer; then

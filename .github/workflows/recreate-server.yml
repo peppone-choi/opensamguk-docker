@@ -109,14 +109,10 @@ jobs:
             printf '%s' "$1" | run_bounded "$WORKFLOW_DEADLINE" 10 python3 -c 'import json, re, sys; payload = json.load(sys.stdin); valid = isinstance(payload, dict) and set(payload) == {"capability", "state", "lease"} and payload["capability"] == "maintenance-v1" and payload["state"] == "drained" and re.fullmatch(r"[a-f0-9]{32}", payload["lease"]) is not None; valid or sys.exit(1); print(payload["state"] + ":" + payload["lease"])'
           }
           maintenance_get() {
-            docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c '
-              timeout -k 2 10 wget -qO- -T 5 --header="Authorization: Bearer $DEPLOYER_TOKEN" http://localhost:9000/maintenance
-            ' 2>/dev/null
+            docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer /usr/local/bin/deployer --authenticated-http GET /maintenance 2>/dev/null
           }
           maintenance_post() {
-            docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c '
-              timeout -k 2 10 wget -qO- -T 5 --header="Authorization: Bearer $DEPLOYER_TOKEN" --post-data="" "http://localhost:9000$1"
-            ' maintenance "$1" 2>/dev/null
+            docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST "$1" 2>/dev/null
           }
           DEPLOYER_FRESH=false
           MAINTENANCE_LEASE=""
@@ -213,9 +209,7 @@ jobs:
               if ! deadline_remaining "$deadline" >/dev/null; then
                 return 4
               fi
-              if job_response="$(docker_exec_bounded "$deadline" 15 opensamguk-deployer sh -c '
-                timeout -k 2 10 wget -qO- -T 5 --header="Authorization: Bearer $DEPLOYER_TOKEN" "http://localhost:9000/jobs/$1"
-              ' job "$target_job_id" 2>/dev/null)"; then
+              if job_response="$(docker_exec_bounded "$deadline" 15 opensamguk-deployer /usr/local/bin/deployer --authenticated-http GET "/jobs/$target_job_id" 2>/dev/null)"; then
                 if job_status="$(printf '%s' "$job_response" | JOB_ID="$target_job_id" run_bounded "$deadline" 10 python3 -c 'import json, os, sys; payload = json.load(sys.stdin); valid = isinstance(payload, dict) and set(payload) == {"id", "status"} and payload["id"] == os.environ["JOB_ID"] and payload["status"] in {"pending", "running", "succeeded", "failed", "cancelled"}; valid or sys.exit(1); print(payload["status"])' 2>/dev/null)"; then
                   printf '%s\n' "$job_status"
                   return 0
@@ -245,12 +239,7 @@ jobs:
               if ! deadline_remaining "$deadline" >/dev/null; then
                 return 4
               fi
-              if cancel_response="$(docker_exec_bounded "$deadline" 15 opensamguk-deployer sh -c '
-                timeout -k 2 10 wget -qO- -T 5 \
-                  --header="Authorization: Bearer $DEPLOYER_TOKEN" \
-                  --post-data="" \
-                  "http://localhost:9000/jobs/$1/cancel"
-              ' job "$target_job_id" 2>/dev/null)"; then
+              if cancel_response="$(docker_exec_bounded "$deadline" 15 opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST "/jobs/$target_job_id/cancel" 2>/dev/null)"; then
                 if cancel_status="$(printf '%s' "$cancel_response" | JOB_ID="$target_job_id" run_bounded "$deadline" 10 python3 -c 'import json, os, sys; payload = json.load(sys.stdin); valid = isinstance(payload, dict) and set(payload) == {"id", "status"} and payload["id"] == os.environ["JOB_ID"] and payload["status"] in {"pending", "running", "succeeded", "failed", "cancelled"}; valid or sys.exit(1); print(payload["status"])' 2>/dev/null)"; then
                   printf '%s\n' "$cancel_status"
                   return 0
@@ -334,14 +323,7 @@ jobs:
             if ! deadline_remaining "$WORKFLOW_DEADLINE" >/dev/null; then
               break
             fi
-            if RESPONSE="$(docker_exec_bounded "$WORKFLOW_DEADLINE" 20 -i opensamguk-deployer sh -c '
-                timeout -k 2 10 cat > /tmp/recreate-server.json
-                timeout -k 2 10 wget -qO- -T 5 \
-                  --header="Authorization: Bearer $DEPLOYER_TOKEN" \
-                  --header="Content-Type: application/json" \
-                  --post-file=/tmp/recreate-server.json \
-                  http://localhost:9000/servers/create
-              ' <<<"$BODY" 2>/dev/null)"; then
+            if RESPONSE="$(docker_exec_bounded "$WORKFLOW_DEADLINE" 20 -i opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST /servers/create <<<"$BODY" 2>/dev/null)"; then
               if JOB_ID="$(printf '%s' "$RESPONSE" | run_bounded "$WORKFLOW_DEADLINE" 10 python3 -c 'import json, re, sys; payload = json.load(sys.stdin); job_id = payload.get("jobId") if isinstance(payload, dict) else None; (isinstance(job_id, str) and re.fullmatch(r"[a-f0-9]{32}", job_id) is not None) or sys.exit(1); print(job_id)' 2>/dev/null)"; then
                 break
               fi
