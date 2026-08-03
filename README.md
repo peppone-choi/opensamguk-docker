@@ -108,7 +108,7 @@ docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env
 
 ```bash
 cp servers/s1.env.example servers/spep.env  # SERVER_ID=pep (compose가 spep/opensamguk-spep로 합성),
-                                            # SERVER_NAME/SERVER_GENERATION, IMAGE_TAG, GAME_API_PORT/WEB_GAME_PORT,
+                                            # SERVER_NAME/SERVER_GENERATION, OPENSAMGUK_WORLD_ID=1, IMAGE_TAG, GAME_API_PORT/WEB_GAME_PORT,
                                             # GAME_POSTGRES_PASSWORD, JWT_SECRET(공유와 동일) 채우기
 docker compose -p opensamguk-spep -f docker-compose.server.yml --env-file servers/spep.env up -d
 
@@ -129,6 +129,7 @@ docker compose -p opensamguk-salpha -f docker-compose.server.yml --env-file serv
 > 레지스트리 `id`는 public id이고, `gameApiUrl`/`gameEngineUrl` 호스트명은 내부 `s<id>-game-api` 등과
 > **반드시 일치**한다. `deployProject`도 내부 compose 프로젝트명(`opensamguk-s<id>`)이다.
 > `generation`은 로비/어드민/게임 메인에 표시되는 기수이며, `servers/s<id>.env`의 `SERVER_GENERATION`과 맞춰 둔다. 알파/테스트 서버는 `0`을 쓸 수 있고, 정식 기수는 보통 `1` 이상으로 시작한다.
+> `OPENSAMGUK_WORLD_ID`는 source 앱의 숫자 world key다. 서버마다 PostgreSQL DB/볼륨이 분리되어 있으므로 모든 `servers/s<id>.env`에서 `1`을 쓴다. public `SERVER_ID`, Docker 내부 `s<id>`, `SERVER_GENERATION`을 넣지 않는다. 이전 env 파일은 compose의 `1` fallback으로 계속 기동되지만, 다음 편집 때 명시 행을 추가한다.
 > deployer는 Docker 실행, deploy/delete/reset, `/readyz` 전에 `servers/s<id>.env`의 `SERVER_ID`가 canonical public
 > id와 정확히 같은지 다시 확인한다. 누락·중복·불일치는 Docker를 호출하지 않고 fail closed 한다.
 
