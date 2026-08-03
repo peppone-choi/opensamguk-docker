@@ -2756,6 +2756,28 @@ func (c config) deleteServer(rawID string, confirm string) (createServerResponse
 		detail, status := mutationAdmissionFailure(err)
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: detail}, status
 	}
+	releaseStaleAdmission := func() {
+		c.lifecycleJobs.finish(jobID, lifecycleJobCancelled)
+		lease.Done()
+		c.lifecycleJobs.discard(jobID)
+	}
+	entry, err = c.registryEntryByID(id)
+	if err != nil {
+		releaseStaleAdmission()
+		return createServerResponse{OK: false, ID: id, Detail: fmt.Sprintf("레지스트리 조회 실패: %v", err)}, http.StatusInternalServerError
+	}
+	if entry.ID == "" {
+		releaseStaleAdmission()
+		return createServerResponse{OK: false, ID: id, Detail: "알 수 없는 서버입니다."}, http.StatusNotFound
+	}
+	if entry.DeployProject != target.Project {
+		releaseStaleAdmission()
+		return createServerResponse{OK: false, ID: id, Detail: "레지스트리 project와 서버 id가 일치하지 않습니다."}, http.StatusConflict
+	}
+	if _, err := c.validateServerTarget(target); err != nil {
+		releaseStaleAdmission()
+		return createServerResponse{OK: false, ID: id, Detail: fmt.Sprintf("서버 env 식별자 검증 실패: %v", err)}, http.StatusConflict
+	}
 	c.startClaimedLifecycleJob(lease, jobID, "delete "+id, func(ctx context.Context) (string, error) {
 		if err := c.writeLifecycleJournal("delete", target); err != nil {
 			return "", err

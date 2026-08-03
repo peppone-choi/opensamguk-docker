@@ -2974,6 +2974,101 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	}
 }
 
+func TestConcurrentDeletesRevalidateAfterMutationAdmission(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
+JWT_SECRET=shared-secret
+SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
+`)
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nGAME_API_PORT=8101\nWEB_GAME_PORT=3101\n")
+
+	firstDownStarted := make(chan struct{})
+	releaseFirstDown := make(chan struct{})
+	var firstDownOnce sync.Once
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseFirstDown) })
+	}
+	defer release()
+	calls := &dockerCallRecorder{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		calls.record(args...)
+		if strings.Contains(strings.Join(args, " "), "down --volumes --remove-orphans") {
+			firstDownOnce.Do(func() {
+				close(firstDownStarted)
+				<-releaseFirstDown
+			})
+		}
+		return "ok\n", nil
+	}
+
+	handler := cfg.withAuth(cfg.handleServers)
+	requestDelete := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodDelete, "/servers?id=pep&confirm=DELETE%20pep", nil)
+		req.Header.Set("Authorization", "Bearer test-token")
+		res := httptest.NewRecorder()
+		handler(res, req)
+		return res
+	}
+
+	first := requestDelete()
+	if first.Code != http.StatusOK {
+		t.Fatalf("first delete status = %d body=%s", first.Code, first.Body.String())
+	}
+	var firstBody createServerResponse
+	if err := json.NewDecoder(first.Body).Decode(&firstBody); err != nil {
+		t.Fatalf("decode first delete response: %v", err)
+	}
+	select {
+	case <-firstDownStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first delete did not enter the held down call")
+	}
+
+	secondResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		secondResult <- requestDelete()
+	}()
+	select {
+	case second := <-secondResult:
+		t.Fatalf("second delete bypassed the first mutation lease: status=%d body=%s", second.Code, second.Body.String())
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	release()
+	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, firstBody.JobID, lifecycleJobSucceeded); completed.Status != lifecycleJobSucceeded {
+		t.Fatalf("first delete completion = %#v", completed)
+	}
+	var second *httptest.ResponseRecorder
+	select {
+	case second = <-secondResult:
+	case <-time.After(time.Second):
+		t.Fatal("second delete did not resume after the first delete completed")
+	}
+	if second.Code != http.StatusNotFound {
+		t.Fatalf("second completed delete status = %d body=%s", second.Code, second.Body.String())
+	}
+	var secondBody createServerResponse
+	if err := json.NewDecoder(second.Body).Decode(&secondBody); err != nil {
+		t.Fatalf("decode second delete response: %v", err)
+	}
+	if secondBody.OK || secondBody.ID != "pep" || secondBody.Detail != "알 수 없는 서버입니다." {
+		t.Fatalf("second completed delete response = %#v", secondBody)
+	}
+	if _, err := os.Stat(cfg.lifecycleJournalFile); !os.IsNotExist(err) {
+		t.Fatalf("second completed delete left a lifecycle journal: %v", err)
+	}
+	if recorded := calls.snapshot(); len(recorded) != 3 {
+		t.Fatalf("second completed delete reached Docker: %#v", recorded)
+	}
+	if state := cfg.operations.maintenanceState(); state != maintenanceStateOpen || cfg.operations.lifecycleRecoveryPending() {
+		t.Fatalf("second completed delete left control plane closed state=%s recoveryPending=%t", state, cfg.operations.lifecycleRecoveryPending())
+	}
+	if patch := envRequest(t, cfg.withAuth(cfg.handleSharedEnv), http.MethodPatch, "/env/shared", `{"values":{"COOKIE_SECURE":"true"}}`); patch.Code != http.StatusOK {
+		t.Fatalf("control plane remained unusable after completed concurrent delete: %d body=%s", patch.Code, patch.Body.String())
+	}
+}
+
 func TestDeleteServerKeepsRegistryWhenDownFails(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
