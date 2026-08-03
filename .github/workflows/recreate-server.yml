@@ -102,6 +102,62 @@ jobs:
           STACK="$HOME/opensamguk-docker"
           cd "$STACK"
 
+          validate_recreate_input() {
+            RAW_SERVER_ID="$SERVER_ID"
+            if [[ ! "$RAW_SERVER_ID" =~ ^[A-Za-z0-9]+$ ]]; then
+              echo "::error::invalid server_id; use non-empty ASCII alphanumeric public id"
+              exit 1
+            fi
+            PUBLIC_ID="$(printf '%s' "$RAW_SERVER_ID" | run_bounded "$WORKFLOW_DEADLINE" 10 tr '[:upper:]' '[:lower:]')"
+            if (( ${#PUBLIC_ID} > 48 )); then
+              echo "::error::server_id must be at most 48 ASCII alphanumeric characters"
+              exit 1
+            fi
+            case "$PUBLIC_ID" in
+              all|admin1|admin2|admin5|admin7|admin8|auction|battle-center|betting|board|chief-center|city|coming-soon|diplomacy|generals|global-diplomacy|history|inherit|join|mailbox|main|map|my|my-boss|my-cities|my-generals|my-nation|nation|nation-betting|nation-finance|npc-control|rankings|register|select-pool|simulator|tournament|tournament-admin|troop|vote|world-log)
+                echo "::error::server_id ${PUBLIC_ID} is reserved for a game route or all-server operation"
+                exit 1
+                ;;
+            esac
+            if ! run_bounded "$WORKFLOW_DEADLINE" 10 python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+          name = os.environ["SERVER_NAME"].strip()
+          generation = os.environ["GENERATION"].strip()
+          image_tag = os.environ["IMAGE_TAG"].strip()
+          game_api_port = os.environ["GAME_API_PORT"].strip()
+          web_game_port = os.environ["WEB_GAME_PORT"].strip()
+          scenario_code = os.environ["SCENARIO_CODE"].strip() or "scenario_1010"
+
+          if not name or "\r" in name or "\n" in name:
+              sys.exit(1)
+          if generation:
+              if re.fullmatch(r"[+-]?[0-9]+", generation) is None:
+                  sys.exit(1)
+              parsed_generation = int(generation, 10)
+              if parsed_generation < 0 or parsed_generation > 9223372036854775807:
+                  sys.exit(1)
+          if image_tag and re.fullmatch(r"[A-Za-z0-9._-]+", image_tag) is None:
+              sys.exit(1)
+          for port in (game_api_port, web_game_port):
+              if re.fullmatch(r"[0-9]+", port) is None or not 1 <= int(port, 10) <= 65535:
+                  sys.exit(1)
+          if game_api_port == web_game_port:
+              sys.exit(1)
+          if re.fullmatch(r"[A-Za-z0-9_.:-]+", scenario_code) is None:
+              sys.exit(1)
+          PY
+            then
+              echo "::error::invalid recreate input; name, generation, image tag, ports, and scenario must match deployer validation"
+              exit 1
+            fi
+            export SERVER_ID="$PUBLIC_ID"
+            INTERNAL_ID="s${PUBLIC_ID}"
+          }
+          validate_recreate_input
+
           maintenance_response_state() {
             printf '%s' "$1" | run_bounded "$WORKFLOW_DEADLINE" 10 python3 -c 'import json, re, sys; payload = json.load(sys.stdin); keys = set(payload) if isinstance(payload, dict) else set(); valid = keys in ({"capability", "state"}, {"capability", "state", "lease"}) and payload.get("capability") == "maintenance-v1" and payload.get("state") in {"open", "draining", "drained"} and ("lease" not in payload or re.fullmatch(r"[a-f0-9]{32}", payload["lease"]) is not None); valid or sys.exit(1); print(payload["state"])'
           }
@@ -114,9 +170,51 @@ jobs:
           maintenance_post() {
             docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST "$1" 2>/dev/null
           }
-          DEPLOYER_FRESH=false
+          deployer_http_ready() {
+            if ! docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c 'timeout -k 2 10 wget -qO- -T 5 http://localhost:9000/healthz' | grep -q '"status":"up"'; then
+              return 1
+            fi
+            docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c 'timeout -k 2 10 wget -qO- -T 5 http://localhost:9000/readyz' | grep -q '"status":"ready"'
+          }
+          wait_for_deployer_ready() {
+            local attempt
+            for ((attempt=1; attempt<=30; attempt++)); do
+              if ! deadline_remaining "$WORKFLOW_DEADLINE" >/dev/null; then
+                break
+              fi
+              if deployer_http_ready; then
+                return 0
+              fi
+              if ! bounded_sleep "$WORKFLOW_DEADLINE" 2; then
+                break
+              fi
+            done
+            return 1
+          }
+          ensure_lifecycle_recovery() {
+            if wait_for_deployer_ready; then
+              return 0
+            fi
+            if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_post /maintenance/repair)")" || [ "$MAINTENANCE_STATE" != drained ]; then
+              echo "::error::deployer lifecycle recovery cannot be verified; leaving maintenance marker closed"
+              return 1
+            fi
+            if ! wait_for_deployer_ready; then
+              echo "::error::deployer lifecycle recovery cannot be verified; leaving maintenance marker closed"
+              return 1
+            fi
+          }
+          DEPLOYER_BOOTSTRAP=false
           MAINTENANCE_LEASE=""
-          if run_bounded "$WORKFLOW_DEADLINE" 15 sudo docker ps -a --format '{{.Names}}' | run_bounded "$WORKFLOW_DEADLINE" 5 grep -Fxq opensamguk-deployer; then
+          if ! DEPLOYER_RUNNING="$(run_bounded "$WORKFLOW_DEADLINE" 15 sudo docker ps --format '{{.Names}}')"; then
+            echo "::error::could not inspect running deployer state; leaving maintenance unchanged"
+            exit 1
+          fi
+          if ! DEPLOYER_ALL="$(run_bounded "$WORKFLOW_DEADLINE" 15 sudo docker ps -a --format '{{.Names}}')"; then
+            echo "::error::could not inspect deployer container state; leaving maintenance unchanged"
+            exit 1
+          fi
+          if printf '%s\n' "$DEPLOYER_RUNNING" | run_bounded "$WORKFLOW_DEADLINE" 5 grep -Fxq opensamguk-deployer; then
             if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_get)")"; then
               echo "::error::running deployer lacks a valid maintenance-v1 capability; aborting before control-plane mutation"
               exit 1
@@ -130,10 +228,16 @@ jobs:
               echo "::error::deployer maintenance drain did not yield a valid recreate lease"
               exit 1
             fi
-          else
+          elif printf '%s\n' "$DEPLOYER_ALL" | run_bounded "$WORKFLOW_DEADLINE" 5 grep -Fxq opensamguk-deployer; then
+            echo "stopped deployer found; persisting maintenance marker before bootstrap"
             run_bounded "$WORKFLOW_DEADLINE" 10 mkdir -p "$STACK/servers"
             : > "$STACK/servers/.deployer-maintenance"
-            DEPLOYER_FRESH=true
+            DEPLOYER_BOOTSTRAP=true
+          else
+            echo "no deployer found; persisting maintenance marker before bootstrap"
+            run_bounded "$WORKFLOW_DEADLINE" 10 mkdir -p "$STACK/servers"
+            : > "$STACK/servers/.deployer-maintenance"
+            DEPLOYER_BOOTSTRAP=true
           fi
 
           run_bounded "$WORKFLOW_DEADLINE" 180 git fetch --prune origin main
@@ -144,10 +248,10 @@ jobs:
           fi
           run_bounded "$WORKFLOW_DEADLINE" 180 git merge --ff-only origin/main
 
-          if [ "$DEPLOYER_FRESH" = true ]; then
+          if [ "$DEPLOYER_BOOTSTRAP" = true ]; then
             COMPOSE=(sudo docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env)
             run_bounded "$WORKFLOW_DEADLINE" 900 "${COMPOSE[@]}" build deployer
-            run_bounded "$WORKFLOW_DEADLINE" 180 "${COMPOSE[@]}" up -d --no-deps deployer
+            run_bounded "$WORKFLOW_DEADLINE" 180 "${COMPOSE[@]}" up -d --force-recreate --no-deps deployer
             deployer_closed=false
             for ((attempt=1; attempt<=30; attempt++)); do
               if ! deadline_remaining "$WORKFLOW_DEADLINE" >/dev/null; then
@@ -165,6 +269,13 @@ jobs:
               echo "::error::fresh deployer did not boot closed with maintenance-v1"
               exit 1
             fi
+          fi
+
+          if ! ensure_lifecycle_recovery; then
+            exit 1
+          fi
+
+          if [ "$DEPLOYER_BOOTSTRAP" = true ]; then
             if ! MAINTENANCE_ENTER="$(maintenance_enter_fields "$(maintenance_post /maintenance/enter)")"; then
               echo "::error::fresh deployer did not yield a recreate lease"
               exit 1
@@ -176,24 +287,6 @@ jobs:
             fi
           fi
 
-          RAW_SERVER_ID="$SERVER_ID"
-          if [[ ! "$RAW_SERVER_ID" =~ ^[A-Za-z0-9]+$ ]]; then
-            echo "::error::invalid server_id; use non-empty ASCII alphanumeric public id"
-            exit 1
-          fi
-          PUBLIC_ID="$(printf '%s' "$RAW_SERVER_ID" | run_bounded "$WORKFLOW_DEADLINE" 10 tr '[:upper:]' '[:lower:]')"
-          if (( ${#PUBLIC_ID} > 48 )); then
-            echo "::error::server_id must be at most 48 ASCII alphanumeric characters"
-            exit 1
-          fi
-          case "$PUBLIC_ID" in
-            all|admin1|admin2|admin5|admin7|admin8|auction|battle-center|betting|board|chief-center|city|coming-soon|diplomacy|generals|global-diplomacy|history|inherit|join|mailbox|main|map|my|my-boss|my-cities|my-generals|my-nation|nation|nation-betting|nation-finance|npc-control|rankings|register|select-pool|simulator|tournament|tournament-admin|troop|vote|world-log)
-              echo "::error::server_id ${PUBLIC_ID} is reserved for a game route or all-server operation"
-              exit 1
-              ;;
-          esac
-          export SERVER_ID="$PUBLIC_ID"
-          INTERNAL_ID="s${PUBLIC_ID}"
           echo "creating public server ${PUBLIC_ID} with internal Docker key ${INTERNAL_ID}"
 
           export CLIENT_OPERATION_ID="$(run_bounded "$WORKFLOW_DEADLINE" 10 python3 -c 'import secrets; print(secrets.token_hex(16))')"

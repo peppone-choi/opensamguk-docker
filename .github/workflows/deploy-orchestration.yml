@@ -82,8 +82,50 @@ jobs:
           maintenance_post() {
             docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST "$1" 2>/dev/null
           }
-          DEPLOYER_FRESH=false
-          if run_bounded "$WORKFLOW_DEADLINE" 15 sudo docker ps -a --format '{{.Names}}' | grep -Fxq opensamguk-deployer; then
+          deployer_http_ready() {
+            if ! docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c 'timeout -k 2 10 wget -qO- -T 5 http://localhost:9000/healthz' | grep -q '"status":"up"'; then
+              return 1
+            fi
+            docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c 'timeout -k 2 10 wget -qO- -T 5 http://localhost:9000/readyz' | grep -q '"status":"ready"'
+          }
+          wait_for_deployer_ready() {
+            local attempt
+            for ((attempt=1; attempt<=30; attempt++)); do
+              if ! deadline_remaining "$WORKFLOW_DEADLINE" >/dev/null; then
+                break
+              fi
+              if deployer_http_ready; then
+                return 0
+              fi
+              if ! bounded_sleep "$WORKFLOW_DEADLINE" 2; then
+                break
+              fi
+            done
+            return 1
+          }
+          ensure_lifecycle_recovery() {
+            if wait_for_deployer_ready; then
+              return 0
+            fi
+            if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_post /maintenance/repair)")" || [ "$MAINTENANCE_STATE" != drained ]; then
+              echo "::error::deployer lifecycle recovery cannot be verified; leaving maintenance marker closed"
+              return 1
+            fi
+            if ! wait_for_deployer_ready; then
+              echo "::error::deployer lifecycle recovery cannot be verified; leaving maintenance marker closed"
+              return 1
+            fi
+          }
+          DEPLOYER_BOOTSTRAP=false
+          if ! DEPLOYER_RUNNING="$(run_bounded "$WORKFLOW_DEADLINE" 15 sudo docker ps --format '{{.Names}}')"; then
+            echo "::error::could not inspect running deployer state; leaving maintenance unchanged"
+            exit 1
+          fi
+          if ! DEPLOYER_ALL="$(run_bounded "$WORKFLOW_DEADLINE" 15 sudo docker ps -a --format '{{.Names}}')"; then
+            echo "::error::could not inspect deployer container state; leaving maintenance unchanged"
+            exit 1
+          fi
+          if printf '%s\n' "$DEPLOYER_RUNNING" | run_bounded "$WORKFLOW_DEADLINE" 5 grep -Fxq opensamguk-deployer; then
             if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_get)")"; then
               echo "::error::running deployer lacks a valid maintenance-v1 capability; aborting before control-plane mutation"
               exit 1
@@ -92,10 +134,16 @@ jobs:
               echo "::error::deployer maintenance drain did not reach drained; aborting before control-plane mutation"
               exit 1
             fi
-          else
+          elif printf '%s\n' "$DEPLOYER_ALL" | run_bounded "$WORKFLOW_DEADLINE" 5 grep -Fxq opensamguk-deployer; then
+            echo "stopped deployer found; persisting maintenance marker before bootstrap"
             run_bounded "$WORKFLOW_DEADLINE" 30 mkdir -p "$STACK/servers"
             : > "$STACK/servers/.deployer-maintenance"
-            DEPLOYER_FRESH=true
+            DEPLOYER_BOOTSTRAP=true
+          else
+            echo "no deployer found; persisting maintenance marker before bootstrap"
+            run_bounded "$WORKFLOW_DEADLINE" 30 mkdir -p "$STACK/servers"
+            : > "$STACK/servers/.deployer-maintenance"
+            DEPLOYER_BOOTSTRAP=true
           fi
 
           run_bounded "$WORKFLOW_DEADLINE" 180 git fetch --prune origin main
@@ -106,37 +154,24 @@ jobs:
           fi
           run_bounded "$WORKFLOW_DEADLINE" 180 git merge --ff-only origin/main
 
+          if [ "$DEPLOYER_BOOTSTRAP" = true ]; then
+            echo "bootstrapping deployer from the persisted maintenance marker"
+          fi
           COMPOSE="sudo docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env"
           run_bounded "$WORKFLOW_DEADLINE" 900 $COMPOSE build deployer
-          run_bounded "$WORKFLOW_DEADLINE" 120 sudo docker run --rm --read-only --network none \
-            -e COMPOSE_DIR=/workspace \
-            -v "$STACK/.env:/workspace/.env:ro" \
-            -v "$STACK/servers:/workspace/servers:ro" \
-            opensamguk-deployer:local --check-registry
-
           run_bounded "$WORKFLOW_DEADLINE" 300 $COMPOSE up -d --force-recreate --no-deps deployer
-          deployer_ready=false
-          for _ in $(seq 1 30); do
-            if ! deadline_remaining "$WORKFLOW_DEADLINE" >/dev/null; then
-              break
-            fi
-            if docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c 'timeout -k 2 10 wget -qO- -T 5 http://localhost:9000/healthz' | grep -q '"status":"up"' && \
-              docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c 'timeout -k 2 10 wget -qO- -T 5 http://localhost:9000/readyz' | grep -q '"status":"ready"'; then
-              deployer_ready=true
-              break
-            fi
-            if ! bounded_sleep "$WORKFLOW_DEADLINE" 2; then
-              break
-            fi
-          done
-          if [ "$deployer_ready" != true ]; then
-            echo "::error::deployer did not become healthz+readyz ready before nginx reload"
+          if ! ensure_lifecycle_recovery; then
             exit 1
           fi
           if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_get)")" || [ "$MAINTENANCE_STATE" != drained ]; then
             echo "::error::recreated deployer did not boot with the persisted maintenance barrier drained"
             exit 1
           fi
+          run_bounded "$WORKFLOW_DEADLINE" 120 sudo docker run --rm --read-only --network none \
+            -e COMPOSE_DIR=/workspace \
+            -v "$STACK/.env:/workspace/.env:ro" \
+            -v "$STACK/servers:/workspace/servers:ro" \
+            opensamguk-deployer:local --check-registry
 
           run_bounded "$WORKFLOW_DEADLINE" 300 $COMPOSE up -d --force-recreate --no-deps nginx
           docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c 'timeout -k 2 10 wget -qO- -T 5 http://localhost:9000/healthz' | grep -q '"status":"up"'

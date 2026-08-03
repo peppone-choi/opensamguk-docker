@@ -2389,7 +2389,7 @@ func TestMaintenanceWorkflowOrderingAndLegacyFailClosedBoundary(t *testing.T) {
 		"maintenance_post /maintenance/enter",
 		"git merge --ff-only origin/main",
 		"$COMPOSE up -d --force-recreate --no-deps deployer",
-		"deployer_ready=true",
+		"if ! ensure_lifecycle_recovery; then",
 		"maintenance_post /maintenance/leave",
 	)
 	assertOrder(t, start,
@@ -2421,6 +2421,93 @@ func TestMaintenanceWorkflowOrderingAndLegacyFailClosedBoundary(t *testing.T) {
 				t.Fatalf("%s legacy capability failure does not abort before fresh marker", name)
 			}
 		})
+	}
+}
+
+func TestMaintenanceWorkflowsRecoverStoppedDeployerBehindClosedMarker(t *testing.T) {
+	workflows := map[string]string{
+		"deploy":   readFile(t, filepath.Join("..", ".github", "workflows", "deploy-orchestration.yml")),
+		"recreate": readFile(t, filepath.Join("..", ".github", "workflows", "recreate-server.yml")),
+		"start":    readFile(t, filepath.Join("..", ".github", "workflows", "start-server.yml")),
+	}
+	for name, workflow := range workflows {
+		t.Run(name, func(t *testing.T) {
+			runningProbe := strings.Index(workflow, `DEPLOYER_RUNNING="$(run_bounded "$WORKFLOW_DEADLINE" 15 sudo docker ps --format '{{.Names}}')"`)
+			allProbe := strings.Index(workflow, `DEPLOYER_ALL="$(run_bounded "$WORKFLOW_DEADLINE" 15 sudo docker ps -a --format '{{.Names}}')"`)
+			marker := strings.Index(workflow, `: > "$STACK/servers/.deployer-maintenance"`)
+			bootstrap := strings.Index(workflow, "DEPLOYER_BOOTSTRAP=true")
+			merge := strings.Index(workflow, "git merge --ff-only origin/main")
+			forceRecreate := strings.Index(workflow, "up -d --force-recreate --no-deps deployer")
+			if runningProbe < 0 || allProbe < 0 || marker < 0 || bootstrap < 0 || merge < 0 || forceRecreate < 0 {
+				t.Fatalf("%s workflow missing stopped-deployer recovery markers running=%d all=%d marker=%d bootstrap=%d merge=%d recreate=%d", name, runningProbe, allProbe, marker, bootstrap, merge, forceRecreate)
+			}
+			if !(runningProbe < allProbe && allProbe < marker && marker < bootstrap && bootstrap < merge && merge < forceRecreate) {
+				t.Fatalf("%s stopped-deployer recovery ordering running=%d all=%d marker=%d bootstrap=%d merge=%d recreate=%d", name, runningProbe, allProbe, marker, bootstrap, merge, forceRecreate)
+			}
+			if strings.Contains(workflow, `if run_bounded "$WORKFLOW_DEADLINE" 15 sudo docker ps -a --format '{{.Names}}'`) {
+				t.Fatalf("%s workflow still treats every existing deployer as runnable", name)
+			}
+		})
+	}
+}
+
+func TestMaintenanceWorkflowsVerifyOrRepairLifecycleBeforeMutation(t *testing.T) {
+	checks := map[string]struct {
+		workflow string
+		mutation string
+	}{
+		"deploy": {
+			workflow: readFile(t, filepath.Join("..", ".github", "workflows", "deploy-orchestration.yml")),
+			mutation: "$COMPOSE up -d --force-recreate --no-deps nginx",
+		},
+		"recreate": {
+			workflow: readFile(t, filepath.Join("..", ".github", "workflows", "recreate-server.yml")),
+			mutation: "/usr/local/bin/deployer --authenticated-http POST /servers/create",
+		},
+		"start": {
+			workflow: readFile(t, filepath.Join("..", ".github", "workflows", "start-server.yml")),
+			mutation: `sudo docker compose -p "$PROJECT"`,
+		},
+	}
+	for name, check := range checks {
+		t.Run(name, func(t *testing.T) {
+			if !strings.Contains(check.workflow, "deployer_http_ready()") || !strings.Contains(check.workflow, "maintenance_post /maintenance/repair") {
+				t.Fatalf("%s workflow lacks ready-or-repair lifecycle recovery contract", name)
+			}
+			recovery := strings.LastIndex(check.workflow, "if ! ensure_lifecycle_recovery; then")
+			mutation := strings.Index(check.workflow, check.mutation)
+			if recovery < 0 || mutation < 0 || recovery >= mutation {
+				t.Fatalf("%s lifecycle recovery must precede mutation recovery=%d mutation=%d", name, recovery, mutation)
+			}
+			if !strings.Contains(check.workflow, "lifecycle recovery cannot be verified; leaving maintenance marker closed") {
+				t.Fatalf("%s workflow does not fail closed when lifecycle recovery cannot be verified", name)
+			}
+		})
+	}
+}
+
+func TestRecreateWorkflowValidatesInputBeforeMaintenanceBarrier(t *testing.T) {
+	workflow := readFile(t, filepath.Join("..", ".github", "workflows", "recreate-server.yml"))
+	for _, want := range []string{
+		"validate_recreate_input()",
+		`RAW_SERVER_ID="$SERVER_ID"`,
+		`INTERNAL_ID="s${PUBLIC_ID}"`,
+		"server_id must be at most 48 ASCII alphanumeric characters",
+		"SERVER_NAME",
+		"GENERATION",
+		"GAME_API_PORT",
+		"WEB_GAME_PORT",
+		"SCENARIO_CODE",
+	} {
+		if !strings.Contains(workflow, want) {
+			t.Fatalf("recreate workflow is missing preflight validation %q", want)
+		}
+	}
+	validation := strings.Index(workflow, "\n          validate_recreate_input\n\n          maintenance_response_state")
+	enter := strings.Index(workflow, "maintenance_post /maintenance/enter")
+	marker := strings.Index(workflow, `: > "$STACK/servers/.deployer-maintenance"`)
+	if validation < 0 || enter < 0 || marker < 0 || !(validation < enter && validation < marker) {
+		t.Fatalf("recreate validation must run before maintenance entry or marker validation=%d enter=%d marker=%d", validation, enter, marker)
 	}
 }
 
@@ -2488,6 +2575,46 @@ func TestStartWorkflowPreservesPublicToInternalServerIDMapping(t *testing.T) {
 	}
 	if got := readFile(t, run.envFile); !strings.Contains(got, "SERVER_ID=s1\n") || !strings.Contains(got, "IMAGE_TAG=v1\n") {
 		t.Fatalf("s1 env mapping = %q", got)
+	}
+}
+
+func TestStartWorkflowBootstrapsStoppedDeployerBeforeAuthenticatedCalls(t *testing.T) {
+	run := runStartWorkflowWithDeployerState(t, "S1", "", "ss1", "SERVER_ID=s1\nIMAGE_TAG=v1\n", "stopped", false)
+	if run.err != nil {
+		t.Fatalf("stopped-deployer start failed: %v output=%s calls=%s", run.err, run.output, run.dockerCalls)
+	}
+	bootstrap := strings.Index(run.dockerCalls, "up -d --force-recreate --no-deps deployer")
+	maintenance := strings.Index(run.dockerCalls, "exec opensamguk-deployer /usr/local/bin/deployer --authenticated-http")
+	if bootstrap < 0 || maintenance < 0 || bootstrap >= maintenance {
+		t.Fatalf("stopped deployer was not recreated before authenticated helper calls bootstrap=%d maintenance=%d calls=%s", bootstrap, maintenance, run.dockerCalls)
+	}
+}
+
+func TestStartWorkflowRepairsPendingJournalBeforeDirectServerMutation(t *testing.T) {
+	run := runStartWorkflowWithDeployerState(t, "S1", "", "ss1", "SERVER_ID=s1\nIMAGE_TAG=v1\n", "running", true)
+	if run.err != nil {
+		t.Fatalf("pending-journal start failed: %v output=%s calls=%s", run.err, run.output, run.dockerCalls)
+	}
+	repair := strings.Index(run.dockerCalls, "/maintenance/repair")
+	serverCompose := strings.Index(run.dockerCalls, "compose -p opensamguk-ss1")
+	if repair < 0 || serverCompose < 0 || repair >= serverCompose {
+		t.Fatalf("pending journal was not repaired before direct server compose repair=%d compose=%d calls=%s", repair, serverCompose, run.dockerCalls)
+	}
+}
+
+func TestRecreateWorkflowRejectsInvalidInputBeforeMaintenanceBarrier(t *testing.T) {
+	run := runRecreateWorkflowWithServerID(t, "all")
+	if run.err == nil {
+		t.Fatalf("reserved recreate id unexpectedly succeeded: %s", run.output)
+	}
+	if !strings.Contains(run.output, "server_id all is reserved") {
+		t.Fatalf("reserved recreate id output = %q", run.output)
+	}
+	if run.dockerCalls != "" {
+		t.Fatalf("reserved recreate id reached Docker before validation: %q", run.dockerCalls)
+	}
+	if _, err := os.Stat(run.maintenanceFile); !os.IsNotExist(err) {
+		t.Fatalf("reserved recreate id persisted a maintenance marker: %v", err)
 	}
 }
 
@@ -3925,10 +4052,11 @@ func fileMode(t *testing.T, path string) os.FileMode {
 }
 
 type startWorkflowRun struct {
-	output      string
-	err         error
-	dockerCalls string
-	envFile     string
+	output          string
+	err             error
+	dockerCalls     string
+	envFile         string
+	maintenanceFile string
 }
 
 func commandEnvironment(values ...string) []string {
@@ -3951,6 +4079,10 @@ func commandEnvironment(values ...string) []string {
 }
 
 func runStartWorkflow(t *testing.T, serverID, imageTag, envFileName, envContent string) startWorkflowRun {
+	return runStartWorkflowWithDeployerState(t, serverID, imageTag, envFileName, envContent, "absent", false)
+}
+
+func runStartWorkflowWithDeployerState(t *testing.T, serverID, imageTag, envFileName, envContent, deployerState string, journalPending bool) startWorkflowRun {
 	t.Helper()
 	root := t.TempDir()
 	home := filepath.Join(root, "home")
@@ -3971,12 +4103,57 @@ func runStartWorkflow(t *testing.T, serverID, imageTag, envFileName, envContent 
 	}
 
 	dockerLog := filepath.Join(root, "docker.calls")
+	deployerBooted := filepath.Join(root, "deployer.booted")
+	journalRepaired := filepath.Join(root, "journal.repaired")
 	writeExecutable(t, filepath.Join(bin, "flock"), "#!/usr/bin/env bash\nexit 0\n")
 	writeExecutable(t, filepath.Join(bin, "git"), "#!/usr/bin/env bash\nexit 0\n")
 	writeExecutable(t, filepath.Join(bin, "sudo"), "#!/usr/bin/env bash\nexec \"$@\"\n")
 	writeExecutable(t, filepath.Join(bin, "sleep"), "#!/usr/bin/env bash\nexit 0\n")
 	writeExecutable(t, filepath.Join(bin, "timeout"), "#!/usr/bin/env bash\nset -euo pipefail\nif [[ \"${1:-}\" == \"--foreground\" ]]; then\n  shift\nfi\nif [[ \"${1:-}\" == \"-k\" ]]; then\n  shift 2\nfi\nshift\nexec \"$@\"\n")
-	writeExecutable(t, filepath.Join(bin, "docker"), "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$WORKFLOW_DOCKER_LOG\"\nif [[ \"${1:-}\" == \"exec\" ]]; then\n  if [[ \"$*\" == *\"/maintenance/leave\"* ]]; then\n    printf '{\\\"capability\\\":\\\"maintenance-v1\\\",\\\"state\\\":\\\"open\\\"}\\n'\n  else\n    printf '{\\\"capability\\\":\\\"maintenance-v1\\\",\\\"state\\\":\\\"drained\\\"}\\n'\n  fi\n  exit 0\nfi\nif [[ \"${1:-}\" == \"ps\" ]]; then\n  printf '%s\\n' ss1-game-api ss1-game-engine ss1-web-game\nfi\n")
+	writeExecutable(t, filepath.Join(bin, "docker"), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$WORKFLOW_DOCKER_LOG"
+if [[ "${1:-}" == "exec" ]]; then
+  args="$*"
+  if [[ "${WORKFLOW_DEPLOYER_STATE:-absent}" == "stopped" && ! -f "$WORKFLOW_DEPLOYER_BOOTED_FILE" ]]; then
+    exit 1
+  fi
+  if [[ "$args" == *"/healthz"* ]]; then
+    printf '{"status":"up"}\n'
+    exit 0
+  fi
+  if [[ "$args" == *"/readyz"* ]]; then
+    if [[ "${WORKFLOW_JOURNAL_PENDING:-false}" == true && ! -f "$WORKFLOW_JOURNAL_REPAIRED_FILE" ]]; then
+      printf '{"error":"lifecycle recovery is required"}\n'
+      exit 1
+    fi
+    printf '{"status":"ready"}\n'
+    exit 0
+  fi
+  if [[ "$args" == *"/maintenance/repair"* ]]; then
+    : > "$WORKFLOW_JOURNAL_REPAIRED_FILE"
+    printf '{"capability":"maintenance-v1","state":"drained"}\n'
+    exit 0
+  fi
+  if [[ "$args" == *"/maintenance/leave"* ]]; then
+    printf '{"capability":"maintenance-v1","state":"open"}\n'
+  else
+    printf '{"capability":"maintenance-v1","state":"drained"}\n'
+  fi
+  exit 0
+fi
+if [[ "${1:-}" == "ps" ]]; then
+  if [[ "${WORKFLOW_DEPLOYER_STATE:-absent}" == "running" ]] || \
+    [[ "${WORKFLOW_DEPLOYER_STATE:-absent}" == "stopped" && "$*" == *"-a"* ]]; then
+    printf '%s\n' opensamguk-deployer
+  fi
+  printf '%s\n' ss1-game-api ss1-game-engine ss1-web-game
+  exit 0
+fi
+if [[ "${1:-}" == "compose" && "$*" == *"up -d"* && "$*" == *"deployer"* ]]; then
+  : > "$WORKFLOW_DEPLOYER_BOOTED_FILE"
+fi
+`)
 	writeExecutable(t, filepath.Join(bin, "curl"), "#!/usr/bin/env bash\nurl=\"${!#}\"\nif [[ \"$url\" == *\"/health\" ]]; then\n  printf '{\"status\":\"up\"}\\n'\nfi\n")
 
 	script := workflowRunScript(t, filepath.Join("..", ".github", "workflows", "start-server.yml"))
@@ -3989,6 +4166,10 @@ func runStartWorkflow(t *testing.T, serverID, imageTag, envFileName, envContent 
 		"SERVER_ID="+serverID,
 		"IMAGE_TAG="+imageTag,
 		"WORKFLOW_DOCKER_LOG="+dockerLog,
+		"WORKFLOW_DEPLOYER_STATE="+deployerState,
+		"WORKFLOW_DEPLOYER_BOOTED_FILE="+deployerBooted,
+		"WORKFLOW_JOURNAL_PENDING="+strconv.FormatBool(journalPending),
+		"WORKFLOW_JOURNAL_REPAIRED_FILE="+journalRepaired,
 	)
 	out, err := cmd.CombinedOutput()
 	dockerCalls, readErr := os.ReadFile(dockerLog)
@@ -3996,10 +4177,11 @@ func runStartWorkflow(t *testing.T, serverID, imageTag, envFileName, envContent 
 		t.Fatal(readErr)
 	}
 	return startWorkflowRun{
-		output:      string(out),
-		err:         err,
-		dockerCalls: string(dockerCalls),
-		envFile:     envFile,
+		output:          string(out),
+		err:             err,
+		dockerCalls:     string(dockerCalls),
+		envFile:         envFile,
+		maintenanceFile: filepath.Join(servers, ".deployer-maintenance"),
 	}
 }
 
@@ -4012,6 +4194,14 @@ func runRecreateWorkflowWithCreateTimeout(t *testing.T) startWorkflowRun {
 }
 
 func runRecreateWorkflowWithScenario(t *testing.T, stallCreate bool) startWorkflowRun {
+	return runRecreateWorkflow(t, "pep", stallCreate)
+}
+
+func runRecreateWorkflowWithServerID(t *testing.T, serverID string) startWorkflowRun {
+	return runRecreateWorkflow(t, serverID, false)
+}
+
+func runRecreateWorkflow(t *testing.T, serverID string, stallCreate bool) startWorkflowRun {
 	t.Helper()
 	root := t.TempDir()
 	home := filepath.Join(root, "home")
@@ -4033,6 +4223,7 @@ func runRecreateWorkflowWithScenario(t *testing.T, stallCreate bool) startWorkfl
 	writeExecutable(t, filepath.Join(bin, "python3"), "#!/usr/bin/env bash\nargs=\"$*\"\nif [[ \"$args\" == *\"state\\\"] + \\\":\\\"\"* ]]; then\n  printf 'drained:0123456789abcdef0123456789abcdef\\n'\nelif [[ \"$args\" == *\"payload.get(\\\"jobId\\\")\"* ]]; then\n  printf 'abcdef0123456789abcdef0123456789\\n'\nelif [[ \"$args\" == *\"import secrets\"* ]]; then\n  printf 'abcdef0123456789abcdef0123456789\\n'\nelif [[ \"$args\" == *\"json.dumps\"* ]]; then\n  printf '{}\\n'\nelse\n  printf 'drained\\n'\nfi\n")
 	dockerScript := `#!/usr/bin/env bash
 set -euo pipefail
+printf '%s\n' "$*" >> "$WORKFLOW_DOCKER_LOG"
 if [[ "$1" == "exec" ]]; then
   args="$*"
 	if [[ "${WORKFLOW_TIMEOUT_STALL_CREATE:-false}" == true && "$args" == *"/servers/create"* ]]; then
@@ -4074,7 +4265,7 @@ fi
 	cmd.Env = commandEnvironment(
 		"HOME="+home,
 		"PATH="+bin+":"+os.Getenv("PATH"),
-		"SERVER_ID=pep",
+		"SERVER_ID="+serverID,
 		"SERVER_NAME=테스트",
 		"GENERATION=0",
 		"IMAGE_TAG=",
@@ -4093,9 +4284,10 @@ fi
 		t.Fatalf("lost-job recreate workflow exceeded its bounded abort deadline: %s calls=%s", output, dockerCalls)
 	}
 	return startWorkflowRun{
-		output:      string(output),
-		err:         err,
-		dockerCalls: string(dockerCalls),
+		output:          string(output),
+		err:             err,
+		dockerCalls:     string(dockerCalls),
+		maintenanceFile: filepath.Join(stack, "servers", ".deployer-maintenance"),
 	}
 }
 
