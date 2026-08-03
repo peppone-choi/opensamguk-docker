@@ -1968,6 +1968,29 @@ func TestServerComposeExportsPublicIDAndWorldIDToSourceServices(t *testing.T) {
 	}
 }
 
+func TestServerComposeMountsExternalScenarioOverridesReadOnly(t *testing.T) {
+	compose := readFile(t, filepath.Join("..", "docker-compose.server.yml"))
+	start := strings.Index(compose, "\n  game-engine:\n")
+	if start < 0 {
+		t.Fatal("compose missing game-engine service")
+	}
+	engine := compose[start:]
+	if end := strings.Index(engine, "\n  game-api:\n"); end < 0 {
+		t.Fatal("compose missing boundary after game-engine service")
+	} else {
+		engine = engine[:end]
+	}
+
+	for _, want := range []string{
+		"SCENARIO_DIR: ${SCENARIO_DIR:-/data/scenarios}",
+		"- ${SCENARIO_HOST_DIR:-./data/scenarios}:${SCENARIO_DIR:-/data/scenarios}:ro",
+	} {
+		if !strings.Contains(engine, want) {
+			t.Fatalf("game-engine scenario override contract missing %q", want)
+		}
+	}
+}
+
 func TestServerEnvTemplateSetsIsolatedDatabaseWorldID(t *testing.T) {
 	template := readFile(t, filepath.Join("..", "servers", "s1.env.example"))
 	if !strings.Contains(template, "\nOPENSAMGUK_WORLD_ID=1\n") {

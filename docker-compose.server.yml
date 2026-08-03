@@ -77,6 +77,7 @@ services:
       # 시나리오 시드(빈 world_state에서 1회 멱등) — scenario_1010 = 174 generals.
       SCENARIO_SEED_ENABLED: ${SCENARIO_SEED_ENABLED:-true}
       SCENARIO_CODE: ${SCENARIO_CODE:-scenario_1010}
+      SCENARIO_DIR: ${SCENARIO_DIR:-/data/scenarios}
       JAVA_OPTS: "-XX:+UseG1GC -XX:MaxRAMPercentage=60.0 -XX:InitialRAMPercentage=40.0 -Djava.security.egd=file:/dev/./urandom"
     depends_on:
       game-postgres:
@@ -85,6 +86,8 @@ services:
         condition: service_healthy
     expose:
       - "8082"
+    volumes:
+      - ${SCENARIO_HOST_DIR:-./data/scenarios}:${SCENARIO_DIR:-/data/scenarios}:ro
     networks:
       - opensamguk-net
     deploy:
