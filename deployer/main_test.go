@@ -764,7 +764,11 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","deployProject":"opensa
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cfg.writeLifecycleJournal("reset", target); err != nil {
+	resetTarget, err := resetLifecycleTargetForEnv(target.EnvFile, nil)
+	if err != nil {
+		t.Fatalf("build crash reset target: %v", err)
+	}
+	if err := cfg.writeResetLifecycleJournal(target, resetTarget); err != nil {
 		t.Fatalf("write crash journal: %v", err)
 	}
 
@@ -807,6 +811,138 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","deployProject":"opensa
 	open := envRequest(t, restarted.withAuth(restarted.handleSharedEnv), http.MethodPatch, "/env/shared", `{"values":{"COOKIE_SECURE":"true"}}`)
 	if open.Code != http.StatusOK {
 		t.Fatalf("mutation after verified repair = %d body=%s", open.Code, open.Body.String())
+	}
+}
+
+func TestPreparedResetJournalWithoutTargetRefusesDestructiveRepair(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","deployProject":"opensamguk-spep"}]
+`)
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSCENARIO_CODE=scenario_1010\nSERVER_GENERATION=1\nSCENARIO_SEED_ENABLED=true\n")
+	target, err := cfg.serverTargetForID("pep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.writeLifecycleJournal("reset", target); err != nil {
+		t.Fatalf("write legacy prepared reset journal: %v", err)
+	}
+
+	restarted := cfg
+	restarted.lifecycleJobs = newLifecycleJobManager()
+	restarted.operations = newOperationCoordinator(restarted.maintenanceFile, restarted.lifecycleJournalFile, restarted.lifecycleJobs)
+	calls := &dockerCallRecorder{}
+	restarted.dockerRunner = func(args ...string) (string, error) {
+		calls.record(args...)
+		return "unexpected Docker call", errors.New("prepared reset recovery must not reach Docker without a target")
+	}
+	maintenance := restarted.withAuth(restarted.withLoopback(restarted.handleMaintenance))
+	repair := loopbackRequest(t, maintenance, http.MethodPost, "/maintenance/repair", "")
+	if repair.Code != http.StatusConflict {
+		t.Fatalf("legacy prepared reset repair = %d body=%s", repair.Code, repair.Body.String())
+	}
+	if calls.count() != 0 {
+		t.Fatalf("legacy prepared reset recovery reached Docker: %#v", calls.snapshot())
+	}
+	if _, err := os.Stat(restarted.lifecycleJournalFile); err != nil {
+		t.Fatalf("legacy prepared reset journal was cleared: %v", err)
+	}
+	if state := restarted.operations.maintenanceState(); state != maintenanceStateDrained {
+		t.Fatalf("legacy prepared reset reopened maintenance: %s", state)
+	}
+}
+
+func TestResetRepairRestoresJournaledTargetAcrossPreparedCrashBoundaries(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		envWritten bool
+	}{
+		{name: "before env write"},
+		{name: "after env write before stage", envWritten: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			cfg := testConfig(t)
+			writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"scenarioCode":"scenario_1010","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
+`)
+			envFile := filepath.Join(cfg.serversDir, "spep.env")
+			writeEnv(t, envFile, "SERVER_ID=pep\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n")
+			target, err := cfg.serverTargetForID("pep")
+			if err != nil {
+				t.Fatal(err)
+			}
+			updates, err := resetEnvUpdates(resetServerRequest{ScenarioCode: "scenario_1002", Generation: "2", TurnTerm: "30"})
+			if err != nil {
+				t.Fatalf("build reset updates: %v", err)
+			}
+			resetTarget, err := resetLifecycleTargetForEnv(envFile, updates)
+			if err != nil {
+				t.Fatalf("build reset target: %v", err)
+			}
+			if err := cfg.writeResetLifecycleJournal(target, resetTarget); err != nil {
+				t.Fatalf("write prepared reset journal: %v", err)
+			}
+			if testCase.envWritten {
+				if err := applyResetLifecycleTarget(envFile, resetTarget); err != nil {
+					t.Fatalf("simulate env write before stage: %v", err)
+				}
+			}
+
+			restarted := cfg
+			restarted.lifecycleJobs = newLifecycleJobManager()
+			restarted.operations = newOperationCoordinator(restarted.maintenanceFile, restarted.lifecycleJournalFile, restarted.lifecycleJobs)
+			calls := &dockerCallRecorder{}
+			restarted.dockerRunner = func(args ...string) (string, error) {
+				calls.record(args...)
+				return "recovered\n", nil
+			}
+			if err := restarted.repairLifecycleJournal(); err != nil {
+				t.Fatalf("repair prepared crash boundary: %v", err)
+			}
+			if got := readFile(t, envFile); !strings.Contains(got, "SCENARIO_CODE=scenario_1002\n") || !strings.Contains(got, "SERVER_GENERATION=2\n") || !strings.Contains(got, "SCENARIO_SEED_ENABLED=true\n") || !strings.Contains(got, "RESET_TURNTERM=30\n") {
+				t.Fatalf("repaired env did not retain journaled reset target:\n%s", got)
+			}
+			entry, err := restarted.registryEntryByID("pep")
+			if err != nil {
+				t.Fatalf("read repaired registry: %v", err)
+			}
+			if entry.Generation != 2 || entry.ScenarioCode != "scenario_1002" || entry.RepairRequired {
+				t.Fatalf("repaired registry = %#v", entry)
+			}
+			if _, err := os.Stat(restarted.lifecycleJournalFile); !os.IsNotExist(err) {
+				t.Fatalf("prepared crash repair retained journal: %v", err)
+			}
+			recorded := calls.snapshot()
+			if len(recorded) != 4 || !strings.Contains(recorded[0], "down --volumes --remove-orphans") || !strings.Contains(recorded[1], "up -d") || !strings.Contains(recorded[2], "gateway-api web-gateway") || !strings.Contains(recorded[3], "--force-recreate --no-deps nginx") {
+				t.Fatalf("prepared crash repair calls = %#v", recorded)
+			}
+		})
+	}
+}
+
+func TestResetRejectsSeedDisabledBeforeJournalOrDocker(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"scenarioCode":"scenario_1010","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
+`)
+	envFile := filepath.Join(cfg.serversDir, "spep.env")
+	const original = "SERVER_ID=pep\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n"
+	writeEnv(t, envFile, original)
+	calls := &dockerCallRecorder{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		calls.record(args...)
+		return "unexpected Docker call", errors.New("seed-disabled reset must be rejected before Docker")
+	}
+
+	response := envRequest(t, cfg.withAuth(cfg.handleServerReset), http.MethodPost, "/servers/reset", `{"id":"pep","confirm":"RESET pep","scenarioSeedEnabled":false}`)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("seed-disabled reset = %d body=%s", response.Code, response.Body.String())
+	}
+	if calls.count() != 0 {
+		t.Fatalf("seed-disabled reset reached Docker: %#v", calls.snapshot())
+	}
+	if _, err := os.Stat(cfg.lifecycleJournalFile); !os.IsNotExist(err) {
+		t.Fatalf("seed-disabled reset wrote a journal: %v", err)
+	}
+	if got := readFile(t, envFile); got != original {
+		t.Fatalf("seed-disabled reset mutated env before rejection:\n%s", got)
 	}
 }
 
@@ -2729,7 +2865,7 @@ func TestResetWritesDurableJournalBeforeDesiredStateMutation(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","deployProject":"opensamguk-spep"}]
 `)
-	const initialEnv = "SERVER_ID=pep\nSCENARIO_CODE=scenario_1010\n"
+	const initialEnv = "SERVER_ID=pep\nSCENARIO_CODE=scenario_1010\nJWT_SECRET=private-reset-key\n"
 	envFile := filepath.Join(cfg.serversDir, "spep.env")
 	writeEnv(t, envFile, initialEnv)
 	prepared := make(chan lifecycleJournal, 1)
@@ -2759,7 +2895,7 @@ func TestResetWritesDurableJournalBeforeDesiredStateMutation(t *testing.T) {
 	}
 	select {
 	case journal := <-prepared:
-		if journal.Operation != "reset" || journal.Stage != lifecycleJournalStagePrepared {
+		if journal.Operation != "reset" || journal.Stage != lifecycleJournalStagePrepared || journal.ResetTarget == nil || journal.ResetTarget.ScenarioCode != "scenario_1002" || journal.ResetTarget.Generation != 1 || !journal.ResetTarget.ScenarioSeedEnabled {
 			t.Fatalf("prepared journal = %#v", journal)
 		}
 	case <-time.After(time.Second):
@@ -2769,8 +2905,11 @@ func TestResetWritesDurableJournalBeforeDesiredStateMutation(t *testing.T) {
 	if err := json.Unmarshal([]byte(readFile(t, cfg.lifecycleJournalFile)), &durable); err != nil {
 		t.Fatalf("decode durable reset journal: %v", err)
 	}
-	if durable.Operation != "reset" || durable.Stage != lifecycleJournalStagePrepared {
+	if durable.Operation != "reset" || durable.Stage != lifecycleJournalStagePrepared || durable.ResetTarget == nil || durable.ResetTarget.ScenarioCode != "scenario_1002" || durable.ResetTarget.Generation != 1 || !durable.ResetTarget.ScenarioSeedEnabled {
 		t.Fatalf("durable reset journal = %#v", durable)
+	}
+	if strings.Contains(readFile(t, cfg.lifecycleJournalFile), "private-reset-key") {
+		t.Fatal("durable reset journal exposed an env secret")
 	}
 	if got := readFile(t, envFile); got != initialEnv {
 		t.Fatalf("reset mutated env before durable write-ahead journal release:\n%s", got)

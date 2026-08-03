@@ -151,6 +151,25 @@ var serverEnvAllowlist = map[string]envFieldSpec{
 	"RESET_PRE_RESERVE_OPEN":     {Description: "리셋: 가오픈 예약"},
 }
 
+var resetLifecycleUpdateKeys = []string{
+	"SCENARIO_CODE",
+	"SCENARIO_SEED_ENABLED",
+	"SERVER_GENERATION",
+	"RESET_TURNTERM",
+	"RESET_SYNC",
+	"RESET_FICTION",
+	"RESET_EXTEND",
+	"RESET_BLOCK_GENERAL_CREATE",
+	"RESET_NPCMODE",
+	"RESET_SHOW_IMG_LEVEL",
+	"RESET_AUTORUN_USER_OPTIONS",
+	"RESET_AUTORUN_USER_MINUTES",
+	"RESET_JOIN_MODE",
+	"RESET_TOURNAMENT_TRIG",
+	"RESET_RESERVE_OPEN",
+	"RESET_PRE_RESERVE_OPEN",
+}
+
 var registryEnvAllowlist = map[string]struct{}{
 	"IMAGE_TAG":                  {},
 	"GAME_API_PORT":              {},
@@ -584,11 +603,19 @@ func writeMaintenanceMarkerAtomic(path string) error {
 }
 
 type lifecycleJournal struct {
-	Version   int    `json:"version"`
-	Operation string `json:"operation"`
-	Stage     string `json:"stage,omitempty"`
-	ServerID  string `json:"serverId"`
-	Project   string `json:"project"`
+	Version     int                   `json:"version"`
+	Operation   string                `json:"operation"`
+	Stage       string                `json:"stage,omitempty"`
+	ServerID    string                `json:"serverId"`
+	Project     string                `json:"project"`
+	ResetTarget *resetLifecycleTarget `json:"resetTarget,omitempty"`
+}
+
+type resetLifecycleTarget struct {
+	ScenarioCode        string            `json:"scenarioCode"`
+	Generation          int               `json:"generation"`
+	ScenarioSeedEnabled bool              `json:"scenarioSeedEnabled"`
+	Updates             map[string]string `json:"updates,omitempty"`
 }
 
 const (
@@ -600,6 +627,18 @@ const (
 )
 
 func (c config) writeLifecycleJournal(operation string, target serverTarget) error {
+	return c.writeLifecycleJournalWithResetTarget(operation, target, nil)
+}
+
+func (c config) writeResetLifecycleJournal(target serverTarget, resetTarget resetLifecycleTarget) error {
+	normalized, err := normalizeResetLifecycleTarget(resetTarget)
+	if err != nil {
+		return err
+	}
+	return c.writeLifecycleJournalWithResetTarget("reset", target, &normalized)
+}
+
+func (c config) writeLifecycleJournalWithResetTarget(operation string, target serverTarget, resetTarget *resetLifecycleTarget) error {
 	if c.lifecycleJournalFile == "" {
 		return errors.New("lifecycle journal path is unavailable")
 	}
@@ -609,12 +648,16 @@ func (c config) writeLifecycleJournal(operation string, target serverTarget) err
 	if !isLifecycleJournalOperation(operation) {
 		return errors.New("unsupported lifecycle journal operation")
 	}
+	if operation != "reset" && resetTarget != nil {
+		return errors.New("only reset journals can carry a reset target")
+	}
 	if err := c.writeLifecycleJournalRecord(lifecycleJournal{
-		Version:   lifecycleJournalVersion,
-		Operation: operation,
-		Stage:     lifecycleJournalStagePrepared,
-		ServerID:  target.ID,
-		Project:   target.Project,
+		Version:     lifecycleJournalVersion,
+		Operation:   operation,
+		Stage:       lifecycleJournalStagePrepared,
+		ServerID:    target.ID,
+		Project:     target.Project,
+		ResetTarget: resetTarget,
 	}); err != nil {
 		return err
 	}
@@ -704,6 +747,16 @@ func (c config) readLifecycleJournal() (lifecycleJournal, bool, error) {
 	}
 	journal.ServerID = target.ID
 	journal.Project = target.Project
+	if journal.Operation != "reset" && journal.ResetTarget != nil {
+		return lifecycleJournal{}, false, errors.New("lifecycle journal has an invalid reset target")
+	}
+	if journal.ResetTarget != nil {
+		normalized, err := normalizeResetLifecycleTarget(*journal.ResetTarget)
+		if err != nil {
+			return lifecycleJournal{}, false, err
+		}
+		journal.ResetTarget = &normalized
+	}
 	return journal, true, nil
 }
 
@@ -775,11 +828,17 @@ func (c config) repairLifecycleJournal() error {
 			return err
 		}
 	case "reset":
+		if err := c.prepareResetRecovery(journal, target); err != nil {
+			return err
+		}
 		if err := c.reconcileServerRegistry(target); err != nil {
 			return err
 		}
 		if err := c.setRegistryRepairRequired(target.ID, true); err != nil {
 			return err
+		}
+		if err := c.advanceLifecycleJournal(lifecycleJournalStageDown); err != nil {
+			return c.markResetRepairRequired(target.ID, err)
 		}
 		if _, err := c.downServerStack(lease.Context(), target.Project, target.EnvFile); err != nil {
 			return c.markResetRepairRequired(target.ID, err)
@@ -846,6 +905,35 @@ func (c config) markResetRepairRequired(id string, cause error) error {
 		return fmt.Errorf("could not durably persist reset repair-required state: %v (original failure: %w)", markerErr, cause)
 	}
 	return cause
+}
+
+func (c config) prepareResetRecovery(journal lifecycleJournal, target serverTarget) error {
+	preMutation := journal.Stage == "" || journal.Stage == lifecycleJournalStagePrepared
+	resetTarget := resetLifecycleTarget{}
+	if journal.ResetTarget != nil {
+		resetTarget = *journal.ResetTarget
+	} else {
+		if preMutation {
+			return errors.New("reset recovery target is unavailable before destructive mutation")
+		}
+		var err error
+		resetTarget, err = resetLifecycleTargetForEnv(target.EnvFile, nil)
+		if err != nil {
+			return err
+		}
+	}
+	if err := applyResetLifecycleTarget(target.EnvFile, resetTarget); err != nil {
+		return err
+	}
+	if preMutation {
+		return c.advanceLifecycleJournal(lifecycleJournalStageEnv)
+	}
+	values, err := c.validateServerTarget(target)
+	if err != nil {
+		return err
+	}
+	_, err = resetRuntimeExpectationFor(values)
+	return err
 }
 
 func newLifecycleJobManager() *lifecycleJobManager {
@@ -2682,6 +2770,10 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 	if _, err := os.Stat(envFile); err != nil {
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: fmt.Sprintf("서버 env 확인 실패: %v", err)}, http.StatusInternalServerError
 	}
+	resetTarget, err := resetLifecycleTargetForEnv(envFile, updates)
+	if err != nil {
+		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: err.Error()}, http.StatusBadRequest
+	}
 	if err := lease.Context().Err(); err != nil {
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: "maintenance in progress"}, http.StatusServiceUnavailable
 	}
@@ -2706,10 +2798,10 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		if err := c.writeLifecycleJournal("reset", target); err != nil {
+		if err := c.writeResetLifecycleJournal(target, resetTarget); err != nil {
 			return "", err
 		}
-		if err := applyResetUpdates(envFile, updates); err != nil {
+		if err := applyResetLifecycleTarget(envFile, resetTarget); err != nil {
 			return "", err
 		}
 		if err := c.advanceLifecycleJournal(lifecycleJournalStageEnv); err != nil {
@@ -3500,6 +3592,118 @@ func resetEnvUpdates(req resetServerRequest) (map[string]string, error) {
 	return values, nil
 }
 
+func isResetLifecycleUpdateKey(key string) bool {
+	for _, candidate := range resetLifecycleUpdateKeys {
+		if key == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func resetLifecycleTargetForEnv(envFile string, requested map[string]string) (resetLifecycleTarget, error) {
+	current, err := readEnvValues(envFile)
+	if err != nil {
+		return resetLifecycleTarget{}, err
+	}
+	values := make(map[string]string, len(current)+len(requested)+3)
+	for key, value := range current {
+		values[key] = value
+	}
+	for key, value := range requested {
+		if !isResetLifecycleUpdateKey(key) {
+			return resetLifecycleTarget{}, fmt.Errorf("reset target contains an unsupported field %q", key)
+		}
+		values[key] = value
+	}
+	for key, value := range map[string]string{
+		"SCENARIO_CODE":         "scenario_1010",
+		"SCENARIO_SEED_ENABLED": "true",
+		"SERVER_GENERATION":     "1",
+	} {
+		if strings.TrimSpace(values[key]) == "" {
+			values[key] = value
+		}
+	}
+	expected, err := resetRuntimeExpectationFor(values)
+	if err != nil {
+		return resetLifecycleTarget{}, err
+	}
+	updates := make(map[string]string, len(resetLifecycleUpdateKeys))
+	for _, key := range resetLifecycleUpdateKeys {
+		value, exists := values[key]
+		if !exists {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			if _, requested := requested[key]; !requested {
+				continue
+			}
+		}
+		updates[key] = value
+	}
+	target := resetLifecycleTarget{
+		ScenarioCode:        expected.scenarioCode,
+		Generation:          expected.generation,
+		ScenarioSeedEnabled: true,
+		Updates:             updates,
+	}
+	return normalizeResetLifecycleTarget(target)
+}
+
+func normalizeResetLifecycleTarget(target resetLifecycleTarget) (resetLifecycleTarget, error) {
+	target.ScenarioCode = strings.TrimSpace(target.ScenarioCode)
+	if !isSafeToken(target.ScenarioCode) {
+		return resetLifecycleTarget{}, errors.New("reset scenario code is invalid")
+	}
+	generation, err := parseGeneration(strconv.Itoa(target.Generation), 1)
+	if err != nil {
+		return resetLifecycleTarget{}, err
+	}
+	if !target.ScenarioSeedEnabled {
+		return resetLifecycleTarget{}, errors.New("reset requires SCENARIO_SEED_ENABLED=true so seeded world state can be verified")
+	}
+	updates := make(map[string]string, len(target.Updates)+3)
+	for key, value := range target.Updates {
+		if !isResetLifecycleUpdateKey(key) {
+			return resetLifecycleTarget{}, fmt.Errorf("reset target contains an unsupported field %q", key)
+		}
+		value = strings.TrimSpace(value)
+		if strings.ContainsAny(value, "\r\n") {
+			return resetLifecycleTarget{}, fmt.Errorf("reset target field %q is invalid", key)
+		}
+		updates[key] = value
+	}
+	canonical := map[string]string{
+		"SCENARIO_CODE":         target.ScenarioCode,
+		"SCENARIO_SEED_ENABLED": "true",
+		"SERVER_GENERATION":     strconv.Itoa(generation),
+	}
+	for key, value := range canonical {
+		if current, exists := updates[key]; exists && current != value {
+			return resetLifecycleTarget{}, fmt.Errorf("reset target field %q conflicts with its normalized value", key)
+		}
+		updates[key] = value
+	}
+	target.Generation = generation
+	target.Updates = updates
+	return target, nil
+}
+
+func applyResetLifecycleTarget(envFile string, target resetLifecycleTarget) error {
+	normalized, err := normalizeResetLifecycleTarget(target)
+	if err != nil {
+		return err
+	}
+	spec := make(map[string]envFieldSpec, len(normalized.Updates))
+	for key := range normalized.Updates {
+		spec[key] = envFieldSpec{Description: "리셋 옵션"}
+	}
+	_, err = patchEnvFile(envFile, spec, normalized.Updates)
+	return err
+}
+
 func (c config) applyResetOptions(envFile string, req resetServerRequest) error {
 	values, err := resetEnvUpdates(req)
 	if err != nil {
@@ -3509,31 +3713,11 @@ func (c config) applyResetOptions(envFile string, req resetServerRequest) error 
 }
 
 func applyResetUpdates(envFile string, values map[string]string) error {
-	current, err := readEnvValues(envFile)
+	target, err := resetLifecycleTargetForEnv(envFile, values)
 	if err != nil {
 		return err
 	}
-	updates := make(map[string]string, len(values)+3)
-	for key, value := range values {
-		updates[key] = value
-	}
-	for key, value := range map[string]string{
-		"SCENARIO_CODE":         "scenario_1010",
-		"SCENARIO_SEED_ENABLED": "true",
-		"SERVER_GENERATION":     "1",
-	} {
-		if strings.TrimSpace(current[key]) == "" {
-			if _, specified := updates[key]; !specified {
-				updates[key] = value
-			}
-		}
-	}
-	spec := map[string]envFieldSpec{}
-	for key := range updates {
-		spec[key] = envFieldSpec{Description: "리셋 옵션"}
-	}
-	_, err = patchEnvFile(envFile, spec, updates)
-	return err
+	return applyResetLifecycleTarget(envFile, target)
 }
 
 func (c config) readRegistry() ([]registryEntry, error) {
