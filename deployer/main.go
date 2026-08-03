@@ -1731,17 +1731,8 @@ func authenticatedHTTPCommand(c config, method, requestPath string, input io.Rea
 		fmt.Fprintln(errOutput, "DEPLOYER_TOKEN is required")
 		return 2
 	}
-	if method != http.MethodGet && method != http.MethodPost {
-		fmt.Fprintln(errOutput, "authenticated HTTP method is invalid")
-		return 2
-	}
-	if !strings.HasPrefix(requestPath, "/") || strings.HasPrefix(requestPath, "//") || strings.ContainsAny(requestPath, "\r\n") {
-		fmt.Fprintln(errOutput, "authenticated HTTP path is invalid")
-		return 2
-	}
-	parsedPath, err := url.ParseRequestURI(requestPath)
-	if err != nil || parsedPath.IsAbs() || parsedPath.Host != "" {
-		fmt.Fprintln(errOutput, "authenticated HTTP path is invalid")
+	if !isAuthenticatedHTTPRouteAllowed(method, requestPath) {
+		fmt.Fprintln(errOutput, "authenticated HTTP route is invalid")
 		return 2
 	}
 	baseURL := strings.TrimRight(c.localHTTPBaseURL, "/")
@@ -1784,6 +1775,31 @@ func authenticatedHTTPCommand(c config, method, requestPath string, input io.Rea
 		return 8
 	}
 	return 0
+}
+
+func isAuthenticatedHTTPRouteAllowed(method, requestPath string) bool {
+	switch method {
+	case http.MethodGet:
+		if requestPath == "/maintenance" {
+			return true
+		}
+		return strings.HasPrefix(requestPath, "/jobs/") && lifecycleJobIDRe.MatchString(strings.TrimPrefix(requestPath, "/jobs/"))
+	case http.MethodPost:
+		switch requestPath {
+		case "/maintenance/enter", "/maintenance/leave", "/maintenance/repair", "/servers/create":
+			return true
+		}
+		if !strings.HasPrefix(requestPath, "/jobs/") {
+			return false
+		}
+		jobPath := strings.TrimPrefix(requestPath, "/jobs/")
+		if !strings.HasSuffix(jobPath, "/cancel") {
+			return false
+		}
+		return lifecycleJobIDRe.MatchString(strings.TrimSuffix(jobPath, "/cancel"))
+	default:
+		return false
+	}
 }
 
 func checkRegistryCommand(c config, output io.Writer) int {

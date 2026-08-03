@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -2250,6 +2251,85 @@ func TestAuthenticatedHTTPCommandRejectsExternalOrErrorRequests(t *testing.T) {
 	status = authenticatedHTTPCommand(config{token: "test-token", localHTTPBaseURL: server.URL}, http.MethodGet, "/maintenance", nil, &output, &diagnostics)
 	if status != 8 || output.String() != `{"error":"denied"}` {
 		t.Fatalf("HTTP-error helper status=%d output=%q diagnostics=%q", status, output.String(), diagnostics.String())
+	}
+}
+
+func TestAuthenticatedHTTPCommandRejectsUnallowlistedRoutesBeforeRequest(t *testing.T) {
+	const jobID = "abcdef0123456789abcdef0123456789"
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"unexpected":true}`))
+	}))
+	defer server.Close()
+
+	for _, testCase := range []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{name: "unknown path", method: http.MethodGet, path: "/status"},
+		{name: "maintenance query", method: http.MethodGet, path: "/maintenance?verbose=true"},
+		{name: "maintenance fragment", method: http.MethodGet, path: "/maintenance#fragment"},
+		{name: "percent encoded maintenance", method: http.MethodGet, path: "/%6daintenance"},
+		{name: "short job", method: http.MethodGet, path: "/jobs/abcdef"},
+		{name: "uppercase job", method: http.MethodGet, path: "/jobs/ABCDEF0123456789ABCDEF0123456789"},
+		{name: "job trailing slash", method: http.MethodGet, path: "/jobs/" + jobID + "/"},
+		{name: "job query", method: http.MethodGet, path: "/jobs/" + jobID + "?next=1"},
+		{name: "job fragment", method: http.MethodGet, path: "/jobs/" + jobID + "#fragment"},
+		{name: "job percent encoded", method: http.MethodGet, path: "/jobs/%61bcdef0123456789abcdef0123456789"},
+		{name: "get cancel", method: http.MethodGet, path: "/jobs/" + jobID + "/cancel"},
+		{name: "post job", method: http.MethodPost, path: "/jobs/" + jobID},
+		{name: "get create", method: http.MethodGet, path: "/servers/create"},
+		{name: "post maintenance", method: http.MethodPost, path: "/maintenance"},
+		{name: "get repair", method: http.MethodGet, path: "/maintenance/repair"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			var output, diagnostics bytes.Buffer
+			status := authenticatedHTTPCommand(config{token: "test-token", localHTTPBaseURL: server.URL}, testCase.method, testCase.path, nil, &output, &diagnostics)
+			if status != 2 {
+				t.Fatalf("unallowlisted helper status = %d output=%q diagnostics=%q", status, output.String(), diagnostics.String())
+			}
+		})
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("unallowlisted helper routes reached listener %d times", got)
+	}
+}
+
+func TestAuthenticatedHTTPCommandAllowsOnlyWorkflowRoutes(t *testing.T) {
+	const jobID = "abcdef0123456789abcdef0123456789"
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			t.Error("allowed helper request omitted its inherited token")
+		}
+		_, _ = fmt.Fprintf(w, "%s %s", r.Method, r.URL.EscapedPath())
+	}))
+	defer server.Close()
+
+	for _, testCase := range []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodGet, path: "/maintenance"},
+		{method: http.MethodPost, path: "/maintenance/enter"},
+		{method: http.MethodPost, path: "/maintenance/leave"},
+		{method: http.MethodPost, path: "/maintenance/repair"},
+		{method: http.MethodGet, path: "/jobs/" + jobID},
+		{method: http.MethodPost, path: "/jobs/" + jobID + "/cancel"},
+		{method: http.MethodPost, path: "/servers/create"},
+	} {
+		var output, diagnostics bytes.Buffer
+		status := authenticatedHTTPCommand(config{token: "test-token", localHTTPBaseURL: server.URL}, testCase.method, testCase.path, strings.NewReader(`{}`), &output, &diagnostics)
+		if status != 0 || output.String() != testCase.method+" "+testCase.path {
+			t.Fatalf("allowed helper route method=%q path=%q status=%d output=%q diagnostics=%q", testCase.method, testCase.path, status, output.String(), diagnostics.String())
+		}
+	}
+	if got := requests.Load(); got != 7 {
+		t.Fatalf("allowed helper routes reached listener %d times, want 7", got)
 	}
 }
 
