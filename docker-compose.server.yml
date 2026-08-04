@@ -78,6 +78,12 @@ services:
       SCENARIO_SEED_ENABLED: ${SCENARIO_SEED_ENABLED:-true}
       SCENARIO_CODE: ${SCENARIO_CODE:-scenario_1010}
       SCENARIO_DIR: ${SCENARIO_DIR:-/data/scenarios}
+      # 리셋이 고른 턴 주기(분). deployer가 servers/<id>.env에 RESET_TURNTERM으로 쓰고
+      # (main.go resetEnvUpdates), compose는 --env-file로 그 파일을 읽는다. 이 한 줄이 없으면
+      # 값이 env 파일까지만 오고 엔진에 닿지 않아 시드가 항상 60분으로 굳는다.
+      # 기본값을 비워 두는 것은 의도적이다 — 미설정의 의미(60분)는 게임 엔진
+      # (SeedBootstrap.DEFAULT_TURN_TERM)이 단독으로 소유해야 두 곳이 갈라지지 않는다.
+      RESET_TURNTERM: ${RESET_TURNTERM:-}
       JAVA_OPTS: "-XX:+UseG1GC -XX:MaxRAMPercentage=60.0 -XX:InitialRAMPercentage=40.0 -Djava.security.egd=file:/dev/./urandom"
     depends_on:
       game-postgres:

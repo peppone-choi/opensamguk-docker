@@ -2182,6 +2182,56 @@ func TestServerComposeMountsExternalScenarioOverridesReadOnly(t *testing.T) {
 	}
 }
 
+// 리셋이 고른 턴 주기가 게임 엔진 프로세스까지 도달하는지 고정한다.
+//
+// deployer는 RESET_TURNTERM을 servers/<id>.env에 쓰고(resetEnvUpdates), compose는
+// --env-file로 그 파일을 읽는다(upServerStack). 그런데 game-engine의 environment
+// 블록에 전달이 없으면 값이 env 파일까지만 오고 엔진에는 닿지 않아, 운영자가
+// 무엇을 고르든 시드가 항상 60분으로 굳는다. 그 끊김을 여기서 막는다.
+//
+// game-api는 시드하지 않으므로(ScenarioSeedRunner는 game-engine 전용) 대상이 아니다.
+func TestServerComposePassesResetTurnTermToGameEngine(t *testing.T) {
+	compose := readFile(t, filepath.Join("..", "docker-compose.server.yml"))
+	start := strings.Index(compose, "\n  game-engine:\n")
+	if start < 0 {
+		t.Fatal("compose missing game-engine service")
+	}
+	engine := compose[start:]
+	end := strings.Index(engine, "\n  game-api:\n")
+	if end < 0 {
+		t.Fatal("compose missing boundary after game-engine service")
+	}
+	engine = engine[:end]
+
+	const want = "RESET_TURNTERM: ${RESET_TURNTERM:-}"
+	if !strings.Contains(engine, want) {
+		t.Fatalf("game-engine must receive the reset turn term %q", want)
+	}
+
+	// 미설정의 의미(60분)는 게임 엔진(SeedBootstrap.DEFAULT_TURN_TERM)이 단독으로
+	// 소유한다. compose가 여기서 숫자를 박으면 정본이 둘이 되고 한쪽만 바뀌었을 때
+	// 조용히 갈라진다 — 이 변경이 닫는 결함과 같은 실패 양상이다.
+	for _, line := range strings.Split(engine, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "RESET_TURNTERM:") {
+			continue
+		}
+		if trimmed != want {
+			t.Fatalf("RESET_TURNTERM must carry no compose-side default: got %q, want %q", trimmed, want)
+		}
+	}
+
+	// deployer가 쓰는 키 이름과 compose가 읽는 키 이름이 같은지도 함께 본다.
+	// 한쪽만 이름이 바뀌면 보간이 조용히 빈 값이 되어 다시 60분으로 굳는다.
+	updates, err := resetEnvUpdates(resetServerRequest{ScenarioCode: "scenario_1002", Generation: "2", TurnTerm: "30"})
+	if err != nil {
+		t.Fatalf("resetEnvUpdates error = %v", err)
+	}
+	if got := updates["RESET_TURNTERM"]; got != "30" {
+		t.Fatalf("deployer must write RESET_TURNTERM=30, got %q", got)
+	}
+}
+
 func TestServerEnvTemplateSetsIsolatedDatabaseWorldID(t *testing.T) {
 	template := readFile(t, filepath.Join("..", "servers", "s1.env.example"))
 	if !strings.Contains(template, "\nOPENSAMGUK_WORLD_ID=1\n") {
