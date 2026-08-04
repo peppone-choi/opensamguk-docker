@@ -120,6 +120,8 @@ services:
       # Admin seed (idempotent on empty users table).
       ADMIN_USERNAME: ${ADMIN_USERNAME:-peppone}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD required}
+      # OPENSAM-93: persistent uploaded profile icons; nginx serves the same volume read-only.
+      PROFILE_ICON_STORAGE_ROOT: /var/lib/opensamguk/profile-icons
       JAVA_OPTS: "-XX:+UseG1GC -XX:MaxRAMPercentage=40.0 -XX:InitialRAMPercentage=25.0 -Djava.security.egd=file:/dev/./urandom"
     depends_on:
       postgres:
@@ -128,6 +130,9 @@ services:
         condition: service_healthy
     expose:
       - "8080"
+    volumes:
+      # OPENSAM-93: gateway-api is the SOLE writer of the profile-icon store.
+      - profile-icons:/var/lib/opensamguk/profile-icons
     networks:
       - opensamguk
     deploy:
@@ -184,6 +189,10 @@ services:
     restart: unless-stopped
     volumes:
       - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # OPENSAM-93: same-origin /d_pic/ read-only serving of gateway-api managed profile icons.
+      # SAME named volume gateway-api writes to, mounted READ-ONLY here — gateway-api stays the sole
+      # writer. Path matches nginx.conf's `location /d_pic/` alias root.
+      - profile-icons:/var/lib/opensamguk/profile-icons:ro
       - nginx-cache:/var/cache/nginx
     depends_on:
       - gateway-api
@@ -205,6 +214,8 @@ volumes:
   pgdata:
     driver: local
   redisdata:
+    driver: local
+  profile-icons:
     driver: local
   nginx-cache:
     driver: local
