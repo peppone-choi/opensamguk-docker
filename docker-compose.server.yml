@@ -87,7 +87,10 @@ services:
     expose:
       - "8082"
     volumes:
-      - ${SCENARIO_HOST_DIR:-./data/scenarios}:${SCENARIO_DIR:-/data/scenarios}:ro
+      # 호스트 절대경로로 바인드한다. deployer는 컨테이너(/workspace) 안에서 compose를 실행하므로
+      # 상대경로는 호스트 데몬에 `/workspace/data/...` 문자열로 전달되고, 데몬이 그걸 호스트 경로로
+      # 해석해 빈 디렉터리를 만든다(= 외부 오버라이드가 조용히 무력화). nginx 바인드와 동일 패턴.
+      - ${COMPOSE_HOST_DIR:-${PWD:-.}}/data/scenarios:${SCENARIO_DIR:-/data/scenarios}:ro
     networks:
       - opensamguk-net
     deploy:
@@ -123,7 +126,10 @@ services:
     expose:
       - "8081"
     volumes:
-      - ${SCENARIO_HOST_DIR:-./data/scenarios}:${SCENARIO_DIR:-/data/scenarios}:ro
+      # 호스트 절대경로로 바인드한다. deployer는 컨테이너(/workspace) 안에서 compose를 실행하므로
+      # 상대경로는 호스트 데몬에 `/workspace/data/...` 문자열로 전달되고, 데몬이 그걸 호스트 경로로
+      # 해석해 빈 디렉터리를 만든다(= 외부 오버라이드가 조용히 무력화). nginx 바인드와 동일 패턴.
+      - ${COMPOSE_HOST_DIR:-${PWD:-.}}/data/scenarios:${SCENARIO_DIR:-/data/scenarios}:ro
     # 외부에서 로비(로비 servers.json의 절대 URL)가 직접 도달하도록 호스트 포트 노출.
     ports:
       - "${GAME_API_PORT:?GAME_API_PORT required}:8081"

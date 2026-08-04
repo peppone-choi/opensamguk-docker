@@ -1971,7 +1971,9 @@ func TestServerComposeExportsPublicIDAndWorldIDToSourceServices(t *testing.T) {
 func TestServerComposeMountsExternalScenarioOverridesReadOnly(t *testing.T) {
 	compose := readFile(t, filepath.Join("..", "docker-compose.server.yml"))
 	const scenarioDir = "SCENARIO_DIR: ${SCENARIO_DIR:-/data/scenarios}"
-	const scenarioMount = "- ${SCENARIO_HOST_DIR:-./data/scenarios}:${SCENARIO_DIR:-/data/scenarios}:ro"
+	// 바인드 소스는 호스트 절대경로여야 한다 — deployer가 컨테이너 안에서 compose를 실행하므로
+	// 상대경로는 호스트 데몬에서 빈 /workspace/... 로 해석돼 외부 오버라이드가 조용히 죽는다.
+	const scenarioMount = "- ${COMPOSE_HOST_DIR:-${PWD:-.}}/data/scenarios:${SCENARIO_DIR:-/data/scenarios}:ro"
 	want := strings.Join([]string{scenarioDir, scenarioMount}, "\n")
 
 	var canonicalContract string
