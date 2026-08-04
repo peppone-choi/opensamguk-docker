@@ -15,3 +15,9 @@ infra/nginx/certs/
 # OS / 에디터
 .DS_Store
 *.swp
+
+# compose bind-mount 런타임 생성물 — docker-compose.server.yml의
+# ${SCENARIO_HOST_DIR:-./data/scenarios} 기본값을 Docker가 자동 생성한다.
+# 내용물(RTK14 생성 시나리오)은 앱 레포에서도 gitignore 대상이며,
+# untracked로 남으면 deploy.yml의 sync 가드가 이후 모든 배포를 차단한다.
+/data/
