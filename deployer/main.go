@@ -276,6 +276,13 @@ var (
 	errMaintenanceClosed      = errors.New("maintenance barrier is closed")
 	errLifecycleJobNotPending = errors.New("lifecycle job is no longer pending")
 	errMaintenanceLeaseUsed   = errors.New("maintenance lease has already been consumed")
+	errDockerUnreachable      = errors.New("docker daemon is unreachable")
+)
+
+const (
+	// /readyz는 워크플로에서 2초 간격으로 폴링되고 wget -T 5 안에서 돌아야 한다.
+	dockerPreflightTimeout     = 3 * time.Second
+	dockerPreflightDetailLimit = 300
 )
 
 // operationCoordinator serializes every durable control-plane mutation. Unlike
@@ -782,6 +789,11 @@ func (c config) clearLifecycleJournal() error {
 func (c config) repairLifecycleJournal() error {
 	if c.operations == nil {
 		return errors.New("operation coordinator unavailable")
+	}
+	// 복구도 docker 없이는 한 발짝도 못 나간다. reset 분기는 prepareResetRecovery에서
+	// env를 먼저 다시 쓰므로, 레코버리 리스를 잡기 전에 도달성부터 확인한다.
+	if err := c.dockerPreflight(context.Background()); err != nil {
+		return err
 	}
 	lease, err := c.operations.beginRecovery()
 	if err != nil {
@@ -1841,6 +1853,14 @@ func (c config) handleReady(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: fmt.Sprintf("레지스트리 준비 실패: %v", err)})
 		return
 	}
+	// readiness는 "지금 변이를 받을 수 있는가"다. docker에 못 닿으면 모든 compose 호출이
+	// 실패하므로 ready가 아니다. 캐시하지 않는다 — 폴링은 2초 간격(워크플로)뿐이고,
+	// 캐시는 진행 중인 장애를 정확히 그 게이트에서 숨긴다.
+	if err := c.dockerPreflight(r.Context()); err != nil {
+		w.Header().Set("Retry-After", "5")
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: err.Error()})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
@@ -1949,6 +1969,11 @@ func (c config) handleMaintenance(w http.ResponseWriter, r *http.Request) {
 		respond(state, "")
 	case r.Method == http.MethodPost && r.URL.Path == "/maintenance/repair":
 		if err := c.repairLifecycleJournal(); err != nil {
+			if errors.Is(err, errDockerUnreachable) {
+				w.Header().Set("Retry-After", "5")
+				writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: err.Error()})
+				return
+			}
 			writeJSON(w, http.StatusConflict, errorResponse{Error: "lifecycle recovery failed"})
 			return
 		}
@@ -3009,21 +3034,36 @@ func lifecycleJobReservationFailure(err error) (string, int) {
 	return "서버 수명주기 작업을 준비하지 못했습니다.", http.StatusInternalServerError
 }
 
-func (c config) beginMutation(jobID string) (*operationLease, error) {
+// 모든 변이(deploy/env patch/create/delete/reset)가 지나가는 단일 진입 관문.
+// 저널·env·레지스트리를 건드리기 전에 동기적으로 호출되므로, 여기서 막으면
+// 어떤 호출자도 되돌릴 수 없는 경계를 넘지 못하고 사유가 HTTP 응답으로 그대로 나간다.
+func (c config) admitMutation() error {
 	if c.operations == nil {
-		return nil, errors.New("operation coordinator unavailable")
+		return errors.New("operation coordinator unavailable")
+	}
+	return c.dockerPreflight(context.Background())
+}
+
+func (c config) beginMutation(jobID string) (*operationLease, error) {
+	if err := c.admitMutation(); err != nil {
+		return nil, err
 	}
 	return c.operations.begin(jobID)
 }
 
 func (c config) beginMaintenanceCreate(jobID, maintenanceLease, operationID string) (*operationLease, error) {
-	if c.operations == nil {
-		return nil, errors.New("operation coordinator unavailable")
+	if err := c.admitMutation(); err != nil {
+		return nil, err
 	}
 	return c.operations.beginWithMaintenanceLease(jobID, maintenanceLease, operationID)
 }
 
 func writeMutationAdmissionError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errDockerUnreachable) {
+		w.Header().Set("Retry-After", "5")
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: err.Error()})
+		return
+	}
 	if errors.Is(err, errMaintenanceClosed) {
 		w.Header().Set("Retry-After", "5")
 		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "maintenance in progress"})
@@ -3037,6 +3077,9 @@ func writeMutationAdmissionError(w http.ResponseWriter, err error) {
 }
 
 func mutationAdmissionFailure(err error) (string, int) {
+	if errors.Is(err, errDockerUnreachable) {
+		return err.Error(), http.StatusServiceUnavailable
+	}
 	if errors.Is(err, errMaintenanceClosed) {
 		return "maintenance in progress", http.StatusServiceUnavailable
 	}
@@ -4265,6 +4308,30 @@ func (c config) upStateless(ctx context.Context, project, envFile string) (strin
 	}
 
 	return sb.String(), nil
+}
+
+// docker 데몬 도달성 프리플라이트. socket-proxy가 사라지면 모든 compose 호출이 실패하는데,
+// 그건 "애매한 결과"가 아니라 확정적으로 아무 일도 일어나지 않은 상태다. 저널/env를 건드리기
+// 전에 이걸로 먼저 걸러서 되돌릴 수 없는 경계를 넘지 않고 깨끗이 실패시킨다.
+// version 섹션은 socket-proxy 화이트리스트에 있다(VERSION=1).
+func (c config) dockerPreflight(parent context.Context) error {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, dockerPreflightTimeout)
+	defer cancel()
+	out, err := c.runDockerContext(ctx, "version", "--format", "{{.Server.Version}}")
+	if err == nil {
+		return nil
+	}
+	detail := strings.TrimSpace(out)
+	if detail == "" {
+		detail = err.Error()
+	}
+	if runes := []rune(detail); len(runes) > dockerPreflightDetailLimit {
+		detail = string(runes[:dockerPreflightDetailLimit]) + "…"
+	}
+	return fmt.Errorf("%w: docker 데몬에 접근할 수 없습니다(socket-proxy 상태를 확인해 주세요): %s", errDockerUnreachable, detail)
 }
 
 // docker CLI 실행 — DOCKER_HOST는 환경에서 상속(socket-proxy). stdout+stderr 합쳐 반환.
