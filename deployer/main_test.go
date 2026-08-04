@@ -143,6 +143,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	releaseReload := make(chan struct{})
 	var enteredOnce sync.Once
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		if strings.Contains(strings.Join(args, " "), "gateway-api web-gateway") {
 			enteredOnce.Do(func() { close(enteredReload) })
 			<-releaseReload
@@ -179,6 +182,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 `)
 	writeEnv(t, filepath.Join(failing.serversDir, "spep.env"), "SERVER_ID=pep\nIMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\n")
 	failing.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		return "sensitive docker output", errors.New("sensitive docker failure")
 	}
 	failedPatch := envRequest(t, failing.withAuth(failing.handleServerEnv), http.MethodPatch, "/env/server?id=pep", `{"values":{"IMAGE_TAG":"v2"}}`)
@@ -211,6 +217,9 @@ func TestConcurrentAuthenticatedCreatesWaitForPriorLifecycleTransaction(t *testi
 		releaseFirstDockerOnce.Do(func() { close(releaseFirstDockerCall) })
 	}
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		blockFirstDockerCall.Do(func() {
 			close(firstDockerCall)
 			<-releaseFirstDockerCall
@@ -305,6 +314,9 @@ func TestCreateServerOperationIDRecoversAmbiguousPostWithoutSecondMutation(t *te
 		releaseFirstDockerOnce.Do(func() { close(releaseFirstDockerCall) })
 	}
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		blockFirstDockerCall.Do(func() {
 			close(firstDockerCall)
 			<-releaseFirstDockerCall
@@ -356,6 +368,9 @@ func TestCreateServerOperationIDBindsNormalizedPayloadBeforeRetryResolution(t *t
 	releaseDocker := make(chan struct{})
 	var started sync.Once
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		started.Do(func() {
 			close(dockerStarted)
 			<-releaseDocker
@@ -421,6 +436,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	var startOnce sync.Once
 	var cancelOnce sync.Once
 	cfg.dockerRunnerContext = func(ctx context.Context, args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		startOnce.Do(func() { close(dockerStarted) })
 		<-ctx.Done()
 		cancelOnce.Do(func() { close(dockerCanceled) })
@@ -479,6 +497,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 `)
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nIMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\n")
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		if strings.Contains(strings.Join(args, " "), "gateway-api web-gateway") {
 			return "reload failed\n", errors.New("shared registry reload failed")
 		}
@@ -512,6 +533,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	restarted.lifecycleJobs = newLifecycleJobManager()
 	restarted.operations = newOperationCoordinator(restarted.maintenanceFile, restarted.lifecycleJournalFile, restarted.lifecycleJobs)
 	restarted.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		return "reloaded\n", nil
 	}
 	if err := restarted.repairLifecycleJournal(); err != nil {
@@ -598,6 +622,9 @@ func TestMaintenanceLeasePermitsOnlyOneLoopbackIdempotentCreate(t *testing.T) {
 	releaseDocker := make(chan struct{})
 	var started sync.Once
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		started.Do(func() {
 			close(dockerStarted)
 			<-releaseDocker
@@ -828,6 +855,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","deployProject":"opensa
 	restarted.operations = newOperationCoordinator(restarted.maintenanceFile, restarted.lifecycleJournalFile, restarted.lifecycleJobs)
 	calls := &dockerCallRecorder{}
 	restarted.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		return "recovered\n", nil
 	}
@@ -883,6 +913,9 @@ func TestPreparedResetJournalWithoutTargetRefusesDestructiveRepair(t *testing.T)
 	restarted.operations = newOperationCoordinator(restarted.maintenanceFile, restarted.lifecycleJournalFile, restarted.lifecycleJobs)
 	calls := &dockerCallRecorder{}
 	restarted.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		return "unexpected Docker call", errors.New("prepared reset recovery must not reach Docker without a target")
 	}
@@ -942,6 +975,9 @@ func TestResetRepairRestoresJournaledTargetAcrossPreparedCrashBoundaries(t *test
 			restarted.operations = newOperationCoordinator(restarted.maintenanceFile, restarted.lifecycleJournalFile, restarted.lifecycleJobs)
 			calls := &dockerCallRecorder{}
 			restarted.dockerRunner = func(args ...string) (string, error) {
+				if dockerPreflightProbe(args) {
+					return "29.0.0\n", nil
+				}
 				calls.record(args...)
 				return "recovered\n", nil
 			}
@@ -978,6 +1014,9 @@ func TestResetRejectsSeedDisabledBeforeJournalOrDocker(t *testing.T) {
 	writeEnv(t, envFile, original)
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		return "unexpected Docker call", errors.New("seed-disabled reset must be rejected before Docker")
 	}
@@ -994,6 +1033,104 @@ func TestResetRejectsSeedDisabledBeforeJournalOrDocker(t *testing.T) {
 	}
 	if got := readFile(t, envFile); got != original {
 		t.Fatalf("seed-disabled reset mutated env before rejection:\n%s", got)
+	}
+}
+
+// socket-proxy가 사라지면 docker에 닿지도 못한다 — 확정적으로 아무 일도 일어나지 않은
+// 상태다. 저널/env를 건드리기 전에 깨끗이 실패해야 하고, repair-required로 잠기면 안 된다.
+func TestDockerUnreachableFailsMutationsBeforeIrreversibleBoundary(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `JWT_SECRET=shared-secret
+SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"scenarioCode":"scenario_1010","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
+`)
+	envFile := filepath.Join(cfg.serversDir, "spep.env")
+	const original = "SERVER_ID=pep\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n"
+	writeEnv(t, envFile, original)
+	calls := &dockerCallRecorder{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		calls.record(args...)
+		return "Cannot connect to the Docker daemon at tcp://socket-proxy:2375.", errors.New("exit status 1")
+	}
+
+	for _, testCase := range []struct {
+		name    string
+		handler http.HandlerFunc
+		method  string
+		path    string
+		body    string
+	}{
+		{"reset", cfg.handleServerReset, http.MethodPost, "/servers/reset", `{"id":"pep","confirm":"RESET pep","scenarioCode":"scenario_1002"}`},
+		{"create", cfg.handleServerCreate, http.MethodPost, "/servers/create", `{"id":"new","name":"새 서버","gameApiPort":"8101","webGamePort":"3101"}`},
+		{"delete", cfg.handleServers, http.MethodDelete, "/servers?id=pep&confirm=DELETE%20pep", ""},
+		{"deploy", cfg.handleDeploy, http.MethodPost, "/deploy", `{"project":"opensamguk-spep","tag":"v2"}`},
+	} {
+		response := envRequest(t, cfg.withAuth(testCase.handler), testCase.method, testCase.path, testCase.body)
+		if response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s with unreachable docker = %d body=%s", testCase.name, response.Code, response.Body.String())
+		}
+		if !strings.Contains(response.Body.String(), "docker 데몬에 접근할 수 없습니다") ||
+			!strings.Contains(response.Body.String(), "socket-proxy:2375") {
+			t.Fatalf("%s response hides the docker cause: %s", testCase.name, response.Body.String())
+		}
+	}
+
+	for _, call := range calls.snapshot() {
+		if !strings.HasPrefix(call, "version ") {
+			t.Fatalf("mutation reached docker past the preflight: %q", call)
+		}
+	}
+	if _, err := os.Stat(cfg.lifecycleJournalFile); !os.IsNotExist(err) {
+		t.Fatalf("unreachable docker wrote a lifecycle journal: %v", err)
+	}
+	if got := readFile(t, envFile); got != original {
+		t.Fatalf("unreachable docker mutated env:\n%s", got)
+	}
+	entry, err := cfg.registryEntryByID("pep")
+	if err != nil {
+		t.Fatalf("registry lookup: %v", err)
+	}
+	if entry.RepairRequired {
+		t.Fatal("unreachable docker locked the server as repair-required")
+	}
+	if state := cfg.operations.maintenanceState(); state != maintenanceStateOpen {
+		t.Fatalf("unreachable docker closed the maintenance barrier: %s", state)
+	}
+
+	// 복구 경로도 같은 관문 뒤에 있다. env를 다시 쓰기 전에 도달성부터 실패해야 한다.
+	if err := cfg.repairLifecycleJournal(); !errors.Is(err, errDockerUnreachable) {
+		t.Fatalf("repair with unreachable docker = %v", err)
+	}
+
+	// docker가 돌아오면 수동 repair 없이 변이 관문이 그대로 다시 열린다.
+	cfg.dockerRunner = func(args ...string) (string, error) { return "ok\n", nil }
+	lease, err := cfg.beginMutation("")
+	if err != nil {
+		t.Fatalf("mutation admission stayed closed after docker recovered: %v", err)
+	}
+	lease.Done()
+}
+
+func TestReadyzIsNotReadyWhileDockerIsUnreachable(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "SERVER_REGISTRY_JSON=[]\n")
+	cfg.dockerRunner = func(args ...string) (string, error) { return "29.0.0\n", nil }
+	if ready := envRequest(t, cfg.handleReady, http.MethodGet, "/readyz", ""); ready.Code != http.StatusOK ||
+		!strings.Contains(ready.Body.String(), `"status":"ready"`) {
+		t.Fatalf("readyz with reachable docker = %d body=%s", ready.Code, ready.Body.String())
+	}
+
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		return "Cannot connect to the Docker daemon at tcp://socket-proxy:2375.", errors.New("exit status 1")
+	}
+	notReady := envRequest(t, cfg.handleReady, http.MethodGet, "/readyz", "")
+	if notReady.Code != http.StatusServiceUnavailable {
+		t.Fatalf("readyz with unreachable docker = %d body=%s", notReady.Code, notReady.Body.String())
+	}
+	if strings.Contains(notReady.Body.String(), `"status":"ready"`) {
+		t.Fatalf("readyz still claimed ready: %s", notReady.Body.String())
+	}
+	if !strings.Contains(notReady.Body.String(), "docker 데몬에 접근할 수 없습니다") {
+		t.Fatalf("readyz hides the docker cause: %s", notReady.Body.String())
 	}
 }
 
@@ -1078,6 +1215,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	var enteredOnce sync.Once
 	var cancelledOnce sync.Once
 	cfg.dockerRunnerContext = func(ctx context.Context, args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		enteredOnce.Do(func() { close(enteredDocker) })
 		<-ctx.Done()
 		cancelledOnce.Do(func() { close(cancelObserved) })
@@ -1139,6 +1279,9 @@ func TestPendingCreateCancelBeforeClaimHasNoMutation(t *testing.T) {
 	var dockerMu sync.Mutex
 	var dockerCalls []string
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		dockerMu.Lock()
 		dockerCalls = append(dockerCalls, strings.Join(args, " "))
 		dockerMu.Unlock()
@@ -1224,6 +1367,9 @@ func TestClaimCancelRaceCancelledBeforeClaimNeverMutates(t *testing.T) {
 		writeEnv(t, filepath.Join(cfg.composeDir, ".env"), sharedEnv)
 		calls := &dockerCallRecorder{}
 		cfg.dockerRunner = func(args ...string) (string, error) {
+			if dockerPreflightProbe(args) {
+				return "29.0.0\n", nil
+			}
 			calls.record(args...)
 			return "", nil
 		}
@@ -1285,6 +1431,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	}
 	cfg.operations = newOperationCoordinator(cfg.maintenanceFile, cfg.lifecycleJournalFile, cfg.lifecycleJobs)
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		t.Fatalf("maintenance-closed mutation reached Docker: %q", args)
 		return "", nil
 	}
@@ -1482,6 +1631,9 @@ func TestDeployPromotesApiAndWebGameTags(t *testing.T) {
 	writeEnv(t, envFile, "# server\nSERVER_ID=1\nIMAGE_TAG=v1\nWEB_GAME_TAG=v-old\nJWT_SECRET=old-secret\n")
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		return "ok\n", nil
 	}
@@ -1522,6 +1674,9 @@ func TestDeployDoesNotMutateEnvWhenPullFails(t *testing.T) {
 	original := "# server\nSERVER_ID=1\nIMAGE_TAG=v1\nWEB_GAME_TAG=v-old\nJWT_SECRET=old-secret\n"
 	writeEnv(t, envFile, original)
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		return "web-game Error not found\n", errors.New("pull failed")
 	}
 
@@ -1570,6 +1725,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nIMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\nJWT_SECRET=old-secret\n")
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		return "ok\n", nil
 	}
@@ -1687,6 +1845,9 @@ func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		return "ok\n", nil
 	}
@@ -1750,6 +1911,9 @@ func TestCreateServerCanonicalizesUppercaseIDAndPreventsCaseCollision(t *testing
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		return "ok\n", nil
 	}
@@ -1857,6 +2021,9 @@ func TestServerTargetIdentityMismatchFailsBeforeReadinessAndDockerMutation(t *te
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=other\nIMAGE_TAG=v1\n")
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		return "", nil
 	}
@@ -1888,6 +2055,9 @@ func TestStagedDockerEnvMustMatchTargetIdentity(t *testing.T) {
 	writeEnv(t, stagedEnv, "SERVER_ID=other\nIMAGE_TAG=v2\n")
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		return "", nil
 	}
@@ -2784,6 +2954,9 @@ func TestCreateServerUsesConfiguredInternalUrls(t *testing.T) {
 	cfg.gatewayAPIURL = "http://gateway-api:18081"
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		return "ok\n", nil
 	}
 
@@ -2809,6 +2982,9 @@ func TestCreateServerAllowsGenerationZeroForAlpha(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		return "ok\n", nil
 	}
 
@@ -3042,6 +3218,9 @@ func TestCreateServerRejectsPortCollisions(t *testing.T) {
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nGAME_API_PORT=8101\nWEB_GAME_PORT=3101\n")
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		t.Fatalf("docker should not be called for a port collision: %#v", args)
 		return "", nil
 	}
@@ -3068,6 +3247,9 @@ func TestCreateServerRejectsSharedPortCollision(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\nGAME_API_PORT=18080\n")
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		t.Fatalf("docker should not be called for a shared port collision: %#v", args)
 		return "", nil
 	}
@@ -3094,6 +3276,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nGAME_API_PORT=8101\nWEB_GAME_PORT=3101\n")
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		return "ok\n", nil
 	}
@@ -3152,6 +3337,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	defer release()
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		if strings.Contains(strings.Join(args, " "), "down --volumes --remove-orphans") {
 			firstDownOnce.Do(func() {
@@ -3237,6 +3425,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 `)
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nGAME_API_PORT=8101\nWEB_GAME_PORT=3101\n")
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		return "down failed\n", errors.New("compose down failed")
 	}
 
@@ -3284,6 +3475,9 @@ func TestDeleteJournalRecoveryCompletesWhenEnvWasAlreadyRemoved(t *testing.T) {
 	}
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		return "reloaded\n", nil
 	}
@@ -3320,6 +3514,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n")
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		return "ok\n", nil
 	}
@@ -3409,6 +3606,9 @@ func TestResetWritesDurableJournalBeforeDesiredStateMutation(t *testing.T) {
 	}
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		return "ok\n", nil
 	}
@@ -3459,6 +3659,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 `)
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n")
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		return "ok\n", nil
 	}
 
@@ -3490,6 +3693,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), original)
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		return "down failed\n", errors.New("compose down failed")
 	}
@@ -3533,6 +3739,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSCENARIO_CODE=scenario_1010\n")
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		if strings.Contains(strings.Join(args, " "), "down --volumes --remove-orphans") {
 			return "down returned an error\n", errors.New("compose down uncertain")
@@ -3571,6 +3780,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSCENARIO_CODE=scenario_1010\n")
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		joined := strings.Join(args, " ")
 		switch {
@@ -3614,6 +3826,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	restarted.lifecycleJobs = newLifecycleJobManager()
 	restarted.operations = newOperationCoordinator(restarted.maintenanceFile, restarted.lifecycleJournalFile, restarted.lifecycleJobs)
 	restarted.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		if strings.Contains(strings.Join(args, " "), "gateway-api web-gateway") {
 			return "shared reload failed\n", errors.New("shared reload failed")
@@ -3632,6 +3847,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	}
 
 	restarted.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		return "verified\n", nil
 	}
@@ -3667,6 +3885,9 @@ func TestResetRepairVerifiesRuntimeDataAndFinalRegistryBeforeJournalClear(t *tes
 	}
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		if strings.Contains(strings.Join(args, " "), "gateway-api web-gateway") {
 			if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); strings.Contains(shared, `"repairRequired":true`) {
@@ -3752,6 +3973,9 @@ func TestResetRepairRetainsBarrierWhenRuntimeVerificationFails(t *testing.T) {
 			}
 			calls := &dockerCallRecorder{}
 			cfg.dockerRunner = func(args ...string) (string, error) {
+				if dockerPreflightProbe(args) {
+					return "29.0.0\n", nil
+				}
 				calls.record(args...)
 				return "ok\n", nil
 			}
@@ -3810,6 +4034,9 @@ func TestResetRepairDurablyMarksBarrierBeforeRepeatingVolumeRemoval(t *testing.T
 		t.Fatalf("advance reset journal: %v", err)
 	}
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		if strings.Contains(strings.Join(args, " "), "down --volumes --remove-orphans") {
 			if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); !strings.Contains(shared, `"repairRequired":true`) {
 				return "", errors.New("repair attempted volume removal before the durable repair barrier")
@@ -3849,6 +4076,9 @@ func TestResetRepairRetainsBarrierWhenSharedReloadVerificationFails(t *testing.T
 	}
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		return "ok\n", nil
 	}
@@ -3894,6 +4124,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	downStarted := make(chan struct{})
 	var downStartedOnce sync.Once
 	cfg.dockerRunnerContext = func(ctx context.Context, args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		if strings.Contains(strings.Join(args, " "), "down --volumes --remove-orphans") {
 			downStartedOnce.Do(func() { close(downStarted) })
@@ -3951,6 +4184,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	calls := &dockerCallRecorder{}
 	serverUpAttempts := 0
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		calls.record(args...)
 		call := strings.Join(args, " ")
 		if strings.Contains(call, "compose -p opensamguk-spep") && strings.Contains(call, " up -d") {
@@ -3995,6 +4231,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"before","generation":1,"gameApiUrl":"h
 	releasePatchReload := make(chan struct{})
 	var patchReloadOnce sync.Once
 	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
 		call := strings.Join(args, " ")
 		if strings.Contains(call, "gateway-api web-gateway") {
 			patchReloadOnce.Do(func() {
@@ -4100,6 +4339,13 @@ func (r *dockerCallRecorder) snapshot() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]string(nil), r.calls...)
+}
+
+// 도달성 프리플라이트(`docker version`)는 실제 docker에서 즉시 응답한다. compose 호출을
+// 실패시키거나 붙잡는 페이크가 프리플라이트까지 건드리면 관문에서 막히므로 먼저 통과시킨다.
+// 프리플라이트 실패 자체는 전용 테스트가 자기 스텁으로 검증한다.
+func dockerPreflightProbe(args []string) bool {
+	return len(args) > 0 && args[0] == "version"
 }
 
 func testConfig(t *testing.T) config {

@@ -159,6 +159,13 @@ nginx `/health`를 항상 확인하고,
 있으면 새 deployer 프로세스도 closed 상태로 부팅하며, 새 mutation은 `503`과 `Retry-After`를 받고, 진행 중인
 mutation은 취소된 context가 Docker runner에서 실제 반환할 때까지 drain한다.
 
+deployer는 socket-proxy 경유로만 Docker에 닿으므로, 모든 mutation admission(`create`/`delete`/`reset`/`deploy`/env
+patch)과 maintenance repair는 journal·env를 건드리기 전에 `docker version` 도달성 프리플라이트(3초)를 먼저 통과해야
+한다. Docker에 닿지 못하면 아무 일도 일어나지 않은 상태이므로 `503`과 한국어 사유로 깨끗이 실패하며, journal이나
+repair-required 잠금을 남기지 않는다. socket-proxy가 돌아오면 수동 repair 없이 그대로 다시 열린다. 같은 이유로
+`/readyz`도 Docker 도달성을 확인한다(`/healthz`는 liveness 그대로). 결과는 캐시하지 않는다 — workflow 폴링은 2초
+간격뿐이고, 캐시는 바로 그 게이트에서 진행 중인 장애를 숨긴다.
+
 create/delete/reset/deploy는 영속 상태를 바꾸기 전에 `servers/.deployer-lifecycle-journal`도 기록한다. journal이
 남은 채로 프로세스가 죽으면 deployer는 closed 상태와 `/readyz` `503`을 유지하고, leave로 다시 열 수 없다. loopback
 maintenance repair가 journal 종류에 맞는 recovery를 끝까지 검증한 뒤 journal을 지우고, 별도 maintenance marker도 없을 때만
