@@ -199,7 +199,10 @@ jobs:
           # socket-proxy만 죽어 있는 상태가 정확히 2026-08-04 장애였으므로 부트스트랩 여부와
           # 무관하게 보장한다. 누락되면 deployer의 모든 docker compose 호출이 exit 1로 죽고,
           # 서버 리셋이 down 단계에서 실패해 repair-required로 잠긴다.
-          run_bounded "$WORKFLOW_DEADLINE" 60 "${DEPLOYER_COMPOSE[@]}" up -d socket-proxy
+          if ! run_bounded "$WORKFLOW_DEADLINE" 300 "${DEPLOYER_COMPOSE[@]}" up -d socket-proxy; then
+            echo "::error::could not ensure the deployer socket-proxy; leaving maintenance marker closed"
+            exit 1
+          fi
 
           if [ "$DEPLOYER_BOOTSTRAP" = true ]; then
             run_bounded "$WORKFLOW_DEADLINE" 900 "${DEPLOYER_COMPOSE[@]}" build deployer
@@ -221,6 +224,25 @@ jobs:
               echo "::error::fresh deployer did not boot closed with maintenance-v1"
               exit 1
             fi
+          fi
+
+          # socket-proxy 컨테이너의 존재가 아니라 deployer -> socket-proxy -> Docker 도달성을 검증한다
+          # (socket-proxy에는 healthcheck가 없어 up -d는 crash-loop을 그대로 통과시킨다).
+          # 비부트스트랩 경로에서는 위 up -d 직후라 갓 생성된 socket-proxy가 아직 바인드
+          # 전일 수 있어 짧게 재시도한다.
+          socket_proxy_reachable=false
+          for ((attempt=1; attempt<=3; attempt++)); do
+            if docker_exec_bounded "$WORKFLOW_DEADLINE" 30 opensamguk-deployer docker version >/dev/null; then
+              socket_proxy_reachable=true
+              break
+            fi
+            if ! bounded_sleep "$WORKFLOW_DEADLINE" 2; then
+              break
+            fi
+          done
+          if [ "$socket_proxy_reachable" != true ]; then
+            echo "::error::deployer cannot reach Docker through socket-proxy; leaving maintenance marker closed"
+            exit 1
           fi
 
           if ! ensure_lifecycle_recovery; then
