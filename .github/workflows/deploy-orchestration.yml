@@ -164,6 +164,12 @@ jobs:
             -v "$STACK/.env:/workspace/.env:ro" \
             -v "$STACK/servers:/workspace/servers:ro" \
             opensamguk-deployer:local --check-registry-targets
+          # deployer는 docker.sock에 직접 붙지 않고 socket-proxy 경유로만 Docker에 접근한다
+          # (docker-compose.shared.yml: DOCKER_HOST=tcp://socket-proxy:2375 + depends_on).
+          # 아래 deployer 재생성은 --no-deps라 의존 서비스를 띄우지 않으므로 여기서 명시적으로
+          # 보장한다. 누락되면 deployer의 모든 docker compose 호출이 exit 1로 죽고, 서버
+          # 리셋이 down 단계에서 실패해 repair-required로 잠긴다(2026-08-04 장애).
+          run_bounded "$WORKFLOW_DEADLINE" 60 $COMPOSE up -d socket-proxy
           run_bounded "$WORKFLOW_DEADLINE" 300 $COMPOSE up -d --force-recreate --no-deps deployer
           if ! ensure_lifecycle_recovery; then
             exit 1
