@@ -2190,7 +2190,7 @@ func TestServerComposeMountsExternalScenarioOverridesReadOnly(t *testing.T) {
 // 무엇을 고르든 시드가 항상 60분으로 굳는다. 그 끊김을 여기서 막는다.
 //
 // game-api는 시드하지 않으므로(ScenarioSeedRunner는 game-engine 전용) 대상이 아니다.
-func TestServerComposePassesResetTurnTermToGameEngine(t *testing.T) {
+func TestServerComposePassesResetOptionsToGameEngine(t *testing.T) {
 	compose := readFile(t, filepath.Join("..", "docker-compose.server.yml"))
 	start := strings.Index(compose, "\n  game-engine:\n")
 	if start < 0 {
@@ -2203,32 +2203,65 @@ func TestServerComposePassesResetTurnTermToGameEngine(t *testing.T) {
 	}
 	engine = engine[:end]
 
-	const want = "RESET_TURNTERM: ${RESET_TURNTERM:-}"
-	if !strings.Contains(engine, want) {
-		t.Fatalf("game-engine must receive the reset turn term %q", want)
+	// 게임 엔진이 실제로 읽는 리셋 옵션. 이 목록이 곧 "엔진까지 도달한다"의 정의다.
+	// 나머지 리셋 키(sync/joinMode/tournamentTrig/autorun/reserve)는 아직 엔진에
+	// 소비자가 없으므로 일부러 뺀다 — 닿지 않는 값을 전달하는 척하지 않는다.
+	wired := []string{
+		"RESET_TURNTERM",
+		"RESET_FICTION",
+		"RESET_EXTEND",
+		"RESET_BLOCK_GENERAL_CREATE",
+		"RESET_NPCMODE",
+		"RESET_SHOW_IMG_LEVEL",
 	}
 
-	// 미설정의 의미(60분)는 게임 엔진(SeedBootstrap.DEFAULT_TURN_TERM)이 단독으로
-	// 소유한다. compose가 여기서 숫자를 박으면 정본이 둘이 되고 한쪽만 바뀌었을 때
-	// 조용히 갈라진다 — 이 변경이 닫는 결함과 같은 실패 양상이다.
-	for _, line := range strings.Split(engine, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(trimmed, "RESET_TURNTERM:") {
-			continue
+	for _, key := range wired {
+		want := key + ": ${" + key + ":-}"
+		if !strings.Contains(engine, want) {
+			t.Fatalf("game-engine must receive the reset option %q", want)
 		}
-		if trimmed != want {
-			t.Fatalf("RESET_TURNTERM must carry no compose-side default: got %q, want %q", trimmed, want)
+
+		// 미설정의 의미(PHP install.php 기본값)는 게임 엔진(SeedBootstrap의
+		// DEFAULT_TURN_TERM / PHP_DEFAULT_*)이 단독으로 소유한다. compose가 여기서
+		// 숫자를 박으면 정본이 둘이 되고 한쪽만 바뀌었을 때 조용히 갈라진다 —
+		// 이 변경이 닫는 결함과 같은 실패 양상이다.
+		for _, line := range strings.Split(engine, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if !strings.HasPrefix(trimmed, key+":") {
+				continue
+			}
+			if trimmed != want {
+				t.Fatalf("%s must carry no compose-side default: got %q, want %q", key, trimmed, want)
+			}
 		}
 	}
 
 	// deployer가 쓰는 키 이름과 compose가 읽는 키 이름이 같은지도 함께 본다.
-	// 한쪽만 이름이 바뀌면 보간이 조용히 빈 값이 되어 다시 60분으로 굳는다.
-	updates, err := resetEnvUpdates(resetServerRequest{ScenarioCode: "scenario_1002", Generation: "2", TurnTerm: "30"})
+	// 한쪽만 이름이 바뀌면 보간이 조용히 빈 값이 되어 다시 기본값으로 굳는다.
+	updates, err := resetEnvUpdates(resetServerRequest{
+		ScenarioCode:       "scenario_1002",
+		Generation:         "2",
+		TurnTerm:           "30",
+		Fiction:            "0",
+		Extend:             "0",
+		BlockGeneralCreate: "2",
+		NPCMode:            "1",
+		ShowImgLevel:       "0",
+	})
 	if err != nil {
 		t.Fatalf("resetEnvUpdates error = %v", err)
 	}
-	if got := updates["RESET_TURNTERM"]; got != "30" {
-		t.Fatalf("deployer must write RESET_TURNTERM=30, got %q", got)
+	for key, want := range map[string]string{
+		"RESET_TURNTERM":             "30",
+		"RESET_FICTION":              "0",
+		"RESET_EXTEND":               "0",
+		"RESET_BLOCK_GENERAL_CREATE": "2",
+		"RESET_NPCMODE":              "1",
+		"RESET_SHOW_IMG_LEVEL":       "0",
+	} {
+		if got := updates[key]; got != want {
+			t.Fatalf("deployer must write %s=%s, got %q", key, want, got)
+		}
 	}
 }
 

@@ -84,6 +84,14 @@ services:
       # 기본값을 비워 두는 것은 의도적이다 — 미설정의 의미(60분)는 게임 엔진
       # (SeedBootstrap.DEFAULT_TURN_TERM)이 단독으로 소유해야 두 곳이 갈라지지 않는다.
       RESET_TURNTERM: ${RESET_TURNTERM:-}
+      # 같은 리셋이 고른 나머지 시나리오 옵션. 위와 같은 이유로 기본값을 비워 둔다 —
+      # 미설정의 의미(PHP install.php 기본값)는 게임 엔진(SeedBootstrap의 PHP_DEFAULT_*)이
+      # 단독으로 소유해야 compose와 엔진이 갈라지지 않는다.
+      RESET_FICTION: ${RESET_FICTION:-}
+      RESET_EXTEND: ${RESET_EXTEND:-}
+      RESET_BLOCK_GENERAL_CREATE: ${RESET_BLOCK_GENERAL_CREATE:-}
+      RESET_NPCMODE: ${RESET_NPCMODE:-}
+      RESET_SHOW_IMG_LEVEL: ${RESET_SHOW_IMG_LEVEL:-}
       JAVA_OPTS: "-XX:+UseG1GC -XX:MaxRAMPercentage=60.0 -XX:InitialRAMPercentage=40.0 -Djava.security.egd=file:/dev/./urandom"
     depends_on:
       game-postgres:
