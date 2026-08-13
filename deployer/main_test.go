@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -2094,6 +2095,370 @@ func TestPublicServerIDRejectsReservedGameRoutesAfterCanonicalization(t *testing
 func TestPublicServerIDRejectsAllServerSentinelAfterCanonicalization(t *testing.T) {
 	if _, _, err := normalizeCreateServerID("ALL"); err == nil || !strings.Contains(err.Error(), `"all"는 전체 서버 예약어`) {
 		t.Fatalf("all-server sentinel error = %v", err)
+	}
+}
+
+func TestV1ServerDefinitionRejectsV2ControlsWhenValidatingTarget(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+	}{
+		{name: "v2 feature flag", key: "V2_ENABLED"},
+		{name: "v2 namespaced setting", key: "V2_WORLD_ID"},
+		{name: "spring profile", key: "SPRING_PROFILES_ACTIVE"},
+		{name: "spring flyway location", key: "SPRING_FLYWAY_LOCATIONS"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Given
+			cfg := testConfig(t)
+			target, err := cfg.serverTargetForID("pep")
+			if err != nil {
+				t.Fatalf("serverTargetForID: %v", err)
+			}
+			writeEnv(t, target.EnvFile, "SERVER_ID=pep\n"+tt.key+"=enabled\n")
+
+			// When
+			response := envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodGet, "/env/server?id=pep", "")
+
+			// Then
+			if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), tt.key) {
+				t.Fatalf("server env response = status %d body %q, want rejected key %q", response.Code, response.Body.String(), tt.key)
+			}
+		})
+	}
+}
+
+func TestV1ServerDefinitionAcceptsV1ControlsWhenValidatingTarget(t *testing.T) {
+	// Given
+	cfg := testConfig(t)
+	target, err := cfg.serverTargetForID("pep")
+	if err != nil {
+		t.Fatalf("serverTargetForID: %v", err)
+	}
+	writeEnv(t, target.EnvFile, "SERVER_ID=pep\nOPENSAMGUK_WORLD_ID=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_DIR=/data/scenarios\n")
+
+	// When
+	_, err = cfg.validateServerTarget(target)
+
+	// Then
+	if err != nil {
+		t.Fatalf("validateServerTarget: %v", err)
+	}
+}
+
+func TestV1ServerDefinitionRejectsV2ControlsWhenPreparingDockerTarget(t *testing.T) {
+	// Given
+	cfg := testConfig(t)
+	target, err := cfg.serverTargetForID("pep")
+	if err != nil {
+		t.Fatalf("serverTargetForID: %v", err)
+	}
+	writeEnv(t, target.EnvFile, "SERVER_ID=pep\nV2_ENABLED=enabled\n")
+
+	// When
+	_, err = cfg.validateDockerServerTarget(target.Project, target.EnvFile, false)
+
+	// Then
+	if err == nil || !strings.Contains(err.Error(), "V2_ENABLED") {
+		t.Fatalf("validateDockerServerTarget error = %v, want V2_ENABLED rejection", err)
+	}
+}
+
+func TestV1ServerDefinitionRejectsUnmanagedSyntaxBeforeDocker(t *testing.T) {
+	tests := []struct {
+		name       string
+		envFile    string
+		definition string
+		wantError  string
+	}{
+		{
+			name:       "exported v2 control in canonical definition",
+			definition: "SERVER_ID=pep\nexport V2_ENABLED=enabled\n",
+			wantError:  "line 2",
+		},
+		{
+			name:       "exported identity override in canonical definition",
+			definition: "SERVER_ID=pep\nexport SERVER_ID=other\n",
+			wantError:  "line 2",
+		},
+		{
+			name:       "duplicate identity in staged definition",
+			envFile:    "staged-server.env",
+			definition: "SERVER_ID=pep\nSERVER_ID=other\n",
+			wantError:  "SERVER_ID",
+		},
+		{
+			name:       "exported v2 control in staged definition",
+			envFile:    "staged-server.env",
+			definition: "SERVER_ID=pep\nexport V2_ENABLED=enabled\n",
+			wantError:  "line 2",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Given
+			cfg := testConfig(t)
+			target, err := cfg.serverTargetForID("pep")
+			if err != nil {
+				t.Fatalf("serverTargetForID: %v", err)
+			}
+			envFile := target.EnvFile
+			if tt.envFile != "" {
+				envFile = filepath.Join(cfg.serversDir, tt.envFile)
+			}
+			writeEnv(t, envFile, tt.definition)
+			calls := &dockerCallRecorder{}
+			cfg.dockerRunner = func(args ...string) (string, error) {
+				calls.record(args...)
+				return "", errors.New("server definition rejection must precede Docker")
+			}
+
+			// When
+			_, err = cfg.pullStateless(context.Background(), target.Project, envFile)
+
+			// Then
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("pullStateless error = %v, want %q", err, tt.wantError)
+			}
+			if got := calls.count(); got != 0 {
+				t.Fatalf("invalid definition reached Docker %d time(s): %q", got, calls.snapshot())
+			}
+		})
+	}
+}
+
+func TestResetRejectsV2DefinitionBeforeDockerAdmission(t *testing.T) {
+	// Given
+	cfg := testConfig(t)
+	target, err := cfg.serverTargetForID("pep")
+	if err != nil {
+		t.Fatalf("serverTargetForID: %v", err)
+	}
+	writeEnv(t, target.EnvFile, "SERVER_ID=pep\nV2_ENABLED=enabled\n")
+	calls := &dockerCallRecorder{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		calls.record(args...)
+		return "", errors.New("invalid definition must not admit Docker")
+	}
+
+	// When
+	response := envRequest(t, cfg.withAuth(cfg.handleServerReset), http.MethodPost, "/servers/reset", `{"id":"pep","confirm":"RESET pep"}`)
+
+	// Then
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "V2_ENABLED") {
+		t.Fatalf("reset response = status %d body %q, want V2 rejection", response.Code, response.Body.String())
+	}
+	if got := calls.count(); got != 0 {
+		t.Fatalf("invalid reset definition reached Docker %d time(s): %q", got, calls.snapshot())
+	}
+}
+
+func TestLifecycleRecoveryRejectsV2DefinitionBeforeDockerPreflight(t *testing.T) {
+	// Given
+	cfg := testConfig(t)
+	target, err := cfg.serverTargetForID("pep")
+	if err != nil {
+		t.Fatalf("serverTargetForID: %v", err)
+	}
+	writeEnv(t, target.EnvFile, "SERVER_ID=pep\nV2_ENABLED=enabled\n")
+	if err := cfg.writeLifecycleJournal("deploy", target); err != nil {
+		t.Fatalf("write lifecycle journal: %v", err)
+	}
+	calls := &dockerCallRecorder{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		calls.record(args...)
+		return "", errors.New("invalid recovery definition must not preflight Docker")
+	}
+
+	// When
+	err = cfg.repairLifecycleJournal()
+
+	// Then
+	if err == nil || !strings.Contains(err.Error(), "V2_ENABLED") {
+		t.Fatalf("repairLifecycleJournal error = %v, want V2 rejection", err)
+	}
+	if got := calls.count(); got != 0 {
+		t.Fatalf("invalid recovery definition reached Docker %d time(s): %q", got, calls.snapshot())
+	}
+	if _, statErr := os.Stat(cfg.lifecycleJournalFile); statErr != nil {
+		t.Fatalf("invalid recovery changed lifecycle journal: %v", statErr)
+	}
+}
+
+func TestResetRecoveryRejectsV2DefinitionBeforeApplyingResetTarget(t *testing.T) {
+	cfg := testConfig(t)
+	target, err := cfg.serverTargetForID("pep")
+	if err != nil {
+		t.Fatalf("serverTargetForID: %v", err)
+	}
+	original := "SERVER_ID=pep\nV2_ENABLED=enabled\n"
+	writeEnv(t, target.EnvFile, original)
+	journal := lifecycleJournal{
+		Operation: "reset",
+		Stage:     lifecycleJournalStagePrepared,
+		ResetTarget: &resetLifecycleTarget{
+			ScenarioCode:        "scenario_1002",
+			Generation:          2,
+			ScenarioSeedEnabled: true,
+		},
+	}
+
+	err = cfg.prepareResetRecovery(journal, target)
+	if err == nil || !strings.Contains(err.Error(), "V2_ENABLED") {
+		t.Fatalf("prepareResetRecovery error = %v, want V2 rejection", err)
+	}
+	after, readErr := os.ReadFile(target.EnvFile)
+	if readErr != nil {
+		t.Fatalf("read reset definition: %v", readErr)
+	}
+	if string(after) != original {
+		t.Fatal("invalid reset recovery changed the server definition")
+	}
+}
+
+func TestServerComposeEnvironmentDropsAmbientDefinitionControls(t *testing.T) {
+	cfg := testConfig(t)
+	environment := cfg.serverComposeEnvironment([]string{
+		"PATH=/usr/bin",
+		"DOCKER_HOST=tcp://docker-proxy:2375",
+		"SERVER_ID=other",
+		"IMAGE_TAG=other-tag",
+		"V2_ENABLED=true",
+		"SPRING_PROFILES_ACTIVE=v2",
+		"COMPOSE_ENV_FILES=unexpected",
+		"COMPOSE_HOST_DIR=/ambient-host",
+		"PWD=/ambient-working-directory",
+	})
+	values := map[string]string{}
+	for _, entry := range environment {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			t.Fatalf("server compose environment retained malformed entry")
+		}
+		values[key] = value
+	}
+	for _, key := range []string{
+		"SERVER_ID",
+		"IMAGE_TAG",
+		"V2_ENABLED",
+		"SPRING_PROFILES_ACTIVE",
+		"COMPOSE_ENV_FILES",
+		"PWD",
+	} {
+		if _, exists := values[key]; exists {
+			t.Fatalf("server compose child inherited %s", key)
+		}
+	}
+	if values["DOCKER_HOST"] != "tcp://docker-proxy:2375" {
+		t.Fatalf("server compose child lost Docker endpoint")
+	}
+	if values["PATH"] != "/usr/bin" {
+		t.Fatalf("server compose child lost executable path")
+	}
+	if values["COMPOSE_HOST_DIR"] != "/synthetic-host" {
+		t.Fatalf("server compose child host directory = %q", values["COMPOSE_HOST_DIR"])
+	}
+}
+
+func TestRunServerDockerContextSanitizesChildEnvironment(t *testing.T) {
+	cfg := testConfig(t)
+	bin := t.TempDir()
+	writeExecutable(t, filepath.Join(bin, "docker"), `#!/bin/sh
+printf 'SERVER_ID=%s\n' "${SERVER_ID-absent}"
+printf 'IMAGE_TAG=%s\n' "${IMAGE_TAG-absent}"
+printf 'V2_ENABLED=%s\n' "${V2_ENABLED-absent}"
+printf 'SPRING_PROFILES_ACTIVE=%s\n' "${SPRING_PROFILES_ACTIVE-absent}"
+printf 'COMPOSE_ENV_FILES=%s\n' "${COMPOSE_ENV_FILES-absent}"
+printf 'COMPOSE_HOST_DIR=%s\n' "${COMPOSE_HOST_DIR-absent}"
+printf 'DOCKER_HOST=%s\n' "${DOCKER_HOST-absent}"
+`)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("SERVER_ID", "other")
+	t.Setenv("IMAGE_TAG", "other-tag")
+	t.Setenv("V2_ENABLED", "true")
+	t.Setenv("SPRING_PROFILES_ACTIVE", "v2")
+	t.Setenv("COMPOSE_ENV_FILES", "unexpected")
+	t.Setenv("COMPOSE_HOST_DIR", "/ambient-host")
+	t.Setenv("DOCKER_HOST", "tcp://docker-proxy:2375")
+
+	out, err := cfg.runServerDockerContext(context.Background(), "version")
+	if err != nil {
+		t.Fatalf("runServerDockerContext: %v", err)
+	}
+	values := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			t.Fatalf("docker child emitted malformed environment line")
+		}
+		values[key] = value
+	}
+	for _, key := range []string{
+		"SERVER_ID",
+		"IMAGE_TAG",
+		"V2_ENABLED",
+		"SPRING_PROFILES_ACTIVE",
+		"COMPOSE_ENV_FILES",
+	} {
+		if values[key] != "absent" {
+			t.Fatalf("docker child inherited %s", key)
+		}
+	}
+	if values["COMPOSE_HOST_DIR"] != "/synthetic-host" {
+		t.Fatalf("docker child host directory = %q", values["COMPOSE_HOST_DIR"])
+	}
+	if values["DOCKER_HOST"] != "tcp://docker-proxy:2375" {
+		t.Fatalf("docker child lost Docker endpoint")
+	}
+}
+
+func TestV1ServerComposeInterpolationKeysAreSanitized(t *testing.T) {
+	compose := readFile(t, filepath.Join("..", "docker-compose.server.yml"))
+	interpolationKey := regexp.MustCompile(`\$\{([A-Z][A-Z0-9_]*)`)
+	for _, match := range interpolationKey.FindAllStringSubmatch(compose, -1) {
+		if !isServerComposeEnvironmentOverride(match[1]) {
+			t.Fatalf("server compose interpolation key %q is not sanitized", match[1])
+		}
+	}
+}
+
+func TestV1ServerComposeExcludesV2ControlsWhenSelectingServices(t *testing.T) {
+	// Given
+	compose := readFile(t, filepath.Join("..", "docker-compose.server.yml"))
+	controls := []string{
+		"V2_",
+		"SPRING_FLYWAY_LOCATIONS:",
+		"SPRING_PROFILES_ACTIVE:",
+	}
+
+	// When
+	for _, service := range []struct {
+		name  string
+		until string
+	}{
+		{name: "game-engine", until: "\n  game-api:\n"},
+		{name: "game-api", until: "\n  web-game:\n"},
+		{name: "web-game", until: "\nvolumes:\n"},
+	} {
+		start := strings.Index(compose, "\n  "+service.name+":\n")
+		if start < 0 {
+			t.Fatalf("compose missing %s service", service.name)
+		}
+		block := compose[start:]
+		end := strings.Index(block, service.until)
+		if end < 0 {
+			t.Fatalf("compose missing boundary after %s service", service.name)
+		}
+
+		// Then
+		for _, control := range controls {
+			if strings.Contains(block[:end], control) {
+				t.Fatalf("%s must not receive v2 control %q", service.name, control)
+			}
+		}
 	}
 }
 
@@ -4465,6 +4830,7 @@ func testConfig(t *testing.T) config {
 	cfg := config{
 		token:                "test-token",
 		composeDir:           root,
+		composeHostDir:       "/synthetic-host",
 		serversDir:           serversDir,
 		composeServer:        filepath.Join(root, "docker-compose.server.yml"),
 		composeShared:        filepath.Join(root, "docker-compose.shared.yml"),
