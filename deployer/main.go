@@ -152,6 +152,55 @@ var serverEnvAllowlist = map[string]envFieldSpec{
 	"RESET_PRE_RESERVE_OPEN":     {Description: "리셋: 가오픈 예약"},
 }
 
+var v2ServerDefinitionKeys = map[string]struct{}{
+	"SPRING_FLYWAY_LOCATIONS": {},
+	"SPRING_PROFILES_ACTIVE":  {},
+}
+
+// serverComposeInterpolationKeys lists every variable the v1 server template
+// interpolates. A server compose child must not inherit these values from the
+// deployer process because Compose gives its shell environment precedence over
+// --env-file.
+var serverComposeInterpolationKeys = map[string]struct{}{
+	"COMPOSE_HOST_DIR":           {},
+	"GATEWAY_API_URL":            {},
+	"GAME_API_PORT":              {},
+	"GAME_API_URL":               {},
+	"GAME_POSTGRES_DB":           {},
+	"GAME_POSTGRES_PASSWORD":     {},
+	"GAME_POSTGRES_USER":         {},
+	"GHCR_OWNER":                 {},
+	"GHCR_REGISTRY":              {},
+	"IMAGE_TAG":                  {},
+	"JWT_SECRET":                 {},
+	"OPENSAMGUK_WORLD_ID":        {},
+	"PWD":                        {},
+	"RESET_BLOCK_GENERAL_CREATE": {},
+	"RESET_EXTEND":               {},
+	"RESET_FICTION":              {},
+	"RESET_NPCMODE":              {},
+	"RESET_SHOW_IMG_LEVEL":       {},
+	"RESET_TURNTERM":             {},
+	"SCENARIO_CODE":              {},
+	"SCENARIO_DIR":               {},
+	"SCENARIO_SEED_ENABLED":      {},
+	"SERVER_GENERATION":          {},
+	"SERVER_ID":                  {},
+	"SERVER_NAME":                {},
+	"TURN_PROFILE_NAME":          {},
+	"WEB_GAME_PORT":              {},
+	"WEB_GAME_TAG":               {},
+}
+
+var serverComposeProcessControlKeys = map[string]struct{}{
+	"COMPOSE_DISABLE_ENV_FILE": {},
+	"COMPOSE_ENV_FILES":        {},
+	"COMPOSE_FILE":             {},
+	"COMPOSE_PATH_SEPARATOR":   {},
+	"COMPOSE_PROFILES":         {},
+	"COMPOSE_PROJECT_NAME":     {},
+}
+
 var resetLifecycleUpdateKeys = []string{
 	"SCENARIO_CODE",
 	"SCENARIO_SEED_ENABLED",
@@ -214,6 +263,7 @@ var sharedEnvAllowlist = map[string]envFieldSpec{
 type config struct {
 	token                     string // Bearer 인증 토큰
 	composeDir                string // compose 파일 디렉터리(/workspace)
+	composeHostDir            string
 	serversDir                string // 서버 env 파일 디렉터리(/workspace/servers)
 	composeServer             string // 서버 compose 파일 절대경로
 	composeShared             string
@@ -790,13 +840,11 @@ func (c config) repairLifecycleJournal() error {
 	if c.operations == nil {
 		return errors.New("operation coordinator unavailable")
 	}
-	// 복구도 docker 없이는 한 발짝도 못 나간다. reset 분기는 prepareResetRecovery에서
-	// env를 먼저 다시 쓰므로, 레코버리 리스를 잡기 전에 도달성부터 확인한다.
-	if err := c.dockerPreflight(context.Background()); err != nil {
-		return err
-	}
 	lease, err := c.operations.beginRecovery()
 	if err != nil {
+		if preflightErr := c.dockerPreflight(context.Background()); preflightErr != nil {
+			return preflightErr
+		}
 		return err
 	}
 	defer lease.Done()
@@ -810,6 +858,16 @@ func (c config) repairLifecycleJournal() error {
 	target, err := c.serverTargetForID(journal.ServerID)
 	if err != nil || target.Project != journal.Project {
 		return errors.New("lifecycle recovery target is invalid")
+	}
+	if _, envErr := os.Stat(target.EnvFile); envErr == nil {
+		if _, err := c.validateServerTarget(target); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(envErr) || (journal.Operation != "create" && journal.Operation != "delete") {
+		return envErr
+	}
+	if err := c.dockerPreflight(lease.Context()); err != nil {
+		return err
 	}
 
 	switch journal.Operation {
@@ -935,6 +993,9 @@ func (c config) prepareResetRecovery(journal lifecycleJournal, target serverTarg
 		if err != nil {
 			return err
 		}
+	}
+	if _, err := c.validateServerTarget(target); err != nil {
+		return err
 	}
 	if err := applyResetLifecycleTarget(target.EnvFile, resetTarget); err != nil {
 		return err
@@ -1152,6 +1213,7 @@ func loadConfig() config {
 	c := config{
 		token:                  os.Getenv("DEPLOYER_TOKEN"),
 		composeDir:             envOr("COMPOSE_DIR", "/workspace"),
+		composeHostDir:         envOr("COMPOSE_HOST_DIR", envOr("PWD", ".")),
 		serversDir:             serversDir,
 		composeServer:          envOr("COMPOSE_SERVER_FILE", "/workspace/docker-compose.server.yml"),
 		composeShared:          envOr("COMPOSE_SHARED_FILE", "/workspace/docker-compose.shared.yml"),
@@ -1520,6 +1582,9 @@ func (c config) validateServerEnvFile(target serverTarget, envFile string) (map[
 			declaredID = line.Value
 		}
 	}
+	if err := validateV1ServerDefinition(lines); err != nil {
+		return nil, err
+	}
 	if serverIDCount != 1 || declaredID != target.ID {
 		envLabel := c.serverEnvDisplayPath(target)
 		if filepath.Clean(envFile) != filepath.Clean(target.EnvFile) {
@@ -1528,6 +1593,23 @@ func (c config) validateServerEnvFile(target serverTarget, envFile string) (map[
 		return nil, fmt.Errorf("SERVER_ID in %s must exactly match canonical public id %s", envLabel, target.ID)
 	}
 	return envValuesFromLines(lines), nil
+}
+
+func validateV1ServerDefinition(lines []envLine) error {
+	for index, line := range lines {
+		if !line.IsKV {
+			trimmed := strings.TrimSpace(line.Raw)
+			if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+				return fmt.Errorf("v1 server definition has unmanaged syntax on line %d", index+1)
+			}
+			continue
+		}
+		_, isV2Key := v2ServerDefinitionKeys[line.Key]
+		if strings.HasPrefix(line.Key, "V2_") || isV2Key {
+			return fmt.Errorf("v1 server definition must not set %s", line.Key)
+		}
+	}
+	return nil
 }
 
 func (c config) validateDockerServerTarget(project string, envFile string, allowStagedEnv bool) (serverTarget, error) {
@@ -2880,6 +2962,9 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 	if req.Confirm != "RESET "+id {
 		return createServerResponse{OK: false, ID: id, Detail: "리셋 확인 문구가 일치하지 않습니다."}, http.StatusBadRequest
 	}
+	if _, err := c.validateServerTarget(target); err != nil {
+		return createServerResponse{OK: false, ID: id, Detail: fmt.Sprintf("서버 env 식별자 검증 실패: %v", err)}, http.StatusConflict
+	}
 	lease, err := c.beginMutation("")
 	if err != nil {
 		detail, status := mutationAdmissionFailure(err)
@@ -2941,6 +3026,9 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 			return detail, fmt.Errorf("reset crossed irreversible volume-removal boundary; new desired state was retained and marked repair-required: %w", cause)
 		}
 		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		if _, err := c.validateServerTarget(target); err != nil {
 			return "", err
 		}
 		if err := c.writeResetLifecycleJournal(target, resetTarget); err != nil {
@@ -4108,7 +4196,7 @@ func (c config) upServerStack(ctx context.Context, project, envFile string) (str
 	if _, err := c.validateDockerServerTarget(project, envFile, false); err != nil {
 		return "", err
 	}
-	return c.runDockerContext(ctx,
+	return c.runServerDockerContext(ctx,
 		"compose", "-p", project,
 		"--env-file", envFile,
 		"-f", c.composeServer,
@@ -4137,7 +4225,7 @@ func (c config) downServerStack(ctx context.Context, project, envFile string) (s
 	if _, err := c.validateDockerServerTarget(project, envFile, false); err != nil {
 		return "", err
 	}
-	return c.runDockerContext(ctx,
+	return c.runServerDockerContext(ctx,
 		"compose", "-p", project,
 		"--env-file", envFile,
 		"-f", c.composeServer,
@@ -4274,7 +4362,7 @@ func (c config) pullStateless(ctx context.Context, project, envFile string) (str
 		"-f", c.composeServer,
 		"pull",
 	}, statelessServices...)
-	if out, err := c.runDockerContext(ctx, pullArgs...); err != nil {
+	if out, err := c.runServerDockerContext(ctx, pullArgs...); err != nil {
 		sb.WriteString("=== pull 실패 ===\n")
 		sb.WriteString(out)
 		return sb.String(), err
@@ -4298,7 +4386,7 @@ func (c config) upStateless(ctx context.Context, project, envFile string) (strin
 		"-f", c.composeServer,
 		"up", "-d", "--force-recreate", "--no-deps",
 	}, statelessServices...)
-	if out, err := c.runDockerContext(ctx, upArgs...); err != nil {
+	if out, err := c.runServerDockerContext(ctx, upArgs...); err != nil {
 		sb.WriteString("\n=== up 실패 ===\n")
 		sb.WriteString(out)
 		return sb.String(), err
@@ -4339,7 +4427,44 @@ func (c config) runDocker(args ...string) (string, error) {
 	return c.runDockerContext(context.Background(), args...)
 }
 
+func isServerComposeEnvironmentOverride(key string) bool {
+	if strings.HasPrefix(key, "V2_") {
+		return true
+	}
+	if _, exists := v2ServerDefinitionKeys[key]; exists {
+		return true
+	}
+	if _, exists := serverComposeInterpolationKeys[key]; exists {
+		return true
+	}
+	_, exists := serverComposeProcessControlKeys[key]
+	return exists
+}
+
+func (c config) serverComposeEnvironment(parent []string) []string {
+	environment := make([]string, 0, len(parent)+1)
+	for _, entry := range parent {
+		key, _, hasValue := strings.Cut(entry, "=")
+		if !hasValue || isServerComposeEnvironmentOverride(key) {
+			continue
+		}
+		environment = append(environment, entry)
+	}
+	if c.composeHostDir != "" {
+		environment = append(environment, "COMPOSE_HOST_DIR="+c.composeHostDir)
+	}
+	return environment
+}
+
+func (c config) runServerDockerContext(parent context.Context, args ...string) (string, error) {
+	return c.runDockerContextWithEnvironment(parent, c.serverComposeEnvironment(os.Environ()), args...)
+}
+
 func (c config) runDockerContext(parent context.Context, args ...string) (string, error) {
+	return c.runDockerContextWithEnvironment(parent, nil, args...)
+}
+
+func (c config) runDockerContextWithEnvironment(parent context.Context, environment []string, args ...string) (string, error) {
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -4364,6 +4489,9 @@ func (c config) runDockerContext(parent context.Context, args ...string) (string
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Dir = c.composeDir
+	if environment != nil {
+		cmd.Env = environment
+	}
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
