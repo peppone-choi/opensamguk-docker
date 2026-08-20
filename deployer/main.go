@@ -77,8 +77,12 @@ var (
 // 스테이트리스 bounce 대상 — game-engine은 의도적으로 제외.
 var statelessServices = envList("DEPLOYER_STATELESS_SERVICES", []string{"game-api", "web-game"})
 var requiredPromoteImagePrefixes = []string{"game-api-", "game-engine-", "web-game-"}
-var sharedEnvServices = envList("DEPLOYER_SHARED_ENV_SERVICES", []string{"gateway-api", "web-gateway", "nginx", "deployer"})
-var sharedRegistryReloadServices = envList("DEPLOYER_SHARED_REGISTRY_RELOAD_SERVICES", []string{"gateway-api", "web-gateway", "nginx"})
+var sharedEnvServices = envList("DEPLOYER_SHARED_ENV_SERVICES", []string{"gateway-api", "board-api", "web-gateway", "nginx", "deployer"})
+
+// gateway-api owns the DB-backed registry and persists create/delete only after the deployer
+// returns confirmed success. Restarting it inside that request can sever the response before
+// the DB transaction runs. Only environment-backed web/nginx consumers are reloaded here.
+var sharedRegistryReloadServices = envList("DEPLOYER_SHARED_REGISTRY_RELOAD_SERVICES", []string{"web-gateway", "nginx"})
 var reservedPublicServerIDs = map[string]struct{}{
 	"all": {},
 }
@@ -1646,6 +1650,46 @@ func (c config) validateRegisteredServerTargets() error {
 	return nil
 }
 
+func (c config) validateRunningServerRegistry(ctx context.Context) error {
+	registry, err := c.readRegistry()
+	if err != nil {
+		return err
+	}
+	registered := make(map[string]struct{}, len(registry))
+	for _, entry := range registry {
+		registered[entry.ID] = struct{}{}
+	}
+	output, err := c.runDockerContext(ctx, "ps", "--filter", "status=running", "--format", `{{.Label "com.docker.compose.project"}}`)
+	if err != nil {
+		return err
+	}
+	seenProjects := map[string]struct{}{}
+	for _, rawProject := range strings.Split(output, "\n") {
+		project := strings.TrimSpace(rawProject)
+		if project == "" || project == "opensamguk-shared" {
+			continue
+		}
+		if _, seen := seenProjects[project]; seen {
+			continue
+		}
+		seenProjects[project] = struct{}{}
+		if !projectRe.MatchString(project) {
+			continue
+		}
+		target, err := c.serverTargetForProject(project)
+		if err != nil {
+			return err
+		}
+		if _, exists := registered[target.ID]; !exists {
+			return fmt.Errorf("running server project %q is missing from SERVER_REGISTRY_JSON", project)
+		}
+		if _, err := c.validateServerTarget(target); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // --- 응답 타입 ---
 
 type statusResponse struct {
@@ -1779,6 +1823,9 @@ type envLine struct {
 
 func main() {
 	cfg := loadConfig()
+	if len(os.Args) == 2 && os.Args[1] == "--check-running-registry-targets" {
+		os.Exit(checkRunningRegistryTargetsCommand(cfg, os.Stderr))
+	}
 	if len(os.Args) == 2 && os.Args[1] == "--check-registry-targets" {
 		os.Exit(checkRegistryTargetsCommand(cfg, os.Stderr))
 	}
@@ -1789,7 +1836,7 @@ func main() {
 		os.Exit(authenticatedHTTPCommand(cfg, os.Args[2], os.Args[3], os.Stdin, os.Stdout, os.Stderr))
 	}
 	if len(os.Args) != 1 {
-		log.Fatal("usage: deployer [--check-registry-targets|--check-registry|--authenticated-http METHOD PATH]")
+		log.Fatal("usage: deployer [--check-running-registry-targets|--check-registry-targets|--check-registry|--authenticated-http METHOD PATH]")
 	}
 	if cfg.token == "" {
 		log.Fatal("DEPLOYER_TOKEN 미설정 — 인증 토큰 필수")
@@ -1906,6 +1953,19 @@ func checkRegistryTargetsCommand(c config, output io.Writer) int {
 		return 1
 	}
 	fmt.Fprintln(output, "registry target validation passed")
+	return 0
+}
+
+func checkRunningRegistryTargetsCommand(c config, output io.Writer) int {
+	if err := c.validateRegisteredServerTargets(); err != nil {
+		fmt.Fprintln(output, "running registry target validation failed")
+		return 1
+	}
+	if err := c.validateRunningServerRegistry(context.Background()); err != nil {
+		fmt.Fprintln(output, "running registry target validation failed")
+		return 1
+	}
+	fmt.Fprintln(output, "running registry target validation passed")
 	return 0
 }
 

@@ -22,6 +22,15 @@ import (
 	"time"
 )
 
+func TestDefaultSharedServiceBoundaries(t *testing.T) {
+	if got, want := strings.Join(sharedEnvServices, ","), "gateway-api,board-api,web-gateway,nginx,deployer"; got != want {
+		t.Fatalf("shared env services = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(sharedRegistryReloadServices, ","), "web-gateway,nginx"; got != want {
+		t.Fatalf("shared registry reload services = %q, want %q", got, want)
+	}
+}
+
 func TestServerEnvGetPatchHappyPath(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "# server\nSERVER_ID=pep\nIMAGE_TAG=v1\nGAME_API_PORT=8101\nJWT_SECRET=old-secret\n")
@@ -147,7 +156,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 		if dockerPreflightProbe(args) {
 			return "29.0.0\n", nil
 		}
-		if strings.Contains(strings.Join(args, " "), "gateway-api web-gateway") {
+		if strings.Contains(strings.Join(args, " "), "up -d --no-deps web-gateway") {
 			enteredOnce.Do(func() { close(enteredReload) })
 			<-releaseReload
 		}
@@ -501,7 +510,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 		if dockerPreflightProbe(args) {
 			return "29.0.0\n", nil
 		}
-		if strings.Contains(strings.Join(args, " "), "gateway-api web-gateway") {
+		if strings.Contains(strings.Join(args, " "), "up -d --no-deps web-gateway") {
 			return "reload failed\n", errors.New("shared registry reload failed")
 		}
 		return "ok\n", nil
@@ -999,7 +1008,7 @@ func TestResetRepairRestoresJournaledTargetAcrossPreparedCrashBoundaries(t *test
 				t.Fatalf("prepared crash repair retained journal: %v", err)
 			}
 			recorded := calls.snapshot()
-			if len(recorded) != 4 || !strings.Contains(recorded[0], "down --volumes --remove-orphans") || !strings.Contains(recorded[1], "up -d") || !strings.Contains(recorded[2], "gateway-api web-gateway") || !strings.Contains(recorded[3], "--force-recreate --no-deps nginx") {
+			if len(recorded) != 4 || !strings.Contains(recorded[0], "down --volumes --remove-orphans") || !strings.Contains(recorded[1], "up -d") || !strings.Contains(recorded[2], "up -d --no-deps web-gateway") || strings.Contains(recorded[2], "gateway-api") || !strings.Contains(recorded[3], "--force-recreate --no-deps nginx") {
 				t.Fatalf("prepared crash repair calls = %#v", recorded)
 			}
 		})
@@ -1626,6 +1635,42 @@ func TestCandidateRegistryTargetCheckDefersLifecycleJournalRecovery(t *testing.T
 	}
 }
 
+func TestRunningRegistryTargetCheckRejectsAnUnseededRunningServer(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "SERVER_REGISTRY_JSON=[]\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\n")
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		return "opensamguk-shared\nopensamguk-spep\nopensamguk-spep\n", nil
+	}
+
+	var output bytes.Buffer
+	if code := checkRunningRegistryTargetsCommand(cfg, &output); code != 1 {
+		t.Fatalf("unseeded running registry exit code = %d, want 1", code)
+	}
+	if got := output.String(); got != "running registry target validation failed\n" {
+		t.Fatalf("unseeded running registry output = %q", got)
+	}
+}
+
+func TestRunningRegistryTargetCheckAcceptsRegisteredProjectsAndIgnoresStaleEnvFiles(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","deployProject":"opensamguk-spep"}]
+`)
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "sstale.env"), "SERVER_ID=stale\n")
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		return "opensamguk-shared\nopensamguk-spep\nunrelated-project\n", nil
+	}
+
+	var output bytes.Buffer
+	if code := checkRunningRegistryTargetsCommand(cfg, &output); code != 0 {
+		t.Fatalf("registered running registry exit code = %d, want 0", code)
+	}
+	if got := output.String(); got != "running registry target validation passed\n" {
+		t.Fatalf("registered running registry output = %q", got)
+	}
+}
+
 func TestDeployPromotesApiAndWebGameTags(t *testing.T) {
 	cfg := testConfig(t)
 	envFile := filepath.Join(cfg.serversDir, "s1.env")
@@ -1748,10 +1793,13 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 		t.Fatalf("PATCH job id = %q", body.JobID)
 	}
 	affected := strings.Join(body.AffectedServices, ",")
-	for _, want := range []string{"game-api", "web-game", "gateway-api", "web-gateway", "nginx"} {
+	for _, want := range []string{"game-api", "web-game", "web-gateway", "nginx"} {
 		if !strings.Contains(affected, want) {
 			t.Fatalf("affected services missing %q: %#v", want, body.AffectedServices)
 		}
+	}
+	if strings.Contains(affected, "gateway-api") {
+		t.Fatalf("affected services restart the registry request owner: %#v", body.AffectedServices)
 	}
 
 	registry, err := cfg.readRegistry()
@@ -1787,7 +1835,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	if len(recorded) != 2 {
 		t.Fatalf("docker calls = %#v", recorded)
 	}
-	if !strings.Contains(recorded[0], "gateway-api web-gateway") || strings.Contains(recorded[0], " nginx") {
+	if !strings.Contains(recorded[0], "up -d --no-deps web-gateway") || strings.Contains(recorded[0], "gateway-api") || strings.Contains(recorded[0], " nginx") {
 		t.Fatalf("shared reload call = %q", recorded[0])
 	}
 	if !strings.Contains(recorded[1], "--force-recreate --no-deps nginx") {
@@ -1899,7 +1947,7 @@ func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 		strings.Contains(recorded[0], "--no-deps") {
 		t.Fatalf("server compose call = %q", recorded[0])
 	}
-	if !strings.Contains(recorded[1], "gateway-api web-gateway") || strings.Contains(recorded[1], " nginx") {
+	if !strings.Contains(recorded[1], "up -d --no-deps web-gateway") || strings.Contains(recorded[1], "gateway-api") || strings.Contains(recorded[1], " nginx") {
 		t.Fatalf("shared reload call = %q", recorded[1])
 	}
 	if !strings.Contains(recorded[2], "--force-recreate --no-deps nginx") {
@@ -2733,6 +2781,7 @@ func TestDeployOrchestrationValidatesCandidateBeforeReplacementAndFullCheckAfter
 		`-v "$STACK/servers:/workspace/servers:ro"`,
 		"opensamguk-deployer:local --check-registry-targets",
 		"opensamguk-deployer:local --check-registry",
+		"/usr/local/bin/deployer --check-running-registry-targets",
 	} {
 		if !strings.Contains(workflow, want) {
 			t.Fatalf("control-plane deployment missing %q", want)
@@ -2744,15 +2793,16 @@ func TestDeployOrchestrationValidatesCandidateBeforeReplacementAndFullCheckAfter
 	deployer := strings.Index(workflow, "$COMPOSE up -d --force-recreate --no-deps deployer")
 	recovery := strings.Index(workflow, "if ! ensure_lifecycle_recovery; then")
 	fullCheck := strings.LastIndex(workflow, "opensamguk-deployer:local --check-registry\n")
+	runningCheck := strings.LastIndex(workflow, "/usr/local/bin/deployer --check-running-registry-targets")
 	healthz := strings.LastIndex(workflow, "http://localhost:9000/healthz")
 	readyz := strings.LastIndex(workflow, "http://localhost:9000/readyz")
 	nginxMarker := "$COMPOSE up -d --force-recreate --no-deps nginx"
 	nginx := strings.Index(workflow, nginxMarker)
-	if build < 0 || candidateCheck < 0 || deployer < 0 || recovery < 0 || fullCheck < 0 || healthz < 0 || readyz < 0 || nginx < 0 {
-		t.Fatalf("missing deployment ordering markers: build=%d candidate=%d deployer=%d recovery=%d full=%d healthz=%d readyz=%d nginx=%d", build, candidateCheck, deployer, recovery, fullCheck, healthz, readyz, nginx)
+	if build < 0 || candidateCheck < 0 || deployer < 0 || recovery < 0 || fullCheck < 0 || runningCheck < 0 || healthz < 0 || readyz < 0 || nginx < 0 {
+		t.Fatalf("missing deployment ordering markers: build=%d candidate=%d deployer=%d recovery=%d full=%d running=%d healthz=%d readyz=%d nginx=%d", build, candidateCheck, deployer, recovery, fullCheck, runningCheck, healthz, readyz, nginx)
 	}
-	if !(build < candidateCheck && candidateCheck < deployer && deployer < recovery && recovery < fullCheck && fullCheck < nginx && nginx < healthz && healthz < readyz) {
-		t.Fatalf("unexpected deployment ordering: build=%d candidate=%d deployer=%d recovery=%d full=%d healthz=%d readyz=%d nginx=%d", build, candidateCheck, deployer, recovery, fullCheck, healthz, readyz, nginx)
+	if !(build < candidateCheck && candidateCheck < deployer && deployer < recovery && recovery < fullCheck && fullCheck < runningCheck && runningCheck < nginx && nginx < healthz && healthz < readyz) {
+		t.Fatalf("unexpected deployment ordering: build=%d candidate=%d deployer=%d recovery=%d full=%d running=%d healthz=%d readyz=%d nginx=%d", build, candidateCheck, deployer, recovery, fullCheck, runningCheck, healthz, readyz, nginx)
 	}
 	if strings.Contains(workflow[candidateCheck:deployer], "--env-file") {
 		t.Fatal("candidate registry check must not receive the shared env through command-line injection")
@@ -3780,7 +3830,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	if !strings.Contains(recorded[0], "compose -p opensamguk-spep") || !strings.Contains(recorded[0], "down --volumes --remove-orphans") {
 		t.Fatalf("delete compose call = %q", recorded[0])
 	}
-	if !strings.Contains(recorded[1], "gateway-api web-gateway") || strings.Contains(recorded[1], " nginx") {
+	if !strings.Contains(recorded[1], "up -d --no-deps web-gateway") || strings.Contains(recorded[1], "gateway-api") || strings.Contains(recorded[1], " nginx") {
 		t.Fatalf("shared reload call = %q", recorded[1])
 	}
 	if !strings.Contains(recorded[2], "--force-recreate --no-deps nginx") {
@@ -4018,7 +4068,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	if !strings.Contains(recorded[1], "up -d") {
 		t.Fatalf("reset up call = %q", recorded[1])
 	}
-	if !strings.Contains(recorded[2], "gateway-api web-gateway") || strings.Contains(recorded[2], " nginx") {
+	if !strings.Contains(recorded[2], "up -d --no-deps web-gateway") || strings.Contains(recorded[2], "gateway-api") || strings.Contains(recorded[2], " nginx") {
 		t.Fatalf("shared reload call = %q", recorded[2])
 	}
 	if !strings.Contains(recorded[3], "--force-recreate --no-deps nginx") {
@@ -4257,7 +4307,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 		switch {
 		case strings.Contains(joined, "down --volumes --remove-orphans"):
 			return "down uncertain\n", errors.New("compose down uncertain")
-		case strings.Contains(joined, "gateway-api web-gateway"):
+		case strings.Contains(joined, "up -d --no-deps web-gateway"):
 			return "shared reload failed\n", errors.New("shared reload failed")
 		default:
 			return "recovered\n", nil
@@ -4299,7 +4349,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 			return "29.0.0\n", nil
 		}
 		calls.record(args...)
-		if strings.Contains(strings.Join(args, " "), "gateway-api web-gateway") {
+		if strings.Contains(strings.Join(args, " "), "up -d --no-deps web-gateway") {
 			return "shared reload failed\n", errors.New("shared reload failed")
 		}
 		return "recovered\n", nil
@@ -4358,7 +4408,7 @@ func TestResetRepairVerifiesRuntimeDataAndFinalRegistryBeforeJournalClear(t *tes
 			return "29.0.0\n", nil
 		}
 		calls.record(args...)
-		if strings.Contains(strings.Join(args, " "), "gateway-api web-gateway") {
+		if strings.Contains(strings.Join(args, " "), "up -d --no-deps web-gateway") {
 			if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); strings.Contains(shared, `"repairRequired":true`) {
 				return "", errors.New("shared reload received a stale repair-required registry")
 			}
@@ -4410,7 +4460,7 @@ func TestResetRepairVerifiesRuntimeDataAndFinalRegistryBeforeJournalClear(t *tes
 		t.Fatalf("verification trace = %q, want %q", got, want)
 	}
 	recorded := calls.snapshot()
-	if len(recorded) != 4 || !strings.Contains(recorded[0], "down --volumes --remove-orphans") || !strings.Contains(recorded[1], "up -d") || !strings.Contains(recorded[2], "gateway-api web-gateway") || !strings.Contains(recorded[3], "--force-recreate --no-deps nginx") {
+	if len(recorded) != 4 || !strings.Contains(recorded[0], "down --volumes --remove-orphans") || !strings.Contains(recorded[1], "up -d") || !strings.Contains(recorded[2], "up -d --no-deps web-gateway") || strings.Contains(recorded[2], "gateway-api") || !strings.Contains(recorded[3], "--force-recreate --no-deps nginx") {
 		t.Fatalf("repair call order = %#v", recorded)
 	}
 }
@@ -4479,7 +4529,7 @@ func TestResetRepairRetainsBarrierWhenRuntimeVerificationFails(t *testing.T) {
 				t.Fatalf("failed reset runtime verification cleared repair marker:\n%s", shared)
 			}
 			for _, call := range calls.snapshot() {
-				if strings.Contains(call, "gateway-api web-gateway") {
+				if strings.Contains(call, "up -d --no-deps web-gateway") {
 					t.Fatalf("failed reset runtime verification reloaded shared consumers: %#v", calls.snapshot())
 				}
 			}
@@ -4577,7 +4627,7 @@ func TestResetRepairRetainsBarrierWhenSharedReloadVerificationFails(t *testing.T
 	if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); !strings.Contains(shared, `"repairRequired":true`) {
 		t.Fatalf("failed shared reload verification cleared repair marker:\n%s", shared)
 	}
-	if !strings.Contains(strings.Join(calls.snapshot(), "\n"), "gateway-api web-gateway") {
+	if !strings.Contains(strings.Join(calls.snapshot(), "\n"), "up -d --no-deps web-gateway") {
 		t.Fatalf("shared reload verification failed before reload ran: %#v", calls.snapshot())
 	}
 }
@@ -4704,7 +4754,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"before","generation":1,"gameApiUrl":"h
 			return "29.0.0\n", nil
 		}
 		call := strings.Join(args, " ")
-		if strings.Contains(call, "gateway-api web-gateway") {
+		if strings.Contains(call, "up -d --no-deps web-gateway") {
 			patchReloadOnce.Do(func() {
 				close(patchReloadStarted)
 				<-releasePatchReload

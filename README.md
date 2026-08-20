@@ -12,9 +12,9 @@
 ## 구성
 
 ```
-docker-compose.shared.yml   # 공유 스택: gateway-postgres·gateway-api·web-gateway·nginx·deployer·socket-proxy
+docker-compose.shared.yml   # 공유 스택: gateway-postgres·gateway-api·board-api·web-gateway·nginx·deployer·socket-proxy
 docker-compose.server.yml   # 게임 서버 스택(서버당 1회): game-postgres·game-redis·game-engine·game-api·web-game
-docker-compose.yml          # 로컬/단일서버 빠른 시작(8서비스 단일 스택). 멀티서버를 안 쓸 때만.
+docker-compose.yml          # 로컬/단일서버 빠른 시작(9서비스 단일 스택). 멀티서버를 안 쓸 때만.
 deployer/                   # 버전 bounce 배포 사이드카(Go stdlib, 외부 의존 0)
 infra/nginx/nginx.conf      # 리버스 프록시(게이트웨이 / 진입점)
 servers/s1.env.example      # 게임 서버 env 예시(서버마다 복제)
@@ -32,7 +32,8 @@ scripts/deploy.sh           # GCP 멀티서버 배포에서는 fail-fast (GitHub
 
 ```
                 ┌──────────── 공유 스택 (opensamguk-shared) ────────────┐
-   브라우저 ──▶ nginx(/) ─▶ web-gateway ─▶ gateway-api ─▶ gateway-postgres(유저/인증)
+   브라우저 ──▶ nginx(/) ─▶ web-gateway ─┬─▶ gateway-api ─▶ gateway-postgres(유저/인증·게시판)
+                                         └─▶ board-api ────────┘
                                               │  └─▶ deployer ─▶ socket-proxy ─▶ docker
                 └────────────────────────────┼───────────────────────────────────┘
                                               │ (레지스트리·로비 절대 URL)
@@ -46,13 +47,15 @@ scripts/deploy.sh           # GCP 멀티서버 배포에서는 fail-fast (GitHub
 
 - **서버별 독립 스택**: 게임 서버마다 자기 `game-engine`(그 월드 InMemoryTurnWorld) + `game-api`
   + `game-postgres` + `game-redis` + 자기 `IMAGE_TAG`. 서버끼리 월드/버전이 완전히 격리된다.
-- **공유 스택**: `gateway-postgres`(유저/인증) + `gateway-api` + `web-gateway` + `nginx`
+- **공유 스택**: `gateway-postgres`(유저/인증·게시판) + `gateway-api` + `board-api` + `web-gateway` + `nginx`
   + `deployer` 사이드카 + `socket-proxy`. 전 서버 공통(로그인/로비/어드민/배포).
 - **로비/게임 진입**: nginx는 `/game/<public-id>`를 해당 게임 서버로 보낸다. 브라우저의 게임 관리 호출은
   `/api/game/api/admin/...`을 포함한 `/api/game/...`이며, httpOnly `sam_access` 쿠키를 Bearer로 바꾸는
   `web-gateway`를 항상 통과한다. direct `/api/admin/...`도 game-api bypass가 없는 `/api/` surface라
   `web-gateway`가 안전하게 404 처리할 수 있다. `sam_server` 쿠키를 가진
   `/game/_next/static`은 같은 게임 웹으로 프록시한다. 잘못된 path/cookie id는 404로 fail-closed 한다.
+- **게시판 진입**: `/api/board/...`는 `web-gateway`의 httpOnly 쿠키→Bearer 프록시를 거쳐 `board-api`로 간다.
+  `board-api`는 토큰을 발급하지 않고 gateway-api와 같은 `JWT_SECRET`으로 access token만 검증한다.
 
 ### 공개 서버 ID 계약
 
@@ -102,7 +105,22 @@ docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env
 - 첫 설치 직후에는 게임 서버가 0개여도 정상이다. `SERVER_REGISTRY_JSON=[]` 상태에서 공유 스택만 먼저
   기동하고, 이후 어드민/수동 절차로 게임 서버를 만든다.
 
+기존 운영 환경에 DB 레지스트리 버전을 처음 올릴 때는 `SERVER_REGISTRY_JSON`을 지우거나 빈 배열로 바꾸면 안 된다.
+새 gateway-api는 `game_server` 테이블이 비어 있을 때만 이 값을 1회 seed로 사용한다. 배포 전 현재 실행 서버가
+`.env` 레지스트리와 `servers/s<id>.env`에 모두 들어 있는지 확인하고 다음 검사가 통과해야 한다.
+
+```bash
+docker exec opensamguk-deployer /usr/local/bin/deployer --check-running-registry-targets
+```
+
+검사가 실패하거나 현재 실행 서버가 seed 목록에서 빠졌다면 gateway-api·board-api 이미지를 승격하지 않는다.
+gateway-api readiness가 새 migration과 seed 완료를 증명한 뒤에만 board-api가 시작된다.
+
 ### 2) 게임 서버 N회 기동
+
+운영 중 서버 추가는 어드민 UI 또는 **Recreate Game Server** 워크플로를 사용한다. 이 경로만 deployer의
+서버 env/스택 생성과 gateway-api의 DB 레지스트리 영속화를 하나의 확인된 흐름으로 묶는다. 아래 수동 compose는
+초기 구축·복구 진단용이며, 이것만 실행해서는 DB 레지스트리에 서버가 추가되지 않는다.
 
 서버마다 `servers/s<public-id>.env`를 만들고(예시 복제) 포트/비밀번호/public `SERVER_ID`가 겹치지 않게 한다.
 
@@ -117,7 +135,7 @@ cp servers/s1.env.example servers/salpha.env
 docker compose -p opensamguk-salpha -f docker-compose.server.yml --env-file servers/salpha.env up -d
 ```
 
-기동 후 공유 스택의 `SERVER_REGISTRY_JSON`에 그 서버를 등록한다(로비/어드민이 인식하도록):
+최초 DB 레지스트리 전환 전에 이미 실행 중인 서버는 공유 스택의 `SERVER_REGISTRY_JSON` seed에 모두 등록한다:
 
 ```json
 [
@@ -132,6 +150,8 @@ docker compose -p opensamguk-salpha -f docker-compose.server.yml --env-file serv
 > `OPENSAMGUK_WORLD_ID`는 source 앱의 숫자 world key다. 서버마다 PostgreSQL DB/볼륨이 분리되어 있으므로 모든 `servers/s<id>.env`에서 `1`을 쓴다. public `SERVER_ID`, Docker 내부 `s<id>`, `SERVER_GENERATION`을 넣지 않는다. 이전 env 파일은 compose의 `1` fallback으로 계속 기동되지만, 다음 편집 때 명시 행을 추가한다.
 > deployer는 Docker 실행, deploy/delete/reset, `/readyz` 전에 `servers/s<id>.env`의 `SERVER_ID`가 canonical public
 > id와 정확히 같은지 다시 확인한다. 누락·중복·불일치는 Docker를 호출하지 않고 fail closed 한다.
+> DB 전환 뒤 `SERVER_REGISTRY_JSON`만 수동 편집해도 `game_server`는 갱신되지 않는다. 이후 membership 변경은
+> 반드시 어드민→deployer의 확인된 성공 경로를 사용한다.
 
 ---
 
@@ -226,7 +246,7 @@ GCP의 shared/per-server orchestration 배포는 GitHub Actions **Deploy Orchest
 
 ### opensamguk
 
-소스 저장소의 `main` 배포는 앱 이미지를 만들고 공유 스택(`gateway-api`, `web-gateway`, `nginx`)만 자동 갱신한다.
+소스 저장소의 `main` 배포는 앱 이미지를 만들고 공유 스택(`gateway-api`, `board-api`, `web-gateway`, `nginx`)만 자동 갱신한다.
 실행 중 게임 서버의 `servers/<id>.env`는 CI가 수정하지 않는다.
 
 - `IMAGE_TAG`: 그 서버의 `game-api`/`game-engine` 핀
@@ -239,7 +259,7 @@ GCP의 shared/per-server orchestration 배포는 GitHub Actions **Deploy Orchest
 호출을 지난 뒤에는 볼륨이 일부라도 제거되었을 수 있으므로 이전 desired state를 되살리지 않는다. down 결과가 불확실하면
 원래 job은 임의의 forward re-up을 주장하지 않고 새 desired state와 `repairRequired=true` journal을 남긴다. 명시적
 maintenance repair가 reset을 다시 끝까지 수행해 seeded `world_state`의 시나리오와 game-api 기수를 확인하고,
-`repairRequired`를 durable하게 지운 최종 registry로 `gateway-api`·`web-gateway`·`nginx`를 reload/health-verify한 뒤에만
+`repairRequired`를 durable하게 지운 최종 registry로 `web-gateway`·`nginx`를 reload하고 기존 `gateway-api`도 health-verify한 뒤에만
 journal과 closed barrier를 해제한다. `SCENARIO_SEED_ENABLED=false`인 reset은 fresh world data를 검증할 수 없으므로
 repair 완료로 처리되지 않는다.
 
@@ -279,7 +299,8 @@ POST deployer/deploy  {"project":"opensamguk-spep","tag":"v1.3.0"}
 레거시 registry에 남은 임의 키나 JWT/password/token 값도 read 시 제거되어 atomically 다시 저장되며 `GET /servers`에는
 반환되지 않는다. `SERVER_NAME`, `SERVER_GENERATION`, `GAME_API_URL`처럼 로비와
 어드민이 직접 쓰는 값은 registry의 top-level 필드도 함께 갱신하고, 공유 스택 registry reload 대상
-(`gateway-api`, `web-gateway`, `nginx`)을 `affectedServices`에 포함한다.
+(`web-gateway`, `nginx`)을 `affectedServices`에 포함한다. `gateway-api`는 deployer 성공 응답 뒤 DB 레지스트리를
+영속화하는 요청 주체이므로 이 reload에서 재시작하지 않는다.
 
 ```text
 GET   deployer/env/shared
@@ -350,7 +371,7 @@ curl -sS -X PATCH -H 'Authorization: Bearer test-token' -H 'Content-Type: applic
 
 ## 단일서버 / 로컬 빠른 시작 (멀티서버 미사용)
 
-멀티서버가 필요 없으면 기존 단일 스택(`docker-compose.yml`)을 그대로 쓴다 — 8서비스 한 프로젝트.
+멀티서버가 필요 없으면 기존 단일 스택(`docker-compose.yml`)을 그대로 쓴다 — 9서비스 한 프로젝트.
 
 ```bash
 cp .env.example .env     # (단일 스택은 POSTGRES_PASSWORD 등 기존 키도 필요 — 주석 참고)
@@ -368,7 +389,7 @@ docker compose up -d
 
 - `COOKIE_SECURE=true`는 **HTTPS에서만** — HTTP면 로그인 쿠키가 막힌다(로컬/HTTP는 `false`).
 - `NEXT_PUBLIC_GATEWAY_URL` / `NEXT_PUBLIC_GAME_URL`을 실제 도메인으로 교체(빌드타임 인라인).
-- `JWT_SECRET`은 gateway-api(발급)·모든 game-api(검증)가 **동일** 값을 써야 한다.
+- `JWT_SECRET`은 gateway-api(발급)·board-api와 모든 game-api(검증)가 **동일** 값을 써야 한다.
 - `DEPLOYER_TOKEN`은 강한 랜덤 값으로 — 이 토큰이 곧 배포 권한이다. 외부 노출 금지(내부망 전용).
 
 ## GHCR 이미지 인증 (private 패키지일 때)
