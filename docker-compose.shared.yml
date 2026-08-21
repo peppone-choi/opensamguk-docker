@@ -59,8 +59,15 @@ services:
       GAME_DATABASE_URL: jdbc:postgresql://gateway-postgres:5432/${GATEWAY_POSTGRES_DB:-sammo_gateway}
       GAME_DB_USER: ${GATEWAY_POSTGRES_USER:-sammo}
       GAME_DB_PASSWORD: ${GATEWAY_POSTGRES_PASSWORD:?GATEWAY_POSTGRES_PASSWORD required}
-      # JWT — gateway-api가 토큰을 발급(board-api와 서버별 game-api가 같은 값으로 검증).
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required — board-api 및 모든 game-api와 동일 값}
+      # JWT — gateway-api만 개인키를 갖고 토큰을 발급한다(RS256). board-api와 서버별 game-api는
+      # 공개키만 받아 검증만 한다(JWT_PUBLIC_KEY, 아래 board-api 참고).
+      JWT_PRIVATE_KEY: ${JWT_PRIVATE_KEY:?JWT_PRIVATE_KEY required}
+      JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY:?JWT_PUBLIC_KEY required}
+      JWT_SIGNING_MODE: ${JWT_SIGNING_MODE:-RS256}
+      JWT_INCLUDE_PROFILE_CLAIMS: ${JWT_INCLUDE_PROFILE_CLAIMS:-true}
+      JWT_LEGACY_SECRET: ${JWT_LEGACY_SECRET:-}
+      JWT_LEGACY_ACCESS_ACCEPT_UNTIL: ${JWT_LEGACY_ACCESS_ACCEPT_UNTIL:-}
+      JWT_LEGACY_REFRESH_ACCEPT_UNTIL: ${JWT_LEGACY_REFRESH_ACCEPT_UNTIL:-}
       JWT_ACCESS_EXPIRATION: ${JWT_ACCESS_EXPIRATION:-900000}
       JWT_REFRESH_EXPIRATION: ${JWT_REFRESH_EXPIRATION:-604800000}
       # 관리자 시드(빈 users 테이블에서 1회 멱등 생성).
@@ -108,11 +115,18 @@ services:
       GAME_DATABASE_URL: jdbc:postgresql://gateway-postgres:5432/${GATEWAY_POSTGRES_DB:-sammo_gateway}
       GAME_DB_USER: ${GATEWAY_POSTGRES_USER:-sammo}
       GAME_DB_PASSWORD: ${GATEWAY_POSTGRES_PASSWORD:?GATEWAY_POSTGRES_PASSWORD required}
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required — gateway-api와 동일 값}
+      # JWT — board-api는 gateway-api가 발급한 토큰을 공개키로만 검증한다(개인키 없음).
+      JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY:?JWT_PUBLIC_KEY required}
+      JWT_LEGACY_SECRET: ${JWT_LEGACY_SECRET:-}
+      JWT_LEGACY_ACCESS_ACCEPT_UNTIL: ${JWT_LEGACY_ACCESS_ACCEPT_UNTIL:-}
       JAVA_OPTS: "-XX:+UseG1GC -XX:MaxRAMPercentage=40.0 -XX:InitialRAMPercentage=25.0 -Djava.security.egd=file:/dev/./urandom"
     depends_on:
       gateway-postgres:
         condition: service_healthy
+      # board-api never calls gateway-api at runtime (it only reads/writes gateway_board_post /
+      # gateway_board_comment on the shared DB). This stays service_healthy anyway to preserve
+      # first-boot migration ordering on an empty DB — gateway-api's Flyway migration must run
+      # before board-api's JPA validates the schema.
       gateway-api:
         condition: service_healthy
     expose:
@@ -144,8 +158,11 @@ services:
     depends_on:
       gateway-api:
         condition: service_healthy
+      # service_started, not service_healthy: 이전 IMAGE_TAG(board-api 이미지 없음)로 롤백하면
+      # board-api가 영구히 unhealthy가 되어 web-gateway까지 못 뜨고 로그인/로비 전체가 502가 된다.
+      # 게시판만 죽고 스택은 살아야 한다.
       board-api:
-        condition: service_healthy
+        condition: service_started
     expose:
       - "3000"
     networks:
@@ -203,6 +220,7 @@ services:
       COMPOSE_SHARED_FILE: /workspace/docker-compose.shared.yml
       DEPLOYER_MAINTENANCE_FILE: /workspace/servers/.deployer-maintenance
       DEPLOYER_LIFECYCLE_JOURNAL_FILE: /workspace/servers/.deployer-lifecycle-journal
+      DEPLOYER_OPERATION_FILE: /workspace/servers/.deployer-operations.json
       COMPOSE_HOST_DIR: ${COMPOSE_HOST_DIR:-${PWD:-.}}
       # GHCR 태그 조회용(공개 패키지면 익명, private면 토큰 필요 — 미해결 가정 참고).
       GHCR_OWNER: ${GHCR_OWNER:-peppone-choi}

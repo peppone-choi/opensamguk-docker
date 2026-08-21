@@ -1958,11 +1958,11 @@ func checkRegistryTargetsCommand(c config, output io.Writer) int {
 
 func checkRunningRegistryTargetsCommand(c config, output io.Writer) int {
 	if err := c.validateRegisteredServerTargets(); err != nil {
-		fmt.Fprintln(output, "running registry target validation failed")
+		fmt.Fprintf(output, "running registry target validation failed: %v\n", err)
 		return 1
 	}
 	if err := c.validateRunningServerRegistry(context.Background()); err != nil {
-		fmt.Fprintln(output, "running registry target validation failed")
+		fmt.Fprintf(output, "running registry target validation failed: %v\n", err)
 		return 1
 	}
 	fmt.Fprintln(output, "running registry target validation passed")

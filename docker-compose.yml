@@ -86,8 +86,10 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: 6379
       OPENSAMGUK_PROFILE: ${TURN_PROFILE_NAME:-che:scenario_2}
-      # JWT — game-api VERIFIES tokens issued by gateway-api. SAME secret, verify-only.
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required — same value as gateway-api}
+      # JWT — game-api VERIFIES tokens issued by gateway-api (public key only, RS256).
+      JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY:?JWT_PUBLIC_KEY required}
+      JWT_LEGACY_SECRET: ${JWT_LEGACY_SECRET:-}
+      JWT_LEGACY_ACCESS_ACCEPT_UNTIL: ${JWT_LEGACY_ACCESS_ACCEPT_UNTIL:-}
       JAVA_OPTS: "-XX:+UseG1GC -XX:MaxRAMPercentage=50.0 -XX:InitialRAMPercentage=30.0 -Djava.security.egd=file:/dev/./urandom"
     depends_on:
       postgres:
@@ -113,8 +115,14 @@ services:
       GAME_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
       REDIS_HOST: redis
       REDIS_PORT: 6379
-      # JWT — gateway-api ISSUES tokens with this secret (SAME value as verifier services).
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required — same value as board-api and game-api}
+      # JWT — gateway-api alone ISSUES tokens (RSA private key). Verifier services get only the public key.
+      JWT_PRIVATE_KEY: ${JWT_PRIVATE_KEY:?JWT_PRIVATE_KEY required}
+      JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY:?JWT_PUBLIC_KEY required}
+      JWT_SIGNING_MODE: ${JWT_SIGNING_MODE:-RS256}
+      JWT_INCLUDE_PROFILE_CLAIMS: ${JWT_INCLUDE_PROFILE_CLAIMS:-true}
+      JWT_LEGACY_SECRET: ${JWT_LEGACY_SECRET:-}
+      JWT_LEGACY_ACCESS_ACCEPT_UNTIL: ${JWT_LEGACY_ACCESS_ACCEPT_UNTIL:-}
+      JWT_LEGACY_REFRESH_ACCEPT_UNTIL: ${JWT_LEGACY_REFRESH_ACCEPT_UNTIL:-}
       JWT_ACCESS_EXPIRATION: ${JWT_ACCESS_EXPIRATION:-900000}
       JWT_REFRESH_EXPIRATION: ${JWT_REFRESH_EXPIRATION:-604800000}
       # Admin seed (idempotent on empty users table).
@@ -154,7 +162,10 @@ services:
       GAME_DATABASE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-sammo}
       GAME_DB_USER: ${POSTGRES_USER:-sammo}
       GAME_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required — same value as gateway-api}
+      # JWT — board-api VERIFIES tokens issued by gateway-api (public key only, RS256).
+      JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY:?JWT_PUBLIC_KEY required}
+      JWT_LEGACY_SECRET: ${JWT_LEGACY_SECRET:-}
+      JWT_LEGACY_ACCESS_ACCEPT_UNTIL: ${JWT_LEGACY_ACCESS_ACCEPT_UNTIL:-}
       JAVA_OPTS: "-XX:+UseG1GC -XX:MaxRAMPercentage=40.0 -XX:InitialRAMPercentage=25.0 -Djava.security.egd=file:/dev/./urandom"
     depends_on:
       postgres:
@@ -189,8 +200,12 @@ services:
     depends_on:
       gateway-api:
         condition: service_healthy
+      # service_started, not service_healthy: a rollback to an IMAGE_TAG with no board-api image
+      # would leave board-api permanently unhealthy and block web-gateway from ever starting —
+      # taking down login/lobby along with the board. The board dying alone is acceptable; the
+      # whole stack dying is not.
       board-api:
-        condition: service_healthy
+        condition: service_started
     expose:
       - "3000"
     networks:

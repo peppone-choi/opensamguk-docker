@@ -55,7 +55,7 @@ scripts/deploy.sh           # GCP 멀티서버 배포에서는 fail-fast (GitHub
   `web-gateway`가 안전하게 404 처리할 수 있다. `sam_server` 쿠키를 가진
   `/game/_next/static`은 같은 게임 웹으로 프록시한다. 잘못된 path/cookie id는 404로 fail-closed 한다.
 - **게시판 진입**: `/api/board/...`는 `web-gateway`의 httpOnly 쿠키→Bearer 프록시를 거쳐 `board-api`로 간다.
-  `board-api`는 토큰을 발급하지 않고 gateway-api와 같은 `JWT_SECRET`으로 access token만 검증한다.
+  `board-api`는 토큰을 발급하지 않고 gateway-api가 발급한 RS256 토큰을 `JWT_PUBLIC_KEY`(공개키)로만 검증한다.
 
 ### 공개 서버 ID 계약
 
@@ -210,10 +210,28 @@ POST /maintenance/repair -> 남은 lifecycle journal을 recovery·runtime/data·
 Server는 marker를 lifecycle job과 서버 postcondition 전체 동안 닫아 둔다. enter가 준 lease는 메모리 안의 단발
 권한이며 loopback + Bearer POST /servers/create에만 전달된다. GET, 로그, create 응답에는 lease를 넣지 않는다.
 enter가 준 lease는 recreate 요청 JSON body로만 전달되고 host Docker argv, HTTP header, 로그, create 응답에는 넣지
-않는다. 동일 operationId의 모호한 재시도는 **정규화된 생성 payload fingerprint까지 같을 때만** 기존 job을 돌려주며
-lease를 다시 소비하지 않는다. 다른 payload로 같은 operationId를 재사용하면 `409`으로 거부한다. deployer 재시작으로
-in-memory job이 사라지거나 어떤 단계가 실패하면 workflow는 절대 deadline, 요청 connect/total timeout, bounded EXIT
-drain 안에서 abort하고 marker를 남겨 fail-closed 상태를 유지한다.
+않는다. 생성·종료 POST의 필수 `operationId`는 32자리 소문자 hex이며, deployer는 종류(`create`/`close`)와 정규화된
+payload fingerprint를 `servers/.deployer-operations.json`에 원자적으로 영속화한다. 같은 key·payload 재시도는 같은
+job/result를 반환하고, 다른 종류나 payload로 같은 key를 재사용하면 `409`로 거부한다. accepted result는 lifecycle
+goroutine 시작 전에 fsync되며, journal도 같은 operationId·종류·서버에 결박된다. 재시작 repair는 이 세 값이 모두
+일치할 때만 변이를 재개하고 성공 terminal을 영속화한 뒤 journal을 지운다. journal이 없는 orphan은 성공으로 추측하지
+않고 안전한 `failed`로 고정한다.
+ledger는 키 재사용 충돌을 영구 보존하기 위해 자동 만료하지 않고 최대 4,096건으로 제한한다. 한도에 도달하면 새 key를
+`503`으로 거부하므로 운영자는 maintenance barrier 아래에서 보존/감사 정책에 따라 ledger를 교체해야 한다.
+
+```text
+POST /servers/create { ..., "operationId":"<32hex>" }
+POST /servers/close  { "id":"pep", "operationId":"<32hex>" }
+GET  /operations/<operationId>
+  -> 200 {"operationId":"...","kind":"create|close","status":"pending|running|succeeded|failed|cancelled","httpStatus":200,"result":{...}}
+  -> 404 {"ok":false,"operationId":"<same key>","status":"not_found"}
+```
+
+호출자는 마지막의 정확한 `not_found` marker만 새 deployer의 missing-key capability로 인정해야 한다. 구버전의 generic
+404나 잘못된 JSON을 missing으로 간주해 POST하면 downgrade 상황에서 비멱등 변이를 재실행할 수 있으므로 fail-closed한다.
+`pending`/`running`은 조회 HTTP 200이며 본문 status로 구분한다. terminal POST 재시도에도 top-level
+`operationId`/`operationStatus`가 포함된다. lifecycle 단계 실패 시 workflow는 절대 deadline, 요청 connect/total
+timeout, bounded EXIT drain 안에서 abort하고 marker를 남겨 fail-closed 상태를 유지한다.
 
 #### 구버전 deployer의 1회 bridge
 
@@ -389,7 +407,8 @@ docker compose up -d
 
 - `COOKIE_SECURE=true`는 **HTTPS에서만** — HTTP면 로그인 쿠키가 막힌다(로컬/HTTP는 `false`).
 - `NEXT_PUBLIC_GATEWAY_URL` / `NEXT_PUBLIC_GAME_URL`을 실제 도메인으로 교체(빌드타임 인라인).
-- `JWT_SECRET`은 gateway-api(발급)·board-api와 모든 game-api(검증)가 **동일** 값을 써야 한다.
+- `JWT_PRIVATE_KEY`는 gateway-api에만 배포한다(발급 전용). `JWT_PUBLIC_KEY`는 board-api와 모든
+  game-api(검증)에 배포하며 gateway-api의 공개키와 **동일** 값이어야 한다.
 - `DEPLOYER_TOKEN`은 강한 랜덤 값으로 — 이 토큰이 곧 배포 권한이다. 외부 노출 금지(내부망 전용).
 
 ## GHCR 이미지 인증 (private 패키지일 때)
