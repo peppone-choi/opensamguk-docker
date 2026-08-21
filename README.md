@@ -95,7 +95,7 @@ docker network create opensamguk-net
 ### 1) 공유 스택 기동
 
 ```bash
-cp .env.example .env     # 값 채우기: GATEWAY_POSTGRES_PASSWORD, JWT_SECRET, ADMIN_*, DEPLOYER_TOKEN,
+cp .env.example .env     # 값 채우기: GATEWAY_POSTGRES_PASSWORD, JWT_PRIVATE_KEY, JWT_PUBLIC_KEY, ADMIN_*, DEPLOYER_TOKEN,
                          #            SERVER_REGISTRY_JSON(서버 표) 등
 docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env up -d
 ```
@@ -127,7 +127,7 @@ gateway-api readiness가 새 migration과 seed 완료를 증명한 뒤에만 boa
 ```bash
 cp servers/s1.env.example servers/spep.env  # SERVER_ID=pep (compose가 spep/opensamguk-spep로 합성),
                                             # SERVER_NAME/SERVER_GENERATION, OPENSAMGUK_WORLD_ID=1, IMAGE_TAG, GAME_API_PORT/WEB_GAME_PORT,
-                                            # GAME_POSTGRES_PASSWORD, JWT_SECRET(공유와 동일) 채우기
+                                            # GAME_POSTGRES_PASSWORD, JWT_PUBLIC_KEY(공유와 동일, 비밀 아님) 채우기
 docker compose -p opensamguk-spep -f docker-compose.server.yml --env-file servers/spep.env up -d
 
 # 서버 2개째 — salpha.env 복제(SERVER_ID=alpha, 포트 82xx/32xx 등 충돌 없게)
@@ -210,28 +210,9 @@ POST /maintenance/repair -> 남은 lifecycle journal을 recovery·runtime/data·
 Server는 marker를 lifecycle job과 서버 postcondition 전체 동안 닫아 둔다. enter가 준 lease는 메모리 안의 단발
 권한이며 loopback + Bearer POST /servers/create에만 전달된다. GET, 로그, create 응답에는 lease를 넣지 않는다.
 enter가 준 lease는 recreate 요청 JSON body로만 전달되고 host Docker argv, HTTP header, 로그, create 응답에는 넣지
-않는다. 생성·종료 POST의 필수 `operationId`는 32자리 소문자 hex이며, deployer는 종류(`create`/`close`)와 정규화된
-payload fingerprint를 `servers/.deployer-operations.json`에 원자적으로 영속화한다. 같은 key·payload 재시도는 같은
-job/result를 반환하고, 다른 종류나 payload로 같은 key를 재사용하면 `409`로 거부한다. accepted result는 lifecycle
-goroutine 시작 전에 fsync되며, journal도 같은 operationId·종류·서버에 결박된다. 재시작 repair는 이 세 값이 모두
-일치할 때만 변이를 재개하고 성공 terminal을 영속화한 뒤 journal을 지운다. journal이 없는 orphan은 성공으로 추측하지
-않고 안전한 `failed`로 고정한다.
-ledger는 키 재사용 충돌을 영구 보존하기 위해 자동 만료하지 않고 최대 4,096건으로 제한한다. 한도에 도달하면 새 key를
-`503`으로 거부하므로 운영자는 maintenance barrier 아래에서 보존/감사 정책에 따라 ledger를 교체해야 한다.
-
-```text
-POST /servers/create { ..., "operationId":"<32hex>" }
-POST /servers/close  { "id":"pep", "operationId":"<32hex>" }
-GET  /operations/<operationId>
-  -> 200 {"operationId":"...","kind":"create|close","status":"pending|running|succeeded|failed|cancelled","httpStatus":200,"result":{...}}
-  -> 404 {"ok":false,"operationId":"<same key>","status":"not_found"}
-```
-
-호출자는 마지막의 정확한 `not_found` marker만 새 deployer의 missing-key capability로 인정해야 한다. 구버전의 generic
-404나 잘못된 JSON을 missing으로 간주해 POST하면 downgrade 상황에서 비멱등 변이를 재실행할 수 있으므로 fail-closed한다.
-`pending`/`running`은 조회 HTTP 200이며 본문 status로 구분한다. terminal POST 재시도에도 top-level
-`operationId`/`operationStatus`가 포함된다. lifecycle 단계 실패 시 workflow는 절대 deadline, 요청 connect/total
-timeout, bounded EXIT drain 안에서 abort하고 marker를 남겨 fail-closed 상태를 유지한다.
+않는다. 생성·종료 POST의 필수 `operationId`는 32자리 소문자 hex이며, 같은 key로 온 서로 다른 요청은 `409`로 거부한다.
+lifecycle 단계 실패 시 workflow는 절대 deadline, 요청 connect/total timeout, bounded EXIT drain 안에서 abort하고
+marker를 남겨 fail-closed 상태를 유지한다.
 
 #### 구버전 deployer의 1회 bridge
 
@@ -260,7 +241,8 @@ GCP의 shared/per-server orchestration 배포는 GitHub Actions **Deploy Orchest
 3. env 파일이 없거나 새 서버를 만들 때만 **Recreate Game Server** 워크플로를 사용한다. 이 워크플로는 deployer
    컨테이너 내부 token으로 loopback `/servers/create`를 호출한다.
    입력값은 `server_id`, `server_name`, `generation`, `image_tag`, `scenario_code`, `game_api_port`,
-   `web_game_port`이며 `jwtSecret`은 비워 shared `JWT_SECRET`을 복사한다.
+   `web_game_port`다. JWT는 요청으로 받지 않고 항상 shared `.env`의 `JWT_PUBLIC_KEY`(+`JWT_LEGACY_*`)를 그대로
+   복사한다.
 
 ### opensamguk
 
@@ -311,8 +293,9 @@ POST deployer/deploy  {"project":"opensamguk-spep","tag":"v1.3.0"}
 ```
 
 환경변수 관리 API도 같은 Bearer 토큰 인증을 사용한다. 임의 raw editor가 아니라 명시 allowlist만 수정한다.
-`DEPLOYER_TOKEN`은 서버 내부 권한 토큰이므로 API 수정 대상에서 제외한다. `JWT_SECRET`, `ADMIN_PASSWORD`,
-`GHCR_TOKEN` 같은 민감값은 PATCH로만 쓰고 GET/PATCH 응답에는 원문 값을 반환하지 않는다.
+`DEPLOYER_TOKEN`은 서버 내부 권한 토큰이므로 API 수정 대상에서 제외한다. `JWT_PRIVATE_KEY`(공유 전용, 서버 API에는
+아예 없음), `JWT_LEGACY_SECRET`, `ADMIN_PASSWORD`, `GHCR_TOKEN` 같은 민감값은 PATCH로만 쓰고 GET/PATCH 응답에는
+원문 값을 반환하지 않는다. `JWT_PUBLIC_KEY`는 비밀이 아니므로 GET에 원문이 그대로 보인다.
 서버별 env PATCH는 명시된 non-secret allowlist만 `SERVER_REGISTRY_JSON`의 해당 서버 `env` 스냅샷으로 동기화한다.
 레거시 registry에 남은 임의 키나 JWT/password/token 값도 read 시 제거되어 atomically 다시 저장되며 `GET /servers`에는
 반환되지 않는다. `SERVER_NAME`, `SERVER_GENERATION`, `GAME_API_URL`처럼 로비와
@@ -325,7 +308,7 @@ GET   deployer/env/shared
 PATCH deployer/env/shared {"values":{"NEXT_PUBLIC_GATEWAY_URL":"https://sam.example.com"}}
 
 GET   deployer/env/server?id=pep
-PATCH deployer/env/server?id=pep {"values":{"IMAGE_TAG":"v1.3.0","WEB_GAME_TAG":"v1.3.0","JWT_SECRET":"base64-secret"}}
+PATCH deployer/env/server?id=pep {"values":{"IMAGE_TAG":"v1.3.0","WEB_GAME_TAG":"v1.3.0","JWT_PUBLIC_KEY":"base64-public-key"}}
 ```
 
 PATCH 응답의 `restartRequired`와 `affectedServices`는 재기동이 필요한 대상을 알려준다. 서버별 env 변경의
@@ -368,7 +351,7 @@ curl -sS -H 'Authorization: Bearer test-token' \
   'http://localhost:9000/env/server?id=pep'
 
 curl -sS -X PATCH -H 'Authorization: Bearer test-token' -H 'Content-Type: application/json' \
-  -d '{"values":{"IMAGE_TAG":"v1.3.0","JWT_SECRET":"new-secret"}}' \
+  -d '{"values":{"IMAGE_TAG":"v1.3.0","JWT_LEGACY_SECRET":"new-secret"}}' \
   'http://localhost:9000/env/server?id=pep'
 
 curl -sS -X PATCH -H 'Authorization: Bearer test-token' -H 'Content-Type: application/json' \
@@ -376,7 +359,7 @@ curl -sS -X PATCH -H 'Authorization: Bearer test-token' -H 'Content-Type: applic
   'http://localhost:9000/env/shared'
 ```
 
-기대값: 첫 두 호출은 200, `JWT_SECRET` 원문은 응답에 없음, `affectedServices`에 `game-engine` 없음,
+기대값: 첫 두 호출은 200, `JWT_LEGACY_SECRET` 원문은 응답에 없음, `affectedServices`에 `game-engine` 없음,
 마지막 호출은 400이며 `DEPLOYER_TOKEN`은 파일에 쓰이지 않음.
 
 ### 버전 고정 / 다운그레이드
