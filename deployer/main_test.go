@@ -1651,7 +1651,11 @@ func TestRunningRegistryTargetCheckRejectsAnUnseededRunningServer(t *testing.T) 
 	if code := checkRunningRegistryTargetsCommand(cfg, &output); code != 1 {
 		t.Fatalf("unseeded running registry exit code = %d, want 1", code)
 	}
-	if got := output.String(); got != "running registry target validation failed\n" {
+	// 구현은 진단용 이유를 덧붙인다(main.go: "...failed: %v"). 운영에서 이유 문자열이
+	// 필요하므로 접두사 + 미등록 프로젝트명 포함만 잠근다.
+	got := output.String()
+	if !strings.HasPrefix(got, "running registry target validation failed: ") ||
+		!strings.Contains(got, "opensamguk-spep") {
 		t.Fatalf("unseeded running registry output = %q", got)
 	}
 }

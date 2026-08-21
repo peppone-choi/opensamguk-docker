@@ -322,7 +322,7 @@ jobs:
 
           export CLIENT_OPERATION_ID="$(run_bounded "$WORKFLOW_DEADLINE" 10 python3 -c 'import secrets; print(secrets.token_hex(16))')"
           export MAINTENANCE_LEASE
-          BODY="$(run_bounded "$WORKFLOW_DEADLINE" 10 python3 -c 'import json, os; print(json.dumps({"id": os.environ["SERVER_ID"], "name": os.environ["SERVER_NAME"], "generation": os.environ["GENERATION"], "imageTag": os.environ["IMAGE_TAG"], "gameApiPort": os.environ["GAME_API_PORT"], "webGamePort": os.environ["WEB_GAME_PORT"], "scenarioCode": os.environ["SCENARIO_CODE"], "scenarioSeedEnabled": True, "jwtSecret": "", "operationId": os.environ["CLIENT_OPERATION_ID"], "maintenanceLease": os.environ["MAINTENANCE_LEASE"]}, ensure_ascii=False))')"
+          BODY="$(run_bounded "$WORKFLOW_DEADLINE" 10 python3 -c 'import json, os; print(json.dumps({"id": os.environ["SERVER_ID"], "name": os.environ["SERVER_NAME"], "generation": os.environ["GENERATION"], "imageTag": os.environ["IMAGE_TAG"], "gameApiPort": os.environ["GAME_API_PORT"], "webGamePort": os.environ["WEB_GAME_PORT"], "scenarioCode": os.environ["SCENARIO_CODE"], "scenarioSeedEnabled": True, "operationId": os.environ["CLIENT_OPERATION_ID"], "maintenanceLease": os.environ["MAINTENANCE_LEASE"]}, ensure_ascii=False))')"
 
           lifecycle_status() {
             local target_job_id="$1"
