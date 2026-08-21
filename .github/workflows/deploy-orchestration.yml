@@ -205,6 +205,8 @@ jobs:
             -v "$STACK/.env:/workspace/.env:ro" \
             -v "$STACK/servers:/workspace/servers:ro" \
             opensamguk-deployer:local --check-registry
+          docker_exec_bounded "$WORKFLOW_DEADLINE" 30 opensamguk-deployer \
+            /usr/local/bin/deployer --check-running-registry-targets
 
           run_bounded "$WORKFLOW_DEADLINE" 300 $COMPOSE up -d --force-recreate --no-deps nginx
           docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c 'timeout -k 2 10 wget -qO- -T 5 http://localhost:9000/healthz' | grep -q '"status":"up"'

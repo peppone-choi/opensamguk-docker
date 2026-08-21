@@ -129,8 +129,10 @@ services:
       SERVER_GENERATION: ${SERVER_GENERATION:-1}
       OPENSAMGUK_WORLD_ID: ${OPENSAMGUK_WORLD_ID:-1}
       SCENARIO_DIR: ${SCENARIO_DIR:-/data/scenarios}
-      # JWT — game-api는 gateway-api가 발급한 토큰을 검증(동일 시크릿, verify-only).
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required — gateway-api와 동일 값}
+      # JWT — game-api는 gateway-api 공개키로 검증만 한다(verify-only, 개인키 미배포).
+      JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY:?JWT_PUBLIC_KEY required — see .env.example}
+      JWT_LEGACY_SECRET: ${JWT_LEGACY_SECRET:-}
+      JWT_LEGACY_ACCESS_ACCEPT_UNTIL: ${JWT_LEGACY_ACCESS_ACCEPT_UNTIL:-}
       JAVA_OPTS: "-XX:+UseG1GC -XX:MaxRAMPercentage=50.0 -XX:InitialRAMPercentage=30.0 -Djava.security.egd=file:/dev/./urandom"
     depends_on:
       game-postgres:

@@ -4,7 +4,7 @@
 #
 # 멀티서버 구조에서 "공유"되는 것:
 #   - 유저/인증 DB(gateway-postgres) — 계정은 서버에 종속되지 않음
-#   - 게이트웨이 API + 게이트웨이 웹(로비/어드민)
+#   - 게이트웨이 API + 게시판 API + 게이트웨이 웹(로비/어드민)
 #   - nginx(게이트웨이 진입점, /)
 #   - deployer 사이드카(서버별 버전 bounce 배포)
 #   - socket-proxy(deployer에만 제한된 docker API 노출)
@@ -59,8 +59,15 @@ services:
       GAME_DATABASE_URL: jdbc:postgresql://gateway-postgres:5432/${GATEWAY_POSTGRES_DB:-sammo_gateway}
       GAME_DB_USER: ${GATEWAY_POSTGRES_USER:-sammo}
       GAME_DB_PASSWORD: ${GATEWAY_POSTGRES_PASSWORD:?GATEWAY_POSTGRES_PASSWORD required}
-      # JWT — gateway-api가 토큰을 발급(서버별 game-api와 동일 시크릿이어야 함).
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required — 모든 game-api와 동일 값}
+      # JWT — gateway-api만 개인키를 갖고 토큰을 발급한다(RS256). board-api와 서버별 game-api는
+      # 공개키만 받아 검증만 한다(JWT_PUBLIC_KEY, 아래 board-api 참고).
+      JWT_PRIVATE_KEY: ${JWT_PRIVATE_KEY:?JWT_PRIVATE_KEY required}
+      JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY:?JWT_PUBLIC_KEY required}
+      JWT_SIGNING_MODE: ${JWT_SIGNING_MODE:-RS256}
+      JWT_INCLUDE_PROFILE_CLAIMS: ${JWT_INCLUDE_PROFILE_CLAIMS:-true}
+      JWT_LEGACY_SECRET: ${JWT_LEGACY_SECRET:-}
+      JWT_LEGACY_ACCESS_ACCEPT_UNTIL: ${JWT_LEGACY_ACCESS_ACCEPT_UNTIL:-}
+      JWT_LEGACY_REFRESH_ACCEPT_UNTIL: ${JWT_LEGACY_REFRESH_ACCEPT_UNTIL:-}
       JWT_ACCESS_EXPIRATION: ${JWT_ACCESS_EXPIRATION:-900000}
       JWT_REFRESH_EXPIRATION: ${JWT_REFRESH_EXPIRATION:-604800000}
       # 관리자 시드(빈 users 테이블에서 1회 멱등 생성).
@@ -84,9 +91,52 @@ services:
         condition: service_healthy
     expose:
       - "8080"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/actuator/health/readiness"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
     volumes:
       # OPENSAM-93: 전콘 저장소. gateway-api가 유일한 writer(쓰기 마운트).
       - profile-icons:/var/lib/opensamguk/profile-icons
+    networks:
+      - opensamguk-net
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  board-api:
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_OWNER:-peppone-choi}/opensamguk:board-api-${IMAGE_TAG:-latest}
+    container_name: opensamguk-board-api
+    restart: unless-stopped
+    environment:
+      GAME_DATABASE_URL: jdbc:postgresql://gateway-postgres:5432/${GATEWAY_POSTGRES_DB:-sammo_gateway}
+      GAME_DB_USER: ${GATEWAY_POSTGRES_USER:-sammo}
+      GAME_DB_PASSWORD: ${GATEWAY_POSTGRES_PASSWORD:?GATEWAY_POSTGRES_PASSWORD required}
+      # JWT — board-api는 gateway-api가 발급한 토큰을 공개키로만 검증한다(개인키 없음).
+      JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY:?JWT_PUBLIC_KEY required}
+      JWT_LEGACY_SECRET: ${JWT_LEGACY_SECRET:-}
+      JWT_LEGACY_ACCESS_ACCEPT_UNTIL: ${JWT_LEGACY_ACCESS_ACCEPT_UNTIL:-}
+      JAVA_OPTS: "-XX:+UseG1GC -XX:MaxRAMPercentage=40.0 -XX:InitialRAMPercentage=25.0 -Djava.security.egd=file:/dev/./urandom"
+    depends_on:
+      gateway-postgres:
+        condition: service_healthy
+      # board-api never calls gateway-api at runtime (it only reads/writes gateway_board_post /
+      # gateway_board_comment on the shared DB). This stays service_healthy anyway to preserve
+      # first-boot migration ordering on an empty DB — gateway-api's Flyway migration must run
+      # before board-api's JPA validates the schema.
+      gateway-api:
+        condition: service_healthy
+    expose:
+      - "8083"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8083/actuator/health/readiness"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
     networks:
       - opensamguk-net
     deploy:
@@ -103,9 +153,16 @@ services:
       PORT: 3000
       # 서버 전용 프록시 타깃(NEXT_PUBLIC_GAME_URL은 빌드타임에 이미지에 인라인됨).
       GATEWAY_API_URL: ${GATEWAY_API_URL:-http://gateway-api:8080}
+      BOARD_API_URL: ${BOARD_API_URL:-http://board-api:8083}
       SERVER_REGISTRY_JSON: ${SERVER_REGISTRY_JSON:-[]}
     depends_on:
-      - gateway-api
+      gateway-api:
+        condition: service_healthy
+      # service_started, not service_healthy: 이전 IMAGE_TAG(board-api 이미지 없음)로 롤백하면
+      # board-api가 영구히 unhealthy가 되어 web-gateway까지 못 뜨고 로그인/로비 전체가 502가 된다.
+      # 게시판만 죽고 스택은 살아야 한다.
+      board-api:
+        condition: service_started
     expose:
       - "3000"
     networks:
@@ -130,6 +187,7 @@ services:
       - /var/www/certbot:/var/www/certbot:ro
     depends_on:
       - gateway-api
+      - board-api
       - web-gateway
     ports:
       - "${NGINX_HTTP_PORT:-80}:80"

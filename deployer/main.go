@@ -77,8 +77,12 @@ var (
 // 스테이트리스 bounce 대상 — game-engine은 의도적으로 제외.
 var statelessServices = envList("DEPLOYER_STATELESS_SERVICES", []string{"game-api", "web-game"})
 var requiredPromoteImagePrefixes = []string{"game-api-", "game-engine-", "web-game-"}
-var sharedEnvServices = envList("DEPLOYER_SHARED_ENV_SERVICES", []string{"gateway-api", "web-gateway", "nginx", "deployer"})
-var sharedRegistryReloadServices = envList("DEPLOYER_SHARED_REGISTRY_RELOAD_SERVICES", []string{"gateway-api", "web-gateway", "nginx"})
+var sharedEnvServices = envList("DEPLOYER_SHARED_ENV_SERVICES", []string{"gateway-api", "board-api", "web-gateway", "nginx", "deployer"})
+
+// gateway-api owns the DB-backed registry and persists create/delete only after the deployer
+// returns confirmed success. Restarting it inside that request can sever the response before
+// the DB transaction runs. Only environment-backed web/nginx consumers are reloaded here.
+var sharedRegistryReloadServices = envList("DEPLOYER_SHARED_REGISTRY_RELOAD_SERVICES", []string{"web-gateway", "nginx"})
 var reservedPublicServerIDs = map[string]struct{}{
 	"all": {},
 }
@@ -125,31 +129,33 @@ var reservedGameRouteIDs = map[string]struct{}{
 }
 
 var serverEnvAllowlist = map[string]envFieldSpec{
-	"IMAGE_TAG":                  {Description: "게임 서버 이미지 태그"},
-	"GAME_API_PORT":              {Description: "game-api 호스트 포트"},
-	"WEB_GAME_PORT":              {Description: "web-game 호스트 포트"},
-	"WEB_GAME_TAG":               {Description: "web-game 이미지 태그"},
-	"TURN_PROFILE_NAME":          {Description: "턴 프로필"},
-	"SCENARIO_SEED_ENABLED":      {Description: "시나리오 자동 시드 활성화"},
-	"SCENARIO_CODE":              {Description: "시드할 시나리오 코드"},
-	"SERVER_NAME":                {Description: "서버 이름"},
-	"SERVER_GENERATION":          {Description: "서버 기수"},
-	"GAME_API_URL":               {Description: "game-api 내부 URL"},
-	"GATEWAY_API_URL":            {Description: "gateway-api 내부 URL"},
-	"JWT_SECRET":                 {Description: "JWT 검증 시크릿", WriteOnly: true},
-	"RESET_TURNTERM":             {Description: "리셋: 턴 시간(분)"},
-	"RESET_SYNC":                 {Description: "리셋: 시간 동기화"},
-	"RESET_FICTION":              {Description: "리셋: NPC 상성"},
-	"RESET_EXTEND":               {Description: "리셋: 확장 NPC"},
-	"RESET_BLOCK_GENERAL_CREATE": {Description: "리셋: 장수 임의 생성"},
-	"RESET_NPCMODE":              {Description: "리셋: NPC 빙의"},
-	"RESET_SHOW_IMG_LEVEL":       {Description: "리셋: 이미지 표기"},
-	"RESET_AUTORUN_USER_OPTIONS": {Description: "리셋: 휴식 턴 시 장수 턴"},
-	"RESET_AUTORUN_USER_MINUTES": {Description: "리셋: 자동 행동 유효 시간"},
-	"RESET_JOIN_MODE":            {Description: "리셋: 임관 모드"},
-	"RESET_TOURNAMENT_TRIG":      {Description: "리셋: 토너먼트 자동 시작"},
-	"RESET_RESERVE_OPEN":         {Description: "리셋: 오픈 예약"},
-	"RESET_PRE_RESERVE_OPEN":     {Description: "리셋: 가오픈 예약"},
+	"IMAGE_TAG":                      {Description: "게임 서버 이미지 태그"},
+	"GAME_API_PORT":                  {Description: "game-api 호스트 포트"},
+	"WEB_GAME_PORT":                  {Description: "web-game 호스트 포트"},
+	"WEB_GAME_TAG":                   {Description: "web-game 이미지 태그"},
+	"TURN_PROFILE_NAME":              {Description: "턴 프로필"},
+	"SCENARIO_SEED_ENABLED":          {Description: "시나리오 자동 시드 활성화"},
+	"SCENARIO_CODE":                  {Description: "시드할 시나리오 코드"},
+	"SERVER_NAME":                    {Description: "서버 이름"},
+	"SERVER_GENERATION":              {Description: "서버 기수"},
+	"GAME_API_URL":                   {Description: "game-api 내부 URL"},
+	"GATEWAY_API_URL":                {Description: "gateway-api 내부 URL"},
+	"JWT_PUBLIC_KEY":                 {Description: "JWT 검증 공개키(비밀 아님, gateway-api와 동일 값)"},
+	"JWT_LEGACY_SECRET":              {Description: "레거시 HS256 검증 시크릿", WriteOnly: true},
+	"JWT_LEGACY_ACCESS_ACCEPT_UNTIL": {Description: "레거시 토큰 수용 만료 시각"},
+	"RESET_TURNTERM":                 {Description: "리셋: 턴 시간(분)"},
+	"RESET_SYNC":                     {Description: "리셋: 시간 동기화"},
+	"RESET_FICTION":                  {Description: "리셋: NPC 상성"},
+	"RESET_EXTEND":                   {Description: "리셋: 확장 NPC"},
+	"RESET_BLOCK_GENERAL_CREATE":     {Description: "리셋: 장수 임의 생성"},
+	"RESET_NPCMODE":                  {Description: "리셋: NPC 빙의"},
+	"RESET_SHOW_IMG_LEVEL":           {Description: "리셋: 이미지 표기"},
+	"RESET_AUTORUN_USER_OPTIONS":     {Description: "리셋: 휴식 턴 시 장수 턴"},
+	"RESET_AUTORUN_USER_MINUTES":     {Description: "리셋: 자동 행동 유효 시간"},
+	"RESET_JOIN_MODE":                {Description: "리셋: 임관 모드"},
+	"RESET_TOURNAMENT_TRIG":          {Description: "리셋: 토너먼트 자동 시작"},
+	"RESET_RESERVE_OPEN":             {Description: "리셋: 오픈 예약"},
+	"RESET_PRE_RESERVE_OPEN":         {Description: "리셋: 가오픈 예약"},
 }
 
 var v2ServerDefinitionKeys = map[string]struct{}{
@@ -162,34 +168,36 @@ var v2ServerDefinitionKeys = map[string]struct{}{
 // deployer process because Compose gives its shell environment precedence over
 // --env-file.
 var serverComposeInterpolationKeys = map[string]struct{}{
-	"COMPOSE_HOST_DIR":           {},
-	"GATEWAY_API_URL":            {},
-	"GAME_API_PORT":              {},
-	"GAME_API_URL":               {},
-	"GAME_POSTGRES_DB":           {},
-	"GAME_POSTGRES_PASSWORD":     {},
-	"GAME_POSTGRES_USER":         {},
-	"GHCR_OWNER":                 {},
-	"GHCR_REGISTRY":              {},
-	"IMAGE_TAG":                  {},
-	"JWT_SECRET":                 {},
-	"OPENSAMGUK_WORLD_ID":        {},
-	"PWD":                        {},
-	"RESET_BLOCK_GENERAL_CREATE": {},
-	"RESET_EXTEND":               {},
-	"RESET_FICTION":              {},
-	"RESET_NPCMODE":              {},
-	"RESET_SHOW_IMG_LEVEL":       {},
-	"RESET_TURNTERM":             {},
-	"SCENARIO_CODE":              {},
-	"SCENARIO_DIR":               {},
-	"SCENARIO_SEED_ENABLED":      {},
-	"SERVER_GENERATION":          {},
-	"SERVER_ID":                  {},
-	"SERVER_NAME":                {},
-	"TURN_PROFILE_NAME":          {},
-	"WEB_GAME_PORT":              {},
-	"WEB_GAME_TAG":               {},
+	"COMPOSE_HOST_DIR":               {},
+	"GATEWAY_API_URL":                {},
+	"GAME_API_PORT":                  {},
+	"GAME_API_URL":                   {},
+	"GAME_POSTGRES_DB":               {},
+	"GAME_POSTGRES_PASSWORD":         {},
+	"GAME_POSTGRES_USER":             {},
+	"GHCR_OWNER":                     {},
+	"GHCR_REGISTRY":                  {},
+	"IMAGE_TAG":                      {},
+	"JWT_PUBLIC_KEY":                 {},
+	"JWT_LEGACY_SECRET":              {},
+	"JWT_LEGACY_ACCESS_ACCEPT_UNTIL": {},
+	"OPENSAMGUK_WORLD_ID":            {},
+	"PWD":                            {},
+	"RESET_BLOCK_GENERAL_CREATE":     {},
+	"RESET_EXTEND":                   {},
+	"RESET_FICTION":                  {},
+	"RESET_NPCMODE":                  {},
+	"RESET_SHOW_IMG_LEVEL":           {},
+	"RESET_TURNTERM":                 {},
+	"SCENARIO_CODE":                  {},
+	"SCENARIO_DIR":                   {},
+	"SCENARIO_SEED_ENABLED":          {},
+	"SERVER_GENERATION":              {},
+	"SERVER_ID":                      {},
+	"SERVER_NAME":                    {},
+	"TURN_PROFILE_NAME":              {},
+	"WEB_GAME_PORT":                  {},
+	"WEB_GAME_TAG":                   {},
 }
 
 var serverComposeProcessControlKeys = map[string]struct{}{
@@ -254,7 +262,9 @@ var sharedEnvAllowlist = map[string]envFieldSpec{
 	"NEXT_PUBLIC_GATEWAY_URL": {Description: "게이트웨이 공개 URL"},
 	"NEXT_PUBLIC_IMAGE_CDN":   {Description: "이미지 CDN URL"},
 	"COOKIE_SECURE":           {Description: "Secure 쿠키 사용 여부"},
-	"JWT_SECRET":              {Description: "JWT 발급 시크릿", WriteOnly: true},
+	"JWT_PRIVATE_KEY":         {Description: "JWT 서명 개인키(gateway-api 전용)", WriteOnly: true},
+	"JWT_PUBLIC_KEY":          {Description: "JWT 검증 공개키(비밀 아님, 서버들이 복사)"},
+	"JWT_LEGACY_SECRET":       {Description: "레거시 HS256 검증 시크릿", WriteOnly: true},
 	"ADMIN_PASSWORD":          {Description: "초기 관리자 비밀번호", WriteOnly: true},
 	"GHCR_TOKEN":              {Description: "GHCR 조회 토큰", WriteOnly: true},
 }
@@ -1646,6 +1656,46 @@ func (c config) validateRegisteredServerTargets() error {
 	return nil
 }
 
+func (c config) validateRunningServerRegistry(ctx context.Context) error {
+	registry, err := c.readRegistry()
+	if err != nil {
+		return err
+	}
+	registered := make(map[string]struct{}, len(registry))
+	for _, entry := range registry {
+		registered[entry.ID] = struct{}{}
+	}
+	output, err := c.runDockerContext(ctx, "ps", "--filter", "status=running", "--format", `{{.Label "com.docker.compose.project"}}`)
+	if err != nil {
+		return err
+	}
+	seenProjects := map[string]struct{}{}
+	for _, rawProject := range strings.Split(output, "\n") {
+		project := strings.TrimSpace(rawProject)
+		if project == "" || project == "opensamguk-shared" {
+			continue
+		}
+		if _, seen := seenProjects[project]; seen {
+			continue
+		}
+		seenProjects[project] = struct{}{}
+		if !projectRe.MatchString(project) {
+			continue
+		}
+		target, err := c.serverTargetForProject(project)
+		if err != nil {
+			return err
+		}
+		if _, exists := registered[target.ID]; !exists {
+			return fmt.Errorf("running server project %q is missing from SERVER_REGISTRY_JSON", project)
+		}
+		if _, err := c.validateServerTarget(target); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // --- 응답 타입 ---
 
 type statusResponse struct {
@@ -1699,7 +1749,10 @@ type createServerRequest struct {
 	WebGamePort         string `json:"webGamePort"`
 	ScenarioCode        string `json:"scenarioCode"`
 	ScenarioSeedEnabled *bool  `json:"scenarioSeedEnabled"`
-	JWTSecret           string `json:"jwtSecret"`
+	// JWT는 요청으로 받지 않는다 — 항상 공유 .env의 JWT_PUBLIC_KEY(+JWT_LEGACY_*)를
+	// 그대로 복사한다(모든 서버가 같은 gateway-api 공개키를 검증해야 하므로 서버별
+	// override는 의미가 없다). 과거 jwtSecret 필드는 어떤 테스트/문서도 실사용하지
+	// 않아 하위호환 없이 제거했다.
 }
 
 type resetServerRequest struct {
@@ -1779,6 +1832,9 @@ type envLine struct {
 
 func main() {
 	cfg := loadConfig()
+	if len(os.Args) == 2 && os.Args[1] == "--check-running-registry-targets" {
+		os.Exit(checkRunningRegistryTargetsCommand(cfg, os.Stderr))
+	}
 	if len(os.Args) == 2 && os.Args[1] == "--check-registry-targets" {
 		os.Exit(checkRegistryTargetsCommand(cfg, os.Stderr))
 	}
@@ -1789,7 +1845,7 @@ func main() {
 		os.Exit(authenticatedHTTPCommand(cfg, os.Args[2], os.Args[3], os.Stdin, os.Stdout, os.Stderr))
 	}
 	if len(os.Args) != 1 {
-		log.Fatal("usage: deployer [--check-registry-targets|--check-registry|--authenticated-http METHOD PATH]")
+		log.Fatal("usage: deployer [--check-running-registry-targets|--check-registry-targets|--check-registry|--authenticated-http METHOD PATH]")
 	}
 	if cfg.token == "" {
 		log.Fatal("DEPLOYER_TOKEN 미설정 — 인증 토큰 필수")
@@ -1906,6 +1962,19 @@ func checkRegistryTargetsCommand(c config, output io.Writer) int {
 		return 1
 	}
 	fmt.Fprintln(output, "registry target validation passed")
+	return 0
+}
+
+func checkRunningRegistryTargetsCommand(c config, output io.Writer) int {
+	if err := c.validateRegisteredServerTargets(); err != nil {
+		fmt.Fprintf(output, "running registry target validation failed: %v\n", err)
+		return 1
+	}
+	if err := c.validateRunningServerRegistry(context.Background()); err != nil {
+		fmt.Fprintf(output, "running registry target validation failed: %v\n", err)
+		return 1
+	}
+	fmt.Fprintln(output, "running registry target validation passed")
 	return 0
 }
 
@@ -2546,16 +2615,18 @@ func (c config) createServer(req createServerRequest) (createServerResponse, int
 }
 
 type normalizedCreateServerRequest struct {
-	ID                  string
-	InternalKey         string
-	Name                string
-	Generation          int
-	ImageTag            string
-	GameAPIPort         string
-	WebGamePort         string
-	ScenarioCode        string
-	ScenarioSeedEnabled bool
-	JWTSecret           string
+	ID                   string
+	InternalKey          string
+	Name                 string
+	Generation           int
+	ImageTag             string
+	GameAPIPort          string
+	WebGamePort          string
+	ScenarioCode         string
+	ScenarioSeedEnabled  bool
+	JWTPublicKey         string
+	JWTLegacySecret      string
+	JWTLegacyAcceptUntil string
 }
 
 func (c config) normalizeCreateServerRequest(req createServerRequest) (normalizedCreateServerRequest, error) {
@@ -2600,27 +2671,39 @@ func (c config) normalizeCreateServerRequest(req createServerRequest) (normalize
 	if req.ScenarioSeedEnabled != nil {
 		seedEnabled = *req.ScenarioSeedEnabled
 	}
-	jwtSecret := strings.TrimSpace(req.JWTSecret)
-	if jwtSecret == "" {
-		jwtSecret = c.sharedEnvValue("JWT_SECRET")
+	// JWT는 서버별 값을 받지 않는다 — gateway-api가 발급하는 토큰을 검증하려면
+	// 모든 서버가 공유 스택과 동일한 공개키를 써야 하므로(서버별 override는 의미가 없다),
+	// 항상 공유 .env에서 복사한다.
+	jwtPublicKey := c.sharedEnvValue("JWT_PUBLIC_KEY")
+	if jwtPublicKey == "" || strings.ContainsAny(jwtPublicKey, "\r\n") {
+		return normalizedCreateServerRequest{}, errors.New("공유 JWT_PUBLIC_KEY가 필요합니다.")
 	}
-	if jwtSecret == "" || strings.ContainsAny(jwtSecret, "\r\n") {
-		return normalizedCreateServerRequest{}, errors.New("공유 JWT_SECRET이 필요합니다.")
+	jwtLegacySecret := c.sharedEnvValue("JWT_LEGACY_SECRET")
+	if strings.ContainsAny(jwtLegacySecret, "\r\n") {
+		return normalizedCreateServerRequest{}, errors.New("공유 JWT_LEGACY_SECRET이 올바르지 않습니다.")
+	}
+	jwtLegacyAcceptUntil := c.sharedEnvValue("JWT_LEGACY_ACCESS_ACCEPT_UNTIL")
+	if strings.ContainsAny(jwtLegacyAcceptUntil, "\r\n") {
+		return normalizedCreateServerRequest{}, errors.New("공유 JWT_LEGACY_ACCESS_ACCEPT_UNTIL이 올바르지 않습니다.")
 	}
 	return normalizedCreateServerRequest{
-		ID:                  id,
-		InternalKey:         internalKey,
-		Name:                name,
-		Generation:          generation,
-		ImageTag:            imageTag,
-		GameAPIPort:         gameAPIPort,
-		WebGamePort:         webGamePort,
-		ScenarioCode:        scenarioCode,
-		ScenarioSeedEnabled: seedEnabled,
-		JWTSecret:           jwtSecret,
+		ID:                   id,
+		InternalKey:          internalKey,
+		Name:                 name,
+		Generation:           generation,
+		ImageTag:             imageTag,
+		GameAPIPort:          gameAPIPort,
+		WebGamePort:          webGamePort,
+		ScenarioCode:         scenarioCode,
+		ScenarioSeedEnabled:  seedEnabled,
+		JWTPublicKey:         jwtPublicKey,
+		JWTLegacySecret:      jwtLegacySecret,
+		JWTLegacyAcceptUntil: jwtLegacyAcceptUntil,
 	}, nil
 }
 
+// JWT 필드는 지문에서 뺀다 — 사용자 입력이 아니라 공유 .env에서 매번 동일하게
+// 파생되므로, 지문에 넣어도 판별력이 없고 넣지 않아도 안전하다.
 func createRequestFingerprint(req normalizedCreateServerRequest) string {
 	payload, _ := json.Marshal(struct {
 		ID                  string `json:"id"`
@@ -2631,7 +2714,6 @@ func createRequestFingerprint(req normalizedCreateServerRequest) string {
 		WebGamePort         string `json:"webGamePort"`
 		ScenarioCode        string `json:"scenarioCode"`
 		ScenarioSeedEnabled bool   `json:"scenarioSeedEnabled"`
-		JWTSecret           string `json:"jwtSecret"`
 	}{
 		ID:                  req.ID,
 		Name:                req.Name,
@@ -2641,13 +2723,12 @@ func createRequestFingerprint(req normalizedCreateServerRequest) string {
 		WebGamePort:         req.WebGamePort,
 		ScenarioCode:        req.ScenarioCode,
 		ScenarioSeedEnabled: req.ScenarioSeedEnabled,
-		JWTSecret:           req.JWTSecret,
 	})
 	sum := sha256.Sum256(payload)
 	return hex.EncodeToString(sum[:])
 }
 
-func (c config) createServerWithMaintenanceLease(req createServerRequest, maintenanceLease string) (createServerResponse, int) {
+func (c config) createServerWithMaintenanceLease(req createServerRequest, maintenanceLease string) (response createServerResponse, responseStatus int) {
 	operationID, err := normalizeLifecycleOperationID(req.OperationID)
 	if err != nil {
 		return createServerResponse{OK: false, Detail: err.Error()}, http.StatusBadRequest
@@ -2669,7 +2750,9 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 	webGamePort := normalized.WebGamePort
 	scenarioCode := normalized.ScenarioCode
 	seedEnabled := normalized.ScenarioSeedEnabled
-	jwtSecret := normalized.JWTSecret
+	jwtPublicKey := normalized.JWTPublicKey
+	jwtLegacySecret := normalized.JWTLegacySecret
+	jwtLegacyAcceptUntil := normalized.JWTLegacyAcceptUntil
 	jobID := ""
 	newReservation := false
 	reservationClaimed := false
@@ -2741,7 +2824,9 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 		{Raw: "GAME_POSTGRES_DB=sammo", Key: "GAME_POSTGRES_DB", Value: "sammo", IsKV: true},
 		{Raw: "GAME_POSTGRES_USER=sammo", Key: "GAME_POSTGRES_USER", Value: "sammo", IsKV: true},
 		{Raw: "GAME_POSTGRES_PASSWORD=" + gamePassword, Key: "GAME_POSTGRES_PASSWORD", Value: gamePassword, IsKV: true},
-		{Raw: "JWT_SECRET=" + jwtSecret, Key: "JWT_SECRET", Value: jwtSecret, IsKV: true},
+		{Raw: "JWT_PUBLIC_KEY=" + jwtPublicKey, Key: "JWT_PUBLIC_KEY", Value: jwtPublicKey, IsKV: true},
+		{Raw: "JWT_LEGACY_SECRET=" + jwtLegacySecret, Key: "JWT_LEGACY_SECRET", Value: jwtLegacySecret, IsKV: true},
+		{Raw: "JWT_LEGACY_ACCESS_ACCEPT_UNTIL=" + jwtLegacyAcceptUntil, Key: "JWT_LEGACY_ACCESS_ACCEPT_UNTIL", Value: jwtLegacyAcceptUntil, IsKV: true},
 		{Raw: "TURN_PROFILE_NAME=che:scenario_2", Key: "TURN_PROFILE_NAME", Value: "che:scenario_2", IsKV: true},
 		{Raw: "SCENARIO_SEED_ENABLED=" + boolText(seedEnabled), Key: "SCENARIO_SEED_ENABLED", Value: boolText(seedEnabled), IsKV: true},
 		{Raw: "SCENARIO_CODE=" + scenarioCode, Key: "SCENARIO_CODE", Value: scenarioCode, IsKV: true},

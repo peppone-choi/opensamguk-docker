@@ -22,6 +22,15 @@ import (
 	"time"
 )
 
+func TestDefaultSharedServiceBoundaries(t *testing.T) {
+	if got, want := strings.Join(sharedEnvServices, ","), "gateway-api,board-api,web-gateway,nginx,deployer"; got != want {
+		t.Fatalf("shared env services = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(sharedRegistryReloadServices, ","), "web-gateway,nginx"; got != want {
+		t.Fatalf("shared registry reload services = %q, want %q", got, want)
+	}
+}
+
 func TestServerEnvGetPatchHappyPath(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "# server\nSERVER_ID=pep\nIMAGE_TAG=v1\nGAME_API_PORT=8101\nJWT_SECRET=old-secret\n")
@@ -137,6 +146,7 @@ func TestLifecycleJobStatusTracksReloadAndRedactsFailure(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
 JWT_SECRET=shared-secret
+JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nIMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\n")
@@ -147,7 +157,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 		if dockerPreflightProbe(args) {
 			return "29.0.0\n", nil
 		}
-		if strings.Contains(strings.Join(args, " "), "gateway-api web-gateway") {
+		if strings.Contains(strings.Join(args, " "), "up -d --no-deps web-gateway") {
 			enteredOnce.Do(func() { close(enteredReload) })
 			<-releaseReload
 		}
@@ -179,6 +189,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	failing := testConfig(t)
 	writeEnv(t, filepath.Join(failing.composeDir, ".env"), `IMAGE_TAG=v1
 JWT_SECRET=shared-secret
+JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
 	writeEnv(t, filepath.Join(failing.serversDir, "spep.env"), "SERVER_ID=pep\nIMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\n")
@@ -208,7 +219,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 
 func TestConcurrentAuthenticatedCreatesWaitForPriorLifecycleTransaction(t *testing.T) {
 	cfg := testConfig(t)
-	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n")
 
 	firstDockerCall := make(chan struct{})
 	releaseFirstDockerCall := make(chan struct{})
@@ -305,7 +316,7 @@ func TestConcurrentAuthenticatedCreatesWaitForPriorLifecycleTransaction(t *testi
 
 func TestCreateServerOperationIDRecoversAmbiguousPostWithoutSecondMutation(t *testing.T) {
 	cfg := testConfig(t)
-	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n")
 
 	firstDockerCall := make(chan struct{})
 	releaseFirstDockerCall := make(chan struct{})
@@ -364,7 +375,7 @@ func TestCreateServerOperationIDRecoversAmbiguousPostWithoutSecondMutation(t *te
 
 func TestCreateServerOperationIDBindsNormalizedPayloadBeforeRetryResolution(t *testing.T) {
 	cfg := testConfig(t)
-	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n")
 	dockerStarted := make(chan struct{})
 	releaseDocker := make(chan struct{})
 	var started sync.Once
@@ -501,7 +512,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 		if dockerPreflightProbe(args) {
 			return "29.0.0\n", nil
 		}
-		if strings.Contains(strings.Join(args, " "), "gateway-api web-gateway") {
+		if strings.Contains(strings.Join(args, " "), "up -d --no-deps web-gateway") {
 			return "reload failed\n", errors.New("shared registry reload failed")
 		}
 		return "ok\n", nil
@@ -618,7 +629,7 @@ func TestMaintenanceAPIBearerLoopbackAndIdempotency(t *testing.T) {
 
 func TestMaintenanceLeasePermitsOnlyOneLoopbackIdempotentCreate(t *testing.T) {
 	cfg := testConfig(t)
-	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n")
 	dockerStarted := make(chan struct{})
 	releaseDocker := make(chan struct{})
 	var started sync.Once
@@ -732,7 +743,7 @@ func TestMaintenanceLeasePermitsOnlyOneLoopbackIdempotentCreate(t *testing.T) {
 
 func TestMaintenanceLeaseAcceptedFromCreateBodyAndNeverReturned(t *testing.T) {
 	cfg := testConfig(t)
-	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n")
 	cfg.dockerRunner = func(args ...string) (string, error) { return "ok\n", nil }
 	maintenance := cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance))
 	enter := loopbackRequest(t, maintenance, http.MethodPost, "/maintenance/enter", "")
@@ -757,7 +768,7 @@ func TestMaintenanceLeaseAcceptedFromCreateBodyAndNeverReturned(t *testing.T) {
 
 func TestRejectedCreateAdmissionDiscardsOperationReservationForRetry(t *testing.T) {
 	cfg := testConfig(t)
-	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n")
 	cfg.dockerRunner = func(args ...string) (string, error) { return "ok\n", nil }
 
 	maintenance := cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance))
@@ -999,7 +1010,7 @@ func TestResetRepairRestoresJournaledTargetAcrossPreparedCrashBoundaries(t *test
 				t.Fatalf("prepared crash repair retained journal: %v", err)
 			}
 			recorded := calls.snapshot()
-			if len(recorded) != 4 || !strings.Contains(recorded[0], "down --volumes --remove-orphans") || !strings.Contains(recorded[1], "up -d") || !strings.Contains(recorded[2], "gateway-api web-gateway") || !strings.Contains(recorded[3], "--force-recreate --no-deps nginx") {
+			if len(recorded) != 4 || !strings.Contains(recorded[0], "down --volumes --remove-orphans") || !strings.Contains(recorded[1], "up -d") || !strings.Contains(recorded[2], "up -d --no-deps web-gateway") || strings.Contains(recorded[2], "gateway-api") || !strings.Contains(recorded[3], "--force-recreate --no-deps nginx") {
 				t.Fatalf("prepared crash repair calls = %#v", recorded)
 			}
 		})
@@ -1042,6 +1053,7 @@ func TestResetRejectsSeedDisabledBeforeJournalOrDocker(t *testing.T) {
 func TestDockerUnreachableFailsMutationsBeforeIrreversibleBoundary(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `JWT_SECRET=shared-secret
+JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"scenarioCode":"scenario_1010","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
 	envFile := filepath.Join(cfg.serversDir, "spep.env")
@@ -1162,7 +1174,7 @@ func TestCreateJournalBeforeEnvIsClearedAfterRestartWhenNoStateWasWritten(t *tes
 
 func TestRestartedMaintenanceMarkerRejectsDirectMutationsAndLosesInMemoryJob(t *testing.T) {
 	cfg := testConfig(t)
-	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "COOKIE_SECURE=false\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "COOKIE_SECURE=false\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n")
 	maintenanceHandler := cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance))
 	enter := loopbackRequest(t, maintenanceHandler, http.MethodPost, "/maintenance/enter", "")
 	entered := decodeMaintenanceResponse(t, enter)
@@ -1272,7 +1284,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 
 func TestPendingCreateCancelBeforeClaimHasNoMutation(t *testing.T) {
 	cfg := testConfig(t)
-	sharedEnv := "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n"
+	sharedEnv := "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n"
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), sharedEnv)
 	firstDockerStarted := make(chan struct{})
 	releaseFirstDocker := make(chan struct{})
@@ -1364,7 +1376,7 @@ func TestPendingCreateCancelBeforeClaimHasNoMutation(t *testing.T) {
 func TestClaimCancelRaceCancelledBeforeClaimNeverMutates(t *testing.T) {
 	for attempt := 0; attempt < 32; attempt++ {
 		cfg := testConfig(t)
-		sharedEnv := "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n"
+		sharedEnv := "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n"
 		writeEnv(t, filepath.Join(cfg.composeDir, ".env"), sharedEnv)
 		calls := &dockerCallRecorder{}
 		cfg.dockerRunner = func(args ...string) (string, error) {
@@ -1422,6 +1434,7 @@ func TestMaintenanceClosedRejectsEveryMutationHandler(t *testing.T) {
 	cfg := testConfig(t)
 	sharedEnv := `COOKIE_SECURE=false
 JWT_SECRET=shared-secret
+JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `
 	serverEnv := "SERVER_ID=pep\nIMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_PORT=8101\nWEB_GAME_PORT=3101\nGAME_API_URL=http://spep-game-api:8081\n"
@@ -1474,7 +1487,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 
 func TestLifecycleJobCapacityFailsBeforeCreateMutationAndPrunesTerminal(t *testing.T) {
 	cfg := testConfig(t)
-	original := "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n"
+	original := "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n"
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), original)
 	for i := 0; i < lifecycleJobMaxEntries; i++ {
 		if _, err := cfg.lifecycleJobs.reserve(); err != nil {
@@ -1521,8 +1534,8 @@ func TestServerEnvPatchCancelsLifecycleReservationWithoutReloadOrOnSetupFailure(
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep","env":{"IMAGE_TAG":"v1","SERVER_NAME":"통일 서버","SERVER_GENERATION":"1","GAME_API_URL":"http://spep-game-api:8081"}}]
 `)
-	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nIMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\nJWT_SECRET=old-secret\n")
-	noReload := envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodPatch, "/env/server?id=pep", `{"values":{"JWT_SECRET":"new-secret"}}`)
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nIMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\nJWT_PUBLIC_KEY=old-public-key\n")
+	noReload := envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodPatch, "/env/server?id=pep", `{"values":{"JWT_PUBLIC_KEY":"new-public-key"}}`)
 	if noReload.Code != http.StatusOK {
 		t.Fatalf("no-reload PATCH status = %d body=%s", noReload.Code, noReload.Body.String())
 	}
@@ -1626,6 +1639,46 @@ func TestCandidateRegistryTargetCheckDefersLifecycleJournalRecovery(t *testing.T
 	}
 }
 
+func TestRunningRegistryTargetCheckRejectsAnUnseededRunningServer(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "SERVER_REGISTRY_JSON=[]\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\n")
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		return "opensamguk-shared\nopensamguk-spep\nopensamguk-spep\n", nil
+	}
+
+	var output bytes.Buffer
+	if code := checkRunningRegistryTargetsCommand(cfg, &output); code != 1 {
+		t.Fatalf("unseeded running registry exit code = %d, want 1", code)
+	}
+	// 구현은 진단용 이유를 덧붙인다(main.go: "...failed: %v"). 운영에서 이유 문자열이
+	// 필요하므로 접두사 + 미등록 프로젝트명 포함만 잠근다.
+	got := output.String()
+	if !strings.HasPrefix(got, "running registry target validation failed: ") ||
+		!strings.Contains(got, "opensamguk-spep") {
+		t.Fatalf("unseeded running registry output = %q", got)
+	}
+}
+
+func TestRunningRegistryTargetCheckAcceptsRegisteredProjectsAndIgnoresStaleEnvFiles(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","deployProject":"opensamguk-spep"}]
+`)
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "sstale.env"), "SERVER_ID=stale\n")
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		return "opensamguk-shared\nopensamguk-spep\nunrelated-project\n", nil
+	}
+
+	var output bytes.Buffer
+	if code := checkRunningRegistryTargetsCommand(cfg, &output); code != 0 {
+		t.Fatalf("registered running registry exit code = %d, want 0", code)
+	}
+	if got := output.String(); got != "running registry target validation passed\n" {
+		t.Fatalf("registered running registry output = %q", got)
+	}
+}
+
 func TestDeployPromotesApiAndWebGameTags(t *testing.T) {
 	cfg := testConfig(t)
 	envFile := filepath.Join(cfg.serversDir, "s1.env")
@@ -1721,9 +1774,10 @@ func TestServerEnvPatchSyncsRegistrySnapshotAndReloadsShared(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
 JWT_SECRET=shared-secret
+JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
-	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nIMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\nJWT_SECRET=old-secret\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nIMAGE_TAG=v1\nSERVER_NAME=통일 서버\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\nJWT_PUBLIC_KEY=old-public-key\n")
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
 		if dockerPreflightProbe(args) {
@@ -1738,7 +1792,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 		cfg.withAuth(cfg.handleServerEnv),
 		http.MethodPatch,
 		"/env/server?id=PEP",
-		`{"values":{"IMAGE_TAG":"v2","SERVER_NAME":"새 서버","SERVER_GENERATION":"0","GAME_API_URL":"http://spep-game-api-new:8081","RESET_TURNTERM":"30","JWT_SECRET":"new-secret"}}`,
+		`{"values":{"IMAGE_TAG":"v2","SERVER_NAME":"새 서버","SERVER_GENERATION":"0","GAME_API_URL":"http://spep-game-api-new:8081","RESET_TURNTERM":"30","JWT_PUBLIC_KEY":"new-public-key"}}`,
 	)
 	if res.Code != http.StatusOK {
 		t.Fatalf("PATCH status = %d body=%s", res.Code, res.Body.String())
@@ -1748,10 +1802,13 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 		t.Fatalf("PATCH job id = %q", body.JobID)
 	}
 	affected := strings.Join(body.AffectedServices, ",")
-	for _, want := range []string{"game-api", "web-game", "gateway-api", "web-gateway", "nginx"} {
+	for _, want := range []string{"game-api", "web-game", "web-gateway", "nginx"} {
 		if !strings.Contains(affected, want) {
 			t.Fatalf("affected services missing %q: %#v", want, body.AffectedServices)
 		}
+	}
+	if strings.Contains(affected, "gateway-api") {
+		t.Fatalf("affected services restart the registry request owner: %#v", body.AffectedServices)
 	}
 
 	registry, err := cfg.readRegistry()
@@ -1787,7 +1844,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	if len(recorded) != 2 {
 		t.Fatalf("docker calls = %#v", recorded)
 	}
-	if !strings.Contains(recorded[0], "gateway-api web-gateway") || strings.Contains(recorded[0], " nginx") {
+	if !strings.Contains(recorded[0], "up -d --no-deps web-gateway") || strings.Contains(recorded[0], "gateway-api") || strings.Contains(recorded[0], " nginx") {
 		t.Fatalf("shared reload call = %q", recorded[0])
 	}
 	if !strings.Contains(recorded[1], "--force-recreate --no-deps nginx") {
@@ -1811,39 +1868,39 @@ func TestSharedEnvRejectsUnknownKey(t *testing.T) {
 func TestServerEnvMasksWriteOnlySecrets(t *testing.T) {
 	cfg := testConfig(t)
 	envFile := filepath.Join(cfg.serversDir, "spep.env")
-	writeEnv(t, envFile, "SERVER_ID=pep\nIMAGE_TAG=v1\nJWT_SECRET=old-secret\n")
+	writeEnv(t, envFile, "SERVER_ID=pep\nIMAGE_TAG=v1\nJWT_LEGACY_SECRET=old-secret\n")
 
 	res := envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodGet, "/env/server?id=pep", "")
 	if res.Code != http.StatusOK {
 		t.Fatalf("GET status = %d body=%s", res.Code, res.Body.String())
 	}
 	body := decodeEnvResponse(t, res)
-	secret := body.Fields["JWT_SECRET"]
+	secret := body.Fields["JWT_LEGACY_SECRET"]
 	if !secret.Configured || !secret.WriteOnly || !secret.Masked {
-		t.Fatalf("JWT_SECRET metadata = %#v", secret)
+		t.Fatalf("JWT_LEGACY_SECRET metadata = %#v", secret)
 	}
 	if secret.Value != nil {
-		t.Fatalf("JWT_SECRET raw value leaked: %#v", *secret.Value)
+		t.Fatalf("JWT_LEGACY_SECRET raw value leaked: %#v", *secret.Value)
 	}
 	if strings.Contains(res.Body.String(), "old-secret") {
 		t.Fatalf("GET leaked raw secret: %s", res.Body.String())
 	}
 
-	res = envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodPatch, "/env/server?id=pep", `{"values":{"JWT_SECRET":"new-secret"}}`)
+	res = envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodPatch, "/env/server?id=pep", `{"values":{"JWT_LEGACY_SECRET":"new-secret"}}`)
 	if res.Code != http.StatusOK {
 		t.Fatalf("PATCH status = %d body=%s", res.Code, res.Body.String())
 	}
 	if strings.Contains(res.Body.String(), "new-secret") {
 		t.Fatalf("PATCH leaked raw secret: %s", res.Body.String())
 	}
-	if !strings.Contains(readFile(t, envFile), "JWT_SECRET=new-secret\n") {
+	if !strings.Contains(readFile(t, envFile), "JWT_LEGACY_SECRET=new-secret\n") {
 		t.Fatalf("secret was not written:\n%s", readFile(t, envFile))
 	}
 }
 
 func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 	cfg := testConfig(t)
-	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n")
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
 		if dockerPreflightProbe(args) {
@@ -1874,13 +1931,18 @@ func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 		"SERVER_GENERATION=3\n",
 		"GAME_API_PORT=8101\n",
 		"WEB_GAME_PORT=3101\n",
-		"JWT_SECRET=shared-secret\n",
+		"JWT_PUBLIC_KEY=shared-public-key\n",
 		"SCENARIO_SEED_ENABLED=true\n",
 		"GAME_API_URL=http://spep-game-api:8081\n",
 	} {
 		if !strings.Contains(serverEnv, want) {
 			t.Fatalf("server env missing %q:\n%s", want, serverEnv)
 		}
+	}
+	// OPENSAM-207/208 회귀: 서버 env는 verify-only 공개키만 받는다 — gateway-api의
+	// 개인키가 서버 스택으로 새 나가면 그 서버가 gateway-api를 사칭하는 토큰을 만들 수 있다.
+	if strings.Contains(serverEnv, "JWT_PRIVATE_KEY") {
+		t.Fatalf("server env leaked JWT_PRIVATE_KEY:\n%s", serverEnv)
 	}
 	sharedEnv := readFile(t, filepath.Join(cfg.composeDir, ".env"))
 	if !strings.Contains(sharedEnv, `"id":"pep"`) ||
@@ -1899,7 +1961,7 @@ func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 		strings.Contains(recorded[0], "--no-deps") {
 		t.Fatalf("server compose call = %q", recorded[0])
 	}
-	if !strings.Contains(recorded[1], "gateway-api web-gateway") || strings.Contains(recorded[1], " nginx") {
+	if !strings.Contains(recorded[1], "up -d --no-deps web-gateway") || strings.Contains(recorded[1], "gateway-api") || strings.Contains(recorded[1], " nginx") {
 		t.Fatalf("shared reload call = %q", recorded[1])
 	}
 	if !strings.Contains(recorded[2], "--force-recreate --no-deps nginx") {
@@ -1909,7 +1971,7 @@ func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 
 func TestCreateServerCanonicalizesUppercaseIDAndPreventsCaseCollision(t *testing.T) {
 	cfg := testConfig(t)
-	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n")
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
 		if dockerPreflightProbe(args) {
@@ -2733,6 +2795,7 @@ func TestDeployOrchestrationValidatesCandidateBeforeReplacementAndFullCheckAfter
 		`-v "$STACK/servers:/workspace/servers:ro"`,
 		"opensamguk-deployer:local --check-registry-targets",
 		"opensamguk-deployer:local --check-registry",
+		"/usr/local/bin/deployer --check-running-registry-targets",
 	} {
 		if !strings.Contains(workflow, want) {
 			t.Fatalf("control-plane deployment missing %q", want)
@@ -2744,15 +2807,16 @@ func TestDeployOrchestrationValidatesCandidateBeforeReplacementAndFullCheckAfter
 	deployer := strings.Index(workflow, "$COMPOSE up -d --force-recreate --no-deps deployer")
 	recovery := strings.Index(workflow, "if ! ensure_lifecycle_recovery; then")
 	fullCheck := strings.LastIndex(workflow, "opensamguk-deployer:local --check-registry\n")
+	runningCheck := strings.LastIndex(workflow, "/usr/local/bin/deployer --check-running-registry-targets")
 	healthz := strings.LastIndex(workflow, "http://localhost:9000/healthz")
 	readyz := strings.LastIndex(workflow, "http://localhost:9000/readyz")
 	nginxMarker := "$COMPOSE up -d --force-recreate --no-deps nginx"
 	nginx := strings.Index(workflow, nginxMarker)
-	if build < 0 || candidateCheck < 0 || deployer < 0 || recovery < 0 || fullCheck < 0 || healthz < 0 || readyz < 0 || nginx < 0 {
-		t.Fatalf("missing deployment ordering markers: build=%d candidate=%d deployer=%d recovery=%d full=%d healthz=%d readyz=%d nginx=%d", build, candidateCheck, deployer, recovery, fullCheck, healthz, readyz, nginx)
+	if build < 0 || candidateCheck < 0 || deployer < 0 || recovery < 0 || fullCheck < 0 || runningCheck < 0 || healthz < 0 || readyz < 0 || nginx < 0 {
+		t.Fatalf("missing deployment ordering markers: build=%d candidate=%d deployer=%d recovery=%d full=%d running=%d healthz=%d readyz=%d nginx=%d", build, candidateCheck, deployer, recovery, fullCheck, runningCheck, healthz, readyz, nginx)
 	}
-	if !(build < candidateCheck && candidateCheck < deployer && deployer < recovery && recovery < fullCheck && fullCheck < nginx && nginx < healthz && healthz < readyz) {
-		t.Fatalf("unexpected deployment ordering: build=%d candidate=%d deployer=%d recovery=%d full=%d healthz=%d readyz=%d nginx=%d", build, candidateCheck, deployer, recovery, fullCheck, healthz, readyz, nginx)
+	if !(build < candidateCheck && candidateCheck < deployer && deployer < recovery && recovery < fullCheck && fullCheck < runningCheck && runningCheck < nginx && nginx < healthz && healthz < readyz) {
+		t.Fatalf("unexpected deployment ordering: build=%d candidate=%d deployer=%d recovery=%d full=%d running=%d healthz=%d readyz=%d nginx=%d", build, candidateCheck, deployer, recovery, fullCheck, runningCheck, healthz, readyz, nginx)
 	}
 	if strings.Contains(workflow[candidateCheck:deployer], "--env-file") {
 		t.Fatal("candidate registry check must not receive the shared env through command-line injection")
@@ -3421,7 +3485,7 @@ func TestCreateServerUsesConfiguredInternalUrls(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.gameAPIInternalPort = "18080"
 	cfg.gatewayAPIURL = "http://gateway-api:18081"
-	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n")
 	cfg.dockerRunner = func(args ...string) (string, error) {
 		if dockerPreflightProbe(args) {
 			return "29.0.0\n", nil
@@ -3449,7 +3513,7 @@ func TestCreateServerUsesConfiguredInternalUrls(t *testing.T) {
 
 func TestCreateServerAllowsGenerationZeroForAlpha(t *testing.T) {
 	cfg := testConfig(t)
-	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n")
 	cfg.dockerRunner = func(args ...string) (string, error) {
 		if dockerPreflightProbe(args) {
 			return "29.0.0\n", nil
@@ -3476,6 +3540,7 @@ func TestServersGetReturnsRegistry(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
 JWT_SECRET=shared-secret
+JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"3","name":"테스트 서버","generation":4,"gameApiUrl":"http://s3-game-api:8081","gameEngineUrl":"http://s3-game-engine:8082","deployProject":"opensamguk-s3"}]
 `)
 
@@ -3684,7 +3749,7 @@ func TestReadRegistryRejectsCanonicalIDCollision(t *testing.T) {
 
 func TestCreateServerRejectsPortCollisions(t *testing.T) {
 	cfg := testConfig(t)
-	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\n")
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n")
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nGAME_API_PORT=8101\nWEB_GAME_PORT=3101\n")
 	cfg.dockerRunner = func(args ...string) (string, error) {
 		if dockerPreflightProbe(args) {
@@ -3714,7 +3779,7 @@ func TestCreateServerRejectsPortCollisions(t *testing.T) {
 
 func TestCreateServerRejectsSharedPortCollision(t *testing.T) {
 	cfg := testConfig(t)
-	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nSERVER_REGISTRY_JSON=[]\nGAME_API_PORT=18080\n")
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\nGAME_API_PORT=18080\n")
 	cfg.dockerRunner = func(args ...string) (string, error) {
 		if dockerPreflightProbe(args) {
 			return "29.0.0\n", nil
@@ -3740,6 +3805,7 @@ func TestDeleteServerStopsStackRemovesEnvAndRegistry(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
 JWT_SECRET=shared-secret
+JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"},{"id":"keep","name":"빼섭","gameApiUrl":"http://skeep-game-api:8081","gameEngineUrl":"http://skeep-game-engine:8082","deployProject":"opensamguk-skeep"}]
 `)
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nGAME_API_PORT=8101\nWEB_GAME_PORT=3101\n")
@@ -3780,7 +3846,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	if !strings.Contains(recorded[0], "compose -p opensamguk-spep") || !strings.Contains(recorded[0], "down --volumes --remove-orphans") {
 		t.Fatalf("delete compose call = %q", recorded[0])
 	}
-	if !strings.Contains(recorded[1], "gateway-api web-gateway") || strings.Contains(recorded[1], " nginx") {
+	if !strings.Contains(recorded[1], "up -d --no-deps web-gateway") || strings.Contains(recorded[1], "gateway-api") || strings.Contains(recorded[1], " nginx") {
 		t.Fatalf("shared reload call = %q", recorded[1])
 	}
 	if !strings.Contains(recorded[2], "--force-recreate --no-deps nginx") {
@@ -3792,6 +3858,7 @@ func TestConcurrentDeletesRevalidateAfterMutationAdmission(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
 JWT_SECRET=shared-secret
+JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nGAME_API_PORT=8101\nWEB_GAME_PORT=3101\n")
@@ -3890,6 +3957,7 @@ func TestDeleteServerKeepsRegistryWhenDownFails(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
 JWT_SECRET=shared-secret
+JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nGAME_API_PORT=8101\nWEB_GAME_PORT=3101\n")
@@ -3978,6 +4046,7 @@ func TestResetServerRecreatesStackWithVolumes(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
 JWT_SECRET=shared-secret
+JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n")
@@ -4018,7 +4087,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	if !strings.Contains(recorded[1], "up -d") {
 		t.Fatalf("reset up call = %q", recorded[1])
 	}
-	if !strings.Contains(recorded[2], "gateway-api web-gateway") || strings.Contains(recorded[2], " nginx") {
+	if !strings.Contains(recorded[2], "up -d --no-deps web-gateway") || strings.Contains(recorded[2], "gateway-api") || strings.Contains(recorded[2], " nginx") {
 		t.Fatalf("shared reload call = %q", recorded[2])
 	}
 	if !strings.Contains(recorded[3], "--force-recreate --no-deps nginx") {
@@ -4124,6 +4193,7 @@ func TestResetServerAllowsGenerationZeroForAlpha(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
 JWT_SECRET=shared-secret
+JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n")
@@ -4156,6 +4226,7 @@ func TestResetServerRetainsDesiredStateAndMarksRepairRequiredWhenDownFails(t *te
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
 JWT_SECRET=shared-secret
+JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
 	original := "SERVER_ID=pep\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n"
@@ -4203,6 +4274,7 @@ func TestResetDownErrorKeepsRepairBarrierEvenWhenForwardUpCouldSucceed(t *testin
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
 JWT_SECRET=shared-secret
+JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSCENARIO_CODE=scenario_1010\n")
@@ -4257,7 +4329,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 		switch {
 		case strings.Contains(joined, "down --volumes --remove-orphans"):
 			return "down uncertain\n", errors.New("compose down uncertain")
-		case strings.Contains(joined, "gateway-api web-gateway"):
+		case strings.Contains(joined, "up -d --no-deps web-gateway"):
 			return "shared reload failed\n", errors.New("shared reload failed")
 		default:
 			return "recovered\n", nil
@@ -4299,7 +4371,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 			return "29.0.0\n", nil
 		}
 		calls.record(args...)
-		if strings.Contains(strings.Join(args, " "), "gateway-api web-gateway") {
+		if strings.Contains(strings.Join(args, " "), "up -d --no-deps web-gateway") {
 			return "shared reload failed\n", errors.New("shared reload failed")
 		}
 		return "recovered\n", nil
@@ -4358,7 +4430,7 @@ func TestResetRepairVerifiesRuntimeDataAndFinalRegistryBeforeJournalClear(t *tes
 			return "29.0.0\n", nil
 		}
 		calls.record(args...)
-		if strings.Contains(strings.Join(args, " "), "gateway-api web-gateway") {
+		if strings.Contains(strings.Join(args, " "), "up -d --no-deps web-gateway") {
 			if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); strings.Contains(shared, `"repairRequired":true`) {
 				return "", errors.New("shared reload received a stale repair-required registry")
 			}
@@ -4410,7 +4482,7 @@ func TestResetRepairVerifiesRuntimeDataAndFinalRegistryBeforeJournalClear(t *tes
 		t.Fatalf("verification trace = %q, want %q", got, want)
 	}
 	recorded := calls.snapshot()
-	if len(recorded) != 4 || !strings.Contains(recorded[0], "down --volumes --remove-orphans") || !strings.Contains(recorded[1], "up -d") || !strings.Contains(recorded[2], "gateway-api web-gateway") || !strings.Contains(recorded[3], "--force-recreate --no-deps nginx") {
+	if len(recorded) != 4 || !strings.Contains(recorded[0], "down --volumes --remove-orphans") || !strings.Contains(recorded[1], "up -d") || !strings.Contains(recorded[2], "up -d --no-deps web-gateway") || strings.Contains(recorded[2], "gateway-api") || !strings.Contains(recorded[3], "--force-recreate --no-deps nginx") {
 		t.Fatalf("repair call order = %#v", recorded)
 	}
 }
@@ -4479,7 +4551,7 @@ func TestResetRepairRetainsBarrierWhenRuntimeVerificationFails(t *testing.T) {
 				t.Fatalf("failed reset runtime verification cleared repair marker:\n%s", shared)
 			}
 			for _, call := range calls.snapshot() {
-				if strings.Contains(call, "gateway-api web-gateway") {
+				if strings.Contains(call, "up -d --no-deps web-gateway") {
 					t.Fatalf("failed reset runtime verification reloaded shared consumers: %#v", calls.snapshot())
 				}
 			}
@@ -4577,7 +4649,7 @@ func TestResetRepairRetainsBarrierWhenSharedReloadVerificationFails(t *testing.T
 	if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); !strings.Contains(shared, `"repairRequired":true`) {
 		t.Fatalf("failed shared reload verification cleared repair marker:\n%s", shared)
 	}
-	if !strings.Contains(strings.Join(calls.snapshot(), "\n"), "gateway-api web-gateway") {
+	if !strings.Contains(strings.Join(calls.snapshot(), "\n"), "up -d --no-deps web-gateway") {
 		t.Fatalf("shared reload verification failed before reload ran: %#v", calls.snapshot())
 	}
 }
@@ -4586,6 +4658,7 @@ func TestResetDownCancellationKeepsRepairBarrierUntilResetCanBeCompleted(t *test
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
 JWT_SECRET=shared-secret
+JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSCENARIO_CODE=scenario_1010\n")
@@ -4647,6 +4720,7 @@ func TestResetServerRetriesForwardRecoveryAfterFirstUpFailure(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
 JWT_SECRET=shared-secret
+JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSCENARIO_CODE=scenario_1010\n")
@@ -4693,6 +4767,7 @@ func TestConcurrentServerPatchThenResetFailurePreservesPatchSnapshot(t *testing.
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
 JWT_SECRET=shared-secret
+JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"before","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep","env":{"IMAGE_TAG":"v1","SERVER_NAME":"before","SERVER_GENERATION":"1","GAME_API_URL":"http://spep-game-api:8081"}}]
 `)
 	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nIMAGE_TAG=v1\nSERVER_NAME=before\nSERVER_GENERATION=1\nGAME_API_URL=http://spep-game-api:8081\nSCENARIO_CODE=scenario_1010\n")
@@ -4704,7 +4779,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"before","generation":1,"gameApiUrl":"h
 			return "29.0.0\n", nil
 		}
 		call := strings.Join(args, " ")
-		if strings.Contains(call, "gateway-api web-gateway") {
+		if strings.Contains(call, "up -d --no-deps web-gateway") {
 			patchReloadOnce.Do(func() {
 				close(patchReloadStarted)
 				<-releasePatchReload
