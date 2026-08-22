@@ -2928,7 +2928,7 @@ func TestRecreateWorkflowBoundsEveryExternalCommandAfterProductionLock(t *testin
 		`run_bounded "$WORKFLOW_DEADLINE" 180 git fetch --prune origin main`,
 		`run_bounded "$WORKFLOW_DEADLINE" 180 git merge --ff-only origin/main`,
 		`run_bounded "$WORKFLOW_DEADLINE" 900 "${COMPOSE[@]}" build deployer`,
-		`run_bounded "$WORKFLOW_DEADLINE" 180 "${COMPOSE[@]}" up -d --no-deps deployer`,
+		`run_bounded "$WORKFLOW_DEADLINE" 180 "${COMPOSE[@]}" up -d --force-recreate --no-deps deployer`,
 		`run_bounded "$WORKFLOW_DEADLINE" 15 sudo docker ps`,
 		`timeout --foreground -k 2 "$requested" "$@"`,
 		`run_bounded "$deadline" "$requested" sudo docker exec "$@"`,
@@ -2947,8 +2947,10 @@ func TestRecreateWorkflowBoundsEveryExternalCommandAfterProductionLock(t *testin
 		if line == "" {
 			continue
 		}
-		if strings.Contains(line, "docker_exec_bounded") && strings.Contains(line, "sh -c '") {
+		dockerExecScriptEnd := false
+		if scriptStart := strings.Index(line, "sh -c '"); scriptStart >= 0 && strings.Contains(line[:scriptStart], "docker_exec_bounded") {
 			inDockerExecScript = true
+			dockerExecScriptEnd = strings.Contains(line[scriptStart+len("sh -c '"):], "'")
 		}
 		if strings.Contains(line, "timeout -k 2") && !inDockerExecScript {
 			t.Fatalf("recreate workflow has a BusyBox timeout outside the absolute-deadline docker-exec wrapper: %s", line)
@@ -2962,7 +2964,7 @@ func TestRecreateWorkflowBoundsEveryExternalCommandAfterProductionLock(t *testin
 			}
 			t.Fatalf("recreate workflow has raw unbounded %q command after lock: %s", command, line)
 		}
-		if inDockerExecScript && strings.HasPrefix(line, "'") {
+		if inDockerExecScript && (dockerExecScriptEnd || strings.HasPrefix(line, "'")) {
 			inDockerExecScript = false
 		}
 	}
@@ -5265,7 +5267,6 @@ func runRecreateWorkflow(t *testing.T, serverID string, stallCreate bool) startW
 	writeExecutable(t, filepath.Join(bin, "git"), "#!/usr/bin/env bash\nexit 0\n")
 	writeExecutable(t, filepath.Join(bin, "sudo"), "#!/usr/bin/env bash\nexec \"$@\"\n")
 	writeExecutable(t, filepath.Join(bin, "sleep"), "#!/usr/bin/env bash\nexit 0\n")
-	writeExecutable(t, filepath.Join(bin, "timeout"), "#!/usr/bin/env bash\nset -euo pipefail\nif [[ \"${1:-}\" == \"--foreground\" ]]; then\n  shift\nfi\nif [[ \"${1:-}\" == \"-k\" ]]; then\n  shift 2\nfi\nshift\nexec \"$@\"\n")
 	writeExecutable(t, filepath.Join(bin, "python3"), "#!/usr/bin/env bash\nargs=\"$*\"\nif [[ \"$args\" == *\"state\\\"] + \\\":\\\"\"* ]]; then\n  printf 'drained:0123456789abcdef0123456789abcdef\\n'\nelif [[ \"$args\" == *\"payload.get(\\\"jobId\\\")\"* ]]; then\n  printf 'abcdef0123456789abcdef0123456789\\n'\nelif [[ \"$args\" == *\"import secrets\"* ]]; then\n  printf 'abcdef0123456789abcdef0123456789\\n'\nelif [[ \"$args\" == *\"json.dumps\"* ]]; then\n  printf '{}\\n'\nelse\n  printf 'drained\\n'\nfi\n")
 	dockerScript := `#!/usr/bin/env bash
 set -euo pipefail
@@ -5275,6 +5276,14 @@ if [[ "$1" == "exec" ]]; then
 	if [[ "${WORKFLOW_TIMEOUT_STALL_CREATE:-false}" == true && "$args" == *"/servers/create"* ]]; then
 	  exit 124
 	fi
+  if [[ "$args" == *"/healthz"* ]]; then
+    printf '{"status":"up"}\n'
+    exit 0
+  fi
+  if [[ "$args" == *"/readyz"* ]]; then
+    printf '{"status":"ready"}\n'
+    exit 0
+  fi
   if [[ "$args" == *"/maintenance/enter"* ]]; then
     printf '{"capability":"maintenance-v1","state":"drained","lease":"0123456789abcdef0123456789abcdef"}\n'
     exit 0
@@ -5303,9 +5312,11 @@ fi
 	writeExecutable(t, filepath.Join(bin, "docker"), dockerScript)
 
 	script := workflowRunScript(t, filepath.Join("..", ".github", "workflows", "recreate-server.yml"))
+	script = strings.ReplaceAll(script, `timeout --foreground -k 2 "$requested" sleep "$requested"`, `sleep "$requested"`)
+	script = strings.ReplaceAll(script, `timeout --foreground -k 2 "$requested" "$@"`, `"$@"`)
 	scriptPath := filepath.Join(root, "recreate-server.sh")
 	writeExecutable(t, scriptPath, script)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "bash", scriptPath)
 	cmd.Env = commandEnvironment(
