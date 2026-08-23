@@ -4317,6 +4317,12 @@ func (c config) reconcileServerRegistry(target serverTarget) error {
 }
 
 func (c config) downServerStack(ctx context.Context, project, envFile string) (string, error) {
+	// Last line of defense right before the destructive call: even if some other
+	// caller path bypasses normalizeCreateServerID's collision check upstream,
+	// never run `down --volumes --remove-orphans` against the shared stack (#32).
+	if project == sharedComposeProjectName {
+		return "", fmt.Errorf("공유 스택 project %q에는 down을 실행할 수 없습니다.", project)
+	}
 	if _, err := c.validateDockerServerTarget(project, envFile, false); err != nil {
 		return "", err
 	}
