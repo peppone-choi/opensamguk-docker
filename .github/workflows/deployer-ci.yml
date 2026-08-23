@@ -1,0 +1,37 @@
+name: Deployer CI
+
+on:
+  pull_request:
+    paths:
+      - "deployer/**"
+      - ".github/workflows/deployer-ci.yml"
+  push:
+    branches: [main]
+    paths:
+      - "deployer/**"
+      - ".github/workflows/deployer-ci.yml"
+
+concurrency:
+  group: deployer-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: deployer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: deployer/go.mod
+      - name: go build
+        run: go build ./...
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test ./...
