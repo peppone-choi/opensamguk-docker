@@ -53,6 +53,10 @@ const (
 	resetVerificationHTTPTimeout   = 5 * time.Second
 	maxVerificationResponseBytes   = 256 << 10
 	isolatedServerWorldID          = "1"
+	// sharedComposeProjectName은 docker-compose.shared.yml의 고정 project name(top-level
+	// `name:`)과 반드시 일치해야 한다. 게임 서버 id가 이 이름과 충돌하는 compose project를
+	// 만들어내면 down --volumes가 공유 스택을 파괴할 수 있다(#32).
+	sharedComposeProjectName = "opensamguk-shared"
 )
 
 // 입력 검증용 화이트리스트 정규식.
@@ -1672,7 +1676,7 @@ func (c config) validateRunningServerRegistry(ctx context.Context) error {
 	seenProjects := map[string]struct{}{}
 	for _, rawProject := range strings.Split(output, "\n") {
 		project := strings.TrimSpace(rawProject)
-		if project == "" || project == "opensamguk-shared" {
+		if project == "" || project == sharedComposeProjectName {
 			continue
 		}
 		if _, seen := seenProjects[project]; seen {
@@ -3575,6 +3579,12 @@ func normalizeCreateServerID(raw string) (string, string, error) {
 	}
 	if _, reserved := reservedPublicServerIDs[id]; reserved {
 		return "", "", fmt.Errorf("서버 id %q는 전체 서버 예약어라 사용할 수 없습니다.", id)
+	}
+	// id가 만들어내는 compose project명이 공유 스택 project명과 충돌하면 거부한다.
+	// 하드코딩된 id 목록이 아니라 실제 파생 결과를 비교해, 접두사 규칙이나 공유
+	// project명이 바뀌어도 재발하지 않게 한다(#32).
+	if projectForServerID(id) == sharedComposeProjectName {
+		return "", "", fmt.Errorf("서버 id %q는 공유 스택 project명과 충돌해 사용할 수 없습니다.", id)
 	}
 	return id, internalServerKey(id), nil
 }
