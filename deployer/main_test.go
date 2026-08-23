@@ -2216,6 +2216,35 @@ func TestServerLifecycleEndpointsRejectSharedProjectCollisionID(t *testing.T) {
 	}
 }
 
+// TestDownServerStackRefusesSharedProjectEvenIfUpstreamValidationIsBypassed is
+// the defense-in-depth test for #32: downServerStack itself must refuse the
+// shared project immediately before issuing `down --volumes --remove-orphans`,
+// independent of whatever validated (or failed to validate) the project name
+// upstream. This proves the guard exists at the destructive call site, not
+// only at request admission.
+func TestDownServerStackRefusesSharedProjectEvenIfUpstreamValidationIsBypassed(t *testing.T) {
+	cfg := testConfig(t)
+	calls := &dockerCallRecorder{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
+		calls.record(args...)
+		return "ok\n", nil
+	}
+
+	_, err := cfg.downServerStack(context.Background(), sharedComposeProjectName, filepath.Join(cfg.serversDir, "irrelevant.env"))
+	if err == nil {
+		t.Fatal("downServerStack unexpectedly allowed the shared project")
+	}
+	if !strings.Contains(err.Error(), sharedComposeProjectName) {
+		t.Fatalf("error = %v, want it to name the shared project", err)
+	}
+	if got := calls.snapshot(); len(got) != 0 {
+		t.Fatalf("docker was invoked while down-guarding the shared project: %#v", got)
+	}
+}
+
 func TestPublicServerIDRejectsAllServerSentinelAfterCanonicalization(t *testing.T) {
 	if _, _, err := normalizeCreateServerID("ALL"); err == nil || !strings.Contains(err.Error(), `"all"는 전체 서버 예약어`) {
 		t.Fatalf("all-server sentinel error = %v", err)
