@@ -2154,6 +2154,68 @@ func TestPublicServerIDRejectsReservedGameRoutesAfterCanonicalization(t *testing
 	}
 }
 
+// TestPublicServerIDRejectsSharedProjectCollision covers #32: id "hared" makes
+// projectForServerID synthesize "opensamguk-shared", colliding with the shared
+// stack's compose project name. The guard must compare derived project names,
+// not a hardcoded id list, so it catches case variants and any future id.
+func TestPublicServerIDRejectsSharedProjectCollision(t *testing.T) {
+	for _, raw := range []string{"hared", "HARED", "HaReD"} {
+		if _, _, err := normalizeCreateServerID(raw); err == nil {
+			t.Fatalf("normalizeCreateServerID(%q) unexpectedly accepted shared-project collision", raw)
+		}
+	}
+	if _, _, err := normalizeCreateServerID("HARED"); err == nil || !strings.Contains(err.Error(), `"hared"는 공유 스택 project명과 충돌`) {
+		t.Fatalf("shared-project collision error = %v", err)
+	}
+	if projectForServerID("hared") != sharedComposeProjectName {
+		t.Fatalf("test premise broken: projectForServerID(hared) = %q, want %q", projectForServerID("hared"), sharedComposeProjectName)
+	}
+	// ordinary ids must keep working.
+	if _, _, err := normalizeCreateServerID("pep"); err != nil {
+		t.Fatalf("normalizeCreateServerID(pep) unexpectedly failed: %v", err)
+	}
+}
+
+// TestServerLifecycleEndpointsRejectSharedProjectCollisionID exercises create,
+// close (delete), reset, and deploy through their HTTP handlers to confirm none
+// of them can ever touch the shared stack's compose project (#32).
+func TestServerLifecycleEndpointsRejectSharedProjectCollisionID(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n")
+	calls := &dockerCallRecorder{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
+		calls.record(args...)
+		return "ok\n", nil
+	}
+
+	create := envRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create", `{"id":"hared","name":"충돌 서버","gameApiPort":"8111","webGamePort":"3111"}`)
+	if create.Code != http.StatusBadRequest {
+		t.Fatalf("create hared status = %d body=%s", create.Code, create.Body.String())
+	}
+
+	del := envRequest(t, cfg.withAuth(cfg.handleServerClose), http.MethodPost, "/servers/close", `{"id":"hared"}`)
+	if del.Code != http.StatusBadRequest {
+		t.Fatalf("close hared status = %d body=%s", del.Code, del.Body.String())
+	}
+
+	reset := envRequest(t, cfg.withAuth(cfg.handleServerReset), http.MethodPost, "/servers/reset?id=hared", `{}`)
+	if reset.Code != http.StatusBadRequest {
+		t.Fatalf("reset hared status = %d body=%s", reset.Code, reset.Body.String())
+	}
+
+	deploy := envRequest(t, cfg.withAuth(cfg.handleDeploy), http.MethodPost, "/deploy", `{"project":"opensamguk-shared","tag":"v1"}`)
+	if deploy.Code != http.StatusBadRequest {
+		t.Fatalf("deploy opensamguk-shared status = %d body=%s", deploy.Code, deploy.Body.String())
+	}
+
+	if got := calls.snapshot(); len(got) != 0 {
+		t.Fatalf("docker was invoked for a shared-project-colliding id: %#v", got)
+	}
+}
+
 func TestPublicServerIDRejectsAllServerSentinelAfterCanonicalization(t *testing.T) {
 	if _, _, err := normalizeCreateServerID("ALL"); err == nil || !strings.Contains(err.Error(), `"all"는 전체 서버 예약어`) {
 		t.Fatalf("all-server sentinel error = %v", err)
