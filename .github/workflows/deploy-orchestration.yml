@@ -8,6 +8,7 @@ on:
       - "deployer/**"
       - "docker-compose.shared.yml"
       - "docker-compose.server.yml"
+      - "scripts/bootstrap-internal-service-token.sh"
       - "infra/nginx/**"
   workflow_dispatch:
 
@@ -153,6 +154,10 @@ jobs:
             exit 1
           fi
           run_bounded "$WORKFLOW_DEADLINE" 180 git merge --ff-only origin/main
+
+          echo "bootstrapping internal service authentication when absent"
+          run_bounded "$WORKFLOW_DEADLINE" 30 \
+            bash scripts/bootstrap-internal-service-token.sh "$STACK/.env" "$STACK/servers"
 
           if [ "$DEPLOYER_BOOTSTRAP" = true ]; then
             echo "bootstrapping deployer from the persisted maintenance marker"

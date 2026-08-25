@@ -2703,6 +2703,87 @@ func TestComposeWiresAuthenticatedGatewayProfileLookup(t *testing.T) {
 	}
 }
 
+func TestInternalServiceTokenBootstrapGeneratesAndPropagatesOneStrongToken(t *testing.T) {
+	root := t.TempDir()
+	servers := filepath.Join(root, "servers")
+	if err := os.MkdirAll(servers, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sharedEnv := filepath.Join(root, ".env")
+	serverEnv := filepath.Join(servers, "spep.env")
+	writeEnv(t, sharedEnv, "IMAGE_TAG=v1\n")
+	writeEnv(t, serverEnv, "SERVER_ID=pep\n")
+
+	output := runInternalServiceTokenBootstrap(t, sharedEnv, servers)
+	sharedValues, err := readEnvValues(sharedEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverValues, err := readEnvValues(serverEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := sharedValues["INTERNAL_SERVICE_TOKEN"]
+	if matched, _ := regexp.MatchString(`^[a-f0-9]{64}$`, token); !matched {
+		t.Fatal("shared env did not receive a 256-bit hex token")
+	}
+	if serverValues["INTERNAL_SERVICE_TOKEN"] != token {
+		t.Fatal("server env did not receive the shared internal service token")
+	}
+	if strings.Contains(output, token) {
+		t.Fatal("bootstrap output exposed the generated token")
+	}
+	if got := fileMode(t, sharedEnv); got != 0o600 {
+		t.Fatalf("shared env mode = %#o, want 0600", got)
+	}
+	if got := fileMode(t, serverEnv); got != 0o600 {
+		t.Fatalf("server env mode = %#o, want 0600", got)
+	}
+}
+
+func TestInternalServiceTokenBootstrapPreservesSharedTokenAndIsIdempotent(t *testing.T) {
+	root := t.TempDir()
+	servers := filepath.Join(root, "servers")
+	if err := os.MkdirAll(servers, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sharedEnv := filepath.Join(root, ".env")
+	serverEnv := filepath.Join(servers, "spep.env")
+	const existing = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	writeEnv(t, sharedEnv, "INTERNAL_SERVICE_TOKEN="+existing+"\nIMAGE_TAG=v1\n")
+	writeEnv(t, serverEnv, "SERVER_ID=pep\nINTERNAL_SERVICE_TOKEN=divergent-token-that-must-be-replaced\n")
+
+	firstOutput := runInternalServiceTokenBootstrap(t, sharedEnv, servers)
+	secondOutput := runInternalServiceTokenBootstrap(t, sharedEnv, servers)
+	sharedValues, err := readEnvValues(sharedEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverValues, err := readEnvValues(serverEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sharedValues["INTERNAL_SERVICE_TOKEN"] != existing {
+		t.Fatal("bootstrap rotated an existing shared token")
+	}
+	if serverValues["INTERNAL_SERVICE_TOKEN"] != existing {
+		t.Fatal("bootstrap did not reconcile the server token to the shared value")
+	}
+	if strings.Contains(firstOutput+secondOutput, existing) {
+		t.Fatal("bootstrap output exposed the existing token")
+	}
+}
+
+func runInternalServiceTokenBootstrap(t *testing.T, sharedEnv, serversDir string) string {
+	t.Helper()
+	cmd := exec.Command("bash", filepath.Join("..", "scripts", "bootstrap-internal-service-token.sh"), sharedEnv, serversDir)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("bootstrap failed: %v\n%s", err, output)
+	}
+	return string(output)
+}
+
 func TestServerComposeMountsExternalScenarioOverridesReadOnly(t *testing.T) {
 	compose := readFile(t, filepath.Join("..", "docker-compose.server.yml"))
 	const scenarioDir = "SCENARIO_DIR: ${SCENARIO_DIR:-/data/scenarios}"
