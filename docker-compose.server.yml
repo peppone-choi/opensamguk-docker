@@ -133,6 +133,9 @@ services:
       JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY:?JWT_PUBLIC_KEY required — see .env.example}
       JWT_LEGACY_SECRET: ${JWT_LEGACY_SECRET:-}
       JWT_LEGACY_ACCESS_ACCEPT_UNTIL: ${JWT_LEGACY_ACCESS_ACCEPT_UNTIL:-}
+      # 신원 SoT는 공유 gateway-api. 전용 내부 토큰으로만 프로필을 조회한다.
+      GATEWAY_API_URL: ${GATEWAY_API_URL:-http://gateway-api:8080}
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?INTERNAL_SERVICE_TOKEN required}
       JAVA_OPTS: "-XX:+UseG1GC -XX:MaxRAMPercentage=50.0 -XX:InitialRAMPercentage=30.0 -Djava.security.egd=file:/dev/./urandom"
     depends_on:
       game-postgres:
