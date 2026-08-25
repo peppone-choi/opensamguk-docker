@@ -1868,7 +1868,7 @@ func TestSharedEnvRejectsUnknownKey(t *testing.T) {
 func TestServerEnvMasksWriteOnlySecrets(t *testing.T) {
 	cfg := testConfig(t)
 	envFile := filepath.Join(cfg.serversDir, "spep.env")
-	writeEnv(t, envFile, "SERVER_ID=pep\nIMAGE_TAG=v1\nJWT_LEGACY_SECRET=old-secret\n")
+	writeEnv(t, envFile, "SERVER_ID=pep\nIMAGE_TAG=v1\nJWT_LEGACY_SECRET=old-secret\nINTERNAL_SERVICE_TOKEN=old-internal-token\n")
 
 	res := envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodGet, "/env/server?id=pep", "")
 	if res.Code != http.StatusOK {
@@ -1885,22 +1885,31 @@ func TestServerEnvMasksWriteOnlySecrets(t *testing.T) {
 	if strings.Contains(res.Body.String(), "old-secret") {
 		t.Fatalf("GET leaked raw secret: %s", res.Body.String())
 	}
+	internalToken := body.Fields["INTERNAL_SERVICE_TOKEN"]
+	if !internalToken.Configured || !internalToken.WriteOnly || !internalToken.Masked || internalToken.Value != nil {
+		t.Fatalf("INTERNAL_SERVICE_TOKEN metadata = %#v", internalToken)
+	}
+	if strings.Contains(res.Body.String(), "old-internal-token") {
+		t.Fatalf("GET leaked raw internal token: %s", res.Body.String())
+	}
 
-	res = envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodPatch, "/env/server?id=pep", `{"values":{"JWT_LEGACY_SECRET":"new-secret"}}`)
+	res = envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodPatch, "/env/server?id=pep", `{"values":{"JWT_LEGACY_SECRET":"new-secret","INTERNAL_SERVICE_TOKEN":"new-internal-token"}}`)
 	if res.Code != http.StatusOK {
 		t.Fatalf("PATCH status = %d body=%s", res.Code, res.Body.String())
 	}
-	if strings.Contains(res.Body.String(), "new-secret") {
+	if strings.Contains(res.Body.String(), "new-secret") || strings.Contains(res.Body.String(), "new-internal-token") {
 		t.Fatalf("PATCH leaked raw secret: %s", res.Body.String())
 	}
-	if !strings.Contains(readFile(t, envFile), "JWT_LEGACY_SECRET=new-secret\n") {
+	updatedEnv := readFile(t, envFile)
+	if !strings.Contains(updatedEnv, "JWT_LEGACY_SECRET=new-secret\n") ||
+		!strings.Contains(updatedEnv, "INTERNAL_SERVICE_TOKEN=new-internal-token\n") {
 		t.Fatalf("secret was not written:\n%s", readFile(t, envFile))
 	}
 }
 
 func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 	cfg := testConfig(t)
-	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n")
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nINTERNAL_SERVICE_TOKEN=shared-internal-token\nSERVER_REGISTRY_JSON=[]\n")
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
 		if dockerPreflightProbe(args) {
@@ -1932,6 +1941,7 @@ func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 		"GAME_API_PORT=8101\n",
 		"WEB_GAME_PORT=3101\n",
 		"JWT_PUBLIC_KEY=shared-public-key\n",
+		"INTERNAL_SERVICE_TOKEN=shared-internal-token\n",
 		"SCENARIO_SEED_ENABLED=true\n",
 		"GAME_API_URL=http://spep-game-api:8081\n",
 	} {
@@ -2653,6 +2663,43 @@ func TestServerComposeExportsPublicIDAndWorldIDToSourceServices(t *testing.T) {
 	}
 	if strings.Contains(compose, "OPENSAMGUK_WORLD_ID: ${SERVER_ID}") {
 		t.Fatal("compose used the public server id as the numeric world id")
+	}
+}
+
+func TestComposeWiresAuthenticatedGatewayProfileLookup(t *testing.T) {
+	serverCompose := readFile(t, filepath.Join("..", "docker-compose.server.yml"))
+	gameAPIStart := strings.Index(serverCompose, "\n  game-api:\n")
+	if gameAPIStart < 0 {
+		t.Fatal("server compose missing game-api service")
+	}
+	gameAPI := serverCompose[gameAPIStart:]
+	gameAPIEnd := strings.Index(gameAPI, "\n  web-game:\n")
+	if gameAPIEnd < 0 {
+		t.Fatal("server compose missing boundary after game-api")
+	}
+	gameAPI = gameAPI[:gameAPIEnd]
+	for _, want := range []string{
+		"GATEWAY_API_URL: ${GATEWAY_API_URL:-http://gateway-api:8080}",
+		"INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?INTERNAL_SERVICE_TOKEN required}",
+	} {
+		if !strings.Contains(gameAPI, want) {
+			t.Fatalf("per-server game-api missing authenticated profile lookup wiring %q", want)
+		}
+	}
+
+	sharedCompose := readFile(t, filepath.Join("..", "docker-compose.shared.yml"))
+	gatewayStart := strings.Index(sharedCompose, "\n  gateway-api:\n")
+	if gatewayStart < 0 {
+		t.Fatal("shared compose missing gateway-api service")
+	}
+	gateway := sharedCompose[gatewayStart:]
+	gatewayEnd := strings.Index(gateway, "\n  board-api:\n")
+	if gatewayEnd < 0 {
+		t.Fatal("shared compose missing boundary after gateway-api")
+	}
+	gateway = gateway[:gatewayEnd]
+	if !strings.Contains(gateway, "INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?INTERNAL_SERVICE_TOKEN required}") {
+		t.Fatal("shared gateway-api missing the internal service token")
 	}
 }
 

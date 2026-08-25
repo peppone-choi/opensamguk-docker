@@ -144,6 +144,7 @@ var serverEnvAllowlist = map[string]envFieldSpec{
 	"SERVER_GENERATION":              {Description: "서버 기수"},
 	"GAME_API_URL":                   {Description: "game-api 내부 URL"},
 	"GATEWAY_API_URL":                {Description: "gateway-api 내부 URL"},
+	"INTERNAL_SERVICE_TOKEN":         {Description: "gateway-api 내부 프로필 조회 토큰", WriteOnly: true},
 	"JWT_PUBLIC_KEY":                 {Description: "JWT 검증 공개키(비밀 아님, gateway-api와 동일 값)"},
 	"JWT_LEGACY_SECRET":              {Description: "레거시 HS256 검증 시크릿", WriteOnly: true},
 	"JWT_LEGACY_ACCESS_ACCEPT_UNTIL": {Description: "레거시 토큰 수용 만료 시각"},
@@ -174,6 +175,7 @@ var v2ServerDefinitionKeys = map[string]struct{}{
 var serverComposeInterpolationKeys = map[string]struct{}{
 	"COMPOSE_HOST_DIR":               {},
 	"GATEWAY_API_URL":                {},
+	"INTERNAL_SERVICE_TOKEN":         {},
 	"GAME_API_PORT":                  {},
 	"GAME_API_URL":                   {},
 	"GAME_POSTGRES_DB":               {},
@@ -268,6 +270,7 @@ var sharedEnvAllowlist = map[string]envFieldSpec{
 	"COOKIE_SECURE":           {Description: "Secure 쿠키 사용 여부"},
 	"JWT_PRIVATE_KEY":         {Description: "JWT 서명 개인키(gateway-api 전용)", WriteOnly: true},
 	"JWT_PUBLIC_KEY":          {Description: "JWT 검증 공개키(비밀 아님, 서버들이 복사)"},
+	"INTERNAL_SERVICE_TOKEN":  {Description: "game-api 내부 프로필 조회 토큰", WriteOnly: true},
 	"JWT_LEGACY_SECRET":       {Description: "레거시 HS256 검증 시크릿", WriteOnly: true},
 	"ADMIN_PASSWORD":          {Description: "초기 관리자 비밀번호", WriteOnly: true},
 	"GHCR_TOKEN":              {Description: "GHCR 조회 토큰", WriteOnly: true},
@@ -2785,6 +2788,7 @@ type normalizedCreateServerRequest struct {
 	JWTPublicKey         string
 	JWTLegacySecret      string
 	JWTLegacyAcceptUntil string
+	InternalServiceToken string
 }
 
 func (c config) normalizeCreateServerRequest(req createServerRequest) (normalizedCreateServerRequest, error) {
@@ -2844,6 +2848,10 @@ func (c config) normalizeCreateServerRequest(req createServerRequest) (normalize
 	if strings.ContainsAny(jwtLegacyAcceptUntil, "\r\n") {
 		return normalizedCreateServerRequest{}, errors.New("공유 JWT_LEGACY_ACCESS_ACCEPT_UNTIL이 올바르지 않습니다.")
 	}
+	internalServiceToken := c.sharedEnvValue("INTERNAL_SERVICE_TOKEN")
+	if strings.ContainsAny(internalServiceToken, "\r\n") {
+		return normalizedCreateServerRequest{}, errors.New("공유 INTERNAL_SERVICE_TOKEN이 올바르지 않습니다.")
+	}
 	return normalizedCreateServerRequest{
 		ID:                   id,
 		InternalKey:          internalKey,
@@ -2857,6 +2865,7 @@ func (c config) normalizeCreateServerRequest(req createServerRequest) (normalize
 		JWTPublicKey:         jwtPublicKey,
 		JWTLegacySecret:      jwtLegacySecret,
 		JWTLegacyAcceptUntil: jwtLegacyAcceptUntil,
+		InternalServiceToken: internalServiceToken,
 	}, nil
 }
 
@@ -2918,6 +2927,7 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 	jwtPublicKey := normalized.JWTPublicKey
 	jwtLegacySecret := normalized.JWTLegacySecret
 	jwtLegacyAcceptUntil := normalized.JWTLegacyAcceptUntil
+	internalServiceToken := normalized.InternalServiceToken
 	jobID := ""
 	newReservation := false
 	reservationClaimed := false
@@ -2998,6 +3008,7 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 		{Raw: "JWT_PUBLIC_KEY=" + jwtPublicKey, Key: "JWT_PUBLIC_KEY", Value: jwtPublicKey, IsKV: true},
 		{Raw: "JWT_LEGACY_SECRET=" + jwtLegacySecret, Key: "JWT_LEGACY_SECRET", Value: jwtLegacySecret, IsKV: true},
 		{Raw: "JWT_LEGACY_ACCESS_ACCEPT_UNTIL=" + jwtLegacyAcceptUntil, Key: "JWT_LEGACY_ACCESS_ACCEPT_UNTIL", Value: jwtLegacyAcceptUntil, IsKV: true},
+		{Raw: "INTERNAL_SERVICE_TOKEN=" + internalServiceToken, Key: "INTERNAL_SERVICE_TOKEN", Value: internalServiceToken, IsKV: true},
 		{Raw: "TURN_PROFILE_NAME=che:scenario_2", Key: "TURN_PROFILE_NAME", Value: "che:scenario_2", IsKV: true},
 		{Raw: "SCENARIO_SEED_ENABLED=" + boolText(seedEnabled), Key: "SCENARIO_SEED_ENABLED", Value: boolText(seedEnabled), IsKV: true},
 		{Raw: "SCENARIO_CODE=" + scenarioCode, Key: "SCENARIO_CODE", Value: scenarioCode, IsKV: true},
