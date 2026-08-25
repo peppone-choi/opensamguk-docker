@@ -5513,3 +5513,211 @@ func waitForContentNotContaining(t *testing.T, path, needle string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// gateway-api(DeployService)가 기대하는 원격 lifecycle 조회 계약을 고정한다.
+// gateway는 CREATE/CLOSE transition을 복구할 때 GET /operations/{operationId}를 부르고,
+// 200 본문에서 operationId/kind/status(/result·httpStatus)를, 미지의 id에 대해서는
+// 정확히 {ok:false,operationId,status:"not_found"} 3-key 404를 요구한다.
+// 이 계약이 어긋나면 gateway는 Unavailable로 떨어져 "이전 deployer 작업 상태를 확인하지
+// 못했습니다"를 영구히 반환하고 서버 생성/삭제가 완료되지 않는다.
+func TestOperationsEndpointServesGatewayLifecycleContract(t *testing.T) {
+	cfg := testConfig(t)
+	handler := cfg.withAuth(cfg.handleOperation)
+	operationID := "0123456789abcdef0123456789abcdef"
+
+	unknown := envRequest(t, handler, http.MethodGet, "/operations/"+operationID, "")
+	if unknown.Code != http.StatusNotFound {
+		t.Fatalf("unknown status = %d body=%s", unknown.Code, unknown.Body.String())
+	}
+	var unknownBody map[string]json.RawMessage
+	if err := json.Unmarshal(unknown.Body.Bytes(), &unknownBody); err != nil {
+		t.Fatalf("decode unknown body: %v", err)
+	}
+	if len(unknownBody) != 3 {
+		t.Fatalf("unknown body must carry exactly ok/operationId/status: %s", unknown.Body.String())
+	}
+	var unknownShape struct {
+		OK          *bool  `json:"ok"`
+		OperationID string `json:"operationId"`
+		Status      string `json:"status"`
+	}
+	if err := json.Unmarshal(unknown.Body.Bytes(), &unknownShape); err != nil {
+		t.Fatalf("decode unknown shape: %v", err)
+	}
+	if unknownShape.OK == nil || *unknownShape.OK || unknownShape.OperationID != operationID ||
+		unknownShape.Status != "not_found" {
+		t.Fatalf("unknown body = %s", unknown.Body.String())
+	}
+
+	jobID, existing, err := cfg.lifecycleJobs.reserveWithOperation(operationID, "fingerprint", lifecycleKindClose)
+	if err != nil || existing {
+		t.Fatalf("reserve operation: err=%v existing=%v", err, existing)
+	}
+	pending := envRequest(t, handler, http.MethodGet, "/operations/"+operationID, "")
+	if pending.Code != http.StatusOK {
+		t.Fatalf("pending status = %d body=%s", pending.Code, pending.Body.String())
+	}
+	var pendingBody struct {
+		OperationID string `json:"operationId"`
+		Kind        string `json:"kind"`
+		Status      string `json:"status"`
+	}
+	if err := json.Unmarshal(pending.Body.Bytes(), &pendingBody); err != nil {
+		t.Fatalf("decode pending: %v", err)
+	}
+	if pendingBody.OperationID != operationID || pendingBody.Kind != "close" || pendingBody.Status != "pending" {
+		t.Fatalf("pending body = %s", pending.Body.String())
+	}
+
+	result := createServerResponse{OK: true, ID: "pep", OperationID: operationID, OperationStatus: lifecycleJobSucceeded}
+	cfg.lifecycleJobs.recordOperationResult(jobID, lifecycleJobSucceeded, http.StatusOK, mustMarshal(t, result))
+
+	done := envRequest(t, handler, http.MethodGet, "/operations/"+operationID, "")
+	if done.Code != http.StatusOK {
+		t.Fatalf("done status = %d body=%s", done.Code, done.Body.String())
+	}
+	var doneBody struct {
+		OperationID string          `json:"operationId"`
+		Kind        string          `json:"kind"`
+		Status      string          `json:"status"`
+		HTTPStatus  int             `json:"httpStatus"`
+		Result      json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(done.Body.Bytes(), &doneBody); err != nil {
+		t.Fatalf("decode done: %v", err)
+	}
+	if doneBody.OperationID != operationID || doneBody.Kind != "close" ||
+		doneBody.Status != string(lifecycleJobSucceeded) || doneBody.HTTPStatus != http.StatusOK {
+		t.Fatalf("done body = %s", done.Body.String())
+	}
+	var echoed createServerResponse
+	if err := json.Unmarshal(doneBody.Result, &echoed); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if !echoed.OK || echoed.ID != "pep" || echoed.OperationID != operationID ||
+		echoed.OperationStatus != lifecycleJobSucceeded {
+		t.Fatalf("result = %s", string(doneBody.Result))
+	}
+}
+
+func TestOperationsEndpointRejectsMalformedTargetsAndMethods(t *testing.T) {
+	cfg := testConfig(t)
+	handler := cfg.withAuth(cfg.handleOperation)
+	operationID := "0123456789abcdef0123456789abcdef"
+
+	unauthorized := httptest.NewRequest(http.MethodGet, "/operations/"+operationID, nil)
+	unauthorizedResponse := httptest.NewRecorder()
+	handler(unauthorizedResponse, unauthorized)
+	if unauthorizedResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d", unauthorizedResponse.Code)
+	}
+	if res := envRequest(t, handler, http.MethodPost, "/operations/"+operationID, ""); res.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("method status = %d body=%s", res.Code, res.Body.String())
+	}
+	for _, target := range []string{
+		"/operations", "/operations/", "/operations/not-an-id",
+		"/operations/0123456789ABCDEF0123456789ABCDEF", "/operations/" + operationID + "/extra",
+	} {
+		res := envRequest(t, handler, http.MethodGet, target, "")
+		if res.Code != http.StatusBadRequest {
+			t.Fatalf("malformed %s status = %d body=%s", target, res.Code, res.Body.String())
+		}
+	}
+}
+
+// gateway는 POST 응답 자체에서도 operationId/operationStatus를 읽어 transition을 진행시키고,
+// 완료 확인은 GET /operations/{id}로 한다(isConfirmedServerSuccess / parseQueriedLifecycleOperation).
+// close가 operationId를 무시하면 삭제는 영원히 확정되지 않는다.
+func TestServerCloseEchoesOperationIdentityAndDedupes(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
+JWT_SECRET=shared-secret
+JWT_PUBLIC_KEY=shared-public-key
+SERVER_REGISTRY_JSON=[{"id":"pep","name":"\ud1b5\uc77c \uc11c\ubc84","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
+`)
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nGAME_API_PORT=8101\nWEB_GAME_PORT=3101\n")
+	calls := &dockerCallRecorder{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
+		calls.record(args...)
+		return "ok\n", nil
+	}
+	handler := cfg.withAuth(cfg.handleServerClose)
+	operationID := "0123456789abcdef0123456789abcdef"
+
+	first := envRequest(t, handler, http.MethodPost, "/servers/close",
+		`{"id":"pep","operationId":"`+operationID+`"}`)
+	if first.Code != http.StatusOK {
+		t.Fatalf("close status = %d body=%s", first.Code, first.Body.String())
+	}
+	var body createServerResponse
+	if err := json.Unmarshal(first.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode close: %v", err)
+	}
+	if !body.OK || body.ID != "pep" || body.OperationID != operationID {
+		t.Fatalf("close body = %s", first.Body.String())
+	}
+	if body.OperationStatus != lifecycleJobPending && body.OperationStatus != lifecycleJobRunning &&
+		body.OperationStatus != lifecycleJobSucceeded {
+		t.Fatalf("close operationStatus = %q", body.OperationStatus)
+	}
+	waitForCalls(t, calls.count, 3)
+	waitForMissing(t, filepath.Join(cfg.serversDir, "spep.env"))
+
+	// \uc644\ub8cc \ub4a4 \uc870\ud68c \uacbd\ub85c\uac00 succeeded \uc640 \ud655\uc815 \ubcf8\ubb38\uc744 \ub3cc\ub824\uc918\uc57c gateway \uac00 transition \uc744 \ub2eb\ub294\ub2e4.
+	deadline := time.Now().Add(5 * time.Second)
+	var queried struct {
+		OperationID string          `json:"operationId"`
+		Kind        string          `json:"kind"`
+		Status      string          `json:"status"`
+		HTTPStatus  int             `json:"httpStatus"`
+		Result      json.RawMessage `json:"result"`
+	}
+	for {
+		res := envRequest(t, cfg.withAuth(cfg.handleOperation), http.MethodGet, "/operations/"+operationID, "")
+		if res.Code != http.StatusOK {
+			t.Fatalf("query status = %d body=%s", res.Code, res.Body.String())
+		}
+		if err := json.Unmarshal(res.Body.Bytes(), &queried); err != nil {
+			t.Fatalf("decode query: %v", err)
+		}
+		if queried.Status == string(lifecycleJobSucceeded) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("operation never reached succeeded: %s", res.Body.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if queried.OperationID != operationID || queried.Kind != "close" || queried.HTTPStatus != http.StatusOK {
+		t.Fatalf("queried = %#v", queried)
+	}
+	var echoed createServerResponse
+	if err := json.Unmarshal(queried.Result, &echoed); err != nil {
+		t.Fatalf("decode queried result: %v", err)
+	}
+	if !echoed.OK || echoed.ID != "pep" || echoed.OperationID != operationID ||
+		echoed.OperationStatus != lifecycleJobSucceeded {
+		t.Fatalf("queried result = %s", string(queried.Result))
+	}
+
+	// \uac19\uc740 operationId \uc7ac\uc2dc\ub3c4\ub294 \uc7ac\uc2e4\ud589 \uc5c6\uc774 \ubc1b\uc544\ub4e4\uc5ec\uc57c \ud55c\ub2e4(gateway \uac00 \uc7ac\uc2dc\ub3c4\ud55c\ub2e4).
+	before := calls.count()
+	second := envRequest(t, handler, http.MethodPost, "/servers/close",
+		`{"id":"pep","operationId":"`+operationID+`"}`)
+	if second.Code != http.StatusOK {
+		t.Fatalf("replay status = %d body=%s", second.Code, second.Body.String())
+	}
+	var replay createServerResponse
+	if err := json.Unmarshal(second.Body.Bytes(), &replay); err != nil {
+		t.Fatalf("decode replay: %v", err)
+	}
+	if replay.OperationID != operationID {
+		t.Fatalf("replay body = %s", second.Body.String())
+	}
+	if after := calls.count(); after != before {
+		t.Fatalf("replay re-ran docker work: before=%d after=%d", before, after)
+	}
+}

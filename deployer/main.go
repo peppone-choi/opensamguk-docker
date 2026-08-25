@@ -312,14 +312,47 @@ const (
 	lifecycleJobCancelled lifecycleJobStatus = "cancelled"
 )
 
+// lifecycleKind는 gateway-api(DeployService)가 GET /operations/{id} 응답의 `kind`로
+// 대조하는 값이다. transition.action(CREATE/CLOSE)의 remoteKind와 문자열이 같아야 한다.
+type lifecycleKind string
+
+const (
+	lifecycleKindCreate lifecycleKind = "create"
+	lifecycleKindClose  lifecycleKind = "close"
+)
+
 type lifecycleJob struct {
 	id                   string
 	status               lifecycleJobStatus
 	finishedAt           time.Time
 	operationID          string
 	operationFingerprint string
+	kind                 lifecycleKind
+	subjectID            string
+	httpStatus           int
+	result               json.RawMessage
 	cancel               context.CancelFunc
 	cancelRequested      bool
+}
+
+// operationResponse는 gateway-api가 원격 lifecycle 작업을 재확인할 때 읽는 본문이다.
+// pending/running이면 result/httpStatus는 비어 있고, terminal이면 POST가 돌려줬을
+// 본문과 동일한 result를 httpStatus와 함께 싣는다.
+type operationResponse struct {
+	OperationID string             `json:"operationId"`
+	Kind        lifecycleKind      `json:"kind"`
+	Status      lifecycleJobStatus `json:"status"`
+	HTTPStatus  int                `json:"httpStatus,omitempty"`
+	Result      json.RawMessage    `json:"result,omitempty"`
+}
+
+// operationNotFoundResponse는 gateway-api의 isExactUnknownOperation이 정확히 3-key로
+// 검사하는 404 본문이다. 필드를 더하면 gateway는 Missing이 아니라 Unavailable로 떨어져
+// transition을 영구 repair-pending 상태로 남긴다.
+type operationNotFoundResponse struct {
+	OK          bool   `json:"ok"`
+	OperationID string `json:"operationId"`
+	Status      string `json:"status"`
 }
 
 type lifecycleJobResponse struct {
@@ -1036,11 +1069,11 @@ func newLifecycleJobManager() *lifecycleJobManager {
 }
 
 func (m *lifecycleJobManager) reserve() (string, error) {
-	id, _, err := m.reserveWithOperation("", "")
+	id, _, err := m.reserveWithOperation("", "", "")
 	return id, err
 }
 
-func (m *lifecycleJobManager) reserveWithOperation(operationID string, operationFingerprint string) (string, bool, error) {
+func (m *lifecycleJobManager) reserveWithOperation(operationID string, operationFingerprint string, kind lifecycleKind) (string, bool, error) {
 	if m == nil {
 		return "", false, errors.New("lifecycle job manager unavailable")
 	}
@@ -1075,7 +1108,7 @@ func (m *lifecycleJobManager) reserveWithOperation(operationID string, operation
 		if _, exists := m.jobs[id]; exists {
 			continue
 		}
-		m.jobs[id] = lifecycleJob{id: id, status: lifecycleJobPending, operationID: operationID, operationFingerprint: operationFingerprint}
+		m.jobs[id] = lifecycleJob{id: id, status: lifecycleJobPending, operationID: operationID, operationFingerprint: operationFingerprint, kind: kind}
 		if operationID != "" {
 			m.operationJobs[operationID] = id
 		}
@@ -1180,6 +1213,89 @@ func (m *lifecycleJobManager) finish(id string, status lifecycleJobStatus) {
 	job.finishedAt = m.currentTimeLocked()
 	job.cancel = nil
 	m.jobs[id] = job
+}
+
+// bindOperationSubject는 이 job이 어떤 서버를 대상으로 하는지 기록한다. terminal 시점에
+// 결과 본문을 합성할 때 gateway가 대조하는 `id`가 된다.
+func (m *lifecycleJobManager) bindOperationSubject(id string, kind lifecycleKind, subjectID string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	job, exists := m.jobs[id]
+	if !exists {
+		return
+	}
+	if kind != "" {
+		job.kind = kind
+	}
+	if subjectID != "" {
+		job.subjectID = subjectID
+	}
+	m.jobs[id] = job
+}
+
+// recordOperationResult는 terminal 결과 본문을 그대로 보존한다. 합성으로는 담을 수 없는
+// 상세(detail 등)를 유지해야 하는 경로에서 쓴다.
+func (m *lifecycleJobManager) recordOperationResult(id string, status lifecycleJobStatus, httpStatus int, result json.RawMessage) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	job, exists := m.jobs[id]
+	if exists {
+		job.httpStatus = httpStatus
+		job.result = result
+		m.jobs[id] = job
+	}
+	m.mu.Unlock()
+	if exists && isTerminalLifecycleJob(status) {
+		m.finish(id, status)
+	}
+}
+
+// lookupOperation은 operationId로 job을 찾아 gateway 계약 본문을 만든다.
+func (m *lifecycleJobManager) lookupOperation(operationID string) (operationResponse, bool) {
+	if m == nil {
+		return operationResponse{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pruneExpiredTerminalLocked(m.currentTimeLocked())
+	jobID, exists := m.operationJobs[operationID]
+	if !exists {
+		return operationResponse{}, false
+	}
+	job, exists := m.jobs[jobID]
+	if !exists {
+		return operationResponse{}, false
+	}
+	response := operationResponse{OperationID: operationID, Kind: job.kind, Status: job.status}
+	if !isTerminalLifecycleJob(job.status) {
+		return response, true
+	}
+	response.HTTPStatus = job.httpStatus
+	response.Result = job.result
+	if response.Result == nil {
+		// 비동기 job은 완료 시 본문을 남기지 않는다 — gateway가 대조하는 최소 형태를 합성한다.
+		synthesized := createServerResponse{
+			OK:              job.status == lifecycleJobSucceeded,
+			ID:              job.subjectID,
+			OperationID:     operationID,
+			OperationStatus: job.status,
+		}
+		if encoded, err := json.Marshal(synthesized); err == nil {
+			response.Result = encoded
+		}
+	}
+	if response.HTTPStatus == 0 {
+		response.HTTPStatus = http.StatusOK
+		if job.status != lifecycleJobSucceeded {
+			response.HTTPStatus = http.StatusInternalServerError
+		}
+	}
+	return response, true
 }
 
 func (m *lifecycleJobManager) lookup(id string) (lifecycleJobResponse, bool) {
@@ -1781,14 +1897,18 @@ type resetServerRequest struct {
 }
 
 type createServerResponse struct {
-	OK               bool     `json:"ok"`
-	ID               string   `json:"id"`
-	Name             string   `json:"name"`
-	Project          string   `json:"project"`
-	JobID            string   `json:"jobId,omitempty"`
-	RestartRequired  bool     `json:"restartRequired"`
-	AffectedServices []string `json:"affectedServices"`
-	Detail           string   `json:"detail"`
+	OK      bool   `json:"ok"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Project string `json:"project"`
+	JobID   string `json:"jobId,omitempty"`
+	// gateway-api는 POST 응답에서 바로 operationId/operationStatus를 읽어 transition을
+	// 진행시킨다(isConfirmedServerSuccess / parsePostedLifecycleOperation).
+	OperationID      string             `json:"operationId,omitempty"`
+	OperationStatus  lifecycleJobStatus `json:"operationStatus,omitempty"`
+	RestartRequired  bool               `json:"restartRequired"`
+	AffectedServices []string           `json:"affectedServices"`
+	Detail           string             `json:"detail"`
 }
 
 type registryEntry struct {
@@ -1870,6 +1990,8 @@ func main() {
 	mux.HandleFunc("/env/server", cfg.withAuth(cfg.handleServerEnv))
 	mux.HandleFunc("/jobs", cfg.withAuth(cfg.handleLifecycleJob))
 	mux.HandleFunc("/jobs/", cfg.withAuth(cfg.handleLifecycleJob))
+	mux.HandleFunc("/operations", cfg.withAuth(cfg.handleOperation))
+	mux.HandleFunc("/operations/", cfg.withAuth(cfg.handleOperation))
 	mux.HandleFunc("/maintenance", cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance)))
 	mux.HandleFunc("/maintenance/", cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance)))
 
@@ -2017,6 +2139,32 @@ func (c config) handleReady(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+}
+
+// handleOperation은 gateway-api가 CREATE/CLOSE transition을 복구할 때 부르는 조회 경로다.
+// 응답 형태는 DeployService.parseQueriedLifecycleOperation / isExactUnknownOperation과
+// 짝을 이룬다 — 특히 404 본문은 정확히 ok/operationId/status 3-key여야 하며, 필드를
+// 더하면 gateway가 Unavailable로 떨어져 transition이 영구 repair-pending으로 남는다.
+func (c config) handleOperation(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/operations" || !strings.HasPrefix(r.URL.Path, "/operations/") {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "operation id가 올바르지 않습니다."})
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/operations/")
+	if strings.Contains(path, "/") || !lifecycleJobIDRe.MatchString(path) {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "operation id가 올바르지 않습니다."})
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "GET only"})
+		return
+	}
+	operation, exists := c.lifecycleJobs.lookupOperation(path)
+	if !exists {
+		writeJSON(w, http.StatusNotFound, operationNotFoundResponse{OK: false, OperationID: path, Status: "not_found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, operation)
 }
 
 func (c config) handleLifecycleJob(w http.ResponseWriter, r *http.Request) {
@@ -2282,7 +2430,7 @@ func (c config) handleServers(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		c.handleServerCreate(w, r)
 	case http.MethodDelete:
-		res, status := c.deleteServer(r.URL.Query().Get("id"), r.URL.Query().Get("confirm"))
+		res, status := c.deleteServer(r.URL.Query().Get("id"), r.URL.Query().Get("confirm"), "")
 		writeCreateServerResponse(w, status, res)
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "GET/POST/DELETE only"})
@@ -2333,10 +2481,16 @@ func (c config) handleServerClose(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		ID string `json:"id"`
+		ID          string `json:"id"`
+		OperationID string `json:"operationId"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "JSON 파싱 실패"})
+		return
+	}
+	operationID, err := normalizeLifecycleOperationID(req.OperationID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, createServerResponse{OK: false, Detail: err.Error()})
 		return
 	}
 	id, _, err := normalizeCreateServerID(req.ID)
@@ -2344,7 +2498,7 @@ func (c config) handleServerClose(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, createServerResponse{OK: false, Detail: err.Error()})
 		return
 	}
-	res, status := c.deleteServer(id, "DELETE "+id)
+	res, status := c.deleteServer(id, "DELETE "+id, operationID)
 	writeCreateServerResponse(w, status, res)
 }
 
@@ -2708,6 +2862,13 @@ func (c config) normalizeCreateServerRequest(req createServerRequest) (normalize
 
 // JWT 필드는 지문에서 뺀다 — 사용자 입력이 아니라 공유 .env에서 매번 동일하게
 // 파생되므로, 지문에 넣어도 판별력이 없고 넣지 않아도 안전하다.
+// closeRequestFingerprint는 같은 operationId가 다른 서버를 가리키는 재사용을 거부하기 위한
+// 지문이다. close 요청은 서버 id 하나로 완전히 결정된다.
+func closeRequestFingerprint(id string) string {
+	sum := sha256.Sum256([]byte("close:" + id))
+	return hex.EncodeToString(sum[:])
+}
+
 func createRequestFingerprint(req normalizedCreateServerRequest) string {
 	payload, _ := json.Marshal(struct {
 		ID                  string `json:"id"`
@@ -2763,7 +2924,7 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 	admissionAttempted := false
 	if operationID != "" {
 		var existing bool
-		jobID, existing, err = c.lifecycleJobs.reserveWithOperation(operationID, createRequestFingerprint(normalized))
+		jobID, existing, err = c.lifecycleJobs.reserveWithOperation(operationID, createRequestFingerprint(normalized), lifecycleKindCreate)
 		if err != nil {
 			if errors.Is(err, errLifecycleOperationConflict) {
 				return createServerResponse{OK: false, ID: id, Detail: "operationId는 다른 서버 생성 요청에 이미 사용되었습니다."}, http.StatusConflict
@@ -2772,11 +2933,17 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 			return createServerResponse{OK: false, ID: id, Detail: detail}, status
 		}
 		if existing {
+			status := lifecycleJobPending
+			if recorded, ok := c.lifecycleJobs.lookup(jobID); ok {
+				status = recorded.Status
+			}
 			return createServerResponse{
-				OK:     true,
-				ID:     id,
-				JobID:  jobID,
-				Detail: "동일한 서버 생성 요청이 이미 접수되었습니다.",
+				OK:              status != lifecycleJobFailed && status != lifecycleJobCancelled,
+				ID:              id,
+				JobID:           jobID,
+				OperationID:     operationID,
+				OperationStatus: status,
+				Detail:          "동일한 서버 생성 요청이 이미 접수되었습니다.",
 			}, http.StatusOK
 		}
 		newReservation = true
@@ -2857,6 +3024,7 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 		return createServerResponse{OK: false, ID: id, Detail: detail}, status
 	}
 	reservationClaimed = true
+	c.lifecycleJobs.bindOperationSubject(jobID, lifecycleKindCreate, id)
 	setupComplete := make(chan error, 1)
 	c.startClaimedLifecycleJob(lease, jobID, "create "+id, func(ctx context.Context) (string, error) {
 		if err := ctx.Err(); err != nil {
@@ -2923,7 +3091,7 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 	if err := <-setupComplete; err != nil {
 		return createServerResponse{OK: false, ID: id, Name: name, Project: entry.DeployProject, Detail: fmt.Sprintf("서버 생성 준비 실패: %v", err)}, http.StatusInternalServerError
 	}
-	return createServerResponse{
+	created := createServerResponse{
 		OK:               true,
 		ID:               id,
 		Name:             name,
@@ -2932,15 +3100,42 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 		RestartRequired:  true,
 		AffectedServices: append(append([]string{}, sharedRegistryReloadServices...), "server-stack"),
 		Detail:           "서버 생성 작업을 시작했습니다. 상태가 준비될 때까지 잠시 기다려 주세요.",
-	}, http.StatusOK
+	}
+	if operationID != "" {
+		created.OperationID = operationID
+		created.OperationStatus = lifecycleJobPending
+		if recorded, ok := c.lifecycleJobs.lookup(jobID); ok {
+			created.OperationStatus = recorded.Status
+		}
+	}
+	return created, http.StatusOK
 }
 
-func (c config) deleteServer(rawID string, confirm string) (createServerResponse, int) {
+func (c config) deleteServer(rawID string, confirm string, operationID string) (createServerResponse, int) {
 	target, err := c.serverTargetForID(rawID)
 	if err != nil {
 		return createServerResponse{OK: false, Detail: err.Error()}, http.StatusBadRequest
 	}
 	id := target.ID
+	// 이미 접수된 operationId는 레지스트리 상태를 보기 전에 먼저 재생한다. 삭제가 끝난 뒤의
+	// 재시도는 서버가 사라져 "알 수 없는 서버입니다" 404가 나는데, gateway는 그 404로는
+	// transition을 닫지 못해 영원히 재시도한다.
+	if operationID != "" {
+		if recorded, exists := c.lifecycleJobs.lookupOperation(operationID); exists {
+			if recorded.Kind != lifecycleKindClose {
+				return createServerResponse{OK: false, ID: id, OperationID: operationID, Detail: "operationId는 다른 서버 요청에 이미 사용되었습니다."}, http.StatusConflict
+			}
+			replay := createServerResponse{
+				OK:              recorded.Status != lifecycleJobFailed && recorded.Status != lifecycleJobCancelled,
+				ID:              id,
+				Project:         target.Project,
+				OperationID:     operationID,
+				OperationStatus: recorded.Status,
+				Detail:          "동일한 서버 종료 요청이 이미 접수되었습니다.",
+			}
+			return replay, http.StatusOK
+		}
+	}
 	if confirm != "DELETE "+id {
 		return createServerResponse{OK: false, ID: id, Detail: "삭제 확인 문구가 일치하지 않습니다."}, http.StatusBadRequest
 	}
@@ -2958,11 +3153,44 @@ func (c config) deleteServer(rawID string, confirm string) (createServerResponse
 		return createServerResponse{OK: false, ID: id, Detail: fmt.Sprintf("서버 env 식별자 검증 실패: %v", err)}, http.StatusConflict
 	}
 	envFile := target.EnvFile
-	jobID, err := c.lifecycleJobs.reserve()
-	if err != nil {
-		detail, status := lifecycleJobReservationFailure(err)
-		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: detail}, status
+	var jobID string
+	if operationID != "" {
+		existingJob, existing, reserveErr := c.lifecycleJobs.reserveWithOperation(operationID, closeRequestFingerprint(id), lifecycleKindClose)
+		if reserveErr != nil {
+			if errors.Is(reserveErr, errLifecycleOperationConflict) {
+				return createServerResponse{OK: false, ID: id, OperationID: operationID, Detail: "operationId는 다른 서버 요청에 이미 사용되었습니다."}, http.StatusConflict
+			}
+			detail, status := lifecycleJobReservationFailure(reserveErr)
+			return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, OperationID: operationID, Detail: detail}, status
+		}
+		if existing {
+			// gateway는 확정을 못 받으면 같은 operationId로 재시도한다. 재실행 없이
+			// 현재 상태를 그대로 돌려줘야 삭제가 두 번 일어나지 않는다.
+			status := lifecycleJobPending
+			if recorded, ok := c.lifecycleJobs.lookup(existingJob); ok {
+				status = recorded.Status
+			}
+			return createServerResponse{
+				OK:              status != lifecycleJobFailed && status != lifecycleJobCancelled,
+				ID:              id,
+				Name:            entry.Name,
+				Project:         entry.DeployProject,
+				JobID:           existingJob,
+				OperationID:     operationID,
+				OperationStatus: status,
+				Detail:          "동일한 서버 종료 요청이 이미 접수되었습니다.",
+			}, http.StatusOK
+		}
+		jobID = existingJob
+	} else {
+		reserved, reserveErr := c.lifecycleJobs.reserve()
+		if reserveErr != nil {
+			detail, status := lifecycleJobReservationFailure(reserveErr)
+			return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: detail}, status
+		}
+		jobID = reserved
 	}
+	c.lifecycleJobs.bindOperationSubject(jobID, lifecycleKindClose, id)
 	lease, err := c.beginMutation(jobID)
 	if err != nil {
 		c.lifecycleJobs.discard(jobID)
@@ -3030,7 +3258,7 @@ func (c config) deleteServer(rawID string, confirm string) (createServerResponse
 		}
 		return detail, nil
 	})
-	return createServerResponse{
+	response := createServerResponse{
 		OK:               true,
 		ID:               id,
 		Name:             entry.Name,
@@ -3039,7 +3267,15 @@ func (c config) deleteServer(rawID string, confirm string) (createServerResponse
 		RestartRequired:  true,
 		AffectedServices: append(append([]string{}, sharedRegistryReloadServices...), "server-stack"),
 		Detail:           "서버 삭제 작업을 시작했습니다. 목록에서 사라질 때까지 잠시 기다려 주세요.",
-	}, http.StatusOK
+	}
+	if operationID != "" {
+		response.OperationID = operationID
+		response.OperationStatus = lifecycleJobPending
+		if recorded, ok := c.lifecycleJobs.lookup(jobID); ok {
+			response.OperationStatus = recorded.Status
+		}
+	}
+	return response, http.StatusOK
 }
 
 func (c config) resetServer(rawID string, req resetServerRequest) (createServerResponse, int) {
