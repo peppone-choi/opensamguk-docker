@@ -22,11 +22,41 @@ const (
 	durableOperationMessageLimit      = 300
 	durableOperationStoreFileName     = ".deployer-operations.json"
 
-	durableOperationRecoveryMessage = "서버 복구 확인이 필요합니다. 운영 복구가 끝날 때까지 기다려 주세요."
-	durableOperationRestartMessage  = "deployer 재시작 전에 작업이 중단되었습니다. 다시 요청해 주세요."
+	durableOperationRequestValidationFailedMessage = "요청 검증에 실패했습니다."
+	durableOperationDockerUnavailableMessage       = "Docker를 사용할 수 없어 작업을 시작하지 못했습니다."
+	durableOperationAlreadyInProgressMessage       = "다른 서버 수명주기 작업이 진행 중입니다."
+	durableOperationCreatePreparationFailedMessage = "서버 생성 준비에 실패했습니다."
+	durableOperationClosePreparationFailedMessage  = "서버 종료 준비에 실패했습니다."
+	durableOperationResetPreparationFailedMessage  = "서버 리셋 준비에 실패했습니다."
+	durableOperationRecoveryMessage                = "서버 복구 확인이 필요합니다. 운영 복구가 끝날 때까지 기다려 주세요."
+	durableOperationVerificationFailedMessage      = "서버 수명주기 검증에 실패했습니다."
+	durableOperationCancelledMessage               = "서버 수명주기 작업이 취소되었습니다."
+	durableOperationRestartMessage                 = "deployer 재시작 전에 작업이 중단되었습니다. 다시 요청해 주세요."
+	durableOperationCreateSucceededMessage         = "서버 생성이 완료되었습니다."
+	durableOperationCloseSucceededMessage          = "서버 종료가 완료되었습니다."
+	durableOperationResetSucceededMessage          = "서버 리셋이 완료되었습니다."
 )
 
 var durableOperationFingerprintRe = regexp.MustCompile(`^[a-f0-9]{64}$`)
+
+type durableOperationMessageID string
+
+const (
+	durableOperationMessageNone                    durableOperationMessageID = ""
+	durableOperationMessageRequestValidationFailed durableOperationMessageID = "request_validation_failed"
+	durableOperationMessageDockerUnavailable       durableOperationMessageID = "docker_unavailable"
+	durableOperationMessageAlreadyInProgress       durableOperationMessageID = "already_in_progress"
+	durableOperationMessageCreatePreparationFailed durableOperationMessageID = "create_preparation_failed"
+	durableOperationMessageClosePreparationFailed  durableOperationMessageID = "close_preparation_failed"
+	durableOperationMessageResetPreparationFailed  durableOperationMessageID = "reset_preparation_failed"
+	durableOperationMessageRecoveryRequired        durableOperationMessageID = "recovery_required"
+	durableOperationMessageVerificationFailed      durableOperationMessageID = "verification_failed"
+	durableOperationMessageCancelled               durableOperationMessageID = "cancelled"
+	durableOperationMessageRestartInterrupted      durableOperationMessageID = "restart_interrupted"
+	durableOperationMessageCreateSucceeded         durableOperationMessageID = "create_succeeded"
+	durableOperationMessageCloseSucceeded          durableOperationMessageID = "close_succeeded"
+	durableOperationMessageResetSucceeded          durableOperationMessageID = "reset_succeeded"
+)
 
 type durableOperationRecord struct {
 	OperationID        string             `json:"operationId"`
@@ -52,6 +82,14 @@ type durableOperationStore struct {
 	retention  time.Duration
 	operations map[string]durableOperationRecord
 	now        func() time.Time
+	fileOps    durableOperationFileOps
+}
+
+type durableOperationFileOps struct {
+	createTemp    func(string, string) (*os.File, error)
+	syncFile      func(*os.File) error
+	rename        func(string, string) error
+	syncDirectory func(string) error
 }
 
 func openDurableOperationStore(path string, maxEntries int, retention time.Duration) (*durableOperationStore, error) {
@@ -70,6 +108,7 @@ func openDurableOperationStore(path string, maxEntries int, retention time.Durat
 		retention:  retention,
 		operations: make(map[string]durableOperationRecord),
 		now:        time.Now,
+		fileOps:    defaultDurableOperationFileOps(),
 	}
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -79,6 +118,18 @@ func openDurableOperationStore(path string, maxEntries int, retention time.Durat
 		return nil, fmt.Errorf("open durable operation store: %w", err)
 	}
 	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat durable operation store: %w", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		if err := file.Chmod(0o600); err != nil {
+			return nil, fmt.Errorf("secure durable operation store permissions: %w", err)
+		}
+		if err := file.Sync(); err != nil {
+			return nil, fmt.Errorf("sync durable operation store permissions: %w", err)
+		}
+	}
 
 	decoder := json.NewDecoder(file)
 	decoder.DisallowUnknownFields()
@@ -111,10 +162,13 @@ func openDurableOperationStore(path string, maxEntries int, retention time.Durat
 	now := store.currentTimeLocked()
 	pruned := cloneDurableOperations(store.operations)
 	if pruneExpiredDurableOperations(pruned, now, retention) {
-		if err := store.persistLocked(pruned); err != nil {
+		committed, err := store.persistLocked(pruned)
+		if committed {
+			store.operations = pruned
+		}
+		if err != nil {
 			return nil, fmt.Errorf("prune durable operation store: %w", err)
 		}
-		store.operations = pruned
 	}
 	return store, nil
 }
@@ -152,17 +206,20 @@ func (s *durableOperationStore) Reserve(record durableOperationRecord) (durableO
 		return durableOperationRecord{}, false, errLifecycleJobCapacity
 	}
 	next[record.OperationID] = record
-	if err := s.persistLocked(next); err != nil {
+	if err := s.persistAndInstallLocked(next); err != nil {
 		return durableOperationRecord{}, false, err
 	}
-	s.operations = next
 	return record, false, nil
 }
 
 // Transition durably changes a non-terminal operation state.
-func (s *durableOperationStore) Transition(operationID string, status lifecycleJobStatus, httpStatus int, publicMessage string) (durableOperationRecord, error) {
+func (s *durableOperationStore) Transition(operationID string, status lifecycleJobStatus, httpStatus int, messageID durableOperationMessageID) (durableOperationRecord, error) {
 	if s == nil {
 		return durableOperationRecord{}, errors.New("durable operation store unavailable")
+	}
+	publicMessage, err := durableOperationPublicMessage(messageID)
+	if err != nil {
+		return durableOperationRecord{}, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -186,10 +243,9 @@ func (s *durableOperationStore) Transition(operationID string, status lifecycleJ
 	next := cloneDurableOperations(s.operations)
 	pruneExpiredDurableOperations(next, record.UpdatedAt, s.retention)
 	next[operationID] = record
-	if err := s.persistLocked(next); err != nil {
+	if err := s.persistAndInstallLocked(next); err != nil {
 		return durableOperationRecord{}, err
 	}
-	s.operations = next
 	return record, nil
 }
 
@@ -238,10 +294,9 @@ func (s *durableOperationStore) Recover(journalOperationID string) error {
 	if !changed {
 		return nil
 	}
-	if err := s.persistLocked(next); err != nil {
+	if err := s.persistAndInstallLocked(next); err != nil {
 		return err
 	}
-	s.operations = next
 	return nil
 }
 
@@ -252,49 +307,72 @@ func (s *durableOperationStore) currentTimeLocked() time.Time {
 	return s.now()
 }
 
-func (s *durableOperationStore) persistLocked(operations map[string]durableOperationRecord) error {
+func (s *durableOperationStore) persistAndInstallLocked(operations map[string]durableOperationRecord) error {
+	committed, err := s.persistLocked(operations)
+	if committed {
+		s.operations = operations
+	}
+	return err
+}
+
+func (s *durableOperationStore) persistLocked(operations map[string]durableOperationRecord) (bool, error) {
 	document := durableOperationDocument{Version: durableOperationStoreVersion, Operations: make([]durableOperationRecord, 0, len(operations))}
 	for _, record := range operations {
 		document.Operations = append(document.Operations, record)
 	}
 	data, err := json.Marshal(document)
 	if err != nil {
-		return fmt.Errorf("encode durable operation store: %w", err)
+		return false, fmt.Errorf("encode durable operation store: %w", err)
 	}
 	data = append(data, '\n')
-	if err := writeDurableOperationFile(s.path, data); err != nil {
-		return fmt.Errorf("persist durable operation store: %w", err)
+	committed, err := writeDurableOperationFile(s.path, data, s.fileOps)
+	if err != nil {
+		return committed, fmt.Errorf("persist durable operation store: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
-func writeDurableOperationFile(path string, data []byte) error {
+func defaultDurableOperationFileOps() durableOperationFileOps {
+	return durableOperationFileOps{
+		createTemp: os.CreateTemp,
+		syncFile: func(file *os.File) error {
+			return file.Sync()
+		},
+		rename:        os.Rename,
+		syncDirectory: syncDirectory,
+	}
+}
+
+func writeDurableOperationFile(path string, data []byte, fileOps durableOperationFileOps) (bool, error) {
 	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".deployer-operations-*")
+	tmp, err := fileOps.createTemp(dir, ".deployer-operations-*")
 	if err != nil {
-		return err
+		return false, err
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 	if err := tmp.Chmod(0o600); err != nil {
 		tmp.Close()
-		return err
+		return false, err
 	}
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
-		return err
+		return false, err
 	}
-	if err := tmp.Sync(); err != nil {
+	if err := fileOps.syncFile(tmp); err != nil {
 		tmp.Close()
-		return err
+		return false, err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return false, err
 	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
+	if err := fileOps.rename(tmpName, path); err != nil {
+		return false, err
 	}
-	return syncDirectory(dir)
+	if err := fileOps.syncDirectory(dir); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 func validateDurableOperationRecord(record durableOperationRecord) error {
@@ -337,7 +415,60 @@ func validateDurableOperationMessage(message string) error {
 			return errors.New("public message contains control characters")
 		}
 	}
-	return nil
+	switch message {
+	case "",
+		durableOperationRequestValidationFailedMessage,
+		durableOperationDockerUnavailableMessage,
+		durableOperationAlreadyInProgressMessage,
+		durableOperationCreatePreparationFailedMessage,
+		durableOperationClosePreparationFailedMessage,
+		durableOperationResetPreparationFailedMessage,
+		durableOperationRecoveryMessage,
+		durableOperationVerificationFailedMessage,
+		durableOperationCancelledMessage,
+		durableOperationRestartMessage,
+		durableOperationCreateSucceededMessage,
+		durableOperationCloseSucceededMessage,
+		durableOperationResetSucceededMessage:
+		return nil
+	default:
+		return errors.New("public message is not an approved lifecycle template")
+	}
+}
+
+func durableOperationPublicMessage(messageID durableOperationMessageID) (string, error) {
+	switch messageID {
+	case durableOperationMessageNone:
+		return "", nil
+	case durableOperationMessageRequestValidationFailed:
+		return durableOperationRequestValidationFailedMessage, nil
+	case durableOperationMessageDockerUnavailable:
+		return durableOperationDockerUnavailableMessage, nil
+	case durableOperationMessageAlreadyInProgress:
+		return durableOperationAlreadyInProgressMessage, nil
+	case durableOperationMessageCreatePreparationFailed:
+		return durableOperationCreatePreparationFailedMessage, nil
+	case durableOperationMessageClosePreparationFailed:
+		return durableOperationClosePreparationFailedMessage, nil
+	case durableOperationMessageResetPreparationFailed:
+		return durableOperationResetPreparationFailedMessage, nil
+	case durableOperationMessageRecoveryRequired:
+		return durableOperationRecoveryMessage, nil
+	case durableOperationMessageVerificationFailed:
+		return durableOperationVerificationFailedMessage, nil
+	case durableOperationMessageCancelled:
+		return durableOperationCancelledMessage, nil
+	case durableOperationMessageRestartInterrupted:
+		return durableOperationRestartMessage, nil
+	case durableOperationMessageCreateSucceeded:
+		return durableOperationCreateSucceededMessage, nil
+	case durableOperationMessageCloseSucceeded:
+		return durableOperationCloseSucceededMessage, nil
+	case durableOperationMessageResetSucceeded:
+		return durableOperationResetSucceededMessage, nil
+	default:
+		return "", errors.New("durable operation message id is invalid")
+	}
 }
 
 func isDurableOperationStatus(status lifecycleJobStatus) bool {
