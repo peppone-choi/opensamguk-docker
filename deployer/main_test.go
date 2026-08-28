@@ -347,6 +347,9 @@ func TestCreateServerOperationIDRecoversAmbiguousPostWithoutSecondMutation(t *te
 	if err := json.NewDecoder(first.Body).Decode(&firstBody); err != nil {
 		t.Fatalf("decode first create response: %v", err)
 	}
+	if reserved, ok := cfg.lifecycleOperationStore.Lookup(operationID); !ok || reserved.Kind != lifecycleKindCreate || reserved.SubjectID != "pep" {
+		t.Fatalf("create durable reservation = %#v, %v", reserved, ok)
+	}
 	select {
 	case <-firstDockerCall:
 	case <-time.After(time.Second):
@@ -379,6 +382,10 @@ func TestCreateServerOperationIDBindsNormalizedPayloadBeforeRetryResolution(t *t
 	dockerStarted := make(chan struct{})
 	releaseDocker := make(chan struct{})
 	var started sync.Once
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseDocker) })
+	}
 	cfg.dockerRunner = func(args ...string) (string, error) {
 		if dockerPreflightProbe(args) {
 			return "29.0.0\n", nil
@@ -389,7 +396,7 @@ func TestCreateServerOperationIDBindsNormalizedPayloadBeforeRetryResolution(t *t
 		})
 		return "ok\n", nil
 	}
-	defer close(releaseDocker)
+	defer release()
 
 	operationID := "fedcba9876543210fedcba9876543210"
 	first := envRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create", `{"id":"PEP","name":" 첫 서버 ","generation":"01","imageTag":" v1 ","gameApiPort":"8101","webGamePort":"3101","scenarioCode":" scenario_1010 ","operationId":"`+operationID+`"}`)
@@ -433,6 +440,10 @@ func TestCreateServerOperationIDBindsNormalizedPayloadBeforeRetryResolution(t *t
 	invalid := envRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create", `{"id":"pep","name":"첫 서버","gameApiPort":"bad","webGamePort":"3101","operationId":"`+operationID+`"}`)
 	if invalid.Code != http.StatusBadRequest {
 		t.Fatalf("invalid retry bypassed validation = %d body=%s", invalid.Code, invalid.Body.String())
+	}
+	release()
+	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, firstBody.JobID, lifecycleJobSucceeded); completed.Status != lifecycleJobSucceeded {
+		t.Fatalf("normalized create completion = %#v", completed)
 	}
 }
 
@@ -764,9 +775,16 @@ func TestMaintenanceLeaseAcceptedFromCreateBodyAndNeverReturned(t *testing.T) {
 	if strings.Contains(response.Body.String(), entered.Lease) {
 		t.Fatalf("create response leaked maintenance lease: %s", response.Body.String())
 	}
+	var accepted createServerResponse
+	if err := json.NewDecoder(response.Body).Decode(&accepted); err != nil {
+		t.Fatalf("decode body lease create response: %v", err)
+	}
+	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, accepted.JobID, lifecycleJobSucceeded); completed.Status != lifecycleJobSucceeded {
+		t.Fatalf("body lease create completion = %#v", completed)
+	}
 }
 
-func TestRejectedCreateAdmissionDiscardsOperationReservationForRetry(t *testing.T) {
+func TestRejectedCreateAdmissionPersistsCancelledOperationWithoutRetryMutation(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n")
 	cfg.dockerRunner = func(args ...string) (string, error) { return "ok\n", nil }
@@ -790,6 +808,10 @@ func TestRejectedCreateAdmissionDiscardsOperationReservationForRetry(t *testing.
 	if retained {
 		t.Fatalf("rejected admission retained operation reservation %q", retainedJobID)
 	}
+	cancelled, ok := cfg.lifecycleOperationStore.Lookup(operationID)
+	if !ok || cancelled.Status != lifecycleJobCancelled || cancelled.PublicMessage != durableOperationCancelledMessage {
+		t.Fatalf("rejected admission durable operation = %#v, %v", cancelled, ok)
+	}
 
 	leave := loopbackRequest(t, maintenance, http.MethodPost, "/maintenance/leave", "")
 	if leave.Code != http.StatusOK || decodeMaintenanceResponse(t, leave).State != maintenanceStateOpen {
@@ -804,14 +826,11 @@ func TestRejectedCreateAdmissionDiscardsOperationReservationForRetry(t *testing.
 	if err := json.NewDecoder(retry.Body).Decode(&retried); err != nil {
 		t.Fatalf("decode retry create response: %v", err)
 	}
-	if !lifecycleJobIDRe.MatchString(retried.JobID) {
-		t.Fatalf("retry job id = %q", retried.JobID)
+	if retried.OK || retried.JobID != "" || retried.OperationID != operationID || retried.OperationStatus != lifecycleJobCancelled {
+		t.Fatalf("cancelled retry response = %#v", retried)
 	}
-	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, retried.JobID, lifecycleJobSucceeded); completed.Status != lifecycleJobSucceeded {
-		t.Fatalf("retry lifecycle completion = %#v", completed)
-	}
-	if _, err := os.Stat(filepath.Join(cfg.serversDir, "spep.env")); err != nil {
-		t.Fatalf("retry did not create server env: %v", err)
+	if _, err := os.Stat(filepath.Join(cfg.serversDir, "spep.env")); !os.IsNotExist(err) {
+		t.Fatalf("cancelled retry mutated server env: %v", err)
 	}
 }
 
@@ -4345,6 +4364,326 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	}
 }
 
+func TestResetOperationIDReplaysIdenticalRequestWithoutSecondDockerMutation(t *testing.T) {
+	cfg := configuredResetOperationTest(t)
+	calls := &dockerCallRecorder{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
+		calls.record(args...)
+		return "ok\n", nil
+	}
+	handler := cfg.withAuth(cfg.handleServerReset)
+	operationID := "0123456789abcdef0123456789abcdef"
+	firstBody := `{"id":"PEP","confirm":"RESET pep","generation":"02","scenarioCode":"scenario_1002","operationId":"` + operationID + `"}`
+	retryBody := `{"id":"pep","confirm":"RESET pep","generation":"2","scenarioCode":"scenario_1002","operationId":"` + operationID + `"}`
+
+	first := envRequest(t, handler, http.MethodPost, "/servers/reset", firstBody)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first reset status = %d body=%s", first.Code, first.Body.String())
+	}
+	var accepted createServerResponse
+	if err := json.Unmarshal(first.Body.Bytes(), &accepted); err != nil {
+		t.Fatalf("decode first reset: %v", err)
+	}
+	if accepted.OperationID != operationID {
+		t.Errorf("first reset operationId = %q, want %q; body=%s", accepted.OperationID, operationID, first.Body.String())
+	}
+	waitForLifecycleJob(t, cfg.lifecycleJobs, accepted.JobID, lifecycleJobSucceeded)
+
+	second := envRequest(t, handler, http.MethodPost, "/servers/reset", retryBody)
+	if second.Code != http.StatusOK {
+		t.Fatalf("replayed reset status = %d body=%s", second.Code, second.Body.String())
+	}
+	var replayed createServerResponse
+	if err := json.Unmarshal(second.Body.Bytes(), &replayed); err != nil {
+		t.Fatalf("decode replayed reset: %v", err)
+	}
+	if replayed.OperationID != operationID {
+		t.Errorf("replayed reset operationId = %q, want %q; body=%s", replayed.OperationID, operationID, second.Body.String())
+	}
+	if replayed.JobID != "" && replayed.JobID != accepted.JobID {
+		waitForAnyTerminalLifecycleJob(t, cfg.lifecycleJobs, replayed.JobID)
+	}
+	if got := countDockerCallsContaining(calls.snapshot(), "down --volumes --remove-orphans"); got != 1 {
+		t.Fatalf("reset down mutations = %d, want 1; calls=%#v", got, calls.snapshot())
+	}
+}
+
+func TestResetOperationIDRejectsDifferentNormalizedRequestBeforeSecondDockerMutation(t *testing.T) {
+	cfg := configuredResetOperationTest(t)
+	calls := &dockerCallRecorder{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
+		calls.record(args...)
+		return "ok\n", nil
+	}
+	handler := cfg.withAuth(cfg.handleServerReset)
+	operationID := "fedcba9876543210fedcba9876543210"
+
+	first := envRequest(t, handler, http.MethodPost, "/servers/reset",
+		`{"id":"pep","confirm":"RESET pep","generation":"2","scenarioCode":"scenario_1002","operationId":"`+operationID+`"}`)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first reset status = %d body=%s", first.Code, first.Body.String())
+	}
+	var accepted createServerResponse
+	if err := json.Unmarshal(first.Body.Bytes(), &accepted); err != nil {
+		t.Fatalf("decode first reset: %v", err)
+	}
+	waitForLifecycleJob(t, cfg.lifecycleJobs, accepted.JobID, lifecycleJobSucceeded)
+	before := len(calls.snapshot())
+
+	conflict := envRequest(t, handler, http.MethodPost, "/servers/reset",
+		`{"id":"pep","confirm":"RESET pep","generation":"2","scenarioCode":"scenario_1003","operationId":"`+operationID+`"}`)
+	if conflict.Code != http.StatusConflict {
+		var unexpectedlyAccepted createServerResponse
+		if err := json.Unmarshal(conflict.Body.Bytes(), &unexpectedlyAccepted); err == nil && unexpectedlyAccepted.JobID != "" {
+			waitForAnyTerminalLifecycleJob(t, cfg.lifecycleJobs, unexpectedlyAccepted.JobID)
+		}
+		t.Fatalf("conflicting reset status = %d, want 409; body=%s", conflict.Code, conflict.Body.String())
+	}
+	if after := len(calls.snapshot()); after != before {
+		t.Fatalf("conflicting reset reached Docker: before=%d after=%d calls=%#v", before, after, calls.snapshot())
+	}
+}
+
+func TestLegacyResetWithoutOperationIDUsesEphemeralJob(t *testing.T) {
+	cfg := configuredResetOperationTest(t)
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
+		return "ok\n", nil
+	}
+	response := envRequest(t, cfg.withAuth(cfg.handleServerReset), http.MethodPost, "/servers/reset",
+		`{"id":"pep","confirm":"RESET pep","scenarioCode":"scenario_1002"}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("legacy reset status = %d body=%s", response.Code, response.Body.String())
+	}
+	var accepted createServerResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &accepted); err != nil {
+		t.Fatalf("decode legacy reset: %v", err)
+	}
+	if accepted.OperationID != "" || accepted.JobID == "" {
+		t.Errorf("legacy reset identity = %#v", accepted)
+	}
+	waitForLifecycleJob(t, cfg.lifecycleJobs, accepted.JobID, lifecycleJobSucceeded)
+	if _, err := os.Stat(cfg.lifecycleOperationStore.path); !os.IsNotExist(err) {
+		t.Fatalf("legacy reset persisted an operation store: %v", err)
+	}
+}
+
+func configuredResetOperationTest(t *testing.T) config {
+	t.Helper()
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=v1
+JWT_SECRET=shared-secret
+JWT_PUBLIC_KEY=shared-public-key
+SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
+`)
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n")
+	cfg.lifecycleOperationStore = mustOpenOperationStore(t, filepath.Join(cfg.serversDir, durableOperationStoreFileName))
+	return cfg
+}
+
+func countDockerCallsContaining(calls []string, fragment string) int {
+	count := 0
+	for _, call := range calls {
+		if strings.Contains(call, fragment) {
+			count++
+		}
+	}
+	return count
+}
+
+func TestRestartLinksJournaledOperationToRepair(t *testing.T) {
+	cfg := configuredResetOperationTest(t)
+	operationID := "1234567890abcdef1234567890abcdef"
+	mustReserveOperation(t, cfg.lifecycleOperationStore, durableOperationRecord{
+		OperationID:        operationID,
+		Kind:               lifecycleKindReset,
+		SubjectID:          "pep",
+		RequestFingerprint: strings.Repeat("a", 64),
+		Status:             lifecycleJobRunning,
+	})
+	writeLinkedResetJournal(t, cfg, operationID)
+	configureLoadConfigTest(t, cfg)
+
+	restarted, err := loadConfig()
+	if err != nil {
+		t.Fatalf("reconstruct config: %v", err)
+	}
+	recovered, ok := restarted.lifecycleOperationStore.Lookup(operationID)
+	if !ok || recovered.Status != lifecycleJobRecoveryRequired {
+		t.Fatalf("restarted journaled operation = %#v, %v", recovered, ok)
+	}
+	calls := &dockerCallRecorder{}
+	restarted.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
+		calls.record(args...)
+		return "ok\n", nil
+	}
+	restarted.httpGet = cfg.httpGet
+	if err := restarted.repairLifecycleJournal(); err != nil {
+		t.Fatalf("repair linked reset operation: %v", err)
+	}
+	persisted := mustOpenOperationStore(t, restarted.lifecycleOperationStore.path)
+	completed, ok := persisted.Lookup(operationID)
+	if !ok || completed.Status != lifecycleJobSucceeded || completed.PublicMessage != durableOperationResetSucceededMessage {
+		t.Fatalf("repaired operation = %#v, %v", completed, ok)
+	}
+}
+
+func TestRestartCancelsUnjournaledPendingOperation(t *testing.T) {
+	cfg := testConfig(t)
+	operationID := "abcdef1234567890abcdef1234567890"
+	mustReserveOperation(t, cfg.lifecycleOperationStore, durableOperationRecord{
+		OperationID:        operationID,
+		Kind:               lifecycleKindCreate,
+		SubjectID:          "pep",
+		RequestFingerprint: strings.Repeat("b", 64),
+		Status:             lifecycleJobPending,
+	})
+	configureLoadConfigTest(t, cfg)
+
+	restarted, err := loadConfig()
+	if err != nil {
+		t.Fatalf("reconstruct config: %v", err)
+	}
+	recovered, ok := restarted.lifecycleOperationStore.Lookup(operationID)
+	if !ok || recovered.Status != lifecycleJobCancelled || recovered.PublicMessage != durableOperationRestartMessage {
+		t.Fatalf("restarted unjournaled operation = %#v, %v", recovered, ok)
+	}
+	if restarted.lifecycleJobs.jobIDForOperation(operationID) != "" {
+		t.Fatal("restart recreated a Docker lifecycle job for an unjournaled operation")
+	}
+}
+
+func TestOperationSuccessIsDurableBeforeJournalClear(t *testing.T) {
+	cfg := configuredResetOperationTest(t)
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
+		return "ok\n", nil
+	}
+	clearBlocked := make(chan struct{})
+	releaseClear := make(chan struct{})
+	var blockOnce sync.Once
+	var releaseOnce sync.Once
+	cfg.lifecycleJournalClearHook = func() {
+		blockOnce.Do(func() {
+			close(clearBlocked)
+			<-releaseClear
+		})
+	}
+	defer releaseOnce.Do(func() { close(releaseClear) })
+	operationID := "00112233445566778899aabbccddeeff"
+
+	response := envRequest(t, cfg.withAuth(cfg.handleServerReset), http.MethodPost, "/servers/reset",
+		`{"id":"pep","confirm":"RESET pep","generation":"2","scenarioCode":"scenario_1002","operationId":"`+operationID+`"}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("reset status = %d body=%s", response.Code, response.Body.String())
+	}
+	var accepted createServerResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &accepted); err != nil {
+		t.Fatalf("decode reset: %v", err)
+	}
+	select {
+	case <-clearBlocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reset did not reach journal clear")
+	}
+	persisted := mustOpenOperationStore(t, cfg.lifecycleOperationStore.path)
+	completed, ok := persisted.Lookup(operationID)
+	if !ok || completed.Status != lifecycleJobSucceeded {
+		t.Fatalf("operation before journal clear = %#v, %v", completed, ok)
+	}
+	if _, err := os.Stat(cfg.lifecycleJournalFile); err != nil {
+		t.Fatalf("journal disappeared before blocked clear: %v", err)
+	}
+	releaseOnce.Do(func() { close(releaseClear) })
+	waitForLifecycleJob(t, cfg.lifecycleJobs, accepted.JobID, lifecycleJobSucceeded)
+}
+
+func TestOperationBackedJobMirrorsRecoveryRequiredOutcome(t *testing.T) {
+	cfg := configuredResetOperationTest(t)
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
+		if strings.Contains(strings.Join(args, " "), "down --volumes --remove-orphans") {
+			return "private docker diagnostic", errors.New("private docker diagnostic")
+		}
+		return "ok\n", nil
+	}
+	operationID := "ffeeddccbbaa99887766554433221100"
+	response := envRequest(t, cfg.withAuth(cfg.handleServerReset), http.MethodPost, "/servers/reset",
+		`{"id":"pep","confirm":"RESET pep","scenarioCode":"scenario_1002","operationId":"`+operationID+`"}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("reset status = %d body=%s", response.Code, response.Body.String())
+	}
+	var accepted createServerResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &accepted); err != nil {
+		t.Fatalf("decode reset: %v", err)
+	}
+	waitForLifecycleJob(t, cfg.lifecycleJobs, accepted.JobID, lifecycleJobRecoveryRequired)
+	lookup := envRequest(t, cfg.withAuth(cfg.handleLifecycleJob), http.MethodGet, "/jobs/"+accepted.JobID, "")
+	if lookup.Code != http.StatusOK {
+		t.Fatalf("job lookup status = %d body=%s", lookup.Code, lookup.Body.String())
+	}
+	var public struct {
+		Status  lifecycleJobStatus `json:"status"`
+		Message string             `json:"publicMessage"`
+	}
+	if err := json.Unmarshal(lookup.Body.Bytes(), &public); err != nil {
+		t.Fatalf("decode job outcome: %v", err)
+	}
+	if public.Status != lifecycleJobRecoveryRequired || public.Message != durableOperationRecoveryMessage || strings.Contains(lookup.Body.String(), "private docker diagnostic") {
+		t.Fatalf("job outcome = %s", lookup.Body.String())
+	}
+}
+
+func writeLinkedResetJournal(t *testing.T, cfg config, operationID string) {
+	t.Helper()
+	payload := map[string]any{
+		"version":       lifecycleJournalVersion,
+		"operation":     "reset",
+		"operationId":   operationID,
+		"operationKind": "reset",
+		"stage":         lifecycleJournalStageDown,
+		"serverId":      "pep",
+		"project":       "opensamguk-spep",
+		"resetTarget": map[string]any{
+			"scenarioCode":        "scenario_1002",
+			"generation":          2,
+			"scenarioSeedEnabled": true,
+		},
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeEnv(t, cfg.lifecycleJournalFile, string(encoded)+"\n")
+}
+
+func configureLoadConfigTest(t *testing.T, cfg config) {
+	t.Helper()
+	t.Setenv("SERVERS_DIR", cfg.serversDir)
+	t.Setenv("COMPOSE_DIR", cfg.composeDir)
+	t.Setenv("COMPOSE_HOST_DIR", cfg.composeHostDir)
+	t.Setenv("COMPOSE_SERVER_FILE", cfg.composeServer)
+	t.Setenv("COMPOSE_SHARED_FILE", cfg.composeShared)
+	t.Setenv("DEPLOYER_OPERATION_STORE_FILE", cfg.lifecycleOperationStore.path)
+	t.Setenv("DEPLOYER_MAINTENANCE_FILE", cfg.maintenanceFile)
+	t.Setenv("DEPLOYER_LIFECYCLE_JOURNAL_FILE", cfg.lifecycleJournalFile)
+}
+
 func TestResetWritesDurableJournalBeforeDesiredStateMutation(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","deployProject":"opensamguk-spep"}]
@@ -5123,20 +5462,25 @@ func testConfig(t *testing.T) config {
 	jobs := newLifecycleJobManager()
 	maintenanceFile := filepath.Join(serversDir, ".deployer-maintenance")
 	lifecycleJournalFile := filepath.Join(serversDir, ".deployer-lifecycle-journal")
+	operationStore, err := openDurableOperationStore(filepath.Join(serversDir, durableOperationStoreFileName), durableOperationMaxEntries, durableOperationTerminalRetention)
+	if err != nil {
+		t.Fatalf("open test durable operation store: %v", err)
+	}
 	cfg := config{
-		token:                "test-token",
-		composeDir:           root,
-		composeHostDir:       "/synthetic-host",
-		serversDir:           serversDir,
-		composeServer:        filepath.Join(root, "docker-compose.server.yml"),
-		composeShared:        filepath.Join(root, "docker-compose.shared.yml"),
-		ghcrOwner:            "owner",
-		ghcrAPIBaseURL:       "https://api.github.com",
-		lifecycleJobs:        jobs,
-		maintenanceFile:      maintenanceFile,
-		lifecycleJournalFile: lifecycleJournalFile,
-		sharedEnvMu:          &sync.Mutex{},
-		operations:           newOperationCoordinator(maintenanceFile, lifecycleJournalFile, jobs),
+		token:                   "test-token",
+		composeDir:              root,
+		composeHostDir:          "/synthetic-host",
+		serversDir:              serversDir,
+		composeServer:           filepath.Join(root, "docker-compose.server.yml"),
+		composeShared:           filepath.Join(root, "docker-compose.shared.yml"),
+		ghcrOwner:               "owner",
+		ghcrAPIBaseURL:          "https://api.github.com",
+		lifecycleJobs:           jobs,
+		lifecycleOperationStore: operationStore,
+		maintenanceFile:         maintenanceFile,
+		lifecycleJournalFile:    lifecycleJournalFile,
+		sharedEnvMu:             &sync.Mutex{},
+		operations:              newOperationCoordinator(maintenanceFile, lifecycleJournalFile, jobs),
 	}
 	cfg.httpGet = func(_ context.Context, endpoint string) (int, []byte, error) {
 		switch {
@@ -5643,13 +5987,14 @@ func waitForContentNotContaining(t *testing.T, path, needle string) {
 }
 
 // gateway-api(DeployService)가 기대하는 원격 lifecycle 조회 계약을 고정한다.
-// gateway는 CREATE/CLOSE transition을 복구할 때 GET /operations/{operationId}를 부르고,
-// 200 본문에서 operationId/kind/status(/result·httpStatus)를, 미지의 id에 대해서는
+// gateway는 CREATE/CLOSE/RESET transition을 복구할 때 GET /operations/{operationId}를 부르고,
+// 200 본문에서 durable operation의 공개 필드를, 미지의 id에 대해서는
 // 정확히 {ok:false,operationId,status:"not_found"} 3-key 404를 요구한다.
 // 이 계약이 어긋나면 gateway는 Unavailable로 떨어져 "이전 deployer 작업 상태를 확인하지
 // 못했습니다"를 영구히 반환하고 서버 생성/삭제가 완료되지 않는다.
 func TestOperationsEndpointServesGatewayLifecycleContract(t *testing.T) {
 	cfg := testConfig(t)
+	cfg.lifecycleOperationStore = mustOpenOperationStore(t, filepath.Join(cfg.serversDir, durableOperationStoreFileName))
 	handler := cfg.withAuth(cfg.handleOperation)
 	operationID := "0123456789abcdef0123456789abcdef"
 
@@ -5677,7 +6022,13 @@ func TestOperationsEndpointServesGatewayLifecycleContract(t *testing.T) {
 		t.Fatalf("unknown body = %s", unknown.Body.String())
 	}
 
-	jobID, existing, err := cfg.lifecycleJobs.reserveWithOperation(operationID, "fingerprint", lifecycleKindClose)
+	_, existing, err := cfg.lifecycleOperationStore.Reserve(durableOperationRecord{
+		OperationID:        operationID,
+		Kind:               lifecycleKindClose,
+		SubjectID:          "pep",
+		RequestFingerprint: strings.Repeat("a", 64),
+		Status:             lifecycleJobPending,
+	})
 	if err != nil || existing {
 		t.Fatalf("reserve operation: err=%v existing=%v", err, existing)
 	}
@@ -5688,43 +6039,40 @@ func TestOperationsEndpointServesGatewayLifecycleContract(t *testing.T) {
 	var pendingBody struct {
 		OperationID string `json:"operationId"`
 		Kind        string `json:"kind"`
+		SubjectID   string `json:"subjectId"`
 		Status      string `json:"status"`
+		HTTPStatus  int    `json:"httpStatus"`
+		Message     string `json:"publicMessage"`
 	}
 	if err := json.Unmarshal(pending.Body.Bytes(), &pendingBody); err != nil {
 		t.Fatalf("decode pending: %v", err)
 	}
-	if pendingBody.OperationID != operationID || pendingBody.Kind != "close" || pendingBody.Status != "pending" {
+	if pendingBody.OperationID != operationID || pendingBody.Kind != "close" || pendingBody.SubjectID != "pep" ||
+		pendingBody.Status != "pending" || pendingBody.HTTPStatus != 0 || pendingBody.Message != "" {
 		t.Fatalf("pending body = %s", pending.Body.String())
 	}
 
-	result := createServerResponse{OK: true, ID: "pep", OperationID: operationID, OperationStatus: lifecycleJobSucceeded}
-	cfg.lifecycleJobs.recordOperationResult(jobID, lifecycleJobSucceeded, http.StatusOK, mustMarshal(t, result))
+	mustTransitionOperation(t, cfg.lifecycleOperationStore, operationID, lifecycleJobSucceeded, http.StatusOK, durableOperationMessageCloseSucceeded)
 
 	done := envRequest(t, handler, http.MethodGet, "/operations/"+operationID, "")
 	if done.Code != http.StatusOK {
 		t.Fatalf("done status = %d body=%s", done.Code, done.Body.String())
 	}
 	var doneBody struct {
-		OperationID string          `json:"operationId"`
-		Kind        string          `json:"kind"`
-		Status      string          `json:"status"`
-		HTTPStatus  int             `json:"httpStatus"`
-		Result      json.RawMessage `json:"result"`
+		OperationID string `json:"operationId"`
+		Kind        string `json:"kind"`
+		SubjectID   string `json:"subjectId"`
+		Status      string `json:"status"`
+		HTTPStatus  int    `json:"httpStatus"`
+		Message     string `json:"publicMessage"`
 	}
 	if err := json.Unmarshal(done.Body.Bytes(), &doneBody); err != nil {
 		t.Fatalf("decode done: %v", err)
 	}
-	if doneBody.OperationID != operationID || doneBody.Kind != "close" ||
-		doneBody.Status != string(lifecycleJobSucceeded) || doneBody.HTTPStatus != http.StatusOK {
+	if doneBody.OperationID != operationID || doneBody.Kind != "close" || doneBody.SubjectID != "pep" ||
+		doneBody.Status != string(lifecycleJobSucceeded) || doneBody.HTTPStatus != http.StatusOK ||
+		doneBody.Message != durableOperationCloseSucceededMessage {
 		t.Fatalf("done body = %s", done.Body.String())
-	}
-	var echoed createServerResponse
-	if err := json.Unmarshal(doneBody.Result, &echoed); err != nil {
-		t.Fatalf("decode result: %v", err)
-	}
-	if !echoed.OK || echoed.ID != "pep" || echoed.OperationID != operationID ||
-		echoed.OperationStatus != lifecycleJobSucceeded {
-		t.Fatalf("result = %s", string(doneBody.Result))
 	}
 }
 
@@ -5797,11 +6145,12 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"\ud1b5\uc77c \uc11c\ubc84","gameApiUrl
 	// \uc644\ub8cc \ub4a4 \uc870\ud68c \uacbd\ub85c\uac00 succeeded \uc640 \ud655\uc815 \ubcf8\ubb38\uc744 \ub3cc\ub824\uc918\uc57c gateway \uac00 transition \uc744 \ub2eb\ub294\ub2e4.
 	deadline := time.Now().Add(5 * time.Second)
 	var queried struct {
-		OperationID string          `json:"operationId"`
-		Kind        string          `json:"kind"`
-		Status      string          `json:"status"`
-		HTTPStatus  int             `json:"httpStatus"`
-		Result      json.RawMessage `json:"result"`
+		OperationID string `json:"operationId"`
+		Kind        string `json:"kind"`
+		SubjectID   string `json:"subjectId"`
+		Status      string `json:"status"`
+		HTTPStatus  int    `json:"httpStatus"`
+		Message     string `json:"publicMessage"`
 	}
 	for {
 		res := envRequest(t, cfg.withAuth(cfg.handleOperation), http.MethodGet, "/operations/"+operationID, "")
@@ -5819,16 +6168,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"\ud1b5\uc77c \uc11c\ubc84","gameApiUrl
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if queried.OperationID != operationID || queried.Kind != "close" || queried.HTTPStatus != http.StatusOK {
+	if queried.OperationID != operationID || queried.Kind != "close" || queried.SubjectID != "pep" ||
+		queried.HTTPStatus != http.StatusOK || queried.Message != durableOperationCloseSucceededMessage {
 		t.Fatalf("queried = %#v", queried)
-	}
-	var echoed createServerResponse
-	if err := json.Unmarshal(queried.Result, &echoed); err != nil {
-		t.Fatalf("decode queried result: %v", err)
-	}
-	if !echoed.OK || echoed.ID != "pep" || echoed.OperationID != operationID ||
-		echoed.OperationStatus != lifecycleJobSucceeded {
-		t.Fatalf("queried result = %s", string(queried.Result))
 	}
 
 	// \uac19\uc740 operationId \uc7ac\uc2dc\ub3c4\ub294 \uc7ac\uc2e4\ud589 \uc5c6\uc774 \ubc1b\uc544\ub4e4\uc5ec\uc57c \ud55c\ub2e4(gateway \uac00 \uc7ac\uc2dc\ub3c4\ud55c\ub2e4).
