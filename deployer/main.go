@@ -297,6 +297,7 @@ type config struct {
 	resetVerifyTimeout        time.Duration
 	resetVerifyPollInterval   time.Duration
 	lifecycleJobs             *lifecycleJobManager
+	lifecycleOperationStore   *durableOperationStore
 	maintenanceFile           string
 	lifecycleJournalFile      string
 	sharedEnvMu               *sync.Mutex
@@ -308,11 +309,12 @@ type config struct {
 type lifecycleJobStatus string
 
 const (
-	lifecycleJobPending   lifecycleJobStatus = "pending"
-	lifecycleJobRunning   lifecycleJobStatus = "running"
-	lifecycleJobSucceeded lifecycleJobStatus = "succeeded"
-	lifecycleJobFailed    lifecycleJobStatus = "failed"
-	lifecycleJobCancelled lifecycleJobStatus = "cancelled"
+	lifecycleJobPending          lifecycleJobStatus = "pending"
+	lifecycleJobRunning          lifecycleJobStatus = "running"
+	lifecycleJobRecoveryRequired lifecycleJobStatus = "recovery_required"
+	lifecycleJobSucceeded        lifecycleJobStatus = "succeeded"
+	lifecycleJobFailed           lifecycleJobStatus = "failed"
+	lifecycleJobCancelled        lifecycleJobStatus = "cancelled"
 )
 
 // lifecycleKind는 gateway-api(DeployService)가 GET /operations/{id} 응답의 `kind`로
@@ -322,6 +324,7 @@ type lifecycleKind string
 const (
 	lifecycleKindCreate lifecycleKind = "create"
 	lifecycleKindClose  lifecycleKind = "close"
+	lifecycleKindReset  lifecycleKind = "reset"
 )
 
 type lifecycleJob struct {
@@ -1340,30 +1343,36 @@ func isTerminalLifecycleJob(status lifecycleJobStatus) bool {
 	return status == lifecycleJobSucceeded || status == lifecycleJobFailed || status == lifecycleJobCancelled
 }
 
-func loadConfig() config {
+func loadConfig() (config, error) {
 	jobs := newLifecycleJobManager()
 	serversDir := envOr("SERVERS_DIR", "/workspace/servers")
+	operationStorePath := envOr("DEPLOYER_OPERATION_STORE_FILE", filepath.Join(serversDir, durableOperationStoreFileName))
+	operationStore, err := openDurableOperationStore(operationStorePath, durableOperationMaxEntries, durableOperationTerminalRetention)
+	if err != nil {
+		return config{}, err
+	}
 	c := config{
-		token:                  os.Getenv("DEPLOYER_TOKEN"),
-		composeDir:             envOr("COMPOSE_DIR", "/workspace"),
-		composeHostDir:         envOr("COMPOSE_HOST_DIR", envOr("PWD", ".")),
-		serversDir:             serversDir,
-		composeServer:          envOr("COMPOSE_SERVER_FILE", "/workspace/docker-compose.server.yml"),
-		composeShared:          envOr("COMPOSE_SHARED_FILE", "/workspace/docker-compose.shared.yml"),
-		ghcrOwner:              envOr("GHCR_OWNER", "peppone-choi"),
-		ghcrToken:              os.Getenv("GHCR_TOKEN"),
-		ghcrAPIBaseURL:         envOr("DEPLOYER_GHCR_API_BASE_URL", "https://api.github.com"),
-		localHTTPBaseURL:       "http://localhost:9000",
-		gameAPIInternalPort:    envOr("DEPLOYER_GAME_API_INTERNAL_PORT", "8081"),
-		gameEngineInternalPort: envOr("DEPLOYER_GAME_ENGINE_INTERNAL_PORT", "8082"),
-		gatewayAPIURL:          envOr("DEPLOYER_GATEWAY_API_URL", "http://gateway-api:8080"),
-		lifecycleJobs:          jobs,
-		maintenanceFile:        envOr("DEPLOYER_MAINTENANCE_FILE", "/workspace/servers/.deployer-maintenance"),
-		lifecycleJournalFile:   envOr("DEPLOYER_LIFECYCLE_JOURNAL_FILE", filepath.Join(serversDir, ".deployer-lifecycle-journal")),
-		sharedEnvMu:            &sync.Mutex{},
+		token:                   os.Getenv("DEPLOYER_TOKEN"),
+		composeDir:              envOr("COMPOSE_DIR", "/workspace"),
+		composeHostDir:          envOr("COMPOSE_HOST_DIR", envOr("PWD", ".")),
+		serversDir:              serversDir,
+		composeServer:           envOr("COMPOSE_SERVER_FILE", "/workspace/docker-compose.server.yml"),
+		composeShared:           envOr("COMPOSE_SHARED_FILE", "/workspace/docker-compose.shared.yml"),
+		ghcrOwner:               envOr("GHCR_OWNER", "peppone-choi"),
+		ghcrToken:               os.Getenv("GHCR_TOKEN"),
+		ghcrAPIBaseURL:          envOr("DEPLOYER_GHCR_API_BASE_URL", "https://api.github.com"),
+		localHTTPBaseURL:        "http://localhost:9000",
+		gameAPIInternalPort:     envOr("DEPLOYER_GAME_API_INTERNAL_PORT", "8081"),
+		gameEngineInternalPort:  envOr("DEPLOYER_GAME_ENGINE_INTERNAL_PORT", "8082"),
+		gatewayAPIURL:           envOr("DEPLOYER_GATEWAY_API_URL", "http://gateway-api:8080"),
+		lifecycleJobs:           jobs,
+		lifecycleOperationStore: operationStore,
+		maintenanceFile:         envOr("DEPLOYER_MAINTENANCE_FILE", "/workspace/servers/.deployer-maintenance"),
+		lifecycleJournalFile:    envOr("DEPLOYER_LIFECYCLE_JOURNAL_FILE", filepath.Join(serversDir, ".deployer-lifecycle-journal")),
+		sharedEnvMu:             &sync.Mutex{},
 	}
 	c.operations = newOperationCoordinator(c.maintenanceFile, c.lifecycleJournalFile, jobs)
-	return c
+	return c, nil
 }
 
 func envOr(key, def string) string {
@@ -1958,7 +1967,10 @@ type envLine struct {
 }
 
 func main() {
-	cfg := loadConfig()
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("durable operation store initialization failed: %v", err)
+	}
 	if len(os.Args) == 2 && os.Args[1] == "--check-running-registry-targets" {
 		os.Exit(checkRunningRegistryTargetsCommand(cfg, os.Stderr))
 	}
