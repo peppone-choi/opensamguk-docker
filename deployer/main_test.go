@@ -4549,6 +4549,17 @@ func TestRestartCancelsUnjournaledPendingOperation(t *testing.T) {
 		RequestFingerprint: strings.Repeat("b", 64),
 		Status:             lifecycleJobPending,
 	})
+	calls := &dockerCallRecorder{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		calls.record(args...)
+		return "29.0.0\n", nil
+	}
+	if err := cfg.recoverDurableLifecycleOperations(); err != nil {
+		t.Fatalf("restart operation recovery: %v", err)
+	}
+	if calls.count() != 0 {
+		t.Fatalf("unjournaled restart recovery reached Docker: %#v", calls.snapshot())
+	}
 	configureLoadConfigTest(t, cfg)
 
 	restarted, err := loadConfig()
@@ -4561,6 +4572,159 @@ func TestRestartCancelsUnjournaledPendingOperation(t *testing.T) {
 	}
 	if restarted.lifecycleJobs.jobIDForOperation(operationID) != "" {
 		t.Fatal("restart recreated a Docker lifecycle job for an unjournaled operation")
+	}
+}
+
+func TestRepairPreparedCreateCancelsLinkedOperationBeforeJournalClear(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "SERVER_REGISTRY_JSON=[]\n")
+	operationID := "13579bdf2468ace013579bdf2468ace0"
+	mustReserveOperation(t, cfg.lifecycleOperationStore, durableOperationRecord{
+		OperationID:        operationID,
+		Kind:               lifecycleKindCreate,
+		SubjectID:          "pep",
+		RequestFingerprint: strings.Repeat("c", 64),
+		Status:             lifecycleJobRunning,
+	})
+	target, err := cfg.serverTargetForID("pep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.writeLinkedLifecycleJournal("create", target, operationID, lifecycleKindCreate); err != nil {
+		t.Fatalf("write linked create journal: %v", err)
+	}
+	configureLoadConfigTest(t, cfg)
+
+	restarted, err := loadConfig()
+	if err != nil {
+		t.Fatalf("reconstruct config: %v", err)
+	}
+	restarted.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
+		t.Fatalf("prepared create repair reached Docker mutation: %q", args)
+		return "", nil
+	}
+	if err := restarted.repairLifecycleJournal(); err != nil {
+		t.Fatalf("repair prepared create: %v", err)
+	}
+	persisted := mustOpenOperationStore(t, restarted.lifecycleOperationStore.path)
+	settled, ok := persisted.Lookup(operationID)
+	if !ok || settled.Status != lifecycleJobCancelled || settled.HTTPStatus != http.StatusConflict || settled.PublicMessage != durableOperationCancelledMessage {
+		t.Fatalf("prepared create repair operation = %#v, %v", settled, ok)
+	}
+	if _, err := os.Stat(restarted.lifecycleJournalFile); !os.IsNotExist(err) {
+		t.Fatalf("prepared create journal remained after terminal operation: %v", err)
+	}
+}
+
+func TestCreatePostReservationRejectionsPersistTerminalFailure(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, cfg config)
+	}{
+		{
+			name: "occupied port",
+			setup: func(t *testing.T, cfg config) {
+				writeEnv(t, filepath.Join(cfg.serversDir, "sbar.env"), "SERVER_ID=bar\nGAME_API_PORT=8101\n")
+			},
+		},
+		{
+			name: "existing env",
+			setup: func(t *testing.T, cfg config) {
+				writeEnv(t, filepath.Join(cfg.serversDir, "sfoo.env"), "SERVER_ID=foo\n")
+			},
+		},
+	}
+	for index, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			cfg := testConfig(t)
+			writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n")
+			testCase.setup(t, cfg)
+			calls := &dockerCallRecorder{}
+			cfg.dockerRunner = func(args ...string) (string, error) {
+				calls.record(args...)
+				return "ok\n", nil
+			}
+			operationID := fmt.Sprintf("000000000000000000000000000000%02x", index+1)
+			response := envRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create",
+				`{"id":"foo","name":"첫 서버","gameApiPort":"8101","webGamePort":"3101","operationId":"`+operationID+`"}`)
+			if response.Code != http.StatusConflict {
+				t.Fatalf("create rejection = %d body=%s", response.Code, response.Body.String())
+			}
+			persisted := mustOpenOperationStore(t, cfg.lifecycleOperationStore.path)
+			record, ok := persisted.Lookup(operationID)
+			if !ok || record.Status != lifecycleJobFailed || record.HTTPStatus != http.StatusConflict || record.PublicMessage != durableOperationCreatePreparationFailedMessage {
+				t.Fatalf("rejected create operation = %#v, %v", record, ok)
+			}
+			if calls.count() != 0 {
+				t.Fatalf("rejected create reached Docker: %#v", calls.snapshot())
+			}
+		})
+	}
+}
+
+func TestClosePostReservationRejectionsPersistTerminalFailure(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","deployProject":"opensamguk-spep"}]
+`)
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\n")
+	calls := &dockerCallRecorder{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		calls.record(args...)
+		return "ok\n", nil
+	}
+
+	invalidConfirmID := "00000000000000000000000000000003"
+	if _, status := cfg.deleteServer("pep", "not confirmed", invalidConfirmID); status != http.StatusBadRequest {
+		t.Fatalf("invalid close confirmation status = %d", status)
+	}
+	persisted := mustOpenOperationStore(t, cfg.lifecycleOperationStore.path)
+	invalidConfirm, ok := persisted.Lookup(invalidConfirmID)
+	if !ok || invalidConfirm.Status != lifecycleJobFailed || invalidConfirm.HTTPStatus != http.StatusBadRequest || invalidConfirm.PublicMessage != durableOperationRequestValidationFailedMessage {
+		t.Fatalf("invalid close confirmation operation = %#v, %v", invalidConfirm, ok)
+	}
+
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=other\n")
+	invalidTargetID := "00000000000000000000000000000004"
+	if _, status := cfg.deleteServer("pep", "DELETE pep", invalidTargetID); status != http.StatusConflict {
+		t.Fatalf("invalid close target status = %d", status)
+	}
+	persisted = mustOpenOperationStore(t, cfg.lifecycleOperationStore.path)
+	invalidTarget, ok := persisted.Lookup(invalidTargetID)
+	if !ok || invalidTarget.Status != lifecycleJobFailed || invalidTarget.HTTPStatus != http.StatusConflict || invalidTarget.PublicMessage != durableOperationClosePreparationFailedMessage {
+		t.Fatalf("invalid close target operation = %#v, %v", invalidTarget, ok)
+	}
+	if calls.count() != 0 {
+		t.Fatalf("rejected close reached Docker: %#v", calls.snapshot())
+	}
+}
+
+func TestResetInMemoryReservationFailurePersistsTerminalOperation(t *testing.T) {
+	cfg := configuredResetOperationTest(t)
+	cfg.lifecycleJobs.maxEntries = 1
+	if _, err := cfg.lifecycleJobs.reserve(); err != nil {
+		t.Fatalf("fill lifecycle job capacity: %v", err)
+	}
+	calls := &dockerCallRecorder{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		calls.record(args...)
+		return "ok\n", nil
+	}
+	operationID := "00000000000000000000000000000005"
+	response := envRequest(t, cfg.withAuth(cfg.handleServerReset), http.MethodPost, "/servers/reset",
+		`{"id":"pep","confirm":"RESET pep","scenarioCode":"scenario_1002","operationId":"`+operationID+`"}`)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("reset reservation rejection = %d body=%s", response.Code, response.Body.String())
+	}
+	persisted := mustOpenOperationStore(t, cfg.lifecycleOperationStore.path)
+	record, ok := persisted.Lookup(operationID)
+	if !ok || record.Status != lifecycleJobFailed || record.HTTPStatus != http.StatusServiceUnavailable || record.PublicMessage != durableOperationResetPreparationFailedMessage {
+		t.Fatalf("reset reservation rejection operation = %#v, %v", record, ok)
+	}
+	if calls.count() != 0 {
+		t.Fatalf("reset reservation rejection reached Docker: %#v", calls.snapshot())
 	}
 }
 

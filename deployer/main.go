@@ -954,9 +954,9 @@ func (c config) repairLifecycleJournal() (repairErr error) {
 	if !exists {
 		return errors.New("lifecycle recovery journal is unavailable")
 	}
-	linkedOperationSucceeded := false
+	linkedOperationSettled := false
 	defer func() {
-		if repairErr == nil || journal.OperationID == "" || linkedOperationSucceeded {
+		if repairErr == nil || journal.OperationID == "" || linkedOperationSettled {
 			return
 		}
 		if transitionErr := c.transitionDurableLifecycleOperation(journal.OperationID, lifecycleJobRecoveryRequired, http.StatusAccepted, durableOperationMessageRecoveryRequired); transitionErr != nil {
@@ -972,7 +972,7 @@ func (c config) repairLifecycleJournal() (repairErr error) {
 			if err := c.verifySucceededLifecycleJournal(journal, target); err != nil {
 				return err
 			}
-			linkedOperationSucceeded = true
+			linkedOperationSettled = true
 			return c.clearLifecycleJournal()
 		}
 	}
@@ -997,6 +997,12 @@ func (c config) repairLifecycleJournal() (repairErr error) {
 		if os.IsNotExist(envErr) && entry.ID == "" {
 			// The journal is durable before the atomic env-file creation. A crash
 			// in that narrow interval left no lifecycle state to recover.
+			if journal.OperationID != "" {
+				if err := c.transitionDurableLifecycleOperation(journal.OperationID, lifecycleJobCancelled, http.StatusConflict, durableOperationMessageCancelled); err != nil {
+					return err
+				}
+				linkedOperationSettled = true
+			}
 			return c.clearLifecycleJournal()
 		}
 		if envErr != nil {
@@ -1090,7 +1096,7 @@ func (c config) repairLifecycleJournal() (repairErr error) {
 		if err := c.transitionDurableLifecycleOperation(journal.OperationID, lifecycleJobSucceeded, http.StatusOK, durableOperationSuccessMessage(journal.OperationKind)); err != nil {
 			return err
 		}
-		linkedOperationSucceeded = true
+		linkedOperationSettled = true
 	}
 	return c.clearLifecycleJournal()
 }
@@ -1269,6 +1275,17 @@ func (c config) transitionDurableLifecycleOperation(operationID string, status l
 		return nil
 	}
 	return err
+}
+
+func (c config) settleRejectedDurableLifecycleOperation(operationID string, httpStatus int, messageID durableOperationMessageID) error {
+	if operationID == "" || httpStatus < http.StatusBadRequest || c.lifecycleOperationStore == nil {
+		return nil
+	}
+	record, ok := c.lifecycleOperationStore.Lookup(operationID)
+	if !ok || record.Status != lifecycleJobPending {
+		return nil
+	}
+	return c.transitionDurableLifecycleOperation(operationID, lifecycleJobFailed, httpStatus, messageID)
 }
 
 func durableOperationSuccessMessage(kind lifecycleKind) durableOperationMessageID {
@@ -3202,8 +3219,17 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 	internalServiceToken := normalized.InternalServiceToken
 	jobID := ""
 	newReservation := false
+	durableReserved := false
 	reservationClaimed := false
 	admissionAttempted := false
+	defer func() {
+		if !durableReserved {
+			return
+		}
+		if err := c.settleRejectedDurableLifecycleOperation(operationID, responseStatus, durableOperationMessageCreatePreparationFailed); err != nil {
+			log.Printf("settle rejected create operation operationId=%s err=%v", operationID, err)
+		}
+	}()
 	fingerprint := createRequestFingerprint(normalized)
 	if operationID == "" {
 		log.Printf("legacy lifecycle request omitted operationId kind=%s subject=%s", lifecycleKindCreate, id)
@@ -3227,6 +3253,7 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 			replay.Project = projectForServerID(id)
 			return replay, http.StatusOK
 		}
+		durableReserved = true
 		var inMemoryExisting bool
 		jobID, inMemoryExisting, err = c.lifecycleJobs.reserveWithOperation(operationID, fingerprint, lifecycleKindCreate)
 		if err != nil {
@@ -3406,7 +3433,7 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 	return created, http.StatusOK
 }
 
-func (c config) deleteServer(rawID string, confirm string, operationID string) (createServerResponse, int) {
+func (c config) deleteServer(rawID string, confirm string, operationID string) (response createServerResponse, responseStatus int) {
 	target, err := c.serverTargetForID(rawID)
 	if err != nil {
 		return createServerResponse{OK: false, Detail: err.Error()}, http.StatusBadRequest
@@ -3414,6 +3441,16 @@ func (c config) deleteServer(rawID string, confirm string, operationID string) (
 	id := target.ID
 	fingerprint := closeRequestFingerprint(id)
 	var durable durableOperationRecord
+	durableReserved := false
+	rejectionMessageID := durableOperationMessageClosePreparationFailed
+	defer func() {
+		if !durableReserved {
+			return
+		}
+		if err := c.settleRejectedDurableLifecycleOperation(operationID, responseStatus, rejectionMessageID); err != nil {
+			log.Printf("settle rejected close operation operationId=%s err=%v", operationID, err)
+		}
+	}()
 	if operationID == "" {
 		log.Printf("legacy lifecycle request omitted operationId kind=%s subject=%s", lifecycleKindClose, id)
 	} else {
@@ -3433,8 +3470,10 @@ func (c config) deleteServer(rawID string, confirm string, operationID string) (
 			replay.Project = target.Project
 			return replay, http.StatusOK
 		}
+		durableReserved = true
 	}
 	if confirm != "DELETE "+id {
+		rejectionMessageID = durableOperationMessageRequestValidationFailed
 		return createServerResponse{OK: false, ID: id, Detail: "삭제 확인 문구가 일치하지 않습니다."}, http.StatusBadRequest
 	}
 	entry, err := c.registryEntryByID(id)
@@ -3545,7 +3584,7 @@ func (c config) deleteServer(rawID string, confirm string, operationID string) (
 	}); err != nil {
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, OperationID: operationID, Detail: durableOperationClosePreparationFailedMessage}, http.StatusInternalServerError
 	}
-	response := createServerResponse{
+	response = createServerResponse{
 		OK:               true,
 		ID:               id,
 		Name:             entry.Name,
@@ -3565,7 +3604,7 @@ func (c config) deleteServer(rawID string, confirm string, operationID string) (
 	return response, http.StatusOK
 }
 
-func (c config) resetServer(rawID string, req resetServerRequest) (createServerResponse, int) {
+func (c config) resetServer(rawID string, req resetServerRequest) (response createServerResponse, responseStatus int) {
 	target, err := c.serverTargetForID(rawID)
 	if err != nil {
 		return createServerResponse{OK: false, Detail: err.Error()}, http.StatusBadRequest
@@ -3609,6 +3648,15 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 	fingerprint := resetRequestFingerprint(id, resetTarget)
 	operationID := requestedOperationID
 	var operation durableOperationRecord
+	durableReserved := false
+	defer func() {
+		if !durableReserved {
+			return
+		}
+		if err := c.settleRejectedDurableLifecycleOperation(operationID, responseStatus, durableOperationMessageResetPreparationFailed); err != nil {
+			log.Printf("settle rejected reset operation operationId=%s err=%v", operationID, err)
+		}
+	}()
 	if operationID == "" {
 		log.Printf("legacy lifecycle request omitted operationId kind=%s subject=%s", lifecycleKindReset, id)
 	} else {
@@ -3627,6 +3675,7 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 			replay.Project = entry.DeployProject
 			return replay, http.StatusOK
 		}
+		durableReserved = true
 	}
 	jobID := ""
 	inMemoryExisting := false
@@ -3745,7 +3794,7 @@ func (c config) resetServer(rawID string, req resetServerRequest) (createServerR
 	}); err != nil {
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, OperationID: operationID, Detail: durableOperationResetPreparationFailedMessage}, http.StatusInternalServerError
 	}
-	response := createServerResponse{
+	response = createServerResponse{
 		OK:               true,
 		ID:               id,
 		Name:             entry.Name,
