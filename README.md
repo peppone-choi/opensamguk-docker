@@ -210,9 +210,38 @@ POST /maintenance/repair -> 남은 lifecycle journal을 recovery·runtime/data·
 Server는 marker를 lifecycle job과 서버 postcondition 전체 동안 닫아 둔다. enter가 준 lease는 메모리 안의 단발
 권한이며 loopback + Bearer POST /servers/create에만 전달된다. GET, 로그, create 응답에는 lease를 넣지 않는다.
 enter가 준 lease는 recreate 요청 JSON body로만 전달되고 host Docker argv, HTTP header, 로그, create 응답에는 넣지
-않는다. 생성·종료 POST의 필수 `operationId`는 32자리 소문자 hex이며, 같은 key로 온 서로 다른 요청은 `409`로 거부한다.
+않는다. 새 생성·종료·리셋 호출의 `operationId`는 32자리 소문자 hex이며, 같은 key로 온 서로 다른 종류·서버·정규화 요청은
+`409`로 거부한다. rollout 중인 구 호출자가 id를 생략하면 경고를 남기고 기존 ephemeral job으로 처리하므로 재시작 idempotency를
+제공하지 않는다.
+
+operation id가 있는 lifecycle 요청은 Docker 작업 전에 `${SERVERS_DIR}/.deployer-operations.json`에 `0600`으로 예약한다.
+경로는 `DEPLOYER_OPERATION_STORE_FILE`로 바꿀 수 있다. 최대 512건을 유지하며 terminal 기록은 24시간 뒤 정리하지만
+`pending`, `running`, `recovery_required` 기록은 자동 삭제하지 않는다. POST의 `pending` 응답은 접수일 뿐 완료가 아니다.
+호출자는 인증된 `GET /operations/{operationId}`를 폴링해 `pending|running|recovery_required` 동안 기다리고,
+`succeeded`에서만 완료로 처리하며 `failed|cancelled`는 `publicMessage`의 제한된 공개 문구로 종료해야 한다.
+
+journal에는 새 lifecycle 요청의 `operationId`와 `operationKind`가 함께 기록된다. deployer 재시작 시 journal과 연결된 미완료
+operation은 `recovery_required`, journal이 없는 미완료 operation은 Docker 재실행 없이 `cancelled`가 된다. worker와 repair는
+성공 operation을 먼저 영속한 뒤 journal을 지운다. 따라서 성공 기록과 journal이 함께 남은 crash 상태에서는 repair가 Docker
+파괴 작업을 재생하지 않고 postcondition을 다시 확인한 뒤 journal만 정리한다. repair 실패 시 journal과
+`recovery_required` 상태를 유지해 `/readyz`와 mutation admission을 계속 닫는다.
 lifecycle 단계 실패 시 workflow는 절대 deadline, 요청 connect/total timeout, bounded EXIT drain 안에서 abort하고
 marker를 남겨 fail-closed 상태를 유지한다.
+
+`operationId`는 클라이언트 확인 1회당 하나만 발급하고, POST 재시도·`GET /operations/{operationId}`
+polling·운영 로그 상관 분석에 같은 ID를 쓴다. `scripts/wait-deployer-operation.sh`는 deployer URL,
+token source, operation ID, epoch 절대 deadline, poll 간격만 받고 `succeeded`에서만 0으로 종료한다.
+`pending|running|recovery_required`는 계속 기다리고 `failed|cancelled`, 없거나 잘못된 응답은 fail-closed한다.
+토큰은 curl 인자가 아닌 stdin config로 전달하고 응답 본문은 로그에 출력하지 않는다.
+
+Workflow polling deadline이 끝나면 "제한 시간 안에 완료를 확인하지 못함"이지 operation의 성공·실패
+판정이 아니다. 새 operation ID로 같은 파괴적 작업을 반복하지 말고, 기록한 ID로 상태를 다시
+조회한다. `recovery_required`면 maintenance marker를 닫힌 채 loopback
+`POST /maintenance/repair`를 실행하고 `/readyz`와 같은 operation의 `succeeded`를 모두 확인한 뒤에만
+후속 서버 검증·maintenance leave를 진행한다. Repair 실패 시 journal과 barrier를 남겨 에스컬레이션한다.
+
+> 배포 상태: 이 절은 현재 변경 세트의 운영 계약을 설명한다. production에 deployer·workflow가
+> 승격되고 일회용 서버 검증 증거가 남기 전에는 배포 완료로 표현하지 않는다.
 
 #### 구버전 deployer의 1회 bridge
 

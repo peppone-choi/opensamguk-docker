@@ -16,6 +16,7 @@ RUN go build -trimpath -ldflags="-s -w" -o /out/deployer .
 # --- 런타임 스테이지 ---
 # docker:27-cli 이미지에는 docker CLI + compose v2 플러그인이 포함된다.
 FROM docker:27-cli
+RUN apk add --no-cache bash curl python3
 # 빌드한 정적 바이너리만 가져온다.
 COPY --from=build /out/deployer /usr/local/bin/deployer
 # compose 파일/서버 env는 호스트에서 /workspace로 마운트(compose.shared.yml 참조).
