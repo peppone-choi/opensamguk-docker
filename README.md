@@ -228,6 +228,21 @@ operation은 `recovery_required`, journal이 없는 미완료 operation은 Docke
 lifecycle 단계 실패 시 workflow는 절대 deadline, 요청 connect/total timeout, bounded EXIT drain 안에서 abort하고
 marker를 남겨 fail-closed 상태를 유지한다.
 
+`operationId`는 클라이언트 확인 1회당 하나만 발급하고, POST 재시도·`GET /operations/{operationId}`
+polling·운영 로그 상관 분석에 같은 ID를 쓴다. `scripts/wait-deployer-operation.sh`는 deployer URL,
+token source, operation ID, epoch 절대 deadline, poll 간격만 받고 `succeeded`에서만 0으로 종료한다.
+`pending|running|recovery_required`는 계속 기다리고 `failed|cancelled`, 없거나 잘못된 응답은 fail-closed한다.
+토큰은 curl 인자가 아닌 stdin config로 전달하고 응답 본문은 로그에 출력하지 않는다.
+
+Workflow polling deadline이 끝나면 "제한 시간 안에 완료를 확인하지 못함"이지 operation의 성공·실패
+판정이 아니다. 새 operation ID로 같은 파괴적 작업을 반복하지 말고, 기록한 ID로 상태를 다시
+조회한다. `recovery_required`면 maintenance marker를 닫힌 채 loopback
+`POST /maintenance/repair`를 실행하고 `/readyz`와 같은 operation의 `succeeded`를 모두 확인한 뒤에만
+후속 서버 검증·maintenance leave를 진행한다. Repair 실패 시 journal과 barrier를 남겨 에스컬레이션한다.
+
+> 배포 상태: 이 절은 현재 변경 세트의 운영 계약을 설명한다. production에 deployer·workflow가
+> 승격되고 일회용 서버 검증 증거가 남기 전에는 배포 완료로 표현하지 않는다.
+
 #### 구버전 deployer의 1회 bridge
 
 기존 deployer에 `/maintenance`가 없거나 404/잘못된 JSON을 반환하면 workflow는 **git merge, build, force-recreate

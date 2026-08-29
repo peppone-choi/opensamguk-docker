@@ -321,6 +321,15 @@ jobs:
           echo "creating public server ${PUBLIC_ID} with internal Docker key ${INTERNAL_ID}"
 
           export CLIENT_OPERATION_ID="$(run_bounded "$WORKFLOW_DEADLINE" 10 python3 -c 'import secrets; print(secrets.token_hex(16))')"
+          if [[ ! "$CLIENT_OPERATION_ID" =~ ^[a-f0-9]{32}$ ]]; then
+            echo "::error::could not generate a valid lifecycle operation id"
+            exit 1
+          fi
+          if ! operation_remaining="$(deadline_remaining "$WORKFLOW_DEADLINE")"; then
+            echo "::error::workflow deadline expired before lifecycle submission; leaving maintenance marker closed"
+            exit 1
+          fi
+          OPERATION_DEADLINE_EPOCH=$(( $(date +%s) + operation_remaining ))
           export MAINTENANCE_LEASE
           BODY="$(run_bounded "$WORKFLOW_DEADLINE" 10 python3 -c 'import json, os; print(json.dumps({"id": os.environ["SERVER_ID"], "name": os.environ["SERVER_NAME"], "generation": os.environ["GENERATION"], "imageTag": os.environ["IMAGE_TAG"], "gameApiPort": os.environ["GAME_API_PORT"], "webGamePort": os.environ["WEB_GAME_PORT"], "scenarioCode": os.environ["SCENARIO_CODE"], "scenarioSeedEnabled": True, "operationId": os.environ["CLIENT_OPERATION_ID"], "maintenanceLease": os.environ["MAINTENANCE_LEASE"]}, ensure_ascii=False))')"
 
@@ -448,7 +457,7 @@ jobs:
               break
             fi
             if RESPONSE="$(docker_exec_bounded "$WORKFLOW_DEADLINE" 20 -i opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST /servers/create <<<"$BODY" 2>/dev/null)"; then
-              if JOB_ID="$(printf '%s' "$RESPONSE" | run_bounded "$WORKFLOW_DEADLINE" 10 python3 -c 'import json, re, sys; payload = json.load(sys.stdin); job_id = payload.get("jobId") if isinstance(payload, dict) else None; (isinstance(job_id, str) and re.fullmatch(r"[a-f0-9]{32}", job_id) is not None) or sys.exit(1); print(job_id)' 2>/dev/null)"; then
+              if JOB_ID="$(printf '%s' "$RESPONSE" | OPERATION_ID="$CLIENT_OPERATION_ID" run_bounded "$WORKFLOW_DEADLINE" 10 python3 -c 'import json, os, re, sys; payload = json.load(sys.stdin); job_id = payload.get("jobId") if isinstance(payload, dict) else None; operation_id = payload.get("operationId") if isinstance(payload, dict) else None; operation_status = payload.get("operationStatus") if isinstance(payload, dict) else None; valid = isinstance(job_id, str) and re.fullmatch(r"[a-f0-9]{32}", job_id) is not None and operation_id == os.environ["OPERATION_ID"] and operation_status in {"pending", "running", "recovery_required", "succeeded"}; valid or sys.exit(1); print(job_id)' 2>/dev/null)"; then
                 break
               fi
               create_exit=1
@@ -470,63 +479,13 @@ jobs:
             exit 1
           fi
 
-          JOB_SUCCEEDED=false
-          for ((poll_attempt=1; poll_attempt<=240; poll_attempt++)); do
-            if ! deadline_remaining "$WORKFLOW_DEADLINE" >/dev/null; then
-              break
-            fi
-            if JOB_STATUS="$(lifecycle_status "$JOB_ID" "$WORKFLOW_DEADLINE")"; then
-              case "$JOB_STATUS" in
-                succeeded)
-                  LIFECYCLE_TERMINAL=true
-                  JOB_SUCCEEDED=true
-                  break
-                  ;;
-                pending|running|cancelled)
-                  if [[ "$JOB_STATUS" == cancelled ]]; then
-                    LIFECYCLE_TERMINAL=true
-                    echo "::error::lifecycle job cancelled"
-                    exit 1
-                  fi
-                  ;;
-                failed)
-                  LIFECYCLE_TERMINAL=true
-                  echo "::error::lifecycle job failed"
-                  exit 1
-                  ;;
-              esac
-            else
-              lookup_status=$?
-              case "$lookup_status" in
-                3)
-                  echo "::error::lifecycle job returned an HTTP error or was lost after deployer restart; leaving maintenance marker closed"
-                  exit 1
-                  ;;
-                2)
-                  echo "::error::lifecycle job returned malformed status responses; leaving maintenance marker closed"
-                  exit 1
-                  ;;
-                *)
-                  echo "::warning::transient lifecycle job lookup failed; retrying within bounded poll budget"
-                  ;;
-              esac
-            fi
-            if ! bounded_sleep "$WORKFLOW_DEADLINE" 5; then
-              break
-            fi
-          done
-          if [[ "$JOB_SUCCEEDED" != true ]]; then
-            echo "::error::lifecycle job did not succeed within 20 minutes; requesting bounded cancellation"
-            if terminal_status="$(cancel_and_await_lifecycle_job "$JOB_ID" "$WORKFLOW_DEADLINE")"; then
-              LIFECYCLE_TERMINAL=true
-              echo "::error::lifecycle job reached terminal status $terminal_status after deadline"
-            else
-              cancellation_exit=$?
-              LIFECYCLE_TERMINAL=true
-              echo "::error::bounded lifecycle cancellation/drain failed with status $cancellation_exit; leaving maintenance marker closed"
-            fi
+          if ! docker_exec_bounded "$WORKFLOW_DEADLINE" "$operation_remaining" opensamguk-deployer \
+            /bin/bash /workspace/scripts/wait-deployer-operation.sh \
+            "http://localhost:9000" "deployer-env" "$CLIENT_OPERATION_ID" "$OPERATION_DEADLINE_EPOCH" 5; then
+            echo "::error::lifecycle operation $CLIENT_OPERATION_ID did not succeed; inspect durable operation state and run lifecycle repair if recovery is required; leaving maintenance marker closed"
             exit 1
           fi
+          LIFECYCLE_TERMINAL=true
 
           server_ready=false
           for ((i=1; i<=90; i++)); do

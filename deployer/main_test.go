@@ -3099,6 +3099,9 @@ func TestRecreateWorkflowRetriesIdempotentlyAndDrainsCancellationBeforeUnlock(t 
 		"flock -w 300 9",
 		"CLIENT_OPERATION_ID",
 		`"operationId": os.environ["CLIENT_OPERATION_ID"]`,
+		"OPERATION_DEADLINE_EPOCH",
+		"scripts/wait-deployer-operation.sh",
+		`"http://localhost:9000" "deployer-env"`,
 		`"maintenanceLease": os.environ["MAINTENANCE_LEASE"]`,
 		"export MAINTENANCE_LEASE",
 		"maintenance_enter_fields",
@@ -3109,13 +3112,10 @@ func TestRecreateWorkflowRetriesIdempotentlyAndDrainsCancellationBeforeUnlock(t 
 		`/usr/local/bin/deployer --authenticated-http GET "/jobs/$target_job_id"`,
 		`/usr/local/bin/deployer --authenticated-http POST "/jobs/$target_job_id/cancel"`,
 		"for ((attempt=1; attempt<=12; attempt++)); do",
-		"for ((poll_attempt=1; poll_attempt<=240; poll_attempt++)); do",
 		"local drain_deadline=$((SECONDS + 60))",
 		"timeout --foreground -k 2",
 		"--max-time 10",
-		"pending|running|cancelled)",
-		"failed)",
-		"lifecycle job returned an HTTP error or was lost after deployer restart",
+		"did not succeed; inspect durable operation state and run lifecycle repair if recovery is required",
 		"bounded lifecycle cancellation/drain could not be confirmed",
 		"maintenance barrier did not reopen after lifecycle terminal and server postconditions",
 	} {
@@ -3135,15 +3135,14 @@ func TestRecreateWorkflowRetriesIdempotentlyAndDrainsCancellationBeforeUnlock(t 
 	operationID := strings.Index(workflow, "CLIENT_OPERATION_ID")
 	create := strings.Index(workflow, "/usr/local/bin/deployer --authenticated-http POST /servers/create")
 	parse := strings.Index(workflow, "payload.get(\"jobId\")")
-	poll := strings.LastIndex(workflow, "$(lifecycle_status \"$JOB_ID\" \"$WORKFLOW_DEADLINE\")")
-	succeeded := strings.Index(workflow, "succeeded)")
+	poll := strings.Index(workflow, "scripts/wait-deployer-operation.sh")
 	postconditions := strings.Index(workflow, "for ((i=1; i<=90; i++)); do")
 	leave := strings.LastIndex(workflow, "maintenance_post /maintenance/leave")
-	if lock < 0 || enter < 0 || merge < 0 || operationID < 0 || create < 0 || parse < 0 || poll < 0 || succeeded < 0 || postconditions < 0 || leave < 0 {
-		t.Fatalf("missing lease lifecycle markers: lock=%d enter=%d merge=%d operationID=%d create=%d parse=%d poll=%d succeeded=%d postconditions=%d leave=%d", lock, enter, merge, operationID, create, parse, poll, succeeded, postconditions, leave)
+	if lock < 0 || enter < 0 || merge < 0 || operationID < 0 || create < 0 || parse < 0 || poll < 0 || postconditions < 0 || leave < 0 {
+		t.Fatalf("missing lease lifecycle markers: lock=%d enter=%d merge=%d operationID=%d create=%d parse=%d poll=%d postconditions=%d leave=%d", lock, enter, merge, operationID, create, parse, poll, postconditions, leave)
 	}
-	if !(lock < enter && enter < merge && merge < operationID && operationID < create && create < parse && parse < poll && poll < succeeded && succeeded < postconditions && postconditions < leave) {
-		t.Fatalf("unexpected closed-barrier ordering: lock=%d enter=%d merge=%d operationID=%d create=%d parse=%d poll=%d succeeded=%d postconditions=%d leave=%d", lock, enter, merge, operationID, create, parse, poll, succeeded, postconditions, leave)
+	if !(lock < enter && enter < merge && merge < operationID && operationID < create && create < parse && parse < poll && poll < postconditions && postconditions < leave) {
+		t.Fatalf("unexpected closed-barrier ordering: lock=%d enter=%d merge=%d operationID=%d create=%d parse=%d poll=%d postconditions=%d leave=%d", lock, enter, merge, operationID, create, parse, poll, postconditions, leave)
 	}
 	if strings.Contains(workflow[enter:create], "maintenance_post /maintenance/leave") {
 		t.Fatal("recreate must not reopen maintenance before the leased create")
@@ -3219,8 +3218,8 @@ func TestRecreateWorkflowLostJobAbortsBoundedAndKeepsMarkerClosed(t *testing.T) 
 	if strings.Contains(run.output, "0123456789abcdef0123456789abcdef") {
 		t.Fatal("recreate workflow leaked its maintenance lease")
 	}
-	if !strings.Contains(run.output, "lifecycle job returned an HTTP error or was lost after deployer restart") {
-		t.Fatalf("lost-job recreate workflow did not fail promptly: %s", run.output)
+	if !strings.Contains(run.output, "lifecycle operation abcdef0123456789abcdef0123456789 did not succeed") {
+		t.Fatalf("lost-operation recreate workflow did not fail promptly: %s", run.output)
 	}
 	if strings.Contains(run.dockerCalls, "leave") {
 		t.Fatalf("lost-job recreate workflow reopened maintenance: %s", run.dockerCalls)
@@ -6157,6 +6156,9 @@ if [[ "$1" == "exec" ]]; then
   if [[ "$args" == *"/maintenance"* ]]; then
     printf '{"capability":"maintenance-v1","state":"drained"}\n'
     exit 0
+  fi
+  if [[ "$args" == *"wait-deployer-operation.sh"* ]]; then
+    exit 1
   fi
   if [[ "$args" == *"/servers/create"* ]]; then
     printf '{"jobId":"abcdef0123456789abcdef0123456789"}\n'
