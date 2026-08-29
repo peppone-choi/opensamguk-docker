@@ -76,13 +76,14 @@ type durableOperationDocument struct {
 }
 
 type durableOperationStore struct {
-	mu         sync.Mutex
-	path       string
-	maxEntries int
-	retention  time.Duration
-	operations map[string]durableOperationRecord
-	now        func() time.Time
-	fileOps    durableOperationFileOps
+	mu                  sync.Mutex
+	path                string
+	maxEntries          int
+	retention           time.Duration
+	operations          map[string]durableOperationRecord
+	deferredTransitions map[string]durableOperationRecord
+	now                 func() time.Time
+	fileOps             durableOperationFileOps
 }
 
 type durableOperationFileOps struct {
@@ -103,12 +104,13 @@ func openDurableOperationStore(path string, maxEntries int, retention time.Durat
 		return nil, errors.New("durable operation terminal retention must be positive")
 	}
 	store := &durableOperationStore{
-		path:       path,
-		maxEntries: maxEntries,
-		retention:  retention,
-		operations: make(map[string]durableOperationRecord),
-		now:        time.Now,
-		fileOps:    defaultDurableOperationFileOps(),
+		path:                path,
+		maxEntries:          maxEntries,
+		retention:           retention,
+		operations:          make(map[string]durableOperationRecord),
+		deferredTransitions: make(map[string]durableOperationRecord),
+		now:                 time.Now,
+		fileOps:             defaultDurableOperationFileOps(),
 	}
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -186,6 +188,19 @@ func (s *durableOperationStore) Reserve(record durableOperationRecord) (durableO
 		if existing.Kind != record.Kind || existing.SubjectID != record.SubjectID || existing.RequestFingerprint != record.RequestFingerprint {
 			return durableOperationRecord{}, false, errLifecycleOperationConflict
 		}
+		if deferred, pending := s.deferredTransitions[record.OperationID]; pending {
+			next := cloneDurableOperations(s.operations)
+			next[record.OperationID] = deferred
+			if err := s.persistAndInstallLocked(next); err != nil {
+				if committed, ok := s.operations[record.OperationID]; ok && committed == deferred {
+					delete(s.deferredTransitions, record.OperationID)
+					return committed, true, nil
+				}
+				return existing, true, fmt.Errorf("%w: %v", errDurableOperationSettlementPending, err)
+			}
+			delete(s.deferredTransitions, record.OperationID)
+			return deferred, true, nil
+		}
 		return existing, true, nil
 	}
 
@@ -244,8 +259,14 @@ func (s *durableOperationStore) Transition(operationID string, status lifecycleJ
 	pruneExpiredDurableOperations(next, record.UpdatedAt, s.retention)
 	next[operationID] = record
 	if err := s.persistAndInstallLocked(next); err != nil {
+		if committed, ok := s.operations[operationID]; !ok || committed != record {
+			s.deferredTransitions[operationID] = record
+		} else {
+			delete(s.deferredTransitions, operationID)
+		}
 		return durableOperationRecord{}, err
 	}
+	delete(s.deferredTransitions, operationID)
 	return record, nil
 }
 

@@ -73,9 +73,10 @@ var (
 )
 
 var (
-	errLifecycleJobCapacity       = errors.New("lifecycle job capacity reached")
-	errLifecycleOperationConflict = errors.New("lifecycle operation id is already bound to a different request")
-	errCreatePortsEqual           = errors.New("game-api와 web-game 포트는 서로 달라야 합니다.")
+	errLifecycleJobCapacity              = errors.New("lifecycle job capacity reached")
+	errLifecycleOperationConflict        = errors.New("lifecycle operation id is already bound to a different request")
+	errDurableOperationSettlementPending = errors.New("durable operation settlement pending")
+	errCreatePortsEqual                  = errors.New("game-api와 web-game 포트는 서로 달라야 합니다.")
 )
 
 // 스테이트리스 bounce 대상 — game-engine은 의도적으로 제외.
@@ -1218,6 +1219,12 @@ func (c config) reserveDurableLifecycleOperation(requestedID string, kind lifecy
 	if err == nil {
 		return record, existing, nil
 	}
+	// An identical retry may be the trigger that re-attempts a deferred terminal
+	// settlement. Do not reinterpret its persistence error as a fresh committed
+	// reservation, or the still-pending record would be replayed again.
+	if existing {
+		return record, true, err
+	}
 	// The atomic rename may be visible even when directory fsync reports an
 	// error. Lookup is the idempotent source of truth for that committed case.
 	if committed, ok := c.lifecycleOperationStore.Lookup(operationID); ok {
@@ -1286,6 +1293,21 @@ func (c config) settleRejectedDurableLifecycleOperation(operationID string, http
 		return nil
 	}
 	return c.transitionDurableLifecycleOperation(operationID, lifecycleJobFailed, httpStatus, messageID)
+}
+
+func rejectedDurableOperationSettlementResponse(response createServerResponse, operationID string, messageID durableOperationMessageID) createServerResponse {
+	message, err := durableOperationPublicMessage(messageID)
+	if err != nil {
+		message = durableOperationVerificationFailedMessage
+	}
+	response.OK = false
+	response.JobID = ""
+	response.OperationID = operationID
+	response.OperationStatus = ""
+	response.RestartRequired = false
+	response.AffectedServices = nil
+	response.Detail = message
+	return response
 }
 
 func durableOperationSuccessMessage(kind lifecycleKind) durableOperationMessageID {
@@ -3227,7 +3249,9 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 			return
 		}
 		if err := c.settleRejectedDurableLifecycleOperation(operationID, responseStatus, durableOperationMessageCreatePreparationFailed); err != nil {
-			log.Printf("settle rejected create operation operationId=%s err=%v", operationID, err)
+			log.Printf("settle rejected create operation unavailable operationId=%s", operationID)
+			response = rejectedDurableOperationSettlementResponse(response, operationID, durableOperationMessageCreatePreparationFailed)
+			responseStatus = http.StatusServiceUnavailable
 		}
 	}()
 	fingerprint := createRequestFingerprint(normalized)
@@ -3448,7 +3472,9 @@ func (c config) deleteServer(rawID string, confirm string, operationID string) (
 			return
 		}
 		if err := c.settleRejectedDurableLifecycleOperation(operationID, responseStatus, rejectionMessageID); err != nil {
-			log.Printf("settle rejected close operation operationId=%s err=%v", operationID, err)
+			log.Printf("settle rejected close operation unavailable operationId=%s", operationID)
+			response = rejectedDurableOperationSettlementResponse(response, operationID, rejectionMessageID)
+			responseStatus = http.StatusServiceUnavailable
 		}
 	}()
 	if operationID == "" {
@@ -3654,7 +3680,9 @@ func (c config) resetServer(rawID string, req resetServerRequest) (response crea
 			return
 		}
 		if err := c.settleRejectedDurableLifecycleOperation(operationID, responseStatus, durableOperationMessageResetPreparationFailed); err != nil {
-			log.Printf("settle rejected reset operation operationId=%s err=%v", operationID, err)
+			log.Printf("settle rejected reset operation unavailable operationId=%s", operationID)
+			response = rejectedDurableOperationSettlementResponse(response, operationID, durableOperationMessageResetPreparationFailed)
+			responseStatus = http.StatusServiceUnavailable
 		}
 	}()
 	if operationID == "" {
@@ -3812,6 +3840,9 @@ func (c config) resetServer(rawID string, req resetServerRequest) (response crea
 }
 
 func lifecycleJobReservationFailure(err error) (string, int) {
+	if errors.Is(err, errDurableOperationSettlementPending) {
+		return "서버 수명주기 작업을 준비하지 못했습니다.", http.StatusServiceUnavailable
+	}
 	if errors.Is(err, errLifecycleJobCapacity) {
 		return "서버 수명주기 작업 대기열이 가득 찼습니다. 잠시 후 다시 시도해 주세요.", http.StatusServiceUnavailable
 	}

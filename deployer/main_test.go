@@ -4499,6 +4499,19 @@ func countDockerCallsContaining(calls []string, fragment string) int {
 	return count
 }
 
+func failNextDurableOperationSettlement(t *testing.T, store *durableOperationStore, diagnostic string) {
+	t.Helper()
+	originalCreateTemp := store.fileOps.createTemp
+	persistAttempts := 0
+	store.fileOps.createTemp = func(dir, pattern string) (*os.File, error) {
+		persistAttempts++
+		if persistAttempts == 2 {
+			return nil, errors.New(diagnostic)
+		}
+		return originalCreateTemp(dir, pattern)
+	}
+}
+
 func TestRestartLinksJournaledOperationToRepair(t *testing.T) {
 	cfg := configuredResetOperationTest(t)
 	operationID := "1234567890abcdef1234567890abcdef"
@@ -4549,22 +4562,24 @@ func TestRestartCancelsUnjournaledPendingOperation(t *testing.T) {
 		RequestFingerprint: strings.Repeat("b", 64),
 		Status:             lifecycleJobPending,
 	})
-	calls := &dockerCallRecorder{}
-	cfg.dockerRunner = func(args ...string) (string, error) {
-		calls.record(args...)
-		return "29.0.0\n", nil
-	}
-	if err := cfg.recoverDurableLifecycleOperations(); err != nil {
-		t.Fatalf("restart operation recovery: %v", err)
-	}
-	if calls.count() != 0 {
-		t.Fatalf("unjournaled restart recovery reached Docker: %#v", calls.snapshot())
-	}
 	configureLoadConfigTest(t, cfg)
+	dockerBin := t.TempDir()
+	dockerCalls := filepath.Join(t.TempDir(), "docker-calls")
+	writeExecutable(t, filepath.Join(dockerBin, "docker"), `#!/bin/sh
+printf '%s\n' "$*" >> "$DEPLOYER_TEST_DOCKER_CALLS"
+printf '29.0.0\n'
+`)
+	t.Setenv("DEPLOYER_TEST_DOCKER_CALLS", dockerCalls)
+	t.Setenv("PATH", dockerBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	restarted, err := loadConfig()
 	if err != nil {
 		t.Fatalf("reconstruct config: %v", err)
+	}
+	if calls, err := os.ReadFile(dockerCalls); err == nil {
+		t.Fatalf("loadConfig recovery reached Docker: %q", calls)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("inspect loadConfig Docker recorder: %v", err)
 	}
 	recovered, ok := restarted.lifecycleOperationStore.Lookup(operationID)
 	if !ok || recovered.Status != lifecycleJobCancelled || recovered.PublicMessage != durableOperationRestartMessage {
@@ -4573,6 +4588,125 @@ func TestRestartCancelsUnjournaledPendingOperation(t *testing.T) {
 	if restarted.lifecycleJobs.jobIDForOperation(operationID) != "" {
 		t.Fatal("restart recreated a Docker lifecycle job for an unjournaled operation")
 	}
+}
+
+func TestRejectedDurableOperationsConvergeAfterTransientSettlementFailure(t *testing.T) {
+	const injectedDiagnostic = "DATABASE_PASSWORD=raw-settlement-diagnostic"
+
+	t.Run("create", func(t *testing.T) {
+		cfg := testConfig(t)
+		writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_SECRET=shared-secret\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n")
+		writeEnv(t, filepath.Join(cfg.serversDir, "sbar.env"), "SERVER_ID=bar\nGAME_API_PORT=8101\n")
+		calls := &dockerCallRecorder{}
+		cfg.dockerRunner = func(args ...string) (string, error) {
+			calls.record(args...)
+			return "ok\n", nil
+		}
+		failNextDurableOperationSettlement(t, cfg.lifecycleOperationStore, injectedDiagnostic)
+		operationID := "00000000000000000000000000000006"
+		body := `{"id":"foo","name":"첫 서버","gameApiPort":"8101","webGamePort":"3101","operationId":"` + operationID + `"}`
+
+		first := envRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create", body)
+		if first.Code != http.StatusServiceUnavailable || first.Header().Get("Retry-After") != "5" {
+			t.Errorf("create settlement failure = %d retry-after=%q body=%s", first.Code, first.Header().Get("Retry-After"), first.Body.String())
+		}
+		var firstBody createServerResponse
+		if err := json.NewDecoder(first.Body).Decode(&firstBody); err != nil {
+			t.Fatalf("decode create settlement failure: %v", err)
+		}
+		if firstBody.Detail != durableOperationCreatePreparationFailedMessage || firstBody.OperationID != operationID || strings.Contains(first.Body.String(), injectedDiagnostic) {
+			t.Errorf("create settlement failure exposed an unsafe contract: %#v", firstBody)
+		}
+
+		retry := envRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create", body)
+		var replay createServerResponse
+		if err := json.NewDecoder(retry.Body).Decode(&replay); err != nil {
+			t.Fatalf("decode create retry: %v", err)
+		}
+		if retry.Code != http.StatusOK || replay.OperationStatus != lifecycleJobFailed || replay.Detail != durableOperationCreatePreparationFailedMessage {
+			t.Errorf("create retry did not replay terminal rejection: status=%d body=%#v", retry.Code, replay)
+		}
+		persisted := mustOpenOperationStore(t, cfg.lifecycleOperationStore.path)
+		record, ok := persisted.Lookup(operationID)
+		if !ok || record.Status != lifecycleJobFailed || record.HTTPStatus != http.StatusConflict || record.PublicMessage != durableOperationCreatePreparationFailedMessage {
+			t.Errorf("create rejection did not converge durably: %#v, %v", record, ok)
+		}
+		if calls.count() != 0 {
+			t.Errorf("create settlement retry reached Docker: %#v", calls.snapshot())
+		}
+	})
+
+	t.Run("close", func(t *testing.T) {
+		cfg := testConfig(t)
+		writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","deployProject":"opensamguk-spep"}]
+`)
+		writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=other\n")
+		calls := &dockerCallRecorder{}
+		cfg.dockerRunner = func(args ...string) (string, error) {
+			calls.record(args...)
+			return "ok\n", nil
+		}
+		failNextDurableOperationSettlement(t, cfg.lifecycleOperationStore, injectedDiagnostic)
+		operationID := "00000000000000000000000000000007"
+
+		first, firstStatus := cfg.deleteServer("pep", "DELETE pep", operationID)
+		if firstStatus != http.StatusServiceUnavailable || first.Detail != durableOperationClosePreparationFailedMessage || first.OperationID != operationID || strings.Contains(first.Detail, injectedDiagnostic) {
+			t.Errorf("close settlement failure = %d %#v", firstStatus, first)
+		}
+		replay, retryStatus := cfg.deleteServer("pep", "DELETE pep", operationID)
+		if retryStatus != http.StatusOK || replay.OperationStatus != lifecycleJobFailed || replay.Detail != durableOperationClosePreparationFailedMessage {
+			t.Errorf("close retry did not replay terminal rejection: status=%d body=%#v", retryStatus, replay)
+		}
+		persisted := mustOpenOperationStore(t, cfg.lifecycleOperationStore.path)
+		record, ok := persisted.Lookup(operationID)
+		if !ok || record.Status != lifecycleJobFailed || record.HTTPStatus != http.StatusConflict || record.PublicMessage != durableOperationClosePreparationFailedMessage {
+			t.Errorf("close rejection did not converge durably: %#v, %v", record, ok)
+		}
+		if calls.count() != 0 {
+			t.Errorf("close settlement retry reached Docker: %#v", calls.snapshot())
+		}
+	})
+
+	t.Run("reset", func(t *testing.T) {
+		cfg := configuredResetOperationTest(t)
+		cfg.lifecycleJobs.maxEntries = 1
+		if _, err := cfg.lifecycleJobs.reserve(); err != nil {
+			t.Fatalf("fill lifecycle job capacity: %v", err)
+		}
+		calls := &dockerCallRecorder{}
+		cfg.dockerRunner = func(args ...string) (string, error) {
+			calls.record(args...)
+			return "ok\n", nil
+		}
+		failNextDurableOperationSettlement(t, cfg.lifecycleOperationStore, injectedDiagnostic)
+		operationID := "00000000000000000000000000000008"
+		body := `{"id":"pep","confirm":"RESET pep","scenarioCode":"scenario_1002","operationId":"` + operationID + `"}`
+
+		first := envRequest(t, cfg.withAuth(cfg.handleServerReset), http.MethodPost, "/servers/reset", body)
+		var firstBody createServerResponse
+		if err := json.NewDecoder(first.Body).Decode(&firstBody); err != nil {
+			t.Fatalf("decode reset settlement failure: %v", err)
+		}
+		if first.Code != http.StatusServiceUnavailable || first.Header().Get("Retry-After") != "5" || firstBody.Detail != durableOperationResetPreparationFailedMessage || firstBody.OperationID != operationID || strings.Contains(first.Body.String(), injectedDiagnostic) {
+			t.Errorf("reset settlement failure = %d retry-after=%q body=%#v", first.Code, first.Header().Get("Retry-After"), firstBody)
+		}
+		retry := envRequest(t, cfg.withAuth(cfg.handleServerReset), http.MethodPost, "/servers/reset", body)
+		var replay createServerResponse
+		if err := json.NewDecoder(retry.Body).Decode(&replay); err != nil {
+			t.Fatalf("decode reset retry: %v", err)
+		}
+		if retry.Code != http.StatusOK || replay.OperationStatus != lifecycleJobFailed || replay.Detail != durableOperationResetPreparationFailedMessage {
+			t.Errorf("reset retry did not replay terminal rejection: status=%d body=%#v", retry.Code, replay)
+		}
+		persisted := mustOpenOperationStore(t, cfg.lifecycleOperationStore.path)
+		record, ok := persisted.Lookup(operationID)
+		if !ok || record.Status != lifecycleJobFailed || record.HTTPStatus != http.StatusServiceUnavailable || record.PublicMessage != durableOperationResetPreparationFailedMessage {
+			t.Errorf("reset rejection did not converge durably: %#v, %v", record, ok)
+		}
+		if calls.count() != 0 {
+			t.Errorf("reset settlement retry reached Docker: %#v", calls.snapshot())
+		}
+	})
 }
 
 func TestRepairPreparedCreateCancelsLinkedOperationBeforeJournalClear(t *testing.T) {
