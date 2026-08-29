@@ -3100,6 +3100,11 @@ func TestRecreateWorkflowRetriesIdempotentlyAndDrainsCancellationBeforeUnlock(t 
 		"CLIENT_OPERATION_ID",
 		`"operationId": os.environ["CLIENT_OPERATION_ID"]`,
 		"OPERATION_DEADLINE_EPOCH",
+		"checking deployer operation polling runtime",
+		"command -v bash",
+		"command -v curl",
+		"command -v python3",
+		"test -x /workspace/scripts/wait-deployer-operation.sh",
 		"scripts/wait-deployer-operation.sh",
 		`"http://localhost:9000" "deployer-env"`,
 		`"maintenanceLease": os.environ["MAINTENANCE_LEASE"]`,
@@ -3133,16 +3138,17 @@ func TestRecreateWorkflowRetriesIdempotentlyAndDrainsCancellationBeforeUnlock(t 
 	enter := strings.Index(workflow, "maintenance_post /maintenance/enter")
 	merge := strings.Index(workflow, "git merge --ff-only origin/main")
 	operationID := strings.Index(workflow, "CLIENT_OPERATION_ID")
+	runtimePreflight := strings.Index(workflow, "checking deployer operation polling runtime")
 	create := strings.Index(workflow, "/usr/local/bin/deployer --authenticated-http POST /servers/create")
 	parse := strings.Index(workflow, "payload.get(\"jobId\")")
-	poll := strings.Index(workflow, "scripts/wait-deployer-operation.sh")
+	poll := strings.LastIndex(workflow, "scripts/wait-deployer-operation.sh")
 	postconditions := strings.Index(workflow, "for ((i=1; i<=90; i++)); do")
 	leave := strings.LastIndex(workflow, "maintenance_post /maintenance/leave")
-	if lock < 0 || enter < 0 || merge < 0 || operationID < 0 || create < 0 || parse < 0 || poll < 0 || postconditions < 0 || leave < 0 {
-		t.Fatalf("missing lease lifecycle markers: lock=%d enter=%d merge=%d operationID=%d create=%d parse=%d poll=%d postconditions=%d leave=%d", lock, enter, merge, operationID, create, parse, poll, postconditions, leave)
+	if lock < 0 || enter < 0 || merge < 0 || operationID < 0 || runtimePreflight < 0 || create < 0 || parse < 0 || poll < 0 || postconditions < 0 || leave < 0 {
+		t.Fatalf("missing lease lifecycle markers: lock=%d enter=%d merge=%d operationID=%d runtimePreflight=%d create=%d parse=%d poll=%d postconditions=%d leave=%d", lock, enter, merge, operationID, runtimePreflight, create, parse, poll, postconditions, leave)
 	}
-	if !(lock < enter && enter < merge && merge < operationID && operationID < create && create < parse && parse < poll && poll < postconditions && postconditions < leave) {
-		t.Fatalf("unexpected closed-barrier ordering: lock=%d enter=%d merge=%d operationID=%d create=%d parse=%d poll=%d postconditions=%d leave=%d", lock, enter, merge, operationID, create, parse, poll, postconditions, leave)
+	if !(lock < enter && enter < merge && merge < operationID && operationID < runtimePreflight && runtimePreflight < create && create < parse && parse < poll && poll < postconditions && postconditions < leave) {
+		t.Fatalf("unexpected closed-barrier ordering: lock=%d enter=%d merge=%d operationID=%d runtimePreflight=%d create=%d parse=%d poll=%d postconditions=%d leave=%d", lock, enter, merge, operationID, runtimePreflight, create, parse, poll, postconditions, leave)
 	}
 	if strings.Contains(workflow[enter:create], "maintenance_post /maintenance/leave") {
 		t.Fatal("recreate must not reopen maintenance before the leased create")
@@ -3196,7 +3202,7 @@ func TestRecreateWorkflowBoundsEveryExternalCommandAfterProductionLock(t *testin
 			if !strings.Contains(line, command) {
 				continue
 			}
-			if strings.Contains(line, "run_bounded") || strings.Contains(line, "bounded_sleep") || strings.Contains(line, "timeout --foreground -k 2") || (inDockerExecScript && strings.Contains(line, "timeout -k 2")) || strings.Contains(line, "COMPOSE=(") {
+			if strings.Contains(line, "run_bounded") || strings.Contains(line, "bounded_sleep") || strings.Contains(line, "timeout --foreground -k 2") || (inDockerExecScript && strings.Contains(line, "timeout -k 2")) || (strings.Contains(line, "docker_exec_bounded") && strings.Contains(line, "command -v ")) || strings.Contains(line, "COMPOSE=(") {
 				continue
 			}
 			t.Fatalf("recreate workflow has raw unbounded %q command after lock: %s", command, line)
@@ -3226,12 +3232,25 @@ func TestRecreateWorkflowLostJobAbortsBoundedAndKeepsMarkerClosed(t *testing.T) 
 	}
 }
 
+func TestRecreateWorkflowDurableReplayWithoutJobIDPollsOperation(t *testing.T) {
+	run := runRecreateWorkflowMode(t, "pep", false, true)
+	if run.err == nil {
+		t.Fatalf("durable replay workflow unexpectedly succeeded in the failure harness: %s", run.output)
+	}
+	if !strings.Contains(run.dockerCalls, "wait-deployer-operation.sh") {
+		t.Fatalf("durable replay without jobId did not reach operation polling: %s", run.dockerCalls)
+	}
+	if strings.Contains(run.dockerCalls, "/jobs/") {
+		t.Fatalf("durable replay without jobId attempted legacy job cancellation: %s", run.dockerCalls)
+	}
+}
+
 func TestRecreateWorkflowAcceptAndStallPathsAreBoundedAndFailClosed(t *testing.T) {
 	run := runRecreateWorkflowWithCreateTimeout(t)
 	if run.err == nil {
 		t.Fatalf("stalled-create recreate workflow unexpectedly succeeded: %s", run.output)
 	}
-	if !strings.Contains(run.output, "server creation did not return a lifecycle job after 3 bounded attempts") {
+	if !strings.Contains(run.output, "server creation did not return a valid durable lifecycle acceptance after 3 bounded attempts") {
 		t.Fatalf("stalled-create workflow did not report its bounded failure: %s", run.output)
 	}
 	if strings.Contains(run.dockerCalls, "leave") {
@@ -6110,6 +6129,10 @@ func runRecreateWorkflowWithServerID(t *testing.T, serverID string) startWorkflo
 }
 
 func runRecreateWorkflow(t *testing.T, serverID string, stallCreate bool) startWorkflowRun {
+	return runRecreateWorkflowMode(t, serverID, stallCreate, false)
+}
+
+func runRecreateWorkflowMode(t *testing.T, serverID string, stallCreate bool, replayWithoutJobID bool) startWorkflowRun {
 	t.Helper()
 	root := t.TempDir()
 	home := filepath.Join(root, "home")
@@ -6127,7 +6150,7 @@ func runRecreateWorkflow(t *testing.T, serverID string, stallCreate bool) startW
 	writeExecutable(t, filepath.Join(bin, "git"), "#!/usr/bin/env bash\nexit 0\n")
 	writeExecutable(t, filepath.Join(bin, "sudo"), "#!/usr/bin/env bash\nexec \"$@\"\n")
 	writeExecutable(t, filepath.Join(bin, "sleep"), "#!/usr/bin/env bash\nexit 0\n")
-	writeExecutable(t, filepath.Join(bin, "python3"), "#!/usr/bin/env bash\nargs=\"$*\"\nif [[ \"$args\" == *\"state\\\"] + \\\":\\\"\"* ]]; then\n  printf 'drained:0123456789abcdef0123456789abcdef\\n'\nelif [[ \"$args\" == *\"payload.get(\\\"jobId\\\")\"* ]]; then\n  printf 'abcdef0123456789abcdef0123456789\\n'\nelif [[ \"$args\" == *\"import secrets\"* ]]; then\n  printf 'abcdef0123456789abcdef0123456789\\n'\nelif [[ \"$args\" == *\"json.dumps\"* ]]; then\n  printf '{}\\n'\nelse\n  printf 'drained\\n'\nfi\n")
+	writeExecutable(t, filepath.Join(bin, "python3"), "#!/usr/bin/env bash\nargs=\"$*\"\nif [[ \"$args\" == *\"state\\\"] + \\\":\\\"\"* ]]; then\n  printf 'drained:0123456789abcdef0123456789abcdef\\n'\nelif [[ \"$args\" == *\"payload.get(\\\"jobId\\\")\"* ]]; then\n  if [[ \"${WORKFLOW_REPLAY_WITHOUT_JOB_ID:-false}\" == true ]]; then\n    if [[ \"$args\" != *\"not has_job_id\"* || \"$args\" != *\"print(job_id if has_job_id else \\\"-\\\")\"* ]]; then exit 1; fi\n    printf '%s\\n' '-'\n  else\n    printf 'abcdef0123456789abcdef0123456789\\n'\n  fi\nelif [[ \"$args\" == *\"import secrets\"* ]]; then\n  printf 'abcdef0123456789abcdef0123456789\\n'\nelif [[ \"$args\" == *\"json.dumps\"* ]]; then\n  printf '{}\\n'\nelse\n  printf 'drained\\n'\nfi\n")
 	dockerScript := `#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >> "$WORKFLOW_DOCKER_LOG"
@@ -6157,11 +6180,15 @@ if [[ "$1" == "exec" ]]; then
     printf '{"capability":"maintenance-v1","state":"drained"}\n'
     exit 0
   fi
-  if [[ "$args" == *"wait-deployer-operation.sh"* ]]; then
+  if [[ "$args" == *"/bin/bash /workspace/scripts/wait-deployer-operation.sh"* ]]; then
     exit 1
   fi
   if [[ "$args" == *"/servers/create"* ]]; then
-    printf '{"jobId":"abcdef0123456789abcdef0123456789"}\n'
+    if [[ "${WORKFLOW_REPLAY_WITHOUT_JOB_ID:-false}" == true ]]; then
+      printf '{"operationId":"abcdef0123456789abcdef0123456789","operationStatus":"running"}\n'
+    else
+      printf '{"jobId":"abcdef0123456789abcdef0123456789","operationId":"abcdef0123456789abcdef0123456789","operationStatus":"pending"}\n'
+    fi
     exit 0
   fi
   if [[ "$args" == *"/jobs/"* ]]; then
@@ -6194,6 +6221,7 @@ fi
 		"WEB_GAME_PORT=3101",
 		"WORKFLOW_DOCKER_LOG="+dockerLog,
 		"WORKFLOW_TIMEOUT_STALL_CREATE="+strconv.FormatBool(stallCreate),
+		"WORKFLOW_REPLAY_WITHOUT_JOB_ID="+strconv.FormatBool(replayWithoutJobID),
 	)
 	output, err := cmd.CombinedOutput()
 	dockerCalls, readErr := os.ReadFile(dockerLog)

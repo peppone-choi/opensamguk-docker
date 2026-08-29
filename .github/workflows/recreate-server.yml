@@ -330,6 +330,13 @@ jobs:
             exit 1
           fi
           OPERATION_DEADLINE_EPOCH=$(( $(date +%s) + operation_remaining ))
+
+          echo "checking deployer operation polling runtime"
+          if ! docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c 'command -v bash >/dev/null && command -v curl >/dev/null && command -v python3 >/dev/null && test -x /workspace/scripts/wait-deployer-operation.sh'; then
+            echo "::error::deployer operation polling runtime is unavailable; aborting before server creation"
+            exit 1
+          fi
+
           export MAINTENANCE_LEASE
           BODY="$(run_bounded "$WORKFLOW_DEADLINE" 10 python3 -c 'import json, os; print(json.dumps({"id": os.environ["SERVER_ID"], "name": os.environ["SERVER_NAME"], "generation": os.environ["GENERATION"], "imageTag": os.environ["IMAGE_TAG"], "gameApiPort": os.environ["GAME_API_PORT"], "webGamePort": os.environ["WEB_GAME_PORT"], "scenarioCode": os.environ["SCENARIO_CODE"], "scenarioSeedEnabled": True, "operationId": os.environ["CLIENT_OPERATION_ID"], "maintenanceLease": os.environ["MAINTENANCE_LEASE"]}, ensure_ascii=False))')"
 
@@ -431,6 +438,7 @@ jobs:
           }
 
           JOB_ID=""
+          CREATE_ACCEPTED=false
           LIFECYCLE_TERMINAL=false
           LIFECYCLE_DRAINING=false
           drain_lifecycle_before_unlock() {
@@ -457,7 +465,11 @@ jobs:
               break
             fi
             if RESPONSE="$(docker_exec_bounded "$WORKFLOW_DEADLINE" 20 -i opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST /servers/create <<<"$BODY" 2>/dev/null)"; then
-              if JOB_ID="$(printf '%s' "$RESPONSE" | OPERATION_ID="$CLIENT_OPERATION_ID" run_bounded "$WORKFLOW_DEADLINE" 10 python3 -c 'import json, os, re, sys; payload = json.load(sys.stdin); job_id = payload.get("jobId") if isinstance(payload, dict) else None; operation_id = payload.get("operationId") if isinstance(payload, dict) else None; operation_status = payload.get("operationStatus") if isinstance(payload, dict) else None; valid = isinstance(job_id, str) and re.fullmatch(r"[a-f0-9]{32}", job_id) is not None and operation_id == os.environ["OPERATION_ID"] and operation_status in {"pending", "running", "recovery_required", "succeeded"}; valid or sys.exit(1); print(job_id)' 2>/dev/null)"; then
+              if JOB_ID="$(printf '%s' "$RESPONSE" | OPERATION_ID="$CLIENT_OPERATION_ID" run_bounded "$WORKFLOW_DEADLINE" 10 python3 -c 'import json, os, re, sys; payload = json.load(sys.stdin); job_id = payload.get("jobId") if isinstance(payload, dict) else None; has_job_id = isinstance(payload, dict) and "jobId" in payload; operation_id = payload.get("operationId") if isinstance(payload, dict) else None; operation_status = payload.get("operationStatus") if isinstance(payload, dict) else None; valid_job = not has_job_id or (isinstance(job_id, str) and re.fullmatch(r"[a-f0-9]{32}", job_id) is not None); valid = valid_job and operation_id == os.environ["OPERATION_ID"] and operation_status in {"pending", "running", "recovery_required", "succeeded"}; valid or sys.exit(1); print(job_id if has_job_id else "-")' 2>/dev/null)"; then
+                if [[ "$JOB_ID" == "-" ]]; then
+                  JOB_ID=""
+                fi
+                CREATE_ACCEPTED=true
                 break
               fi
               create_exit=1
@@ -474,8 +486,8 @@ jobs:
               break
             fi
           done
-          if [[ -z "$JOB_ID" ]]; then
-            echo "::error::server creation did not return a lifecycle job after 3 bounded attempts; leaving maintenance marker closed"
+          if [[ "$CREATE_ACCEPTED" != true ]]; then
+            echo "::error::server creation did not return a valid durable lifecycle acceptance after 3 bounded attempts; leaving maintenance marker closed"
             exit 1
           fi
 

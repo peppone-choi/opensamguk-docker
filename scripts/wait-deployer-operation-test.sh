@@ -74,13 +74,15 @@ run_case() {
 
 run_case success_after_recovery_required \
   "{\"operationId\":\"$operation_id\",\"status\":\"pending\",\"publicMessage\":\"body-secret-1\"}
+{\"operationId\":\"$operation_id\",\"status\":\"running\",\"publicMessage\":\"body-secret-running\"}
 {\"operationId\":\"$operation_id\",\"status\":\"recovery_required\",\"publicMessage\":\"body-secret-2\"}
 {\"operationId\":\"$operation_id\",\"status\":\"succeeded\",\"publicMessage\":\"body-secret-3\"}" \
-  0 3
+  0 4
 run_case terminal_failed \
   "{\"operationId\":\"$operation_id\",\"status\":\"failed\",\"publicMessage\":\"body-secret-failed\"}" \
   1 1
 run_case malformed_response '{"operationId":"wrong","status":"succeeded","publicMessage":"body-secret-malformed"}' 1 1
+run_case malformed_json '{not-json' 1 1
 run_case missing_response '{}' 1 1
 
 echo "wait-deployer-operation contract tests: PASS"
