@@ -8,6 +8,7 @@ servers/*.env
 !servers/*.env.example
 servers/.deployer-maintenance
 servers/.deployer-lifecycle-journal
+servers/.deployer-operations.json
 
 # 런타임 TLS 인증서 — 운영 호스트에서만 생성·갱신, 절대 커밋 금지
 infra/nginx/certs/

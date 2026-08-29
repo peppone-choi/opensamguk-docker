@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     paths:
+      - ".gitignore"
       - ".github/workflows/deploy-orchestration.yml"
       - "deployer/**"
       - "docker-compose.shared.yml"
