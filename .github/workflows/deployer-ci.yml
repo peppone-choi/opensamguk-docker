@@ -4,11 +4,13 @@ on:
   pull_request:
     paths:
       - "deployer/**"
+      - ".gitignore"
       - ".github/workflows/deployer-ci.yml"
   push:
     branches: [main]
     paths:
       - "deployer/**"
+      - ".gitignore"
       - ".github/workflows/deployer-ci.yml"
 
 concurrency:
@@ -26,6 +28,9 @@ jobs:
         working-directory: deployer
     steps:
       - uses: actions/checkout@v4
+      - name: runtime state is gitignored
+        working-directory: .
+        run: git check-ignore -q --no-index servers/.deployer-operations.json
       - uses: actions/setup-go@v5
         with:
           go-version-file: deployer/go.mod
