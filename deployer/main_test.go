@@ -3034,10 +3034,15 @@ func TestDeployOrchestrationValidatesCandidateBeforeReplacementAndFullCheckAfter
 		"opensamguk-deployer:local --check-registry-targets",
 		"opensamguk-deployer:local --check-registry",
 		"/usr/local/bin/deployer --check-running-registry-targets",
+		`--tmpfs /tmp:rw,noexec,nosuid,size=1m`,
+		`-e DEPLOYER_OPERATION_STORE_FILE=/tmp/deployer-operations.json`,
 	} {
 		if !strings.Contains(workflow, want) {
 			t.Fatalf("control-plane deployment missing %q", want)
 		}
+	}
+	if got := strings.Count(workflow, `-e DEPLOYER_OPERATION_STORE_FILE=/tmp/deployer-operations.json`); got != 2 {
+		t.Fatalf("isolated candidate operation store count=%d, want 2", got)
 	}
 
 	build := strings.Index(workflow, "$COMPOSE build deployer")
