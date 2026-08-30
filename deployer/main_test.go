@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -635,6 +636,32 @@ func TestMaintenanceAPIBearerLoopbackAndIdempotency(t *testing.T) {
 	}
 	if _, err := os.Stat(cfg.maintenanceFile); !os.IsNotExist(err) {
 		t.Fatalf("maintenance marker remained after leave: %v", err)
+	}
+}
+
+func TestMaintenanceRepairLogsInternalFailureWithoutReturningIt(t *testing.T) {
+	cfg := testConfig(t)
+	handler := cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance))
+
+	var diagnostics bytes.Buffer
+	previousOutput := log.Writer()
+	previousFlags := log.Flags()
+	log.SetOutput(&diagnostics)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(previousOutput)
+		log.SetFlags(previousFlags)
+	}()
+
+	repair := loopbackRequest(t, handler, http.MethodPost, "/maintenance/repair", "")
+	if repair.Code != http.StatusConflict {
+		t.Fatalf("repair without journal status=%d body=%s", repair.Code, repair.Body.String())
+	}
+	if strings.Contains(repair.Body.String(), "lifecycle recovery journal is unavailable") {
+		t.Fatalf("repair response leaked internal detail: %s", repair.Body.String())
+	}
+	if !strings.Contains(diagnostics.String(), "maintenance repair failed: lifecycle recovery journal is unavailable") {
+		t.Fatalf("repair diagnostics=%q", diagnostics.String())
 	}
 }
 
