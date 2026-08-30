@@ -73,7 +73,11 @@ jobs:
             if (( requested > remaining )); then
               requested="$remaining"
             fi
-            timeout --foreground -k 2 "$requested" sleep "$requested"
+            local timeout_seconds=$((requested + 1))
+            if (( timeout_seconds > remaining )); then
+              timeout_seconds="$remaining"
+            fi
+            timeout --foreground -k 2 "$timeout_seconds" sleep "$requested"
           }
           run_bounded() {
             local deadline="$1"

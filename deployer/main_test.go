@@ -3307,6 +3307,27 @@ func TestDeployAndStartWorkflowsBoundCommandsWhileHoldingProductionLock(t *testi
 	}
 }
 
+func TestMaintenanceWorkflowsGiveBoundedSleepTerminationGrace(t *testing.T) {
+	workflows := map[string]string{
+		"deploy":   readFile(t, filepath.Join("..", ".github", "workflows", "deploy-orchestration.yml")),
+		"recreate": readFile(t, filepath.Join("..", ".github", "workflows", "recreate-server.yml")),
+		"start":    readFile(t, filepath.Join("..", ".github", "workflows", "start-server.yml")),
+	}
+	for name, workflow := range workflows {
+		t.Run(name, func(t *testing.T) {
+			for _, want := range []string{
+				`local timeout_seconds=$((requested + 1))`,
+				`if (( timeout_seconds > remaining )); then`,
+				`timeout --foreground -k 2 "$timeout_seconds" sleep "$requested"`,
+			} {
+				if !strings.Contains(workflow, want) {
+					t.Fatalf("%s workflow bounded_sleep lacks termination grace contract %q", name, want)
+				}
+			}
+		})
+	}
+}
+
 func TestAuthenticatedHTTPCommandUsesInheritedTokenWithoutLeakingIt(t *testing.T) {
 	const token = "credential-must-not-appear-in-argv"
 	var method, path, authorization, contentType, body string
