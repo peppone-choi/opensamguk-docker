@@ -84,6 +84,14 @@ jobs:
           maintenance_post() {
             docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST "$1" 2>/dev/null
           }
+          maintenance_repair() {
+            docker_exec_bounded "$WORKFLOW_DEADLINE" 300 opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST /maintenance/repair 285
+          }
+          dump_lifecycle_recovery_diagnostics() {
+            echo "::group::deployer lifecycle recovery diagnostics"
+            run_bounded "$WORKFLOW_DEADLINE" 20 sudo docker logs --tail 200 opensamguk-deployer 2>&1 || true
+            echo "::endgroup::"
+          }
           deployer_http_ready() {
             if ! docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer sh -c 'timeout -k 2 10 wget -qO- -T 5 http://localhost:9000/healthz' | grep -q '"status":"up"'; then
               return 1
@@ -109,11 +117,13 @@ jobs:
             if wait_for_deployer_ready; then
               return 0
             fi
-            if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_post /maintenance/repair)")" || [ "$MAINTENANCE_STATE" != drained ]; then
+            if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_repair)")" || [ "$MAINTENANCE_STATE" != drained ]; then
+              dump_lifecycle_recovery_diagnostics
               echo "::error::deployer lifecycle recovery cannot be verified; leaving maintenance marker closed"
               return 1
             fi
             if ! wait_for_deployer_ready; then
+              dump_lifecycle_recovery_diagnostics
               echo "::error::deployer lifecycle recovery cannot be verified; leaving maintenance marker closed"
               return 1
             fi

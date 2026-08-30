@@ -38,21 +38,22 @@ import (
 )
 
 const (
-	maxDockerDNSLabelLength        = 63
-	internalServerKeyPrefix        = "s"
-	gameEngineDockerLabelSuffix    = "-game-engine"
-	longestServerDockerLabelSuffix = "-game-postgres"
-	maxPublicServerIDLength        = maxDockerDNSLabelLength - len(internalServerKeyPrefix) - len(longestServerDockerLabelSuffix)
-	lifecycleJobIDBytes            = 16
-	maintenanceLeaseBytes          = 16
-	lifecycleJobMaxEntries         = 128
-	lifecycleJobTerminalRetention  = time.Hour
-	maintenanceLeaseHeader         = "X-Maintenance-Lease"
-	resetVerificationTimeout       = 2 * time.Minute
-	resetVerificationPollInterval  = time.Second
-	resetVerificationHTTPTimeout   = 5 * time.Second
-	maxVerificationResponseBytes   = 256 << 10
-	isolatedServerWorldID          = "1"
+	maxDockerDNSLabelLength         = 63
+	internalServerKeyPrefix         = "s"
+	gameEngineDockerLabelSuffix     = "-game-engine"
+	longestServerDockerLabelSuffix  = "-game-postgres"
+	maxPublicServerIDLength         = maxDockerDNSLabelLength - len(internalServerKeyPrefix) - len(longestServerDockerLabelSuffix)
+	lifecycleJobIDBytes             = 16
+	maintenanceLeaseBytes           = 16
+	lifecycleJobMaxEntries          = 128
+	lifecycleJobTerminalRetention   = time.Hour
+	maintenanceLeaseHeader          = "X-Maintenance-Lease"
+	resetVerificationTimeout        = 2 * time.Minute
+	resetVerificationPollInterval   = time.Second
+	resetVerificationHTTPTimeout    = 5 * time.Second
+	authenticatedHTTPDefaultTimeout = 10 * time.Second
+	maxVerificationResponseBytes    = 256 << 10
+	isolatedServerWorldID           = "1"
 	// sharedComposeProjectName은 docker-compose.shared.yml의 고정 project name(top-level
 	// `name:`)과 반드시 일치해야 한다. 게임 서버 id가 이 이름과 충돌하는 compose project를
 	// 만들어내면 down --volumes가 공유 스택을 파괴할 수 있다(#32).
@@ -289,6 +290,7 @@ type config struct {
 	ghcrToken                 string // GHCR 조회 토큰(private면 필요, 없으면 익명)
 	ghcrAPIBaseURL            string
 	localHTTPBaseURL          string
+	authenticatedHTTPTimeout  time.Duration
 	dockerRunner              func(args ...string) (string, error)
 	dockerRunnerContext       func(context.Context, ...string) (string, error)
 	httpGet                   func(context.Context, string) (int, []byte, error)
@@ -1619,24 +1621,25 @@ func loadConfig() (config, error) {
 		return config{}, err
 	}
 	c := config{
-		token:                   os.Getenv("DEPLOYER_TOKEN"),
-		composeDir:              envOr("COMPOSE_DIR", "/workspace"),
-		composeHostDir:          envOr("COMPOSE_HOST_DIR", envOr("PWD", ".")),
-		serversDir:              serversDir,
-		composeServer:           envOr("COMPOSE_SERVER_FILE", "/workspace/docker-compose.server.yml"),
-		composeShared:           envOr("COMPOSE_SHARED_FILE", "/workspace/docker-compose.shared.yml"),
-		ghcrOwner:               envOr("GHCR_OWNER", "peppone-choi"),
-		ghcrToken:               os.Getenv("GHCR_TOKEN"),
-		ghcrAPIBaseURL:          envOr("DEPLOYER_GHCR_API_BASE_URL", "https://api.github.com"),
-		localHTTPBaseURL:        "http://localhost:9000",
-		gameAPIInternalPort:     envOr("DEPLOYER_GAME_API_INTERNAL_PORT", "8081"),
-		gameEngineInternalPort:  envOr("DEPLOYER_GAME_ENGINE_INTERNAL_PORT", "8082"),
-		gatewayAPIURL:           envOr("DEPLOYER_GATEWAY_API_URL", "http://gateway-api:8080"),
-		lifecycleJobs:           jobs,
-		lifecycleOperationStore: operationStore,
-		maintenanceFile:         envOr("DEPLOYER_MAINTENANCE_FILE", "/workspace/servers/.deployer-maintenance"),
-		lifecycleJournalFile:    envOr("DEPLOYER_LIFECYCLE_JOURNAL_FILE", filepath.Join(serversDir, ".deployer-lifecycle-journal")),
-		sharedEnvMu:             &sync.Mutex{},
+		token:                    os.Getenv("DEPLOYER_TOKEN"),
+		composeDir:               envOr("COMPOSE_DIR", "/workspace"),
+		composeHostDir:           envOr("COMPOSE_HOST_DIR", envOr("PWD", ".")),
+		serversDir:               serversDir,
+		composeServer:            envOr("COMPOSE_SERVER_FILE", "/workspace/docker-compose.server.yml"),
+		composeShared:            envOr("COMPOSE_SHARED_FILE", "/workspace/docker-compose.shared.yml"),
+		ghcrOwner:                envOr("GHCR_OWNER", "peppone-choi"),
+		ghcrToken:                os.Getenv("GHCR_TOKEN"),
+		ghcrAPIBaseURL:           envOr("DEPLOYER_GHCR_API_BASE_URL", "https://api.github.com"),
+		localHTTPBaseURL:         "http://localhost:9000",
+		authenticatedHTTPTimeout: authenticatedHTTPDefaultTimeout,
+		gameAPIInternalPort:      envOr("DEPLOYER_GAME_API_INTERNAL_PORT", "8081"),
+		gameEngineInternalPort:   envOr("DEPLOYER_GAME_ENGINE_INTERNAL_PORT", "8082"),
+		gatewayAPIURL:            envOr("DEPLOYER_GATEWAY_API_URL", "http://gateway-api:8080"),
+		lifecycleJobs:            jobs,
+		lifecycleOperationStore:  operationStore,
+		maintenanceFile:          envOr("DEPLOYER_MAINTENANCE_FILE", "/workspace/servers/.deployer-maintenance"),
+		lifecycleJournalFile:     envOr("DEPLOYER_LIFECYCLE_JOURNAL_FILE", filepath.Join(serversDir, ".deployer-lifecycle-journal")),
+		sharedEnvMu:              &sync.Mutex{},
 	}
 	c.operations = newOperationCoordinator(c.maintenanceFile, c.lifecycleJournalFile, jobs)
 	if err := c.recoverDurableLifecycleOperations(); err != nil {
@@ -2270,11 +2273,18 @@ func main() {
 	if len(os.Args) == 2 && os.Args[1] == "--check-registry" {
 		os.Exit(checkRegistryCommand(cfg, os.Stderr))
 	}
-	if len(os.Args) == 4 && os.Args[1] == "--authenticated-http" {
+	if (len(os.Args) == 4 || len(os.Args) == 5) && os.Args[1] == "--authenticated-http" {
+		if len(os.Args) == 5 {
+			timeoutSeconds, err := strconv.Atoi(os.Args[4])
+			if err != nil || timeoutSeconds < 1 || timeoutSeconds > 300 {
+				log.Fatal("authenticated HTTP timeout must be an integer from 1 to 300 seconds")
+			}
+			cfg.authenticatedHTTPTimeout = time.Duration(timeoutSeconds) * time.Second
+		}
 		os.Exit(authenticatedHTTPCommand(cfg, os.Args[2], os.Args[3], os.Stdin, os.Stdout, os.Stderr))
 	}
 	if len(os.Args) != 1 {
-		log.Fatal("usage: deployer [--check-running-registry-targets|--check-registry-targets|--check-registry|--authenticated-http METHOD PATH]")
+		log.Fatal("usage: deployer [--check-running-registry-targets|--check-registry-targets|--check-registry|--authenticated-http METHOD PATH [TIMEOUT_SECONDS]]")
 	}
 	if cfg.token == "" {
 		log.Fatal("DEPLOYER_TOKEN 미설정 — 인증 토큰 필수")
@@ -2324,7 +2334,11 @@ func authenticatedHTTPCommand(c config, method, requestPath string, input io.Rea
 	if baseURL == "" {
 		baseURL = "http://localhost:9000"
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	timeout := c.authenticatedHTTPTimeout
+	if timeout <= 0 {
+		timeout = authenticatedHTTPDefaultTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	var body io.Reader
 	if method == http.MethodPost {
@@ -2340,7 +2354,7 @@ func authenticatedHTTPCommand(c config, method, requestPath string, input io.Rea
 		req.Header.Set("Content-Type", "application/json")
 	}
 	client := &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: timeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},

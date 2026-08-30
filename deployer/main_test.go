@@ -3348,6 +3348,38 @@ func TestAuthenticatedHTTPCommandUsesInheritedTokenWithoutLeakingIt(t *testing.T
 	}
 }
 
+func TestAuthenticatedHTTPCommandHonorsConfiguredTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(40 * time.Millisecond)
+		_, _ = w.Write([]byte(`{"state":"drained"}`))
+	}))
+	defer server.Close()
+
+	for _, testCase := range []struct {
+		name       string
+		timeout    time.Duration
+		wantStatus int
+	}{
+		{name: "short timeout fails", timeout: 10 * time.Millisecond, wantStatus: 1},
+		{name: "recovery timeout succeeds", timeout: 200 * time.Millisecond, wantStatus: 0},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			var output, diagnostics bytes.Buffer
+			status := authenticatedHTTPCommand(
+				config{token: "test-token", localHTTPBaseURL: server.URL, authenticatedHTTPTimeout: testCase.timeout},
+				http.MethodPost,
+				"/maintenance/repair",
+				nil,
+				&output,
+				&diagnostics,
+			)
+			if status != testCase.wantStatus {
+				t.Fatalf("status=%d, want %d diagnostics=%q", status, testCase.wantStatus, diagnostics.String())
+			}
+		})
+	}
+}
+
 func TestAuthenticatedHTTPCommandRejectsExternalOrErrorRequests(t *testing.T) {
 	var output, diagnostics bytes.Buffer
 	status := authenticatedHTTPCommand(config{token: "test-token"}, http.MethodGet, "//outside.example/maintenance", nil, &output, &diagnostics)
@@ -3591,8 +3623,16 @@ func TestMaintenanceWorkflowsVerifyOrRepairLifecycleBeforeMutation(t *testing.T)
 	}
 	for name, check := range checks {
 		t.Run(name, func(t *testing.T) {
-			if !strings.Contains(check.workflow, "deployer_http_ready()") || !strings.Contains(check.workflow, "maintenance_post /maintenance/repair") {
+			if !strings.Contains(check.workflow, "deployer_http_ready()") || !strings.Contains(check.workflow, "maintenance_repair") {
 				t.Fatalf("%s workflow lacks ready-or-repair lifecycle recovery contract", name)
+			}
+			for _, want := range []string{
+				`docker_exec_bounded "$WORKFLOW_DEADLINE" 300 opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST /maintenance/repair 285`,
+				`docker logs --tail 200 opensamguk-deployer`,
+			} {
+				if !strings.Contains(check.workflow, want) {
+					t.Fatalf("%s workflow lacks bounded lifecycle recovery diagnostic contract %q", name, want)
+				}
 			}
 			recovery := strings.LastIndex(check.workflow, "if ! ensure_lifecycle_recovery; then")
 			mutation := strings.Index(check.workflow, check.mutation)
