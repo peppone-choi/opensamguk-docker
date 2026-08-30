@@ -190,6 +190,24 @@ jobs:
           dump_lifecycle_recovery_diagnostics() {
             echo "::group::deployer lifecycle recovery diagnostics"
             run_bounded "$WORKFLOW_DEADLINE" 20 sudo docker logs --tail 200 opensamguk-deployer 2>&1 || true
+            local RECOVERY_INTERNAL_ID
+            RECOVERY_INTERNAL_ID="$(run_bounded "$WORKFLOW_DEADLINE" 10 python3 - "$STACK/servers/.deployer-lifecycle-journal" <<'PY'
+          import json, pathlib, re, sys
+          path = pathlib.Path(sys.argv[1])
+          try:
+              payload = json.loads(path.read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError):
+              raise SystemExit(1)
+          server_id = payload.get("serverId") if isinstance(payload, dict) else None
+          if not isinstance(server_id, str) or re.fullmatch(r"[a-z0-9]{1,48}", server_id) is None:
+              raise SystemExit(1)
+          print("s" + server_id)
+          PY
+            )" || RECOVERY_INTERNAL_ID=""
+            if [ -n "$RECOVERY_INTERNAL_ID" ]; then
+              run_bounded "$WORKFLOW_DEADLINE" 20 sudo docker ps -a --filter "name=${RECOVERY_INTERNAL_ID}-game-engine" --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' 2>&1 || true
+              run_bounded "$WORKFLOW_DEADLINE" 20 sudo docker logs --tail 200 "${RECOVERY_INTERNAL_ID}-game-engine" 2>&1 || true
+            fi
             echo "::endgroup::"
           }
           deployer_http_ready() {
