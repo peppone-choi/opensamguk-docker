@@ -205,7 +205,9 @@ jobs:
           COMPOSE="sudo docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env"
           run_bounded "$WORKFLOW_DEADLINE" 900 $COMPOSE build deployer
           run_bounded "$WORKFLOW_DEADLINE" 120 sudo docker run --rm --read-only --network none \
+            --tmpfs /tmp:rw,noexec,nosuid,size=1m \
             -e COMPOSE_DIR=/workspace \
+            -e DEPLOYER_OPERATION_STORE_FILE=/tmp/deployer-operations.json \
             -v "$STACK/.env:/workspace/.env:ro" \
             -v "$STACK/servers:/workspace/servers:ro" \
             opensamguk-deployer:local --check-registry-targets
@@ -246,7 +248,9 @@ jobs:
             exit 1
           fi
           run_bounded "$WORKFLOW_DEADLINE" 120 sudo docker run --rm --read-only --network none \
+            --tmpfs /tmp:rw,noexec,nosuid,size=1m \
             -e COMPOSE_DIR=/workspace \
+            -e DEPLOYER_OPERATION_STORE_FILE=/tmp/deployer-operations.json \
             -v "$STACK/.env:/workspace/.env:ro" \
             -v "$STACK/servers:/workspace/servers:ro" \
             opensamguk-deployer:local --check-registry
