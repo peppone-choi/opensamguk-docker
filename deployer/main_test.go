@@ -3628,6 +3628,10 @@ func TestMaintenanceWorkflowsVerifyOrRepairLifecycleBeforeMutation(t *testing.T)
 			}
 			for _, want := range []string{
 				`docker_exec_bounded "$WORKFLOW_DEADLINE" 300 opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST /maintenance/repair 285`,
+				`/usr/local/bin/deployer --help 2>&1`,
+				`docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST /maintenance/repair >/dev/null 2>&1 || true`,
+				`for ((attempt=1; attempt<=150; attempt++))`,
+				`maintenance_get`,
 				`docker logs --tail 200 opensamguk-deployer`,
 			} {
 				if !strings.Contains(check.workflow, want) {
