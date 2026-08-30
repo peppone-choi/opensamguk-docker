@@ -2591,6 +2591,7 @@ func (c config) handleMaintenance(w http.ResponseWriter, r *http.Request) {
 		respond(state, "")
 	case r.Method == http.MethodPost && r.URL.Path == "/maintenance/repair":
 		if err := c.repairLifecycleJournal(); err != nil {
+			log.Printf("maintenance repair failed: %v", err)
 			if errors.Is(err, errDockerUnreachable) {
 				w.Header().Set("Retry-After", "5")
 				writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: err.Error()})
