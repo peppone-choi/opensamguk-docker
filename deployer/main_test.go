@@ -3686,6 +3686,10 @@ func TestMaintenanceWorkflowsVerifyOrRepairLifecycleBeforeMutation(t *testing.T)
 				`for ((attempt=1; attempt<=150; attempt++))`,
 				`maintenance_get`,
 				`docker logs --tail 200 opensamguk-deployer`,
+				`servers/.deployer-lifecycle-journal`,
+				`re.fullmatch(r"[a-z0-9]{1,48}", server_id)`,
+				`docker ps -a --filter "name=${RECOVERY_INTERNAL_ID}-game-engine"`,
+				`docker logs --tail 200 "${RECOVERY_INTERNAL_ID}-game-engine"`,
 			} {
 				if !strings.Contains(check.workflow, want) {
 					t.Fatalf("%s workflow lacks bounded lifecycle recovery diagnostic contract %q", name, want)
