@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -637,6 +638,259 @@ func TestMaintenanceAPIBearerLoopbackAndIdempotency(t *testing.T) {
 	if _, err := os.Stat(cfg.maintenanceFile); !os.IsNotExist(err) {
 		t.Fatalf("maintenance marker remained after leave: %v", err)
 	}
+}
+
+func TestEnterMaintenanceIfIdleRejectsActiveWorkWithoutCancellationAndLaterSucceeds(t *testing.T) {
+	cfg := testConfig(t)
+	jobID, err := cfg.lifecycleJobs.reserve()
+	if err != nil {
+		t.Fatalf("reserve lifecycle job: %v", err)
+	}
+	lease, err := cfg.operations.begin(jobID)
+	if err != nil {
+		t.Fatalf("begin active operation: %v", err)
+	}
+
+	state, token, err := cfg.operations.enterMaintenanceIfIdle()
+	if !errors.Is(err, errMaintenanceIdleConflict) || state != maintenanceStateOpen || token != "" {
+		t.Fatalf("busy idle admission state=%q token=%q err=%v", state, token, err)
+	}
+	if lease.Context().Err() != nil {
+		t.Fatal("busy idle admission cancelled the active operation")
+	}
+	if cfg.operations.maintenanceState() != maintenanceStateOpen {
+		t.Fatal("busy idle admission changed the maintenance barrier")
+	}
+	if cfg.operations.maintenanceLease != nil {
+		t.Fatal("busy idle admission created a maintenance lease")
+	}
+	if _, err := os.Stat(cfg.maintenanceFile); !os.IsNotExist(err) {
+		t.Fatalf("busy idle admission created a marker: %v", err)
+	}
+	cfg.lifecycleJobs.mu.Lock()
+	job := cfg.lifecycleJobs.jobs[jobID]
+	cfg.lifecycleJobs.mu.Unlock()
+	if job.status != lifecycleJobRunning || job.cancelRequested {
+		t.Fatalf("busy idle admission changed lifecycle cancellation state: %#v", job)
+	}
+
+	lease.Done()
+	cfg.lifecycleJobs.finish(jobID, lifecycleJobSucceeded)
+	state, token, err = cfg.operations.enterMaintenanceIfIdle()
+	if err != nil || state != maintenanceStateDrained || !lifecycleJobIDRe.MatchString(token) {
+		t.Fatalf("later idle admission state=%q token=%q err=%v", state, token, err)
+	}
+}
+
+func TestEnterMaintenanceIfIdleRejectsExistingBarrierAndJournalStates(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		setup func(*testing.T, config)
+	}{
+		{
+			name: "closed coordinator",
+			setup: func(t *testing.T, cfg config) {
+				cfg.operations.closed = true
+			},
+		},
+		{
+			name: "persisted marker",
+			setup: func(t *testing.T, cfg config) {
+				writeEnv(t, cfg.maintenanceFile, "existing marker\n")
+			},
+		},
+		{
+			name: "journal pending",
+			setup: func(t *testing.T, cfg config) {
+				cfg.operations.journalPending = true
+			},
+		},
+		{
+			name: "persisted journal",
+			setup: func(t *testing.T, cfg config) {
+				writeEnv(t, cfg.lifecycleJournalFile, "existing journal\n")
+			},
+		},
+		{
+			name: "unreadable marker path",
+			setup: func(t *testing.T, cfg config) {
+				parentFile := filepath.Join(filepath.Dir(cfg.maintenanceFile), "not-a-directory")
+				writeEnv(t, parentFile, "file\n")
+				cfg.operations.markerPath = filepath.Join(parentFile, "marker")
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			cfg := testConfig(t)
+			testCase.setup(t, cfg)
+			state, token, err := cfg.operations.enterMaintenanceIfIdle()
+			if !errors.Is(err, errMaintenanceIdleConflict) || token != "" {
+				t.Fatalf("conflicting idle admission state=%q token=%q err=%v", state, token, err)
+			}
+			if cfg.operations.maintenanceLease != nil {
+				t.Fatal("conflicting idle admission created a lease")
+			}
+		})
+	}
+}
+
+func TestEnterMaintenanceIfIdlePersistsBeforeClosingAndRefusesDuplicate(t *testing.T) {
+	cfg := testConfig(t)
+	state, token, err := cfg.operations.enterMaintenanceIfIdle()
+	if err != nil || state != maintenanceStateDrained || !lifecycleJobIDRe.MatchString(token) {
+		t.Fatalf("idle admission state=%q token=%q err=%v", state, token, err)
+	}
+	if got := readFile(t, cfg.maintenanceFile); got != "{\"capability\":\"maintenance-v1\"}\n" {
+		t.Fatalf("maintenance marker = %q", got)
+	}
+	if cfg.operations.maintenanceState() != maintenanceStateDrained {
+		t.Fatal("successful idle admission did not close the barrier")
+	}
+	if lease, beginErr := cfg.operations.begin(""); !errors.Is(beginErr, errMaintenanceClosed) || lease != nil {
+		t.Fatalf("mutation began after idle admission lease=%#v err=%v", lease, beginErr)
+	}
+
+	duplicateState, duplicateToken, duplicateErr := cfg.operations.enterMaintenanceIfIdle()
+	if !errors.Is(duplicateErr, errMaintenanceIdleConflict) || duplicateState != maintenanceStateDrained || duplicateToken != "" {
+		t.Fatalf("duplicate idle admission state=%q token=%q err=%v", duplicateState, duplicateToken, duplicateErr)
+	}
+}
+
+func TestEnterMaintenanceIfIdleFailsClosedWhenDirectorySyncFailsAfterRename(t *testing.T) {
+	cfg := testConfig(t)
+	injected := errors.New("injected maintenance marker directory sync failure")
+	syncCalled := false
+	cfg.operations.writeMarker = func(path string) (bool, error) {
+		return writeMaintenanceMarkerDurableWithSync(path, func(string) error {
+			syncCalled = true
+			return injected
+		})
+	}
+
+	state, token, err := cfg.operations.enterMaintenanceIfIdle()
+	if !errors.Is(err, injected) || state != maintenanceStateDrained || token != "" {
+		t.Fatalf("post-rename sync failure state=%q token=%q err=%v", state, token, err)
+	}
+	if !syncCalled {
+		t.Fatal("durable marker write did not sync the containing directory")
+	}
+	if got := readFile(t, cfg.maintenanceFile); got != "{\"capability\":\"maintenance-v1\"}\n" {
+		t.Fatalf("committed marker after sync failure = %q", got)
+	}
+	if !cfg.operations.closed || cfg.operations.maintenanceLease != nil {
+		t.Fatal("post-rename sync failure left an admitting coordinator or usable lease")
+	}
+	if lease, beginErr := cfg.operations.begin(""); lease != nil || !errors.Is(beginErr, errMaintenanceClosed) {
+		t.Fatalf("mutation admitted beside post-rename marker lease=%#v err=%v", lease, beginErr)
+	}
+}
+
+func TestEnterMaintenanceIfIdleAdmissionIsAtomicWithBegin(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.operations.mu.Lock()
+	ready := make(chan struct{}, 2)
+	beginResult := make(chan error, 1)
+	idleResult := make(chan error, 1)
+	var admittedLease *operationLease
+	go func() {
+		ready <- struct{}{}
+		var err error
+		admittedLease, err = cfg.operations.begin("")
+		beginResult <- err
+	}()
+	go func() {
+		ready <- struct{}{}
+		_, _, err := cfg.operations.enterMaintenanceIfIdle()
+		idleResult <- err
+	}()
+	<-ready
+	<-ready
+	cfg.operations.mu.Unlock()
+
+	beginErr := <-beginResult
+	idleErr := <-idleResult
+	beginWon := beginErr == nil
+	idleWon := idleErr == nil
+	if beginWon == idleWon {
+		t.Fatalf("atomic admission winners begin=%t idle=%t beginErr=%v idleErr=%v", beginWon, idleWon, beginErr, idleErr)
+	}
+	if beginWon {
+		if !errors.Is(idleErr, errMaintenanceIdleConflict) {
+			t.Fatalf("begin winner got idle error %v", idleErr)
+		}
+		admittedLease.Done()
+	} else if !errors.Is(beginErr, errMaintenanceClosed) {
+		t.Fatalf("idle winner got begin error %v", beginErr)
+	}
+}
+
+func TestMaintenanceEnterIfIdleHTTPBoundaries(t *testing.T) {
+	cfg := testConfig(t)
+	handler := cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance))
+
+	unauthorized := httptest.NewRecorder()
+	unauthorizedRequest := httptest.NewRequest(http.MethodPost, "/maintenance/enter-if-idle", nil)
+	unauthorizedRequest.RemoteAddr = "127.0.0.1:31000"
+	handler(unauthorized, unauthorizedRequest)
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized idle admission = %d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+
+	nonLoopback := httptest.NewRecorder()
+	nonLoopbackRequest := httptest.NewRequest(http.MethodPost, "/maintenance/enter-if-idle", nil)
+	nonLoopbackRequest.Header.Set("Authorization", "Bearer test-token")
+	nonLoopbackRequest.RemoteAddr = "198.51.100.4:31000"
+	handler(nonLoopback, nonLoopbackRequest)
+	if nonLoopback.Code != http.StatusForbidden {
+		t.Fatalf("non-loopback idle admission = %d body=%s", nonLoopback.Code, nonLoopback.Body.String())
+	}
+
+	success := loopbackRequest(t, handler, http.MethodPost, "/maintenance/enter-if-idle", "")
+	var successPayload map[string]any
+	if err := json.Unmarshal(success.Body.Bytes(), &successPayload); err != nil {
+		t.Fatalf("decode idle admission success: %v", err)
+	}
+	if success.Code != http.StatusOK || len(successPayload) != 3 || successPayload["capability"] != "maintenance-v1" || successPayload["state"] != "drained" || !lifecycleJobIDRe.MatchString(fmt.Sprint(successPayload["lease"])) {
+		t.Fatalf("idle admission success = %d body=%s", success.Code, success.Body.String())
+	}
+
+	duplicate := loopbackRequest(t, handler, http.MethodPost, "/maintenance/enter-if-idle", "")
+	if duplicate.Code != http.StatusConflict || duplicate.Body.String() != "{\"error\":\"maintenance idle admission unavailable\"}\n" || strings.Contains(duplicate.Body.String(), fmt.Sprint(successPayload["lease"])) {
+		t.Fatalf("duplicate idle admission = %d body=%s", duplicate.Code, duplicate.Body.String())
+	}
+
+	wrongMethod := loopbackRequest(t, handler, http.MethodGet, "/maintenance/enter-if-idle", "")
+	if wrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("idle admission wrong method = %d body=%s", wrongMethod.Code, wrongMethod.Body.String())
+	}
+}
+
+func TestMaintenanceEnterIfIdleHTTPMapsUnavailableAndPersistenceFailure(t *testing.T) {
+	t.Run("nil coordinator", func(t *testing.T) {
+		cfg := testConfig(t)
+		cfg.operations = nil
+		response := loopbackRequest(t, cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance)), http.MethodPost, "/maintenance/enter-if-idle", "")
+		if response.Code != http.StatusServiceUnavailable || response.Body.String() != "{\"error\":\"maintenance coordinator unavailable\"}\n" {
+			t.Fatalf("nil coordinator = %d body=%s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("marker persistence failure", func(t *testing.T) {
+		cfg := testConfig(t)
+		unwritable := filepath.Join(filepath.Dir(cfg.maintenanceFile), "unwritable")
+		if err := os.Mkdir(unwritable, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(unwritable, 0o700) })
+		cfg.operations.markerPath = filepath.Join(unwritable, "marker")
+		response := loopbackRequest(t, cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance)), http.MethodPost, "/maintenance/enter-if-idle", "")
+		if response.Code != http.StatusInternalServerError || response.Body.String() != "{\"error\":\"maintenance idle admission failed\"}\n" {
+			t.Fatalf("persistence failure = %d body=%s", response.Code, response.Body.String())
+		}
+		if cfg.operations.closed || cfg.operations.maintenanceLease != nil {
+			t.Fatal("persistence failure mutated coordinator")
+		}
+	})
 }
 
 func TestMaintenanceRepairLogsInternalFailureWithoutReturningIt(t *testing.T) {
@@ -3518,6 +3772,7 @@ func TestAuthenticatedHTTPCommandAllowsOnlyWorkflowRoutes(t *testing.T) {
 	}{
 		{method: http.MethodGet, path: "/maintenance"},
 		{method: http.MethodPost, path: "/maintenance/enter"},
+		{method: http.MethodPost, path: "/maintenance/enter-if-idle"},
 		{method: http.MethodPost, path: "/maintenance/leave"},
 		{method: http.MethodPost, path: "/maintenance/repair"},
 		{method: http.MethodGet, path: "/jobs/" + jobID},
@@ -3530,8 +3785,127 @@ func TestAuthenticatedHTTPCommandAllowsOnlyWorkflowRoutes(t *testing.T) {
 			t.Fatalf("allowed helper route method=%q path=%q status=%d output=%q diagnostics=%q", testCase.method, testCase.path, status, output.String(), diagnostics.String())
 		}
 	}
-	if got := requests.Load(); got != 7 {
-		t.Fatalf("allowed helper routes reached listener %d times, want 7", got)
+	if got := requests.Load(); got != 8 {
+		t.Fatalf("allowed helper routes reached listener %d times, want 8", got)
+	}
+}
+
+func TestAuthenticatedHTTPModeDoesNotRecoverDurableStoreBeforeExit(t *testing.T) {
+	buildDir := t.TempDir()
+	binary := filepath.Join(buildDir, "deployer")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build deployer subprocess: %v\n%s", err, output)
+	}
+	listener, err := net.Listen("tcp4", "127.0.0.1:9000")
+	if err != nil {
+		t.Fatalf("listen for authenticated HTTP subprocess: %v", err)
+	}
+	var requests atomic.Int32
+	requestDetails := make(chan [3]string, 1)
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		requestDetails <- [3]string{r.Method, r.URL.Path, r.Header.Get("Authorization")}
+		_, _ = w.Write([]byte(`{"capability":"maintenance-v1","state":"open"}`))
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+
+	operationID := "1234567890abcdef1234567890abcdef"
+	now := time.Date(2026, time.September, 5, 0, 0, 0, 0, time.UTC)
+	document := durableOperationDocument{
+		Version: durableOperationStoreVersion,
+		Operations: []durableOperationRecord{{
+			OperationID:        operationID,
+			Kind:               lifecycleKindReset,
+			SubjectID:          "pep",
+			RequestFingerprint: strings.Repeat("a", 64),
+			Status:             lifecycleJobRunning,
+			CreatedAt:          now,
+			UpdatedAt:          now,
+		}},
+	}
+	original, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original = append(original, '\n')
+
+	for _, testCase := range []struct {
+		name  string
+		args  []string
+		token string
+	}{
+		{name: "missing token", args: []string{"--authenticated-http", http.MethodGet, "/maintenance"}},
+		{name: "invalid timeout", args: []string{"--authenticated-http", http.MethodGet, "/maintenance", "invalid"}, token: "test-token"},
+		{name: "invalid route", args: []string{"--authenticated-http", http.MethodGet, "/status"}, token: "test-token"},
+		{name: "invalid usage", args: []string{"--unknown"}, token: "test-token"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			root := t.TempDir()
+			storePath := filepath.Join(root, durableOperationStoreFileName)
+			if err := os.WriteFile(storePath, original, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command(binary, testCase.args...)
+			command.Env = commandEnvironment(
+				"DEPLOYER_TOKEN="+testCase.token,
+				"SERVERS_DIR="+root,
+				"DEPLOYER_OPERATION_STORE_FILE="+storePath,
+				"DEPLOYER_MAINTENANCE_FILE="+filepath.Join(root, ".deployer-maintenance"),
+				"DEPLOYER_LIFECYCLE_JOURNAL_FILE="+filepath.Join(root, ".deployer-lifecycle-journal"),
+			)
+			if err := command.Run(); err == nil {
+				t.Fatal("invalid HTTP-only subprocess unexpectedly succeeded")
+			}
+			after, err := os.ReadFile(storePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(after, original) {
+				t.Fatalf("HTTP-only subprocess recovered durable store\nbefore=%s\nafter=%s", original, after)
+			}
+			if got := requests.Load(); got != 0 {
+				t.Fatalf("invalid HTTP-only subprocess made %d request(s)", got)
+			}
+		})
+	}
+
+	root := t.TempDir()
+	storePath := filepath.Join(root, durableOperationStoreFileName)
+	if err := os.WriteFile(storePath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	valid := exec.Command(binary, "--authenticated-http", http.MethodGet, "/maintenance")
+	valid.Env = commandEnvironment(
+		"DEPLOYER_TOKEN=test-token",
+		"SERVERS_DIR="+root,
+		"DEPLOYER_OPERATION_STORE_FILE="+storePath,
+		"DEPLOYER_MAINTENANCE_FILE="+filepath.Join(root, ".deployer-maintenance"),
+		"DEPLOYER_LIFECYCLE_JOURNAL_FILE="+filepath.Join(root, ".deployer-lifecycle-journal"),
+	)
+	var output bytes.Buffer
+	valid.Stdout = &output
+	if err := valid.Run(); err != nil {
+		t.Fatalf("valid authenticated HTTP subprocess: %v", err)
+	}
+	if output.String() != `{"capability":"maintenance-v1","state":"open"}` {
+		t.Fatalf("valid authenticated HTTP output = %q", output.String())
+	}
+	select {
+	case details := <-requestDetails:
+		if details != [3]string{http.MethodGet, "/maintenance", "Bearer test-token"} {
+			t.Fatalf("valid authenticated HTTP request = %#v", details)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("valid authenticated HTTP subprocess made no request")
+	}
+	after, err := os.ReadFile(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, original) {
+		t.Fatalf("valid authenticated HTTP subprocess recovered durable store\nbefore=%s\nafter=%s", original, after)
 	}
 }
 
@@ -3544,7 +3918,6 @@ func TestMaintenanceWorkflowsKeepCredentialsOutOfEverySpawnedProcessArgument(t *
 	for name, workflow := range workflows {
 		t.Run(name, func(t *testing.T) {
 			for _, forbidden := range []string{
-				"DEPLOYER_TOKEN",
 				"Authorization: Bearer",
 				"docker exec -e",
 				"-e DEPLOYER_TOKEN=",
@@ -3553,6 +3926,15 @@ func TestMaintenanceWorkflowsKeepCredentialsOutOfEverySpawnedProcessArgument(t *
 				if strings.Contains(workflow, forbidden) {
 					t.Fatalf("%s workflow exposes a credential in a spawned process argument with %q", name, forbidden)
 				}
+			}
+			if name == "deploy" {
+				if !strings.Contains(workflow, `token = os.environ.get("DEPLOYER_TOKEN", "")`) {
+					t.Fatal("deploy workflow does not read its token inside the container-side HTTP process")
+				}
+				return
+			}
+			if strings.Contains(workflow, "DEPLOYER_TOKEN") {
+				t.Fatalf("%s workflow exposes DEPLOYER_TOKEN outside the container-side helper", name)
 			}
 			if !strings.Contains(workflow, "/usr/local/bin/deployer --authenticated-http") {
 				t.Fatalf("%s workflow does not use the container-side authenticated HTTP helper", name)
@@ -3588,7 +3970,7 @@ func TestMaintenanceWorkflowOrderingAndLegacyFailClosedBoundary(t *testing.T) {
 	}
 	assertOrder(t, deploy,
 		"exec 9>/tmp/opensamguk-production.lock",
-		"maintenance_post /maintenance/enter",
+		"maintenance_post /maintenance/enter-if-idle",
 		"git merge --ff-only origin/main",
 		"$COMPOSE build deployer",
 		"opensamguk-deployer:local --check-registry-targets",
@@ -3615,7 +3997,11 @@ func TestMaintenanceWorkflowOrderingAndLegacyFailClosedBoundary(t *testing.T) {
 
 	for name, workflow := range map[string]string{"deploy": deploy, "start": start, "recreate": recreate} {
 		t.Run(name, func(t *testing.T) {
-			legacy := strings.Index(workflow, "running deployer lacks a valid maintenance-v1 capability")
+			legacyMessage := "running deployer lacks a valid maintenance-v1 capability"
+			if name == "deploy" {
+				legacyMessage = "running deployer is busy or lacks atomic idle admission"
+			}
+			legacy := strings.Index(workflow, legacyMessage)
 			marker := strings.Index(workflow, `: > "$STACK/servers/.deployer-maintenance"`)
 			merge := strings.Index(workflow, "git merge --ff-only origin/main")
 			if legacy < 0 || marker < 0 || merge < 0 || !(legacy < marker && marker < merge) {
@@ -3680,9 +4066,6 @@ func TestMaintenanceWorkflowsVerifyOrRepairLifecycleBeforeMutation(t *testing.T)
 				t.Fatalf("%s workflow lacks ready-or-repair lifecycle recovery contract", name)
 			}
 			for _, want := range []string{
-				`docker_exec_bounded "$WORKFLOW_DEADLINE" 300 opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST /maintenance/repair 285`,
-				`/usr/local/bin/deployer --help 2>&1`,
-				`docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST /maintenance/repair >/dev/null 2>&1 || true`,
 				`for ((attempt=1; attempt<=150; attempt++))`,
 				`maintenance_get`,
 				`docker logs --tail 200 opensamguk-deployer`,
@@ -3693,6 +4076,23 @@ func TestMaintenanceWorkflowsVerifyOrRepairLifecycleBeforeMutation(t *testing.T)
 			} {
 				if !strings.Contains(check.workflow, want) {
 					t.Fatalf("%s workflow lacks bounded lifecycle recovery diagnostic contract %q", name, want)
+				}
+			}
+			if name == "deploy" {
+				for _, want := range []string{`maintenance_post /maintenance/repair 285`, `python3 -c '`, `class NoRedirect`} {
+					if !strings.Contains(check.workflow, want) {
+						t.Fatalf("deploy workflow lacks container-direct lifecycle repair contract %q", want)
+					}
+				}
+			} else {
+				for _, want := range []string{
+					`docker_exec_bounded "$WORKFLOW_DEADLINE" 300 opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST /maintenance/repair 285`,
+					`/usr/local/bin/deployer --help 2>&1`,
+					`docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST /maintenance/repair >/dev/null 2>&1 || true`,
+				} {
+					if !strings.Contains(check.workflow, want) {
+						t.Fatalf("%s workflow lacks legacy-compatible lifecycle repair contract %q", name, want)
+					}
 				}
 			}
 			recovery := strings.LastIndex(check.workflow, "if ! ensure_lifecycle_recovery; then")

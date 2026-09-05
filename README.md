@@ -177,7 +177,10 @@ nginx `/health`를 항상 확인하고,
 호스트 workflow끼리는 `/tmp/opensamguk-production.lock`으로 직렬화하지만, 직접 deployer API 호출까지 이 lock을
 공유하지는 않는다. 그래서 deployer는 `servers/.deployer-maintenance`라는 영속 marker를 별도로 사용한다. marker가
 있으면 새 deployer 프로세스도 closed 상태로 부팅하며, 새 mutation은 `503`과 `Retry-After`를 받고, 진행 중인
-mutation은 취소된 context가 Docker runner에서 실제 반환할 때까지 drain한다.
+mutation은 취소된 context가 Docker runner에서 실제 반환할 때까지 drain한다. 일반 `enter`는 이 취소·drain 동작을
+가지지만, Deploy Orchestration은 활성 작업이 없을 때만 원자적으로 marker를 잡는 `enter-if-idle`만 사용한다.
+활성 작업, 이미 닫힌 barrier, marker, 복구 journal 중 하나라도 있으면 `409`로 거부하며 작업을 취소하거나
+새 marker·lease를 만들지 않는다.
 
 deployer는 socket-proxy 경유로만 Docker에 닿으므로, 모든 mutation admission(`create`/`delete`/`reset`/`deploy`/env
 patch)과 maintenance repair는 journal·env를 건드리기 전에 `docker version` 도달성 프리플라이트(3초)를 먼저 통과해야
@@ -201,9 +204,15 @@ workflow는 deployer 컨테이너의 loopback에서만 다음 Bearer API를 호�
 ```text
 GET  /maintenance        -> {"capability":"maintenance-v1","state":"open|draining|drained"}
 POST /maintenance/enter  -> drained 후 32-hex 단발 lease를 포함해 반환
+POST /maintenance/enter-if-idle -> idle일 때만 marker를 영속하고 drained + 32-hex lease 반환; busy/기존 상태는 409
 POST /maintenance/leave  -> 성공한 workflow가 마지막에만 open
 POST /maintenance/repair -> 남은 lifecycle journal을 recovery·runtime/data·shared reload까지 검증한 뒤에만 지움 (marker가 없을 때만 open)
 ```
+
+Deploy Orchestration은 실행 중 deployer에서 `enter-if-idle`이 성공한 경우에만 checkout·build·replacement로 진행한다.
+`409`, 연결 실패, 알 수 없는 응답, 또는 이 route가 없는 구버전 controller에서는 기존의 취소하는
+`/maintenance/enter`로 fallback하지 않고 checkout 전에 종료한다. 사전 admission HTTP는 설치된 구버전 deployer 바이너를
+실행하지 않고 컨테이너 내 Python이 자신의 `DEPLOYER_TOKEN`을 읽어 loopback으로만 전송한다.
 
 **처음 설치되어 deployer 컨테이너가 전혀 없는 경우**에는 workflow가 marker를 먼저 만들고 deployer를 closed로
 기동한 뒤 확인한다. Deploy Orchestration과 Start Existing Game Server는 성공 검증 뒤에만 leave 한다. Recreate Game
@@ -245,15 +254,19 @@ Workflow polling deadline이 끝나면 "제한 시간 안에 완료를 확인하
 
 #### 구버전 deployer의 1회 bridge
 
-기존 deployer에 `/maintenance`가 없거나 404/잘못된 JSON을 반환하면 workflow는 **git merge, build, force-recreate
+기존 deployer에 `/maintenance/enter-if-idle`이 없거나 404/잘못된 JSON을 반환하면 workflow는 **git merge, build, force-recreate
 전에 중단**한다. unknown in-memory job을 자동으로 drain했다고 간주하거나 marker만 만들어 구버전을 조용히
-업그레이드하면 안 된다. 다음 증거가 있을 때만 계획된 control-plane downtime으로 1회 bridge를 수행한다.
+업그레이드하면 안 된다. 자동 fallback은 없으며, 초기 승격에는 다음 증거를 준비한 수동 1회 legacy bootstrap가
+선행되어야 한다. 이 절은 절차를 임의로 자동화하는 허가가 아니다.
 
 1. gateway가 deployer mutation을 호출하지 못하게 차단한다.
 2. host-lock workflow가 실행 중이 아님을 확인한다.
 3. 알고 있는 lifecycle job ID를 모두 cancel하고 terminal 상태까지 확인한다.
 4. unknown accepted request가 없다는 운영 증거를 확보한 뒤에만 `servers/.deployer-maintenance`를 만들고 deployer-only bridge 교체를 수행한다.
-5. 새 deployer의 loopback `/maintenance`가 `maintenance-v1` + `drained`임을 확인한 뒤 정상 Deploy Orchestration을 다시 실행한다.
+5. 새 deployer의 loopback `GET /maintenance`가 `maintenance-v1` + `drained`임을 확인하고 증거를 남긴다.
+
+이후 첫 정상 workflow 실행을 위한 barrier 상태 전환은 별도로 검토·승인된 1회 bootstrap runbook이 필요하다.
+이 문서는 marker 자동 삭제, 취소 endpoint fallback, 미확인 작업 강제 종료를 그 절차로 규정하지 않는다.
 
 unknown job이 없다는 증거를 만들 수 없으면 bridge하지 말고 control-plane downtime을 유지한다. 이 절차는 persistent
 job queue로의 자동 migration이 아니며, 기존 job 상태를 추측하거나 replay하지 않는다.
