@@ -4,12 +4,16 @@ on:
   pull_request:
     paths:
       - "deployer/**"
+      - "scripts/deploy-orchestration-admission-test.sh"
+      - ".github/workflows/deploy-orchestration.yml"
       - ".gitignore"
       - ".github/workflows/deployer-ci.yml"
   push:
     branches: [main]
     paths:
       - "deployer/**"
+      - "scripts/deploy-orchestration-admission-test.sh"
+      - ".github/workflows/deploy-orchestration.yml"
       - ".gitignore"
       - ".github/workflows/deployer-ci.yml"
 
@@ -40,5 +44,8 @@ jobs:
         run: go vet ./...
       - name: go test
         run: go test ./...
+      - name: deploy orchestration admission boundary
+        working-directory: .
+        run: bash scripts/deploy-orchestration-admission-test.sh
       - name: container build
         run: docker build --tag opensamguk-deployer:ci .

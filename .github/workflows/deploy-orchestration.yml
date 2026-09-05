@@ -82,24 +82,74 @@ jobs:
           maintenance_response_state() {
             printf '%s' "$1" | run_bounded "$WORKFLOW_DEADLINE" 10 python3 -c 'import json, re, sys; payload = json.load(sys.stdin); keys = set(payload) if isinstance(payload, dict) else set(); valid = keys in ({"capability", "state"}, {"capability", "state", "lease"}) and payload.get("capability") == "maintenance-v1" and payload.get("state") in {"open", "draining", "drained"} and ("lease" not in payload or re.fullmatch(r"[a-f0-9]{32}", payload["lease"]) is not None); valid or sys.exit(1); print(payload["state"])'
           }
+          maintenance_idle_entry_state() {
+            printf '%s' "$1" | run_bounded "$WORKFLOW_DEADLINE" 10 python3 -c 'import json, re, sys; payload = json.load(sys.stdin); valid = isinstance(payload, dict) and set(payload) == {"capability", "state", "lease"} and payload.get("capability") == "maintenance-v1" and payload.get("state") == "drained" and isinstance(payload.get("lease"), str) and re.fullmatch(r"[a-f0-9]{32}", payload["lease"]) is not None; valid or sys.exit(1); print(payload["state"])'
+          }
+          maintenance_http() {
+            local method="$1"
+            local path="$2"
+            local timeout_seconds="$3"
+            local command_timeout=$((timeout_seconds + 5))
+            docker_exec_bounded "$WORKFLOW_DEADLINE" "$command_timeout" opensamguk-deployer python3 -c '
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          method, path, timeout_text = sys.argv[1:]
+          allowed = {
+              ("GET", "/maintenance"),
+              ("POST", "/maintenance/enter-if-idle"),
+              ("POST", "/maintenance/leave"),
+              ("POST", "/maintenance/repair"),
+          }
+          if (method, path) not in allowed:
+              raise SystemExit(2)
+          try:
+              timeout_seconds = int(timeout_text)
+          except ValueError:
+              raise SystemExit(2)
+          if not 1 <= timeout_seconds <= 285:
+              raise SystemExit(2)
+          token = os.environ.get("DEPLOYER_TOKEN", "")
+          if not token:
+              raise SystemExit(2)
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          request = urllib.request.Request(
+              "http://localhost:9000" + path,
+              data=b"" if method == "POST" else None,
+              headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+              method=method,
+          )
+          try:
+              response = urllib.request.build_opener(NoRedirect).open(request, timeout=timeout_seconds)
+          except urllib.error.HTTPError as error:
+              response = error
+          except (OSError, TimeoutError, urllib.error.URLError):
+              raise SystemExit(1)
+          try:
+              body = response.read(4097)
+              status = response.status
+          finally:
+              response.close()
+          if len(body) > 4096:
+              raise SystemExit(1)
+          sys.stdout.buffer.write(body)
+          raise SystemExit(0 if 200 <= status < 300 else 8)
+          ' "$method" "$path" "$timeout_seconds"
+          }
           maintenance_get() {
-            docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer /usr/local/bin/deployer --authenticated-http GET /maintenance 2>/dev/null
+            maintenance_http GET /maintenance 10 2>/dev/null
           }
           maintenance_post() {
-            docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST "$1" 2>/dev/null
-          }
-          authenticated_http_supports_timeout() {
-            local usage
-            usage="$(docker_exec_bounded "$WORKFLOW_DEADLINE" 5 opensamguk-deployer /usr/local/bin/deployer --help 2>&1 || true)"
-            printf '%s' "$usage" | run_bounded "$WORKFLOW_DEADLINE" 5 grep -q 'TIMEOUT_SECONDS'
+            maintenance_http POST "$1" "${2:-10}" 2>/dev/null
           }
           maintenance_repair() {
-            if authenticated_http_supports_timeout; then
-              docker_exec_bounded "$WORKFLOW_DEADLINE" 300 opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST /maintenance/repair 285
-              return
-            fi
-            docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST /maintenance/repair >/dev/null 2>&1 || true
-            wait_for_lifecycle_repair && maintenance_get
+            maintenance_post /maintenance/repair 285
           }
           dump_lifecycle_recovery_diagnostics() {
             echo "::group::deployer lifecycle recovery diagnostics"
@@ -164,7 +214,13 @@ jobs:
             if wait_for_deployer_ready; then
               return 0
             fi
-            if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_repair)")" || [ "$MAINTENANCE_STATE" != drained ]; then
+            local maintenance_response
+            if ! maintenance_response="$(maintenance_repair)"; then
+              dump_lifecycle_recovery_diagnostics
+              echo "::error::deployer lifecycle recovery cannot be verified; leaving maintenance marker closed"
+              return 1
+            fi
+            if ! MAINTENANCE_STATE="$(maintenance_response_state "$maintenance_response")" || [ "$MAINTENANCE_STATE" != drained ]; then
               dump_lifecycle_recovery_diagnostics
               echo "::error::deployer lifecycle recovery cannot be verified; leaving maintenance marker closed"
               return 1
@@ -185,12 +241,12 @@ jobs:
             exit 1
           fi
           if printf '%s\n' "$DEPLOYER_RUNNING" | run_bounded "$WORKFLOW_DEADLINE" 5 grep -Fxq opensamguk-deployer; then
-            if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_get)")"; then
-              echo "::error::running deployer lacks a valid maintenance-v1 capability; aborting before control-plane mutation"
+            if ! MAINTENANCE_RESPONSE="$(maintenance_post /maintenance/enter-if-idle)"; then
+              echo "::error::running deployer is busy or lacks atomic idle admission; aborting before control-plane mutation"
               exit 1
             fi
-            if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_post /maintenance/enter)")" || [ "$MAINTENANCE_STATE" != drained ]; then
-              echo "::error::deployer maintenance drain did not reach drained; aborting before control-plane mutation"
+            if ! MAINTENANCE_STATE="$(maintenance_idle_entry_state "$MAINTENANCE_RESPONSE")" || [ "$MAINTENANCE_STATE" != drained ]; then
+              echo "::error::running deployer is busy or lacks atomic idle admission; aborting before control-plane mutation"
               exit 1
             fi
           elif printf '%s\n' "$DEPLOYER_ALL" | run_bounded "$WORKFLOW_DEADLINE" 5 grep -Fxq opensamguk-deployer; then
@@ -261,7 +317,11 @@ jobs:
           if ! ensure_lifecycle_recovery; then
             exit 1
           fi
-          if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_get)")" || [ "$MAINTENANCE_STATE" != drained ]; then
+          if ! MAINTENANCE_RESPONSE="$(maintenance_get)"; then
+            echo "::error::recreated deployer did not boot with the persisted maintenance barrier drained"
+            exit 1
+          fi
+          if ! MAINTENANCE_STATE="$(maintenance_response_state "$MAINTENANCE_RESPONSE")" || [ "$MAINTENANCE_STATE" != drained ]; then
             echo "::error::recreated deployer did not boot with the persisted maintenance barrier drained"
             exit 1
           fi
@@ -317,7 +377,11 @@ jobs:
             echo "no valid registered server; game route check skipped"
           fi
 
-          if ! MAINTENANCE_STATE="$(maintenance_response_state "$(maintenance_post /maintenance/leave)")" || [ "$MAINTENANCE_STATE" != open ]; then
+          if ! MAINTENANCE_RESPONSE="$(maintenance_post /maintenance/leave)"; then
+            echo "::error::deployer maintenance barrier did not reopen after successful orchestration verification"
+            exit 1
+          fi
+          if ! MAINTENANCE_STATE="$(maintenance_response_state "$MAINTENANCE_RESPONSE")" || [ "$MAINTENANCE_STATE" != open ]; then
             echo "::error::deployer maintenance barrier did not reopen after successful orchestration verification"
             exit 1
           fi

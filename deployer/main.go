@@ -382,10 +382,11 @@ type lifecycleJobManager struct {
 }
 
 var (
-	errMaintenanceClosed      = errors.New("maintenance barrier is closed")
-	errLifecycleJobNotPending = errors.New("lifecycle job is no longer pending")
-	errMaintenanceLeaseUsed   = errors.New("maintenance lease has already been consumed")
-	errDockerUnreachable      = errors.New("docker daemon is unreachable")
+	errMaintenanceClosed       = errors.New("maintenance barrier is closed")
+	errMaintenanceIdleConflict = errors.New("maintenance idle admission conflict")
+	errLifecycleJobNotPending  = errors.New("lifecycle job is no longer pending")
+	errMaintenanceLeaseUsed    = errors.New("maintenance lease has already been consumed")
+	errDockerUnreachable       = errors.New("docker daemon is unreachable")
 )
 
 const (
@@ -408,6 +409,7 @@ type operationCoordinator struct {
 	markerPath       string
 	journalPath      string
 	jobs             *lifecycleJobManager
+	writeMarker      func(string) (bool, error)
 }
 
 type maintenanceAdmissionLease struct {
@@ -430,6 +432,7 @@ func newOperationCoordinator(markerPath string, journalPath string, jobs *lifecy
 		markerPath:  markerPath,
 		journalPath: journalPath,
 		jobs:        jobs,
+		writeMarker: writeMaintenanceMarkerDurable,
 	}
 	coordinator.cond = sync.NewCond(&coordinator.mu)
 	if stateFilePresent(markerPath) || stateFilePresent(journalPath) {
@@ -681,6 +684,43 @@ func (c *operationCoordinator) enterMaintenance() (maintenanceState, string, err
 	return state, token, nil
 }
 
+func (c *operationCoordinator) enterMaintenanceIfIdle() (maintenanceState, string, error) {
+	if c == nil {
+		return maintenanceStateDrained, "", errors.New("operation coordinator unavailable")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	state := c.maintenanceStateLocked()
+	if c.active != nil || c.closed || c.journalPending || stateFilePresent(c.markerPath) || stateFilePresent(c.journalPath) {
+		return state, "", errMaintenanceIdleConflict
+	}
+	token, err := randomHex(maintenanceLeaseBytes)
+	if err != nil {
+		return state, "", err
+	}
+	writeMarker := c.writeMarker
+	if writeMarker == nil {
+		writeMarker = writeMaintenanceMarkerDurable
+	}
+	committed, err := writeMarker(c.markerPath)
+	if err != nil {
+		if committed || stateFilePresent(c.markerPath) {
+			c.closed = true
+			c.maintenanceLease = nil
+			c.cond.Broadcast()
+		}
+		return c.maintenanceStateLocked(), "", err
+	}
+	if !committed {
+		return state, "", errors.New("maintenance marker was not committed")
+	}
+	c.closed = true
+	c.maintenanceLease = &maintenanceAdmissionLease{token: token}
+	c.cond.Broadcast()
+	return maintenanceStateDrained, token, nil
+}
+
 func (c *operationCoordinator) leaveMaintenance() (maintenanceState, error) {
 	if c == nil {
 		return maintenanceStateDrained, errors.New("operation coordinator unavailable")
@@ -718,6 +758,20 @@ func writeMaintenanceMarkerAtomic(path string) error {
 		return err
 	}
 	return writeFileAtomic(path, []byte("{\"capability\":\"maintenance-v1\"}\n"))
+}
+
+func writeMaintenanceMarkerDurable(path string) (bool, error) {
+	return writeMaintenanceMarkerDurableWithSync(path, syncDirectory)
+}
+
+func writeMaintenanceMarkerDurableWithSync(path string, syncDir func(string) error) (bool, error) {
+	if path == "" {
+		return false, errors.New("maintenance marker path is unavailable")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return false, err
+	}
+	return writeFileAtomicWithDurabilityResult(path, []byte("{\"capability\":\"maintenance-v1\"}\n"), true, syncDir)
 }
 
 type lifecycleJournal struct {
@@ -2260,6 +2314,9 @@ type envLine struct {
 }
 
 func main() {
+	if handled, status := earlyCommand(os.Args, os.Getenv, os.Stdin, os.Stdout, os.Stderr); handled {
+		os.Exit(status)
+	}
 	cfg, err := loadConfig()
 	if err != nil {
 		log.Fatalf("durable operation store initialization failed: %v", err)
@@ -2272,19 +2329,6 @@ func main() {
 	}
 	if len(os.Args) == 2 && os.Args[1] == "--check-registry" {
 		os.Exit(checkRegistryCommand(cfg, os.Stderr))
-	}
-	if (len(os.Args) == 4 || len(os.Args) == 5) && os.Args[1] == "--authenticated-http" {
-		if len(os.Args) == 5 {
-			timeoutSeconds, err := strconv.Atoi(os.Args[4])
-			if err != nil || timeoutSeconds < 1 || timeoutSeconds > 300 {
-				log.Fatal("authenticated HTTP timeout must be an integer from 1 to 300 seconds")
-			}
-			cfg.authenticatedHTTPTimeout = time.Duration(timeoutSeconds) * time.Second
-		}
-		os.Exit(authenticatedHTTPCommand(cfg, os.Args[2], os.Args[3], os.Stdin, os.Stdout, os.Stderr))
-	}
-	if len(os.Args) != 1 {
-		log.Fatal("usage: deployer [--check-running-registry-targets|--check-registry-targets|--check-registry|--authenticated-http METHOD PATH [TIMEOUT_SECONDS]]")
 	}
 	if cfg.token == "" {
 		log.Fatal("DEPLOYER_TOKEN 미설정 — 인증 토큰 필수")
@@ -2319,6 +2363,42 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func earlyCommand(args []string, getenv func(string) string, input io.Reader, output, errOutput io.Writer) (bool, int) {
+	const usage = "usage: deployer [--check-running-registry-targets|--check-registry-targets|--check-registry|--authenticated-http METHOD PATH [TIMEOUT_SECONDS]]"
+	if len(args) >= 2 && args[1] == "--authenticated-http" {
+		if len(args) != 4 && len(args) != 5 {
+			fmt.Fprintln(errOutput, usage)
+			return true, 2
+		}
+		timeout := authenticatedHTTPDefaultTimeout
+		if len(args) == 5 {
+			timeoutSeconds, err := strconv.Atoi(args[4])
+			if err != nil || timeoutSeconds < 1 || timeoutSeconds > 300 {
+				fmt.Fprintln(errOutput, "authenticated HTTP timeout must be an integer from 1 to 300 seconds")
+				return true, 2
+			}
+			timeout = time.Duration(timeoutSeconds) * time.Second
+		}
+		cfg := config{
+			token:                    getenv("DEPLOYER_TOKEN"),
+			localHTTPBaseURL:         "http://localhost:9000",
+			authenticatedHTTPTimeout: timeout,
+		}
+		return true, authenticatedHTTPCommand(cfg, args[2], args[3], input, output, errOutput)
+	}
+	if len(args) == 1 {
+		return false, 0
+	}
+	if len(args) == 2 {
+		switch args[1] {
+		case "--check-running-registry-targets", "--check-registry-targets", "--check-registry":
+			return false, 0
+		}
+	}
+	fmt.Fprintln(errOutput, usage)
+	return true, 2
 }
 
 func authenticatedHTTPCommand(c config, method, requestPath string, input io.Reader, output, errOutput io.Writer) int {
@@ -2385,7 +2465,7 @@ func isAuthenticatedHTTPRouteAllowed(method, requestPath string) bool {
 		return strings.HasPrefix(requestPath, "/jobs/") && lifecycleJobIDRe.MatchString(strings.TrimPrefix(requestPath, "/jobs/"))
 	case http.MethodPost:
 		switch requestPath {
-		case "/maintenance/enter", "/maintenance/leave", "/maintenance/repair", "/servers/create":
+		case "/maintenance/enter", "/maintenance/enter-if-idle", "/maintenance/leave", "/maintenance/repair", "/servers/create":
 			return true
 		}
 		if !strings.HasPrefix(requestPath, "/jobs/") {
@@ -2579,6 +2659,21 @@ func (c config) handleMaintenance(w http.ResponseWriter, r *http.Request) {
 				status = http.StatusConflict
 			}
 			writeJSON(w, status, errorResponse{Error: "maintenance enter failed"})
+			return
+		}
+		respond(state, lease)
+	case r.Method == http.MethodPost && r.URL.Path == "/maintenance/enter-if-idle":
+		if c.operations == nil {
+			writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "maintenance coordinator unavailable"})
+			return
+		}
+		state, lease, err := c.operations.enterMaintenanceIfIdle()
+		if err != nil {
+			if errors.Is(err, errMaintenanceIdleConflict) {
+				writeJSON(w, http.StatusConflict, errorResponse{Error: "maintenance idle admission unavailable"})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "maintenance idle admission failed"})
 			return
 		}
 		respond(state, lease)
@@ -4180,11 +4275,16 @@ func writeFileAtomicDurable(path string, data []byte) error {
 }
 
 func writeFileAtomicWithDurability(path string, data []byte, durable bool) error {
+	_, err := writeFileAtomicWithDurabilityResult(path, data, durable, syncDirectory)
+	return err
+}
+
+func writeFileAtomicWithDurabilityResult(path string, data []byte, durable bool, syncDir func(string) error) (bool, error) {
 	dir := filepath.Dir(path)
 	attrs := atomicWriteAttrs(path)
 	tmp, err := os.CreateTemp(dir, ".env-write-*")
 	if err != nil {
-		return err
+		return false, err
 	}
 	tmpName := tmp.Name()
 	defer func() {
@@ -4192,38 +4292,41 @@ func writeFileAtomicWithDurability(path string, data []byte, durable bool) error
 	}()
 	if err := tmp.Chmod(0o600); err != nil {
 		_ = tmp.Close()
-		return err
+		return false, err
 	}
 	if attrs.hasOwner && os.Geteuid() == 0 {
 		if err := tmp.Chown(attrs.uid, attrs.gid); err != nil {
 			_ = tmp.Close()
-			return err
+			return false, err
 		}
 	}
 	if err := tmp.Chmod(attrs.mode); err != nil {
 		_ = tmp.Close()
-		return err
+		return false, err
 	}
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
-		return err
+		return false, err
 	}
 	if durable {
 		if err := tmp.Sync(); err != nil {
 			_ = tmp.Close()
-			return err
+			return false, err
 		}
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return false, err
 	}
 	if err := os.Rename(tmpName, path); err != nil {
-		return err
+		return false, err
 	}
 	if !durable {
-		return nil
+		return true, nil
 	}
-	return syncDirectory(dir)
+	if syncDir == nil {
+		return true, errors.New("directory sync is unavailable")
+	}
+	return true, syncDir(dir)
 }
 
 func syncDirectory(path string) error {
