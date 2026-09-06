@@ -25,6 +25,627 @@ import (
 	"time"
 )
 
+type preparationLifecycleCase struct {
+	name        string
+	kind        lifecycleKind
+	operationID string
+	body        string
+	setup       func(*testing.T) config
+	terminal    lifecycleJobStatus
+	mutation    string
+}
+
+func preparationLifecycleCases() []preparationLifecycleCase {
+	return []preparationLifecycleCase{
+		{"create", lifecycleKindCreate, "11111111111111111111111111111111", `{"id":"pep","name":"준비 서버","gameApiPort":"8101","webGamePort":"3101","operationId":"11111111111111111111111111111111"}`, func(t *testing.T) config {
+			cfg := testConfig(t)
+			writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n")
+			return cfg
+		}, lifecycleJobSucceeded, "up -d"},
+		{"close", lifecycleKindClose, "22222222222222222222222222222222", `{"id":"pep","confirm":"DELETE pep","operationId":"22222222222222222222222222222222"}`, configuredResetOperationTest, lifecycleJobSucceeded, "down --volumes --remove-orphans"},
+		{"reset", lifecycleKindReset, "33333333333333333333333333333333", `{"id":"pep","confirm":"RESET pep","scenarioCode":"scenario_1002","operationId":"33333333333333333333333333333333"}`, configuredResetOperationTest, lifecycleJobSucceeded, "down --volumes --remove-orphans"},
+	}
+}
+
+func (tc preparationLifecycleCase) post(t *testing.T, cfg config, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	var handler http.HandlerFunc
+	switch tc.kind {
+	case lifecycleKindCreate:
+		handler = cfg.handleServerCreate
+	case lifecycleKindClose:
+		handler = cfg.handleServerClose
+	case lifecycleKindReset:
+		handler = cfg.handleServerReset
+	}
+	return envRequest(t, cfg.withAuth(handler), http.MethodPost, "/servers/"+tc.name, body)
+}
+
+func preparationIdle(t *testing.T, cfg config) *httptest.ResponseRecorder {
+	t.Helper()
+	return loopbackRequest(t, cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance)), http.MethodPost, "/maintenance/enter-if-idle", "")
+}
+
+func assertPreparationBusy(t *testing.T, cfg config) {
+	t.Helper()
+	if res := preparationIdle(t, cfg); res.Code != http.StatusConflict {
+		t.Errorf("preparation admitted idle: %d %s", res.Code, res.Body.String())
+	}
+	cfg.operations.mu.Lock()
+	hasLease := cfg.operations.maintenanceLease != nil
+	cfg.operations.mu.Unlock()
+	if hasLease || stateFilePresent(cfg.maintenanceFile) {
+		t.Error("busy idle created marker or maintenance lease")
+	}
+}
+
+func awaitPreparationSignal(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatal("preparation barrier was not reached")
+	}
+}
+
+func awaitPreparationResponse(t *testing.T, ch <-chan *httptest.ResponseRecorder) *httptest.ResponseRecorder {
+	t.Helper()
+	select {
+	case res := <-ch:
+		return res
+	case <-time.After(5 * time.Second):
+		t.Fatal("preparation request remained blocked")
+		return nil
+	}
+}
+
+func assertPreparationCompletion(t *testing.T, cfg config, tc preparationLifecycleCase, res *httptest.ResponseRecorder, calls *dockerCallRecorder) {
+	t.Helper()
+	if res.Code != http.StatusOK {
+		t.Fatalf("lifecycle response = %d %s", res.Code, res.Body.String())
+	}
+	var body createServerResponse
+	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	waitForLifecycleJob(t, cfg.lifecycleJobs, body.JobID, tc.terminal)
+	cfg.operations.mu.Lock()
+	for cfg.operations.active != nil {
+		cfg.operations.cond.Wait()
+	}
+	cfg.operations.mu.Unlock()
+	record, ok := cfg.lifecycleOperationStore.Lookup(tc.operationID)
+	if !ok || record.Status != tc.terminal {
+		t.Fatalf("terminal operation = %#v", record)
+	}
+	if got := countDockerCallsContaining(calls.snapshot(), "opensamguk-spep"); got == 0 {
+		t.Fatal("lifecycle did not reach server Docker")
+	}
+	var primaryCalls []string
+	for _, call := range calls.snapshot() {
+		if strings.Contains(call, "opensamguk-spep") {
+			primaryCalls = append(primaryCalls, call)
+		}
+	}
+	if got := countDockerCallsContaining(primaryCalls, tc.mutation); got != 1 {
+		t.Errorf("primary mutations = %d, calls=%v", got, calls.snapshot())
+	}
+}
+
+func TestLifecyclePreparationRejectsIdleWhileDurableReservationSyncs(t *testing.T) {
+	for _, tc := range preparationLifecycleCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.setup(t)
+			reservationPersisted, releaseReservation := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			cfg.lifecycleOperationStore.fileOps.syncDirectory = func(dir string) error {
+				if err := syncDirectory(dir); err != nil {
+					return err
+				}
+				once.Do(func() { close(reservationPersisted); <-releaseReservation })
+				return nil
+			}
+			calls := &dockerCallRecorder{}
+			cfg.dockerRunner = func(args ...string) (string, error) { calls.record(args...); return "29.0.0\n", nil }
+			result := make(chan *httptest.ResponseRecorder, 1)
+			go func() { result <- tc.post(t, cfg, tc.body) }()
+			awaitPreparationSignal(t, reservationPersisted)
+			assertPreparationBusy(t, cfg)
+			if calls.count() != 0 {
+				t.Error("Docker ran before reservation sync returned")
+			}
+			close(releaseReservation)
+			assertPreparationCompletion(t, cfg, tc, awaitPreparationResponse(t, result), calls)
+		})
+	}
+}
+
+func TestLifecyclePreparationRejectsIdleThroughDockerPreflight(t *testing.T) {
+	for _, tc := range preparationLifecycleCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.setup(t)
+			preflight, release := make(chan struct{}), make(chan struct{})
+			calls := &dockerCallRecorder{}
+			var preflightContext context.Context
+			cfg.dockerRunnerContext = func(ctx context.Context, args ...string) (string, error) {
+				if dockerPreflightProbe(args) {
+					preflightContext = ctx
+					close(preflight)
+					<-release
+					return "29.0.0\n", nil
+				}
+				calls.record(args...)
+				return "ok\n", nil
+			}
+			result := make(chan *httptest.ResponseRecorder, 1)
+			go func() { result <- tc.post(t, cfg, tc.body) }()
+			awaitPreparationSignal(t, preflight)
+			record, ok := cfg.lifecycleOperationStore.Lookup(tc.operationID)
+			jobID := cfg.lifecycleJobs.jobIDForOperation(tc.operationID)
+			job, exists := cfg.lifecycleJobs.lookup(jobID)
+			if !ok || record.Status != lifecycleJobPending || record.Kind != tc.kind || record.SubjectID != "pep" || !exists || job.Status != lifecycleJobPending {
+				t.Errorf("pending state: %#v %#v", record, job)
+			}
+			retry := tc.post(t, cfg, tc.body)
+			var replay createServerResponse
+			if err := json.Unmarshal(retry.Body.Bytes(), &replay); err != nil {
+				t.Fatal(err)
+			}
+			if retry.Code != http.StatusOK || replay.OperationID != tc.operationID || replay.JobID != jobID || replay.OperationStatus != lifecycleJobPending {
+				t.Errorf("pending replay = %d %#v", retry.Code, replay)
+			}
+			assertPreparationBusy(t, cfg)
+			if preflightContext.Err() != nil || calls.count() != 0 {
+				t.Error("idle cancelled preparation or reached Docker mutation")
+			}
+			cfg.lifecycleJobs.mu.Lock()
+			pending := cfg.lifecycleJobs.jobs[jobID]
+			cfg.lifecycleJobs.mu.Unlock()
+			if pending.status != lifecycleJobPending || pending.cancelRequested {
+				t.Error("idle changed pending job")
+			}
+			close(release)
+			assertPreparationCompletion(t, cfg, tc, awaitPreparationResponse(t, result), calls)
+			idle := preparationIdle(t, cfg)
+			var drained maintenanceResponse
+			if err := json.Unmarshal(idle.Body.Bytes(), &drained); err != nil {
+				t.Fatal(err)
+			}
+			if idle.Code != http.StatusOK || drained.State != maintenanceStateDrained || !lifecycleJobIDRe.MatchString(drained.Lease) || !stateFilePresent(cfg.maintenanceFile) {
+				t.Errorf("completed idle = %d %#v", idle.Code, drained)
+			}
+		})
+	}
+}
+
+// Signal the precise Cond.Wait boundary, without choosing a winner by sleeping.
+type preparationWaitLocker struct {
+	mu            *sync.Mutex
+	waiting       chan struct{}
+	once          sync.Once
+	resumed       chan struct{}
+	releaseResume chan struct{}
+	resumeOnce    sync.Once
+}
+
+func (l *preparationWaitLocker) Lock() {
+	l.mu.Lock()
+	l.resumeOnce.Do(func() { close(l.resumed); <-l.releaseResume })
+}
+func (l *preparationWaitLocker) Unlock() { l.mu.Unlock(); l.once.Do(func() { close(l.waiting) }) }
+
+func TestLifecyclePreparationWaitsForActiveThenPromotesWithoutIdleGap(t *testing.T) {
+	for _, tc := range preparationLifecycleCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.setup(t)
+			old, err := cfg.operations.begin("")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer old.Done()
+			waiting := make(chan struct{})
+			resumed, releaseResume := make(chan struct{}), make(chan struct{})
+			cfg.operations.cond.L = &preparationWaitLocker{mu: &cfg.operations.mu, waiting: waiting, resumed: resumed, releaseResume: releaseResume}
+			work, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			calls := &dockerCallRecorder{}
+			cfg.dockerRunner = func(args ...string) (string, error) {
+				if dockerPreflightProbe(args) {
+					return "29.0.0\n", nil
+				}
+				calls.record(args...)
+				once.Do(func() { close(work); <-release })
+				return "ok\n", nil
+			}
+			result := make(chan *httptest.ResponseRecorder, 1)
+			go func() { result <- tc.post(t, cfg, tc.body) }()
+			awaitPreparationSignal(t, waiting)
+			cfg.operations.mu.Lock()
+			preparing := reflect.ValueOf(cfg.operations).Elem().FieldByName("preparing")
+			if cfg.operations.active != old || !preparing.IsValid() || preparing.IsNil() {
+				t.Error("active wait lost published preparation or overwrote active")
+			}
+			cfg.operations.mu.Unlock()
+			assertPreparationBusy(t, cfg)
+			if old.Context().Err() != nil {
+				t.Error("idle cancelled existing active")
+			}
+			select {
+			case res := <-result:
+				t.Errorf("promotion returned before old active released: %d", res.Code)
+			default:
+			}
+			old.Done()
+			awaitPreparationSignal(t, resumed)
+			// The waking promoter holds mu and is stopped at the channel barrier.
+			// This observes the handoff after old active release, before claiming.
+			if cfg.operations.active != nil || cfg.operations.preparing == nil {
+				t.Error("active release exposed an idle gap before promotion")
+			}
+			close(releaseResume)
+			awaitPreparationSignal(t, work)
+			cfg.operations.mu.Lock()
+			preparing = reflect.ValueOf(cfg.operations).Elem().FieldByName("preparing")
+			jobID := cfg.lifecycleJobs.jobIDForOperation(tc.operationID)
+			if cfg.operations.active == nil || cfg.operations.active == old || cfg.operations.active.jobID != jobID || (preparing.IsValid() && !preparing.IsNil()) {
+				t.Error("preparation did not atomically install its claimed active job")
+			}
+			cfg.operations.mu.Unlock()
+			assertPreparationBusy(t, cfg)
+			close(release)
+			assertPreparationCompletion(t, cfg, tc, awaitPreparationResponse(t, result), calls)
+		})
+	}
+}
+
+func TestLifecycleIdleWinnerCreatesNoPendingReservation(t *testing.T) {
+	for _, tc := range preparationLifecycleCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.setup(t)
+			calls := &dockerCallRecorder{}
+			cfg.dockerRunner = func(args ...string) (string, error) { calls.record(args...); return "ok\n", nil }
+			if res := preparationIdle(t, cfg); res.Code != http.StatusOK {
+				t.Fatal(res.Body.String())
+			}
+			res := tc.post(t, cfg, tc.body)
+			if res.Code != http.StatusServiceUnavailable {
+				t.Errorf("closed lifecycle = %d %s", res.Code, res.Body.String())
+			}
+			if _, ok := cfg.lifecycleOperationStore.Lookup(tc.operationID); ok {
+				t.Error("idle winner allowed durable reservation")
+			}
+			if cfg.lifecycleJobs.jobIDForOperation(tc.operationID) != "" || calls.count() != 0 {
+				t.Error("idle winner allowed job reservation or Docker")
+			}
+		})
+	}
+}
+
+func TestLifecycleTerminalPersistenceFailureWithoutJournalBlocksIdle(t *testing.T) {
+	for _, tc := range preparationLifecycleCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.setup(t)
+			mustReserveOperation(t, cfg.lifecycleOperationStore, durableOperationRecord{OperationID: tc.operationID, Kind: tc.kind, SubjectID: "pep", RequestFingerprint: strings.Repeat("a", 64), Status: lifecycleJobPending})
+			jobID, _, err := cfg.lifecycleJobs.reserveWithOperation(tc.operationID, strings.Repeat("a", 64), tc.kind)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lease, err := cfg.operations.begin(jobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeRelease := make(chan bool, 1)
+			cancel := lease.cancel
+			lease.cancel = func() {
+				cfg.operations.mu.Lock()
+				beforeRelease <- cfg.operations.active == lease && cfg.operations.preparationSettlementPending && cfg.operations.closed
+				cfg.operations.mu.Unlock()
+				cancel()
+			}
+			work, release := make(chan struct{}), make(chan struct{})
+			if err := cfg.startClaimedDurableLifecycleJob(lease, jobID, "no journal", tc.operationID, tc.kind, func(context.Context) (string, error) {
+				close(work)
+				<-release
+				return "", errors.New("failed before journal")
+			}); err != nil {
+				t.Fatal(err)
+			}
+			awaitPreparationSignal(t, work)
+			cfg.lifecycleOperationStore.mu.Lock()
+			cfg.lifecycleOperationStore.fileOps.createTemp = func(string, string) (*os.File, error) { return nil, errors.New("terminal persistence unavailable") }
+			cfg.lifecycleOperationStore.mu.Unlock()
+			close(release)
+			// Done cancels its context as the worker exits, then clears active under mu.
+			awaitPreparationSignal(t, lease.Context().Done())
+			if !<-beforeRelease {
+				t.Error("worker terminal failure was not fail-closed before Done began")
+			}
+			cfg.operations.mu.Lock()
+			for cfg.operations.active != nil {
+				cfg.operations.cond.Wait()
+			}
+			unsettled := reflect.ValueOf(cfg.operations).Elem().FieldByName("preparationSettlementPending")
+			if !unsettled.IsValid() || !unsettled.Bool() || !cfg.operations.closed {
+				t.Error("worker released active without installing unsettled fail-closed state")
+			}
+			cfg.operations.mu.Unlock()
+			if stateFilePresent(cfg.lifecycleJournalFile) {
+				t.Error("test work unexpectedly wrote journal")
+			}
+			record, _ := cfg.lifecycleOperationStore.Lookup(tc.operationID)
+			if record.Status != lifecycleJobRunning {
+				t.Errorf("unconfirmed terminal record = %#v", record)
+			}
+			assertPreparationBusy(t, cfg)
+			calls := &dockerCallRecorder{}
+			cfg.dockerRunner = func(args ...string) (string, error) { calls.record(args...); return "ok\n", nil }
+			otherID := "44444444444444444444444444444444"
+			res := tc.post(t, cfg, strings.ReplaceAll(tc.body, tc.operationID, otherID))
+			if res.Code != http.StatusServiceUnavailable {
+				t.Errorf("unsettled admission = %d", res.Code)
+			}
+			if _, ok := cfg.lifecycleOperationStore.Lookup(otherID); ok {
+				t.Error("unsettled worker allowed another reservation")
+			}
+			if cfg.lifecycleJobs.jobIDForOperation(otherID) != "" || calls.count() != 0 {
+				t.Error("unsettled worker allowed another job or Docker")
+			}
+		})
+	}
+}
+
+func TestLifecyclePreparationStartupSettlementFailureRetainsActive(t *testing.T) {
+	for _, tc := range preparationLifecycleCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.setup(t)
+			starting, release := make(chan struct{}), make(chan struct{})
+			original := cfg.lifecycleOperationStore.fileOps.createTemp
+			attempts := 0
+			cfg.lifecycleOperationStore.fileOps.createTemp = func(dir, pattern string) (*os.File, error) {
+				attempts++
+				if attempts == 2 {
+					close(starting)
+					<-release
+				}
+				if attempts >= 2 {
+					return nil, errors.New("startup settlement unavailable")
+				}
+				return original(dir, pattern)
+			}
+			calls := &dockerCallRecorder{}
+			cfg.dockerRunner = func(args ...string) (string, error) {
+				if !dockerPreflightProbe(args) {
+					calls.record(args...)
+				}
+				return "29.0.0\n", nil
+			}
+			result := make(chan *httptest.ResponseRecorder, 1)
+			go func() { result <- tc.post(t, cfg, tc.body) }()
+			awaitPreparationSignal(t, starting)
+			assertPreparationBusy(t, cfg)
+			cfg.operations.mu.Lock()
+			lease := cfg.operations.active
+			if lease == nil || cfg.operations.preparing != nil {
+				t.Fatal("startup did not own promoted active lease")
+			}
+			cancel := lease.cancel
+			beforeRelease := make(chan bool, 1)
+			lease.cancel = func() {
+				cfg.operations.mu.Lock()
+				beforeRelease <- cfg.operations.active == lease && cfg.operations.preparationSettlementPending && cfg.operations.closed
+				cfg.operations.mu.Unlock()
+				cancel()
+			}
+			cfg.operations.mu.Unlock()
+			close(release)
+			if res := awaitPreparationResponse(t, result); res.Code != http.StatusServiceUnavailable {
+				t.Errorf("startup rejection = %d %s", res.Code, res.Body.String())
+			}
+			if !<-beforeRelease {
+				t.Error("startup released active before sticky fail-closed state")
+			}
+			assertPreparationBusy(t, cfg)
+			if calls.count() != 0 || stateFilePresent(cfg.lifecycleJournalFile) {
+				t.Error("failed startup reached worker mutation")
+			}
+		})
+	}
+}
+
+func TestLifecycleStartupReplaySettlesRunningBeforeActiveRelease(t *testing.T) {
+	for _, tc := range preparationLifecycleCases() {
+		for _, failSettlement := range []bool{false, true} {
+			t.Run(tc.name+"/settlement-fails="+strconv.FormatBool(failSettlement), func(t *testing.T) {
+				cfg := tc.setup(t)
+				startupFailed, releaseCleanup := make(chan struct{}), make(chan struct{})
+				replayFlushed := make(chan struct{})
+				var startupFailure atomic.Bool
+				var finishBarrier sync.Once
+				// finish's clock runs only after the initial running-transition helper
+				// has returned its error, and before the caller's rejection lookup.
+				cfg.lifecycleJobs.now = func() time.Time {
+					if startupFailure.Load() {
+						finishBarrier.Do(func() { close(startupFailed); <-releaseCleanup })
+					}
+					return time.Now()
+				}
+				originalCreate := cfg.lifecycleOperationStore.fileOps.createTemp
+				persistAttempts := 0
+				cfg.lifecycleOperationStore.fileOps.createTemp = func(dir, pattern string) (*os.File, error) {
+					persistAttempts++
+					if persistAttempts == 2 {
+						startupFailure.Store(true)
+						return nil, errors.New("initial running transition unavailable")
+					}
+					if failSettlement && persistAttempts >= 4 {
+						return nil, errors.New("terminal rejection settlement unavailable")
+					}
+					return originalCreate(dir, pattern)
+				}
+				cfg.lifecycleOperationStore.fileOps.syncDirectory = func(dir string) error {
+					if err := syncDirectory(dir); err != nil {
+						return err
+					}
+					if persistAttempts == 3 {
+						close(replayFlushed)
+					}
+					return nil
+				}
+				calls := &dockerCallRecorder{}
+				cfg.dockerRunner = func(args ...string) (string, error) {
+					if !dockerPreflightProbe(args) {
+						calls.record(args...)
+					}
+					return "29.0.0\n", nil
+				}
+				firstResult := make(chan *httptest.ResponseRecorder, 1)
+				go func() { firstResult <- tc.post(t, cfg, tc.body) }()
+				awaitPreparationSignal(t, startupFailed)
+				pending, _ := cfg.lifecycleOperationStore.Lookup(tc.operationID)
+				if pending.Status != lifecycleJobPending {
+					t.Errorf("failed startup record = %#v", pending)
+				}
+				cfg.operations.mu.Lock()
+				lease := cfg.operations.active
+				if lease == nil {
+					cfg.operations.mu.Unlock()
+					t.Fatal("startup failure lost active ownership before cleanup")
+				}
+				cancel := lease.cancel
+				safeRelease := make(chan bool, 1)
+				lease.cancel = func() {
+					record, ok := cfg.lifecycleOperationStore.Lookup(tc.operationID)
+					cfg.operations.mu.Lock()
+					closed := cfg.operations.preparationSettlementPending && cfg.operations.closed
+					safeRelease <- cfg.operations.active == lease && ((ok && isTerminalLifecycleJob(record.Status)) || closed)
+					cfg.operations.mu.Unlock()
+					cancel()
+				}
+				cfg.operations.mu.Unlock()
+				retryResult := make(chan *httptest.ResponseRecorder, 1)
+				go func() { retryResult <- tc.post(t, cfg, tc.body) }()
+				awaitPreparationSignal(t, replayFlushed)
+				running, _ := cfg.lifecycleOperationStore.Lookup(tc.operationID)
+				if running.Status != lifecycleJobRunning {
+					t.Errorf("concurrent identical replay did not flush running: %#v", running)
+				}
+				assertPreparationBusy(t, cfg)
+				close(releaseCleanup)
+				first := awaitPreparationResponse(t, firstResult)
+				wantStatus := http.StatusInternalServerError
+				if failSettlement {
+					wantStatus = http.StatusServiceUnavailable
+				}
+				if first.Code != wantStatus {
+					t.Errorf("startup response = %d, want %d: %s", first.Code, wantStatus, first.Body.String())
+				}
+				if !<-safeRelease {
+					t.Error("startup cleanup released active with running record, no worker, and open admission")
+				}
+				retry := awaitPreparationResponse(t, retryResult)
+				var replay createServerResponse
+				if err := json.Unmarshal(retry.Body.Bytes(), &replay); err != nil {
+					t.Fatal(err)
+				}
+				if retry.Code != http.StatusOK || replay.OperationID != tc.operationID || replay.OperationStatus != lifecycleJobRunning {
+					t.Errorf("concurrent replay = %d %#v", retry.Code, replay)
+				}
+				if calls.count() != 0 || stateFilePresent(cfg.lifecycleJournalFile) {
+					t.Error("failed startup launched worker or Docker mutation")
+				}
+				record, _ := cfg.lifecycleOperationStore.Lookup(tc.operationID)
+				if failSettlement {
+					if record.Status != lifecycleJobRunning {
+						t.Errorf("unconfirmed rejection = %#v", record)
+					}
+					assertUnsettledPreparationBlocksNewMutation(t, cfg)
+					if calls.count() != 0 {
+						t.Error("distinct request reached Docker after unsettled startup")
+					}
+				} else {
+					if record.Status != lifecycleJobFailed || record.HTTPStatus != http.StatusInternalServerError {
+						t.Errorf("startup-owned running was not settled terminal: %#v", record)
+					}
+					if idle := preparationIdle(t, cfg); idle.Code != http.StatusOK {
+						t.Errorf("confirmed rejection did not release idle: %d", idle.Code)
+					}
+				}
+			})
+		}
+	}
+}
+
+func assertUnsettledPreparationBlocksNewMutation(t *testing.T, cfg config) {
+	t.Helper()
+	assertPreparationBusy(t, cfg)
+	otherID := "55555555555555555555555555555555"
+	_, status := cfg.deleteServer("pep", "DELETE pep", otherID)
+	if status != http.StatusServiceUnavailable {
+		t.Errorf("unsettled new mutation = %d", status)
+	}
+	if _, ok := cfg.lifecycleOperationStore.Lookup(otherID); ok {
+		t.Error("unsettled preparation reserved another durable operation")
+	}
+	if cfg.lifecycleJobs.jobIDForOperation(otherID) != "" {
+		t.Error("unsettled preparation reserved another job")
+	}
+}
+
+func TestMaintenanceEnterCancelsPreparationAndWaitsForSettlement(t *testing.T) {
+	for _, failSettlement := range []bool{false, true} {
+		t.Run(fmt.Sprint(failSettlement), func(t *testing.T) {
+			tc := preparationLifecycleCases()[0]
+			cfg := tc.setup(t)
+			preflight, cancelled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			cfg.dockerRunnerContext = func(ctx context.Context, args ...string) (string, error) {
+				if !dockerPreflightProbe(args) {
+					t.Error("cancelled preparation reached Docker mutation")
+					return "", nil
+				}
+				close(preflight)
+				<-ctx.Done()
+				close(cancelled)
+				<-release
+				return "", ctx.Err()
+			}
+			result := make(chan *httptest.ResponseRecorder, 1)
+			go func() { result <- tc.post(t, cfg, tc.body) }()
+			awaitPreparationSignal(t, preflight)
+			if failSettlement {
+				cfg.lifecycleOperationStore.mu.Lock()
+				cfg.lifecycleOperationStore.fileOps.createTemp = func(string, string) (*os.File, error) { return nil, errors.New("settlement unavailable") }
+				cfg.lifecycleOperationStore.mu.Unlock()
+			}
+			entered := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				entered <- loopbackRequest(t, cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance)), http.MethodPost, "/maintenance/enter", "")
+			}()
+			awaitPreparationSignal(t, cancelled)
+			select {
+			case <-entered:
+				t.Error("maintenance returned before preparation settled")
+			default:
+			}
+			close(release)
+			if res := awaitPreparationResponse(t, result); res.Code != http.StatusServiceUnavailable {
+				t.Errorf("cancelled preparation = %d", res.Code)
+			}
+			awaitPreparationResponse(t, entered)
+			record, _ := cfg.lifecycleOperationStore.Lookup(tc.operationID)
+			cfg.operations.mu.Lock()
+			unsettled := reflect.ValueOf(cfg.operations).Elem().FieldByName("preparationSettlementPending")
+			if failSettlement {
+				if !unsettled.IsValid() || !unsettled.Bool() || !cfg.operations.closed {
+					t.Error("enter drained before unsettled state installed")
+				}
+			} else if record.Status != lifecycleJobCancelled {
+				t.Errorf("enter drained before terminal cancellation: %#v", record)
+			}
+			cfg.operations.mu.Unlock()
+		})
+	}
+}
+
 func TestDefaultSharedServiceBoundaries(t *testing.T) {
 	if got, want := strings.Join(sharedEnvServices, ","), "gateway-api,board-api,web-gateway,nginx,deployer"; got != want {
 		t.Fatalf("shared env services = %q, want %q", got, want)
@@ -5326,6 +5947,7 @@ func TestRejectedDurableOperationsConvergeAfterTransientSettlementFailure(t *tes
 		if firstBody.Detail != durableOperationCreatePreparationFailedMessage || firstBody.OperationID != operationID || strings.Contains(first.Body.String(), injectedDiagnostic) {
 			t.Errorf("create settlement failure exposed an unsafe contract: %#v", firstBody)
 		}
+		assertUnsettledPreparationBlocksNewMutation(t, cfg)
 
 		retry := envRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create", body)
 		var replay createServerResponse
@@ -5335,6 +5957,7 @@ func TestRejectedDurableOperationsConvergeAfterTransientSettlementFailure(t *tes
 		if retry.Code != http.StatusOK || replay.OperationStatus != lifecycleJobFailed || replay.Detail != durableOperationCreatePreparationFailedMessage {
 			t.Errorf("create retry did not replay terminal rejection: status=%d body=%#v", retry.Code, replay)
 		}
+		assertPreparationBusy(t, cfg)
 		persisted := mustOpenOperationStore(t, cfg.lifecycleOperationStore.path)
 		record, ok := persisted.Lookup(operationID)
 		if !ok || record.Status != lifecycleJobFailed || record.HTTPStatus != http.StatusConflict || record.PublicMessage != durableOperationCreatePreparationFailedMessage {
@@ -5362,10 +5985,12 @@ func TestRejectedDurableOperationsConvergeAfterTransientSettlementFailure(t *tes
 		if firstStatus != http.StatusServiceUnavailable || first.Detail != durableOperationClosePreparationFailedMessage || first.OperationID != operationID || strings.Contains(first.Detail, injectedDiagnostic) {
 			t.Errorf("close settlement failure = %d %#v", firstStatus, first)
 		}
+		assertUnsettledPreparationBlocksNewMutation(t, cfg)
 		replay, retryStatus := cfg.deleteServer("pep", "DELETE pep", operationID)
 		if retryStatus != http.StatusOK || replay.OperationStatus != lifecycleJobFailed || replay.Detail != durableOperationClosePreparationFailedMessage {
 			t.Errorf("close retry did not replay terminal rejection: status=%d body=%#v", retryStatus, replay)
 		}
+		assertPreparationBusy(t, cfg)
 		persisted := mustOpenOperationStore(t, cfg.lifecycleOperationStore.path)
 		record, ok := persisted.Lookup(operationID)
 		if !ok || record.Status != lifecycleJobFailed || record.HTTPStatus != http.StatusConflict || record.PublicMessage != durableOperationClosePreparationFailedMessage {
@@ -5399,6 +6024,7 @@ func TestRejectedDurableOperationsConvergeAfterTransientSettlementFailure(t *tes
 		if first.Code != http.StatusServiceUnavailable || first.Header().Get("Retry-After") != "5" || firstBody.Detail != durableOperationResetPreparationFailedMessage || firstBody.OperationID != operationID || strings.Contains(first.Body.String(), injectedDiagnostic) {
 			t.Errorf("reset settlement failure = %d retry-after=%q body=%#v", first.Code, first.Header().Get("Retry-After"), firstBody)
 		}
+		assertUnsettledPreparationBlocksNewMutation(t, cfg)
 		retry := envRequest(t, cfg.withAuth(cfg.handleServerReset), http.MethodPost, "/servers/reset", body)
 		var replay createServerResponse
 		if err := json.NewDecoder(retry.Body).Decode(&replay); err != nil {
@@ -5407,6 +6033,7 @@ func TestRejectedDurableOperationsConvergeAfterTransientSettlementFailure(t *tes
 		if retry.Code != http.StatusOK || replay.OperationStatus != lifecycleJobFailed || replay.Detail != durableOperationResetPreparationFailedMessage {
 			t.Errorf("reset retry did not replay terminal rejection: status=%d body=%#v", retry.Code, replay)
 		}
+		assertPreparationBusy(t, cfg)
 		persisted := mustOpenOperationStore(t, cfg.lifecycleOperationStore.path)
 		record, ok := persisted.Lookup(operationID)
 		if !ok || record.Status != lifecycleJobFailed || record.HTTPStatus != http.StatusServiceUnavailable || record.PublicMessage != durableOperationResetPreparationFailedMessage {

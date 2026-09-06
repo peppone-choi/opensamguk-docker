@@ -189,13 +189,20 @@ nginx `/health`를 항상 확인하고,
 있으면 새 deployer 프로세스도 closed 상태로 부팅하며, 새 mutation은 `503`과 `Retry-After`를 받고, 진행 중인
 mutation은 취소된 context가 Docker runner에서 실제 반환할 때까지 drain한다. 일반 `enter`는 이 취소·drain 동작을
 가지지만, Deploy Orchestration은 활성 작업이 없을 때만 원자적으로 marker를 잡는 `enter-if-idle`만 사용한다.
-활성 작업, 이미 닫힌 barrier, marker, 복구 journal 중 하나라도 있으면 `409`로 거부하며 작업을 취소하거나
+생성·종료·리셋은 영속 operation이나 메모리 job을 예약하기 전부터 preparation을 게시해 busy로 취급한다.
+preparation은 Docker 프리플라이트와 기존 active 작업의 종료 대기 동안 유지되며, 같은 잠금 안에서 job을 claim하고
+새 active로 넘기므로 중간에 idle 틈이 생기지 않는다. 활성 작업이나 preparation, 이미 닫힌 barrier, marker, 복구 journal
+중 하나라도 있으면 `409`로 거부하며 작업을 취소하거나
 새 marker·lease를 만들지 않는다.
+일반 `enter`는 preparation context도 취소하고, 영속 종료 결과 확인 또는 미확정 정산의 fail-closed 상태 설치까지 기다린다.
+이 동기화는 controller가 소유하는 marker와 journal 변경을 전제로 한다. 외부에서 호스트 파일을 직접 만드는 작업에는
+별도의 운영자 fence가 필요하다.
 
 deployer는 socket-proxy 경유로만 Docker에 닿으므로, 모든 mutation admission(`create`/`delete`/`reset`/`deploy`/env
 patch)과 maintenance repair는 journal·env를 건드리기 전에 `docker version` 도달성 프리플라이트(3초)를 먼저 통과해야
-한다. Docker에 닿지 못하면 아무 일도 일어나지 않은 상태이므로 `503`과 한국어 사유로 깨끗이 실패하며, journal이나
-repair-required 잠금을 남기지 않는다. socket-proxy가 돌아오면 수동 repair 없이 그대로 다시 열린다. 같은 이유로
+한다. Docker에 닿지 못하면 Docker mutation 없이 `503`과 한국어 사유로 실패하며, journal이나
+repair-required 잠금을 남기지 않는다. 영속 거절 정산까지 확인된 경우 socket-proxy가 돌아오면 수동 repair 없이 다시
+시도할 수 있다. 같은 이유로
 `/readyz`도 Docker 도달성을 확인한다(`/healthz`는 liveness 그대로). 결과는 캐시하지 않는다 — workflow 폴링은 2초
 간격뿐이고, 캐시는 바로 그 게이트에서 진행 중인 장애를 숨긴다.
 
@@ -238,6 +245,10 @@ operation id가 있는 lifecycle 요청은 Docker 작업 전에 `${SERVERS_DIR}/
 `pending`, `running`, `recovery_required` 기록은 자동 삭제하지 않는다. POST의 `pending` 응답은 접수일 뿐 완료가 아니다.
 호출자는 인증된 `GET /operations/{operationId}`를 폴링해 `pending|running|recovery_required` 동안 기다리고,
 `succeeded`에서만 완료로 처리하며 `failed|cancelled`는 `publicMessage`의 제한된 공개 문구로 종료해야 한다.
+동기적 준비·시작 거절 또는 worker의 terminal 결과를 영속했다고 확인하지 못하면, preparation이나 active를 해제하기
+전에 admission을 fail-closed로 고정한다. journal을 쓰기 전 실패도 동일하게 처리한다. 이 상태에서는 idle과 leave 및
+새 mutation을 거부하며, 동일 operation 재시도는 기존 terminal 결과를 정산·재생할 수 있지만 coordinator를 다시 열지는
+않는다. 재시작 또는 운영자 처리가 필요하다.
 
 journal에는 새 lifecycle 요청의 `operationId`와 `operationKind`가 함께 기록된다. deployer 재시작 시 journal과 연결된 미완료
 operation은 `recovery_required`, journal이 없는 미완료 operation은 Docker 재실행 없이 `cancelled`가 된다. worker와 repair는
