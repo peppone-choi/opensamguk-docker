@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -1260,7 +1261,7 @@ func TestResetRepairRestoresJournaledTargetAcrossPreparedCrashBoundaries(t *test
 			writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"scenarioCode":"scenario_1010","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
 			envFile := filepath.Join(cfg.serversDir, "spep.env")
-			writeEnv(t, envFile, "SERVER_ID=pep\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n")
+			writeEnv(t, envFile, "SERVER_ID=pep\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\nSCENARIO_LOOKUP_DIR=\n")
 			target, err := cfg.serverTargetForID("pep")
 			if err != nil {
 				t.Fatal(err)
@@ -1296,7 +1297,7 @@ func TestResetRepairRestoresJournaledTargetAcrossPreparedCrashBoundaries(t *test
 			if err := restarted.repairLifecycleJournal(); err != nil {
 				t.Fatalf("repair prepared crash boundary: %v", err)
 			}
-			if got := readFile(t, envFile); !strings.Contains(got, "SCENARIO_CODE=scenario_1002\n") || !strings.Contains(got, "SERVER_GENERATION=2\n") || !strings.Contains(got, "SCENARIO_SEED_ENABLED=true\n") || !strings.Contains(got, "RESET_TURNTERM=30\n") {
+			if got := readFile(t, envFile); !strings.Contains(got, "SCENARIO_CODE=scenario_1002\n") || !strings.Contains(got, "SERVER_GENERATION=2\n") || !strings.Contains(got, "SCENARIO_SEED_ENABLED=true\n") || !strings.Contains(got, "RESET_TURNTERM=30\n") || strings.Count(got, "SCENARIO_LOOKUP_DIR=\n") != 1 {
 				t.Fatalf("repaired env did not retain journaled reset target:\n%s", got)
 			}
 			entry, err := restarted.registryEntryByID("pep")
@@ -1305,6 +1306,9 @@ func TestResetRepairRestoresJournaledTargetAcrossPreparedCrashBoundaries(t *test
 			}
 			if entry.Generation != 2 || entry.ScenarioCode != "scenario_1002" || entry.RepairRequired {
 				t.Fatalf("repaired registry = %#v", entry)
+			}
+			if value, exists := entry.Env["SCENARIO_LOOKUP_DIR"]; !exists || value != "" {
+				t.Fatalf("repaired registry lost empty lookup snapshot: %#v", entry.Env)
 			}
 			if _, err := os.Stat(restarted.lifecycleJournalFile); !os.IsNotExist(err) {
 				t.Fatalf("prepared crash repair retained journal: %v", err)
@@ -2152,6 +2156,115 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	}
 }
 
+func TestServerEnvScenarioLookupDirAllowsOnlyExactModes(t *testing.T) {
+	testCases := []struct {
+		name    string
+		value   string
+		allowed bool
+	}{
+		{name: "explicit_empty", value: "", allowed: true},
+		{name: "external_default", value: "/data/scenarios", allowed: true},
+		{name: "whitespace", value: " "},
+		{name: "arbitrary_path", value: "/tmp/scenarios"},
+		{name: "trailing_slash", value: "/data/scenarios/"},
+		{name: "interpolation", value: "${SCENARIO_DIR}"},
+		{name: "carriage_return", value: "\r"},
+		{name: "line_feed", value: "\n"},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			cfg := testConfig(t)
+			registryFile := filepath.Join(cfg.composeDir, ".env")
+			envFile := filepath.Join(cfg.serversDir, "spep.env")
+			writeEnv(t, registryFile, `SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
+`)
+			writeEnv(t, envFile, "SERVER_ID=pep\n")
+			envBefore := readFile(t, envFile)
+			registryBefore := readFile(t, registryFile)
+			calls := &dockerCallRecorder{}
+			cfg.dockerRunner = func(args ...string) (string, error) {
+				calls.record(args...)
+				return "ok\n", nil
+			}
+			payload, err := json.Marshal(map[string]any{
+				"values": map[string]string{"SCENARIO_LOOKUP_DIR": testCase.value},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			response := envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodPatch, "/env/server?id=pep", string(payload))
+			if !testCase.allowed {
+				if response.Code != http.StatusBadRequest {
+					t.Fatalf("PATCH status = %d body=%s", response.Code, response.Body.String())
+				}
+				if got := readFile(t, envFile); got != envBefore {
+					t.Fatalf("invalid PATCH mutated env: before=%q after=%q", envBefore, got)
+				}
+				if got := readFile(t, registryFile); got != registryBefore {
+					t.Fatalf("invalid PATCH mutated registry: before=%q after=%q", registryBefore, got)
+				}
+				if calls.count() != 0 {
+					t.Fatalf("invalid PATCH reached Docker: %#v", calls.snapshot())
+				}
+				return
+			}
+
+			if response.Code != http.StatusOK {
+				t.Fatalf("PATCH status = %d body=%s", response.Code, response.Body.String())
+			}
+			body := decodeEnvResponse(t, response)
+			if body.JobID == "" {
+				t.Fatal("successful lookup PATCH did not schedule registry reload")
+			}
+			if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, body.JobID, lifecycleJobSucceeded); completed.Status != lifecycleJobSucceeded {
+				t.Fatalf("lookup PATCH completion = %#v", completed)
+			}
+			if got := strings.Count(readFile(t, envFile), "SCENARIO_LOOKUP_DIR="+testCase.value+"\n"); got != 1 {
+				t.Fatalf("lookup env line count = %d in %q", got, readFile(t, envFile))
+			}
+			if testCase.value == "" {
+				if got := readFile(t, envFile); got != "SERVER_ID=pep\nSCENARIO_LOOKUP_DIR=\n" {
+					t.Fatalf("explicit empty env bytes = %q", got)
+				}
+			}
+			field := body.Fields["SCENARIO_LOOKUP_DIR"]
+			if field.Value == nil || *field.Value != testCase.value {
+				t.Fatalf("PATCH lookup field = %#v", field)
+			}
+			entry, err := cfg.registryEntryByID("pep")
+			if err != nil {
+				t.Fatalf("read registry: %v", err)
+			}
+			if value, exists := entry.Env["SCENARIO_LOOKUP_DIR"]; !exists || value != testCase.value {
+				t.Fatalf("registry lookup snapshot = %#v", entry.Env)
+			}
+			if testCase.value == "" {
+				if field.Configured {
+					t.Fatalf("explicit empty changed configured convention: %#v", field)
+				}
+				get := envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodGet, "/env/server?id=pep", "")
+				if get.Code != http.StatusOK {
+					t.Fatalf("GET status = %d body=%s", get.Code, get.Body.String())
+				}
+				readback := decodeEnvResponse(t, get).Fields["SCENARIO_LOOKUP_DIR"]
+				if readback.Value == nil || *readback.Value != "" || readback.Configured {
+					t.Fatalf("explicit empty GET field = %#v", readback)
+				}
+				if !strings.Contains(readFile(t, registryFile), `"SCENARIO_LOOKUP_DIR":""`) {
+					t.Fatalf("registry JSON lost explicit empty lookup: %s", readFile(t, registryFile))
+				}
+			}
+			for _, call := range calls.snapshot() {
+				if strings.Contains(call, "compose -p opensamguk-spep") {
+					t.Fatalf("lookup PATCH restarted game stack: %q", call)
+				}
+			}
+		})
+	}
+}
+
 func TestSharedEnvRejectsUnknownKey(t *testing.T) {
 	cfg := testConfig(t)
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\n")
@@ -2793,6 +2906,7 @@ func TestServerComposeEnvironmentDropsAmbientDefinitionControls(t *testing.T) {
 		"SPRING_PROFILES_ACTIVE=v2",
 		"COMPOSE_ENV_FILES=unexpected",
 		"COMPOSE_HOST_DIR=/ambient-host",
+		"SCENARIO_LOOKUP_DIR=/attacker",
 		"PWD=/ambient-working-directory",
 	})
 	values := map[string]string{}
@@ -2809,6 +2923,7 @@ func TestServerComposeEnvironmentDropsAmbientDefinitionControls(t *testing.T) {
 		"V2_ENABLED",
 		"SPRING_PROFILES_ACTIVE",
 		"COMPOSE_ENV_FILES",
+		"SCENARIO_LOOKUP_DIR",
 		"PWD",
 	} {
 		if _, exists := values[key]; exists {
@@ -2836,6 +2951,7 @@ printf 'V2_ENABLED=%s\n' "${V2_ENABLED-absent}"
 printf 'SPRING_PROFILES_ACTIVE=%s\n' "${SPRING_PROFILES_ACTIVE-absent}"
 printf 'COMPOSE_ENV_FILES=%s\n' "${COMPOSE_ENV_FILES-absent}"
 printf 'COMPOSE_HOST_DIR=%s\n' "${COMPOSE_HOST_DIR-absent}"
+printf 'SCENARIO_LOOKUP_DIR=%s\n' "${SCENARIO_LOOKUP_DIR-absent}"
 printf 'DOCKER_HOST=%s\n' "${DOCKER_HOST-absent}"
 `)
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -2845,6 +2961,7 @@ printf 'DOCKER_HOST=%s\n' "${DOCKER_HOST-absent}"
 	t.Setenv("SPRING_PROFILES_ACTIVE", "v2")
 	t.Setenv("COMPOSE_ENV_FILES", "unexpected")
 	t.Setenv("COMPOSE_HOST_DIR", "/ambient-host")
+	t.Setenv("SCENARIO_LOOKUP_DIR", "/attacker")
 	t.Setenv("DOCKER_HOST", "tcp://docker-proxy:2375")
 
 	out, err := cfg.runServerDockerContext(context.Background(), "version")
@@ -2865,6 +2982,7 @@ printf 'DOCKER_HOST=%s\n' "${DOCKER_HOST-absent}"
 		"V2_ENABLED",
 		"SPRING_PROFILES_ACTIVE",
 		"COMPOSE_ENV_FILES",
+		"SCENARIO_LOOKUP_DIR",
 	} {
 		if values[key] != "absent" {
 			t.Fatalf("docker child inherited %s", key)
@@ -3086,7 +3204,7 @@ func runInternalServiceTokenBootstrap(t *testing.T, sharedEnv, serversDir string
 
 func TestServerComposeMountsExternalScenarioOverridesReadOnly(t *testing.T) {
 	compose := readFile(t, filepath.Join("..", "docker-compose.server.yml"))
-	const scenarioDir = "SCENARIO_DIR: ${SCENARIO_DIR:-/data/scenarios}"
+	const scenarioDir = "SCENARIO_DIR: ${SCENARIO_LOOKUP_DIR-${SCENARIO_DIR:-/data/scenarios}}"
 	// 바인드 소스는 호스트 절대경로여야 한다 — deployer가 컨테이너 안에서 compose를 실행하므로
 	// 상대경로는 호스트 데몬에서 빈 /workspace/... 로 해석돼 외부 오버라이드가 조용히 죽는다.
 	const scenarioMount = "- ${COMPOSE_HOST_DIR:-${PWD:-.}}/data/scenarios:${SCENARIO_DIR:-/data/scenarios}:ro"
@@ -3125,6 +3243,74 @@ func TestServerComposeMountsExternalScenarioOverridesReadOnly(t *testing.T) {
 		if contract != want {
 			t.Fatalf("%s scenario override contract = %q, want exactly read-only %q", service.name, contract, want)
 		}
+	}
+}
+
+func TestServerComposeRendersScenarioLookupMatrix(t *testing.T) {
+	testCases := []struct {
+		name       string
+		scenario   string
+		wantLookup string
+		wantTarget string
+	}{
+		{name: "missing_uses_default", wantLookup: "/data/scenarios", wantTarget: "/data/scenarios"},
+		{name: "missing_uses_legacy_custom", scenario: "SCENARIO_DIR=/custom/scenarios\n", wantLookup: "/custom/scenarios", wantTarget: "/custom/scenarios"},
+		{name: "explicit_empty", scenario: "SCENARIO_DIR=/data/scenarios\nSCENARIO_LOOKUP_DIR=\n", wantLookup: "", wantTarget: "/data/scenarios"},
+		{name: "external_lookup", scenario: "SCENARIO_LOOKUP_DIR=/data/scenarios\n", wantLookup: "/data/scenarios", wantTarget: "/data/scenarios"},
+	}
+	const required = "SERVER_ID=pep\nGAME_POSTGRES_PASSWORD=fixture-password\nJWT_PUBLIC_KEY=fixture-public-key\nINTERNAL_SERVICE_TOKEN=fixture-internal-token\nGAME_API_PORT=8101\nWEB_GAME_PORT=3101\nCOMPOSE_HOST_DIR=/synthetic-host\n"
+	type renderedService struct {
+		Environment map[string]string `json:"environment"`
+		Volumes     []struct {
+			Target   string `json:"target"`
+			ReadOnly bool   `json:"read_only"`
+		} `json:"volumes"`
+	}
+	type renderedCompose struct {
+		Services map[string]renderedService `json:"services"`
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			cfg := config{composeHostDir: "/synthetic-host"}
+			fixtureDir := t.TempDir()
+			if err := os.Chmod(fixtureDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			fixture := filepath.Join(fixtureDir, "server.env")
+			writeEnv(t, fixture, required+testCase.scenario)
+			cmd := exec.Command("docker", "compose", "-f", filepath.Join("..", "docker-compose.server.yml"), "--env-file", fixture, "config", "--format", "json")
+			parentEnvironment := append(append([]string{}, os.Environ()...), "SCENARIO_LOOKUP_DIR=/attacker")
+			cmd.Env = cfg.serverComposeEnvironment(parentEnvironment)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("compose config: %v\n%s", err, output)
+			}
+			var rendered renderedCompose
+			if err := json.Unmarshal(output, &rendered); err != nil {
+				t.Fatalf("decode compose config: %v\n%s", err, output)
+			}
+			var canonical renderedService
+			for index, name := range []string{"game-engine", "game-api"} {
+				service, exists := rendered.Services[name]
+				if !exists {
+					t.Fatalf("compose config missing %s", name)
+				}
+				if got := service.Environment["SCENARIO_DIR"]; got != testCase.wantLookup {
+					t.Errorf("%s lookup = %q, want %q", name, got, testCase.wantLookup)
+				}
+				if len(service.Volumes) != 1 || service.Volumes[0].Target != testCase.wantTarget || !service.Volumes[0].ReadOnly {
+					t.Errorf("%s scenario mount = %#v, want target=%q read-only", name, service.Volumes, testCase.wantTarget)
+				}
+				if index == 0 {
+					canonical = service
+					continue
+				}
+				if service.Environment["SCENARIO_DIR"] != canonical.Environment["SCENARIO_DIR"] || !reflect.DeepEqual(service.Volumes, canonical.Volumes) {
+					t.Errorf("engine/API scenario contracts differ: engine=%#v api=%#v", canonical, service)
+				}
+			}
+		})
 	}
 }
 
@@ -4808,7 +4994,7 @@ JWT_SECRET=shared-secret
 JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
-	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\nSCENARIO_LOOKUP_DIR=\n")
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
 		if dockerPreflightProbe(args) {
@@ -4853,6 +5039,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 		t.Fatalf("nginx reload call = %q", recorded[3])
 	}
 	serverEnv := readFile(t, filepath.Join(cfg.serversDir, "spep.env"))
+	if strings.Count(serverEnv, "SCENARIO_LOOKUP_DIR=\n") != 1 {
+		t.Fatalf("reset did not preserve exact empty lookup line:\n%s", serverEnv)
+	}
 	for _, want := range []string{
 		"SCENARIO_CODE=scenario_1002\n",
 		"SCENARIO_SEED_ENABLED=true\n",
@@ -4878,7 +5067,8 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	sharedEnv := readFile(t, filepath.Join(cfg.composeDir, ".env"))
 	if !strings.Contains(sharedEnv, `"id":"pep"`) ||
 		!strings.Contains(sharedEnv, `"generation":2`) ||
-		!strings.Contains(sharedEnv, `"scenarioCode":"scenario_1002"`) {
+		!strings.Contains(sharedEnv, `"scenarioCode":"scenario_1002"`) ||
+		!strings.Contains(sharedEnv, `"SCENARIO_LOOKUP_DIR":""`) {
 		t.Fatalf("registry generation/scenario was not updated:\n%s", sharedEnv)
 	}
 }
@@ -5564,6 +5754,9 @@ func TestResetWritesDurableJournalBeforeDesiredStateMutation(t *testing.T) {
 	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, body.JobID, lifecycleJobSucceeded); completed.Status != lifecycleJobSucceeded {
 		t.Fatalf("reset completion after journal release = %#v", completed)
 	}
+	if got := readFile(t, envFile); strings.Contains(got, "SCENARIO_LOOKUP_DIR=") {
+		t.Fatalf("reset synthesized missing lookup key:\n%s", got)
+	}
 }
 
 func TestResetServerAllowsGenerationZeroForAlpha(t *testing.T) {
@@ -6100,7 +6293,7 @@ JWT_SECRET=shared-secret
 JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
-	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSCENARIO_CODE=scenario_1010\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSCENARIO_CODE=scenario_1010\nSCENARIO_LOOKUP_DIR=\n")
 	calls := &dockerCallRecorder{}
 	serverUpAttempts := 0
 	cfg.dockerRunner = func(args ...string) (string, error) {
@@ -6132,10 +6325,10 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	if serverUpAttempts != 2 {
 		t.Fatalf("server up attempts = %d, want 2; calls=%#v", serverUpAttempts, calls.snapshot())
 	}
-	if got := readFile(t, filepath.Join(cfg.serversDir, "spep.env")); !strings.Contains(got, "SCENARIO_CODE=scenario_1002\n") {
+	if got := readFile(t, filepath.Join(cfg.serversDir, "spep.env")); !strings.Contains(got, "SCENARIO_CODE=scenario_1002\n") || strings.Count(got, "SCENARIO_LOOKUP_DIR=\n") != 1 {
 		t.Fatalf("forward recovery did not retain new desired env:\n%s", got)
 	}
-	if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); strings.Contains(shared, `"repairRequired":true`) {
+	if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); strings.Contains(shared, `"repairRequired":true`) || !strings.Contains(shared, `"SCENARIO_LOOKUP_DIR":""`) {
 		t.Fatalf("successful forward recovery retained repair-required marker:\n%s", shared)
 	}
 }

@@ -77,7 +77,7 @@ services:
       # 시나리오 시드(빈 world_state에서 1회 멱등) — scenario_1010 = 174 generals.
       SCENARIO_SEED_ENABLED: ${SCENARIO_SEED_ENABLED:-true}
       SCENARIO_CODE: ${SCENARIO_CODE:-scenario_1010}
-      SCENARIO_DIR: ${SCENARIO_DIR:-/data/scenarios}
+      SCENARIO_DIR: ${SCENARIO_LOOKUP_DIR-${SCENARIO_DIR:-/data/scenarios}}
       # 리셋이 고른 턴 주기(분). deployer가 servers/<id>.env에 RESET_TURNTERM으로 쓰고
       # (main.go resetEnvUpdates), compose는 --env-file로 그 파일을 읽는다. 이 한 줄이 없으면
       # 값이 env 파일까지만 오고 엔진에 닿지 않아 시드가 항상 60분으로 굳는다.
@@ -128,7 +128,7 @@ services:
       SERVER_NAME: ${SERVER_NAME:-}
       SERVER_GENERATION: ${SERVER_GENERATION:-1}
       OPENSAMGUK_WORLD_ID: ${OPENSAMGUK_WORLD_ID:-1}
-      SCENARIO_DIR: ${SCENARIO_DIR:-/data/scenarios}
+      SCENARIO_DIR: ${SCENARIO_LOOKUP_DIR-${SCENARIO_DIR:-/data/scenarios}}
       # JWT — game-api는 gateway-api 공개키로 검증만 한다(verify-only, 개인키 미배포).
       JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY:?JWT_PUBLIC_KEY required — see .env.example}
       JWT_LEGACY_SECRET: ${JWT_LEGACY_SECRET:-}

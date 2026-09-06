@@ -142,6 +142,7 @@ var serverEnvAllowlist = map[string]envFieldSpec{
 	"TURN_PROFILE_NAME":              {Description: "턴 프로필"},
 	"SCENARIO_SEED_ENABLED":          {Description: "시나리오 자동 시드 활성화"},
 	"SCENARIO_CODE":                  {Description: "시드할 시나리오 코드"},
+	"SCENARIO_LOOKUP_DIR":            {Description: "시나리오 조회 소스"},
 	"SERVER_NAME":                    {Description: "서버 이름"},
 	"SERVER_GENERATION":              {Description: "서버 기수"},
 	"GAME_API_URL":                   {Description: "game-api 내부 URL"},
@@ -199,6 +200,7 @@ var serverComposeInterpolationKeys = map[string]struct{}{
 	"RESET_TURNTERM":                 {},
 	"SCENARIO_CODE":                  {},
 	"SCENARIO_DIR":                   {},
+	"SCENARIO_LOOKUP_DIR":            {},
 	"SCENARIO_SEED_ENABLED":          {},
 	"SERVER_GENERATION":              {},
 	"SERVER_ID":                      {},
@@ -244,6 +246,7 @@ var registryEnvAllowlist = map[string]struct{}{
 	"TURN_PROFILE_NAME":          {},
 	"SCENARIO_SEED_ENABLED":      {},
 	"SCENARIO_CODE":              {},
+	"SCENARIO_LOOKUP_DIR":        {},
 	"SERVER_NAME":                {},
 	"SERVER_GENERATION":          {},
 	"GAME_API_URL":               {},
@@ -4142,12 +4145,19 @@ func readEnvFields(path string, allowlist map[string]envFieldSpec) (map[string]e
 }
 
 func validateEnvPatch(values map[string]string, allowlist map[string]envFieldSpec) error {
-	for key := range values {
+	for key, value := range values {
 		if _, ok := allowlist[key]; !ok {
 			return fmt.Errorf("허용되지 않은 env key: %s", key)
 		}
+		if key == "SCENARIO_LOOKUP_DIR" && !isExactScenarioLookupDir(value) {
+			return errors.New("SCENARIO_LOOKUP_DIR 값은 빈 문자열 또는 /data/scenarios만 허용됩니다.")
+		}
 	}
 	return nil
+}
+
+func isExactScenarioLookupDir(value string) bool {
+	return value == "" || value == "/data/scenarios"
 }
 
 func patchEnvFile(path string, allowlist map[string]envFieldSpec, updates map[string]string) (map[string]envField, error) {
