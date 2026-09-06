@@ -403,16 +403,18 @@ const (
 // maintenance marker, so a workflow can drain the running deployer before
 // replacing containers or shared files.
 type operationCoordinator struct {
-	mu               sync.Mutex
-	cond             *sync.Cond
-	closed           bool
-	journalPending   bool
-	active           *operationLease
-	maintenanceLease *maintenanceAdmissionLease
-	markerPath       string
-	journalPath      string
-	jobs             *lifecycleJobManager
-	writeMarker      func(string) (bool, error)
+	mu                           sync.Mutex
+	cond                         *sync.Cond
+	closed                       bool
+	journalPending               bool
+	active                       *operationLease
+	preparing                    *operationPreparation
+	preparationSettlementPending bool
+	maintenanceLease             *maintenanceAdmissionLease
+	markerPath                   string
+	journalPath                  string
+	jobs                         *lifecycleJobManager
+	writeMarker                  func(string) (bool, error)
 }
 
 type maintenanceAdmissionLease struct {
@@ -428,6 +430,201 @@ type operationLease struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	done        sync.Once
+}
+
+// A preparation is published before either durable or ephemeral reservation.
+// It remains busy through rejection settlement or the atomic transfer to active.
+type operationPreparation struct {
+	coordinator  *operationCoordinator
+	kind         lifecycleKind
+	operationID  string
+	subjectID    string
+	fingerprint  string
+	leaseAttempt string
+	admissionErr error
+	ctx          context.Context
+	cancel       context.CancelFunc
+	done         sync.Once
+}
+
+func (p *operationPreparation) Context() context.Context { return p.ctx }
+
+func (p *operationPreparation) complete(settled bool) {
+	if p == nil {
+		return
+	}
+	p.done.Do(func() {
+		p.cancel()
+		c := p.coordinator
+		c.mu.Lock()
+		if !settled {
+			c.preparationSettlementPending = true
+			c.closed = true
+		}
+		if c.preparing == p {
+			c.preparing = nil
+		}
+		c.cond.Broadcast()
+		c.mu.Unlock()
+	})
+}
+
+func (c *operationCoordinator) markPreparationSettlementPending() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.preparationSettlementPending = true
+	c.closed = true
+	c.cond.Broadcast()
+	c.mu.Unlock()
+}
+
+func (c *operationCoordinator) prepare(kind lifecycleKind, operationID, subjectID, fingerprint, token string) (*operationPreparation, error) {
+	if c == nil {
+		return nil, errors.New("operation coordinator unavailable")
+	}
+	marker, journal := stateFilePresent(c.markerPath), stateFilePresent(c.journalPath)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if marker {
+		c.closed = true
+	}
+	if journal && c.active == nil {
+		c.closed = true
+		c.journalPending = true
+	}
+	for c.preparing != nil && !c.closed {
+		c.cond.Wait()
+	}
+	if c.preparationSettlementPending || (c.journalPending && c.active == nil) || c.preparing != nil {
+		return nil, errMaintenanceClosed
+	}
+	if c.closed && (kind != lifecycleKindCreate || operationID == "" || token == "") {
+		return nil, errMaintenanceClosed
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	p := &operationPreparation{coordinator: c, kind: kind, operationID: operationID, subjectID: subjectID, fingerprint: fingerprint, leaseAttempt: token, ctx: ctx, cancel: cancel}
+	if c.closed {
+		lease := c.maintenanceLease
+		if lease == nil || lease.consumed || !secureEqual(lease.token, token) {
+			p.admissionErr = errMaintenanceClosed
+		}
+	}
+	c.preparing = p
+	return p, nil
+}
+
+func (p *operationPreparation) promote(jobID string) (*operationLease, error) {
+	c := p.coordinator
+	marker, journal := stateFilePresent(c.markerPath), stateFilePresent(c.journalPath)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if marker {
+		c.closed = true
+	}
+	if journal && c.active == nil {
+		c.closed = true
+		c.journalPending = true
+	}
+	check := func() error {
+		if c.preparing != p || p.Context().Err() != nil || p.admissionErr != nil || c.preparationSettlementPending || (c.journalPending && c.active == nil) {
+			return errMaintenanceClosed
+		}
+		if c.closed {
+			lease := c.maintenanceLease
+			if p.kind != lifecycleKindCreate || p.operationID == "" || p.leaseAttempt == "" || lease == nil || lease.consumed || !secureEqual(lease.token, p.leaseAttempt) {
+				return errMaintenanceClosed
+			}
+		}
+		return nil
+	}
+	for c.active != nil {
+		if err := check(); err != nil {
+			return nil, err
+		}
+		c.cond.Wait()
+	}
+	if err := check(); err != nil {
+		return nil, err
+	}
+	if c.jobs == nil || !c.jobs.claim(jobID, p.cancel) {
+		return nil, errLifecycleJobNotPending
+	}
+	if c.closed {
+		c.maintenanceLease.consumed = true
+		c.maintenanceLease.operationID = p.operationID
+		c.maintenanceLease.jobID = jobID
+	}
+	lease := &operationLease{coordinator: c, jobID: jobID, ctx: p.ctx, cancel: p.cancel}
+	c.active = lease
+	c.preparing = nil
+	// Cancellation now belongs to the active lease, not preparation cleanup.
+	p.done.Do(func() {})
+	c.cond.Broadcast()
+	return lease, nil
+}
+
+func (c config) beginPreparedLifecycle(p *operationPreparation, jobID string) (*operationLease, error) {
+	if err := c.dockerPreflight(p.Context()); err != nil {
+		return nil, err
+	}
+	return p.promote(jobID)
+}
+
+// Lookup must precede Reserve: an absent replay lookup must never create state
+// outside a published preparation. Known non-terminal records may flush a
+// previously deferred terminal transition even when admission is sticky-closed.
+func (c config) replayDurableLifecycleOperation(operationID string, kind lifecycleKind, subjectID, fingerprint string) (durableOperationRecord, bool, error) {
+	if operationID == "" {
+		return durableOperationRecord{}, false, nil
+	}
+	if c.lifecycleOperationStore == nil {
+		return durableOperationRecord{}, false, errors.New("durable operation store unavailable")
+	}
+	record, ok := c.lifecycleOperationStore.Lookup(operationID)
+	if !ok {
+		return durableOperationRecord{}, false, nil
+	}
+	if record.Kind != kind || record.SubjectID != subjectID || record.RequestFingerprint != fingerprint {
+		return durableOperationRecord{}, false, errLifecycleOperationConflict
+	}
+	if !isTerminalLifecycleJob(record.Status) {
+		return c.reserveDurableLifecycleOperation(operationID, kind, subjectID, fingerprint)
+	}
+	return record, true, nil
+}
+
+func (c config) prepareLifecycleOperation(kind lifecycleKind, operationID, subjectID, fingerprint, token string) (*operationPreparation, durableOperationRecord, bool, error) {
+	if record, exists, err := c.replayDurableLifecycleOperation(operationID, kind, subjectID, fingerprint); exists || err != nil {
+		return nil, record, exists, err
+	}
+	p, err := c.operations.prepare(kind, operationID, subjectID, fingerprint, token)
+	if err != nil {
+		return nil, durableOperationRecord{}, false, err
+	}
+	if record, exists, err := c.replayDurableLifecycleOperation(operationID, kind, subjectID, fingerprint); exists || err != nil {
+		p.complete(true)
+		return nil, record, exists, err
+	}
+	if p.admissionErr != nil {
+		// Invalid/consumed create leases keep their terminal tombstone contract
+		// without ever publishing a transient pending operation or a job.
+		want := durableOperationRecord{OperationID: operationID, Kind: kind, SubjectID: subjectID, RequestFingerprint: fingerprint, Status: lifecycleJobCancelled, HTTPStatus: http.StatusConflict, PublicMessage: durableOperationCancelledMessage}
+		record, _, reserveErr := c.lifecycleOperationStore.Reserve(want)
+		if reserveErr != nil {
+			committed, ok := c.lifecycleOperationStore.Lookup(operationID)
+			if ok && committed.Kind == kind && committed.SubjectID == subjectID && committed.RequestFingerprint == fingerprint && committed.Status == want.Status && committed.HTTPStatus == want.HTTPStatus && committed.PublicMessage == want.PublicMessage {
+				reserveErr = nil
+			}
+		}
+		p.complete(reserveErr == nil)
+		if reserveErr != nil {
+			return nil, record, false, errDurableOperationSettlementPending
+		}
+		return nil, record, false, p.admissionErr
+	}
+	return p, durableOperationRecord{}, false, nil
 }
 
 func newOperationCoordinator(markerPath string, journalPath string, jobs *lifecycleJobManager) *operationCoordinator {
@@ -456,37 +653,21 @@ func stateFilePresent(path string) bool {
 }
 
 func (c *operationCoordinator) begin(jobID string) (*operationLease, error) {
-	return c.beginWithMaintenanceLease(jobID, "", "")
-}
-
-func (c *operationCoordinator) beginWithMaintenanceLease(jobID, token, operationID string) (*operationLease, error) {
 	if c == nil {
 		return nil, errors.New("operation coordinator unavailable")
 	}
 	c.mu.Lock()
-	for c.active != nil && !c.closed {
+	for (c.active != nil || c.preparing != nil) && !c.closed {
 		c.cond.Wait()
 	}
-	if c.journalPending || stateFilePresent(c.journalPath) {
+	if c.preparationSettlementPending || c.closed || c.journalPending || stateFilePresent(c.journalPath) {
 		c.closed = true
-		c.journalPending = true
 		c.mu.Unlock()
 		if jobID != "" && c.jobs != nil {
 			c.jobs.requestCancel(jobID)
 		}
 		return nil, errMaintenanceClosed
 	}
-	if c.closed {
-		lease := c.maintenanceLease
-		if c.active != nil || jobID == "" || operationID == "" || lease == nil || lease.consumed || !secureEqual(lease.token, token) {
-			c.mu.Unlock()
-			if jobID != "" && c.jobs != nil {
-				c.jobs.requestCancel(jobID)
-			}
-			return nil, errMaintenanceClosed
-		}
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	if jobID != "" {
 		if c.jobs == nil || !c.jobs.claim(jobID, cancel) {
@@ -494,11 +675,6 @@ func (c *operationCoordinator) beginWithMaintenanceLease(jobID, token, operation
 			cancel()
 			return nil, errLifecycleJobNotPending
 		}
-	}
-	if c.closed {
-		c.maintenanceLease.consumed = true
-		c.maintenanceLease.operationID = operationID
-		c.maintenanceLease.jobID = jobID
 	}
 	lease := &operationLease{
 		coordinator: c,
@@ -516,7 +692,7 @@ func (c *operationCoordinator) beginRecovery() (*operationLease, error) {
 		return nil, errors.New("operation coordinator unavailable")
 	}
 	c.mu.Lock()
-	for c.active != nil {
+	for c.active != nil || c.preparing != nil {
 		c.cond.Wait()
 	}
 	if !c.journalPending && !stateFilePresent(c.journalPath) {
@@ -551,7 +727,7 @@ func (c *operationCoordinator) clearLifecycleJournalPending() {
 	}
 	c.mu.Lock()
 	c.journalPending = false
-	if !stateFilePresent(c.markerPath) {
+	if !c.preparationSettlementPending && !stateFilePresent(c.markerPath) {
 		c.closed = false
 	}
 	c.cond.Broadcast()
@@ -635,7 +811,7 @@ func (c *operationCoordinator) maintenanceStateLocked() maintenanceState {
 	if !c.closed {
 		return maintenanceStateOpen
 	}
-	if c.active != nil {
+	if c.active != nil || c.preparing != nil {
 		return maintenanceStateDraining
 	}
 	return maintenanceStateDrained
@@ -653,6 +829,9 @@ func (c *operationCoordinator) enterMaintenance() (maintenanceState, string, err
 		}
 	}
 	c.closed = true
+	if c.preparing != nil {
+		c.preparing.cancel()
+	}
 	active := c.active
 	if active != nil {
 		active.cancel()
@@ -665,7 +844,7 @@ func (c *operationCoordinator) enterMaintenance() (maintenanceState, string, err
 	}
 
 	c.mu.Lock()
-	for c.active != nil {
+	for c.active != nil || c.preparing != nil {
 		c.cond.Wait()
 	}
 	if c.maintenanceLease == nil {
@@ -695,7 +874,7 @@ func (c *operationCoordinator) enterMaintenanceIfIdle() (maintenanceState, strin
 	defer c.mu.Unlock()
 
 	state := c.maintenanceStateLocked()
-	if c.active != nil || c.closed || c.journalPending || stateFilePresent(c.markerPath) || stateFilePresent(c.journalPath) {
+	if c.active != nil || c.preparing != nil || c.preparationSettlementPending || c.closed || c.journalPending || stateFilePresent(c.markerPath) || stateFilePresent(c.journalPath) {
 		return state, "", errMaintenanceIdleConflict
 	}
 	token, err := randomHex(maintenanceLeaseBytes)
@@ -733,8 +912,11 @@ func (c *operationCoordinator) leaveMaintenance() (maintenanceState, error) {
 	if !c.closed {
 		return maintenanceStateOpen, nil
 	}
-	if c.active != nil {
+	if c.active != nil || c.preparing != nil {
 		return maintenanceStateDraining, errors.New("maintenance operation is not drained")
+	}
+	if c.preparationSettlementPending {
+		return maintenanceStateDrained, errors.New("lifecycle operation settlement is required before maintenance can open")
 	}
 	if c.journalPending || stateFilePresent(c.journalPath) {
 		c.closed = true
@@ -1343,13 +1525,35 @@ func (c config) transitionDurableLifecycleOperation(operationID string, status l
 	return err
 }
 
-func (c config) settleRejectedDurableLifecycleOperation(operationID string, httpStatus int, messageID durableOperationMessageID) error {
-	if operationID == "" || httpStatus < http.StatusBadRequest || c.lifecycleOperationStore == nil {
+func (c config) settleRejectedDurableLifecycleOperation(operationID string, httpStatus int, messageID durableOperationMessageID, lease *operationLease) error {
+	if operationID == "" || httpStatus < http.StatusBadRequest {
 		return nil
 	}
+	if c.lifecycleOperationStore == nil {
+		return errors.New("durable operation store unavailable")
+	}
 	record, ok := c.lifecycleOperationStore.Lookup(operationID)
-	if !ok || record.Status != lifecycleJobPending {
+	if !ok {
+		return errors.New("rejected durable operation is unavailable")
+	}
+	if isTerminalLifecycleJob(record.Status) {
 		return nil
+	}
+	if record.Status == lifecycleJobRunning {
+		// A retry can flush deferred running after startup failed but before
+		// rejection cleanup. Only the caller that still owns active and has not
+		// transferred it to a worker may settle that running operation here.
+		if lease == nil || lease.coordinator != c.operations {
+			return errors.New("rejected running operation has no owned active lease")
+		}
+		c.operations.mu.Lock()
+		ownsActive := c.operations.active == lease
+		c.operations.mu.Unlock()
+		if !ownsActive {
+			return errors.New("rejected running operation is no longer owned")
+		}
+	} else if record.Status != lifecycleJobPending {
+		return errors.New("rejected durable operation is not terminal or settleable")
 	}
 	return c.transitionDurableLifecycleOperation(operationID, lifecycleJobFailed, httpStatus, messageID)
 }
@@ -3352,22 +3556,48 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 	jwtLegacySecret := normalized.JWTLegacySecret
 	jwtLegacyAcceptUntil := normalized.JWTLegacyAcceptUntil
 	internalServiceToken := normalized.InternalServiceToken
+	fingerprint := createRequestFingerprint(normalized)
+	preparation, replayRecord, replayExists, err := c.prepareLifecycleOperation(lifecycleKindCreate, operationID, id, fingerprint, maintenanceLease)
+	if err != nil {
+		if errors.Is(err, errLifecycleOperationConflict) {
+			return createServerResponse{OK: false, ID: id, OperationID: operationID, Detail: "operationId는 다른 서버 생성 요청에 이미 사용되었습니다."}, http.StatusConflict
+		}
+		detail, status := lifecyclePreparationFailure(err)
+		return createServerResponse{OK: false, ID: id, OperationID: operationID, Detail: detail}, status
+	}
+	if replayExists {
+		replay := lifecycleOperationReplay(replayRecord, c.lifecycleJobs.jobIDForOperation(operationID), "동일한 서버 생성 요청이 이미 접수되었습니다.")
+		replay.Name = name
+		replay.Project = projectForServerID(id)
+		return replay, http.StatusOK
+	}
 	jobID := ""
 	newReservation := false
 	durableReserved := false
 	reservationClaimed := false
-	admissionAttempted := false
+	preserveCancelledJob := false
+	var lease *operationLease
+	workerStarted, settlementConfirmed := false, true
 	defer func() {
-		if !durableReserved {
+		if workerStarted {
 			return
 		}
-		if err := c.settleRejectedDurableLifecycleOperation(operationID, responseStatus, durableOperationMessageCreatePreparationFailed); err != nil {
-			log.Printf("settle rejected create operation unavailable operationId=%s", operationID)
-			response = rejectedDurableOperationSettlementResponse(response, operationID, durableOperationMessageCreatePreparationFailed)
-			responseStatus = http.StatusServiceUnavailable
+		if durableReserved {
+			if err := c.settleRejectedDurableLifecycleOperation(operationID, responseStatus, durableOperationMessageCreatePreparationFailed, lease); err != nil {
+				log.Printf("settle rejected create operation unavailable operationId=%s", operationID)
+				response = rejectedDurableOperationSettlementResponse(response, operationID, durableOperationMessageCreatePreparationFailed)
+				responseStatus = http.StatusServiceUnavailable
+				settlementConfirmed = false
+			}
+		}
+		if !settlementConfirmed {
+			c.operations.markPreparationSettlementPending()
+		}
+		preparation.complete(settlementConfirmed)
+		if lease != nil {
+			lease.Done()
 		}
 	}()
-	fingerprint := createRequestFingerprint(normalized)
 	if operationID == "" {
 		log.Printf("legacy lifecycle request omitted operationId kind=%s subject=%s", lifecycleKindCreate, id)
 		jobID, err = c.lifecycleJobs.reserve()
@@ -3406,7 +3636,7 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 	}
 	newReservation = true
 	defer func() {
-		if newReservation && !reservationClaimed && !admissionAttempted {
+		if newReservation && !reservationClaimed && !preserveCancelledJob {
 			c.lifecycleJobs.discard(jobID)
 		}
 	}()
@@ -3465,20 +3695,18 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 		DeployProject: target.Project,
 		Env:           registryEnvSnapshot(envValuesFromLines(envLines)),
 	}
-	admissionAttempted = true
-	lease, err := c.beginMaintenanceCreate(jobID, maintenanceLease, operationID)
+	c.lifecycleJobs.bindOperationSubject(jobID, lifecycleKindCreate, id)
+	lease, err = c.beginPreparedLifecycle(preparation, jobID)
 	if err != nil {
-		if errors.Is(err, errMaintenanceClosed) {
-			c.lifecycleJobs.discard(jobID)
-		}
+		preserveCancelledJob = errors.Is(err, errLifecycleJobNotPending)
 		if transitionErr := c.transitionDurableLifecycleOperation(operationID, lifecycleJobCancelled, http.StatusConflict, durableOperationMessageCancelled); transitionErr != nil {
+			settlementConfirmed = false
 			log.Printf("cancel rejected create operation operationId=%s err=%v", operationID, transitionErr)
 		}
 		detail, status := mutationAdmissionFailure(err)
 		return createServerResponse{OK: false, ID: id, Detail: detail}, status
 	}
 	reservationClaimed = true
-	c.lifecycleJobs.bindOperationSubject(jobID, lifecycleKindCreate, id)
 	setupComplete := make(chan error, 1)
 	if err := c.startClaimedDurableLifecycleJob(lease, jobID, "create "+id, operationID, lifecycleKindCreate, func(ctx context.Context) (string, error) {
 		if err := ctx.Err(); err != nil {
@@ -3547,6 +3775,7 @@ func (c config) createServerWithMaintenanceLease(req createServerRequest, mainte
 	}); err != nil {
 		return createServerResponse{OK: false, ID: id, Name: name, Project: entry.DeployProject, OperationID: operationID, Detail: durableOperationCreatePreparationFailedMessage}, http.StatusInternalServerError
 	}
+	workerStarted = true
 	if err := <-setupComplete; err != nil {
 		return createServerResponse{OK: false, ID: id, Name: name, Project: entry.DeployProject, Detail: fmt.Sprintf("서버 생성 준비 실패: %v", err)}, http.StatusInternalServerError
 	}
@@ -3577,17 +3806,42 @@ func (c config) deleteServer(rawID string, confirm string, operationID string) (
 	}
 	id := target.ID
 	fingerprint := closeRequestFingerprint(id)
+	preparation, replayRecord, replayExists, err := c.prepareLifecycleOperation(lifecycleKindClose, operationID, id, fingerprint, "")
+	if err != nil {
+		if errors.Is(err, errLifecycleOperationConflict) {
+			return createServerResponse{OK: false, ID: id, OperationID: operationID, Detail: "operationId는 다른 서버 요청에 이미 사용되었습니다."}, http.StatusConflict
+		}
+		detail, status := lifecyclePreparationFailure(err)
+		return createServerResponse{OK: false, ID: id, OperationID: operationID, Detail: detail}, status
+	}
+	if replayExists {
+		replay := lifecycleOperationReplay(replayRecord, c.lifecycleJobs.jobIDForOperation(operationID), "동일한 서버 종료 요청이 이미 접수되었습니다.")
+		replay.Project = target.Project
+		return replay, http.StatusOK
+	}
 	var durable durableOperationRecord
 	durableReserved := false
+	var lease *operationLease
+	workerStarted, settlementConfirmed := false, true
 	rejectionMessageID := durableOperationMessageClosePreparationFailed
 	defer func() {
-		if !durableReserved {
+		if workerStarted {
 			return
 		}
-		if err := c.settleRejectedDurableLifecycleOperation(operationID, responseStatus, rejectionMessageID); err != nil {
-			log.Printf("settle rejected close operation unavailable operationId=%s", operationID)
-			response = rejectedDurableOperationSettlementResponse(response, operationID, rejectionMessageID)
-			responseStatus = http.StatusServiceUnavailable
+		if durableReserved {
+			if err := c.settleRejectedDurableLifecycleOperation(operationID, responseStatus, rejectionMessageID, lease); err != nil {
+				log.Printf("settle rejected close operation unavailable operationId=%s", operationID)
+				response = rejectedDurableOperationSettlementResponse(response, operationID, rejectionMessageID)
+				responseStatus = http.StatusServiceUnavailable
+				settlementConfirmed = false
+			}
+		}
+		if !settlementConfirmed {
+			c.operations.markPreparationSettlementPending()
+		}
+		preparation.complete(settlementConfirmed)
+		if lease != nil {
+			lease.Done()
 		}
 	}()
 	if operationID == "" {
@@ -3648,10 +3902,11 @@ func (c config) deleteServer(rawID string, confirm string, operationID string) (
 		return replay, http.StatusOK
 	}
 	c.lifecycleJobs.bindOperationSubject(jobID, lifecycleKindClose, id)
-	lease, err := c.beginMutation(jobID)
+	lease, err = c.beginPreparedLifecycle(preparation, jobID)
 	if err != nil {
 		c.lifecycleJobs.discard(jobID)
 		if transitionErr := c.transitionDurableLifecycleOperation(operationID, lifecycleJobCancelled, http.StatusConflict, durableOperationMessageCancelled); transitionErr != nil {
+			settlementConfirmed = false
 			log.Printf("cancel rejected close operation operationId=%s err=%v", operationID, transitionErr)
 		}
 		detail, status := mutationAdmissionFailure(err)
@@ -3659,7 +3914,6 @@ func (c config) deleteServer(rawID string, confirm string, operationID string) (
 	}
 	releaseStaleAdmission := func() {
 		c.lifecycleJobs.finish(jobID, lifecycleJobCancelled)
-		lease.Done()
 		c.lifecycleJobs.discard(jobID)
 	}
 	entry, err = c.registryEntryByID(id)
@@ -3723,6 +3977,7 @@ func (c config) deleteServer(rawID string, confirm string, operationID string) (
 	}); err != nil {
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, OperationID: operationID, Detail: durableOperationClosePreparationFailedMessage}, http.StatusInternalServerError
 	}
+	workerStarted = true
 	response = createServerResponse{
 		OK:               true,
 		ID:               id,
@@ -3786,16 +4041,42 @@ func (c config) resetServer(rawID string, req resetServerRequest) (response crea
 	}
 	fingerprint := resetRequestFingerprint(id, resetTarget)
 	operationID := requestedOperationID
+	preparation, replayRecord, replayExists, err := c.prepareLifecycleOperation(lifecycleKindReset, operationID, id, fingerprint, "")
+	if err != nil {
+		if errors.Is(err, errLifecycleOperationConflict) {
+			return createServerResponse{OK: false, ID: id, OperationID: operationID, Detail: "operationId는 다른 서버 리셋 요청에 이미 사용되었습니다."}, http.StatusConflict
+		}
+		detail, status := lifecyclePreparationFailure(err)
+		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, OperationID: operationID, Detail: detail}, status
+	}
+	if replayExists {
+		replay := lifecycleOperationReplay(replayRecord, c.lifecycleJobs.jobIDForOperation(operationID), "동일한 서버 리셋 요청이 이미 접수되었습니다.")
+		replay.Name = entry.Name
+		replay.Project = entry.DeployProject
+		return replay, http.StatusOK
+	}
 	var operation durableOperationRecord
 	durableReserved := false
+	var lease *operationLease
+	workerStarted, settlementConfirmed := false, true
 	defer func() {
-		if !durableReserved {
+		if workerStarted {
 			return
 		}
-		if err := c.settleRejectedDurableLifecycleOperation(operationID, responseStatus, durableOperationMessageResetPreparationFailed); err != nil {
-			log.Printf("settle rejected reset operation unavailable operationId=%s", operationID)
-			response = rejectedDurableOperationSettlementResponse(response, operationID, durableOperationMessageResetPreparationFailed)
-			responseStatus = http.StatusServiceUnavailable
+		if durableReserved {
+			if err := c.settleRejectedDurableLifecycleOperation(operationID, responseStatus, durableOperationMessageResetPreparationFailed, lease); err != nil {
+				log.Printf("settle rejected reset operation unavailable operationId=%s", operationID)
+				response = rejectedDurableOperationSettlementResponse(response, operationID, durableOperationMessageResetPreparationFailed)
+				responseStatus = http.StatusServiceUnavailable
+				settlementConfirmed = false
+			}
+		}
+		if !settlementConfirmed {
+			c.operations.markPreparationSettlementPending()
+		}
+		preparation.complete(settlementConfirmed)
+		if lease != nil {
+			lease.Done()
 		}
 	}()
 	if operationID == "" {
@@ -3836,10 +4117,11 @@ func (c config) resetServer(rawID string, req resetServerRequest) (response crea
 		return replay, http.StatusOK
 	}
 	c.lifecycleJobs.bindOperationSubject(jobID, lifecycleKindReset, id)
-	lease, err := c.beginMutation(jobID)
+	lease, err = c.beginPreparedLifecycle(preparation, jobID)
 	if err != nil {
 		c.lifecycleJobs.discard(jobID)
 		if transitionErr := c.transitionDurableLifecycleOperation(operationID, lifecycleJobCancelled, http.StatusConflict, durableOperationMessageCancelled); transitionErr != nil {
+			settlementConfirmed = false
 			log.Printf("cancel rejected reset operation operationId=%s err=%v", operationID, transitionErr)
 		}
 		detail, status := mutationAdmissionFailure(err)
@@ -3935,6 +4217,7 @@ func (c config) resetServer(rawID string, req resetServerRequest) (response crea
 	}); err != nil {
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, OperationID: operationID, Detail: durableOperationResetPreparationFailedMessage}, http.StatusInternalServerError
 	}
+	workerStarted = true
 	response = createServerResponse{
 		OK:               true,
 		ID:               id,
@@ -3950,6 +4233,13 @@ func (c config) resetServer(rawID string, req resetServerRequest) (response crea
 		response.OperationStatus = lifecycleJobPending
 	}
 	return response, http.StatusOK
+}
+
+func lifecyclePreparationFailure(err error) (string, int) {
+	if errors.Is(err, errMaintenanceClosed) {
+		return mutationAdmissionFailure(err)
+	}
+	return lifecycleJobReservationFailure(err)
 }
 
 func lifecycleJobReservationFailure(err error) (string, int) {
@@ -3977,13 +4267,6 @@ func (c config) beginMutation(jobID string) (*operationLease, error) {
 		return nil, err
 	}
 	return c.operations.begin(jobID)
-}
-
-func (c config) beginMaintenanceCreate(jobID, maintenanceLease, operationID string) (*operationLease, error) {
-	if err := c.admitMutation(); err != nil {
-		return nil, err
-	}
-	return c.operations.beginWithMaintenanceLease(jobID, maintenanceLease, operationID)
 }
 
 func writeMutationAdmissionError(w http.ResponseWriter, err error) {
@@ -4039,7 +4322,6 @@ func (c config) startClaimedLifecycleJob(lease *operationLease, id string, name 
 func (c config) startClaimedDurableLifecycleJob(lease *operationLease, jobID, name, operationID string, kind lifecycleKind, job func(context.Context) (string, error)) error {
 	if err := c.transitionDurableLifecycleOperation(operationID, lifecycleJobRunning, http.StatusAccepted, durableOperationMessageNone); err != nil {
 		c.lifecycleJobs.finish(jobID, lifecycleJobFailed)
-		lease.Done()
 		return err
 	}
 	go func() {
@@ -4075,6 +4357,7 @@ func (c config) startClaimedDurableLifecycleJob(lease *operationLease, jobID, na
 			}
 		}
 		if transitionErr != nil {
+			lease.coordinator.markPreparationSettlementPending()
 			status = lifecycleJobFailed
 			log.Printf("server lifecycle durable transition failed name=%s err=%v", name, transitionErr)
 		} else if operationID != "" {
