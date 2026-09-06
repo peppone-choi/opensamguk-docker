@@ -124,6 +124,16 @@ gateway-api readiness가 새 migration과 seed 완료를 증명한 뒤에만 boa
 
 서버마다 `servers/s<public-id>.env`를 만들고(예시 복제) 포트/비밀번호/public `SERVER_ID`가 겹치지 않게 한다.
 
+서버별 시나리오 조회 소스는 deployer env PATCH에서 `SCENARIO_LOOKUP_DIR`로 선택한다. 허용되는 값은
+바이트 단위로 정확히 다음 두 개뿐이다.
+
+- `SCENARIO_LOOKUP_DIR=`: engine/API 프로세스에 빈 `SCENARIO_DIR`를 전달하여 내장 시나리오 조회 모드를 선택한다.
+- `SCENARIO_LOOKUP_DIR=/data/scenarios`: 읽기 전용으로 마운트된 외부 `/data/scenarios`를 조회한다.
+
+이 키가 없는 기존 env는 호환성을 위해 `SCENARIO_DIR`을 계속 사용하고, `SCENARIO_DIR`도 없으면
+`/data/scenarios`로 폴백한다. `SCENARIO_LOOKUP_DIR` 선택은 기존 bind mount를 바꾸지 않으며 mount 목적지는
+여전히 `SCENARIO_DIR` 또는 기본 `/data/scenarios`이다. 따라서 빈 조회 모드에서도 기존 읽기 전용 mount는 그대로 유지된다.
+
 ```bash
 cp servers/s1.env.example servers/spep.env  # SERVER_ID=pep (compose가 spep/opensamguk-spep로 합성),
                                             # SERVER_NAME/SERVER_GENERATION, OPENSAMGUK_WORLD_ID=1, IMAGE_TAG, GAME_API_PORT/WEB_GAME_PORT,
