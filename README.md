@@ -476,3 +476,10 @@ GCP Compute Engine **e2-standard-2**(2 vCPU / 8 GiB) 기준(단일서버). LLM·
 ---
 
 > 이미지·로직의 단일 출처는 소스 저장소다. 이 저장소는 오케스트레이션(compose/nginx/env)만 둔다.
+
+
+### 전콘 원본 업로드 용량
+
+수동 전콘 편집은 원본8MiB와 자르기 좌표를 전송합니다. nginx는 HTTP·HTTPS의
+`/api/account/profile-icon` 및 직접 API 경로 `/api/gateway/auth/account/profile-icon`만9MiB까지 허용합니다.
+그 외 API의2MiB 한도와 요청 속도 제한은 유지합니다. 대응하는 앱 이미지가 배포되어야 원본과 세 구도 저장 기능을 사용할 수 있습니다.
