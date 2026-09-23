@@ -108,8 +108,8 @@ docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env
 기존 운영 환경에 DB 레지스트리 버전을 처음 올릴 때는 `SERVER_REGISTRY_JSON`을 지우거나 빈 배열로 바꾸면 안 된다.
 새 gateway-api는 `game_server` 테이블이 비어 있을 때만 이 값을 1회 seed로 사용한다. 배포 전 현재 실행 서버가
 `.env` 레지스트리와 `servers/s<id>.env`에 모두 들어 있는지 확인하고 다음 검사가 통과해야 한다.
-V60부터 시드 완료 상태를 DB에 기록해 마지막 서버 삭제 후 재기동해도 과거 JSON을 재적용하지 않는다.
-기존 DB에 서버와 계정이 모두 없다면 V60 적용 전에 JSON이 의도한 최초 시드인지 확인한다.
+V62부터 시드 완료 상태를 DB에 기록해 마지막 서버 삭제 후 재기동해도 과거 JSON을 재적용하지 않는다.
+기존 DB에 서버와 계정이 모두 없다면 V62 적용 전에 JSON이 의도한 최초 시드인지 확인한다.
 구 gateway-api 버전으로 롤백할 때는 빈 DB에 남은 과거 JSON이 재적용될 수 있으므로
 `SERVER_REGISTRY_JSON=[]`을 먼저 확인한다.
 
