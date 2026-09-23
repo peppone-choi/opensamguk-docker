@@ -108,6 +108,10 @@ docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env
 기존 운영 환경에 DB 레지스트리 버전을 처음 올릴 때는 `SERVER_REGISTRY_JSON`을 지우거나 빈 배열로 바꾸면 안 된다.
 새 gateway-api는 `game_server` 테이블이 비어 있을 때만 이 값을 1회 seed로 사용한다. 배포 전 현재 실행 서버가
 `.env` 레지스트리와 `servers/s<id>.env`에 모두 들어 있는지 확인하고 다음 검사가 통과해야 한다.
+V62부터 시드 완료 상태를 DB에 기록해 마지막 서버 삭제 후 재기동해도 과거 JSON을 재적용하지 않는다.
+기존 DB에 서버와 계정이 모두 없다면 V62 적용 전에 JSON이 의도한 최초 시드인지 확인한다.
+구 gateway-api 버전으로 롤백할 때는 빈 DB에 남은 과거 JSON이 재적용될 수 있으므로
+`SERVER_REGISTRY_JSON=[]`을 먼저 확인한다.
 
 ```bash
 docker exec opensamguk-deployer /usr/local/bin/deployer --check-running-registry-targets
@@ -322,7 +326,7 @@ GCP의 shared/per-server orchestration 배포는 GitHub Actions **Deploy Orchest
 호출을 지난 뒤에는 볼륨이 일부라도 제거되었을 수 있으므로 이전 desired state를 되살리지 않는다. down 결과가 불확실하면
 원래 job은 임의의 forward re-up을 주장하지 않고 새 desired state와 `repairRequired=true` journal을 남긴다. 명시적
 maintenance repair가 reset을 다시 끝까지 수행해 seeded `world_state`의 시나리오와 game-api 기수를 확인하고,
-`repairRequired`를 durable하게 지운 최종 registry로 `web-gateway`·`nginx`를 reload하고 기존 `gateway-api`도 health-verify한 뒤에만
+`repairRequired`를 durable하게 지운 최종 registry로 `web-gateway`를 재생성하고 nginx에 HUP을 보내 새 upstream을 반영하며, 기존 `gateway-api`도 health-verify한 뒤에만
 journal과 closed barrier를 해제한다. `SCENARIO_SEED_ENABLED=false`인 reset은 fresh world data를 검증할 수 없으므로
 repair 완료로 처리되지 않는다.
 
@@ -364,7 +368,21 @@ POST deployer/deploy  {"project":"opensamguk-spep","tag":"v1.3.0"}
 반환되지 않는다. `SERVER_NAME`, `SERVER_GENERATION`, `GAME_API_URL`처럼 로비와
 어드민이 직접 쓰는 값은 registry의 top-level 필드도 함께 갱신하고, 공유 스택 registry reload 대상
 (`web-gateway`, `nginx`)을 `affectedServices`에 포함한다. `gateway-api`는 deployer 성공 응답 뒤 DB 레지스트리를
-영속화하는 요청 주체이므로 이 reload에서 재시작하지 않는다.
+영속화하는 요청 주체이므로 이 reload에서 재시작하지 않는다. 이 목록은 환경변수로 확장할 수 없다.
+`web-gateway`는 `SERVER_REGISTRY_JSON`을 런타임 env로 읽으므로 재생성한다. nginx는 정적
+`web-gateway` upstream의 새 주소를 읽어야 하므로 HUP으로 worker를 교체한다. nginx 컨테이너는
+유지되어 `/api/gateway/auth/me`의 gateway-api 직접 경로를 계속 제공한다. 반면
+`/api/auth/me`는 web-gateway를 경유하므로 이 경로의 무중단은 별도로 보장하지 않는다.
+
+격리 스택에서 인증된 `GET /api/gateway/auth/me`를 연속 측정할 때는 헤더가 들어 있는
+`0600` curl config 파일을 별도로 준비하고
+`python3 scripts/poll-auth-me.py URL PRIVATE_CURL_CONFIG auth-poll.tsv`를 실행한다.
+기본 간격은 3초다. nginx의 `/api/gateway/` 요청 제한은 클라이언트 IP당 분당 60회이고
+작업 상태 폴링도 같은 제한을 공유하므로, 더 빠른 인증 폴링은 가용성 장애가 없어도 503을 만들 수 있다.
+스크립트는 시각·HTTP 상태·소요 시간·성공 여부만 기록한다. 생성→삭제→리셋 작업의
+operation 상태를 각각 `succeeded`까지 확인한 뒤 폴링을 중지하고 마지막 줄의
+`failures=0`을 확인한다. `gateway-api` 컨테이너 ID를 전후에 비교해 재기동이 없었는지
+별도로 기록한다. 이 파일과 인증 config에는 토큰 원문을 넣어 보고하지 않는다.
 
 ```text
 GET   deployer/env/shared

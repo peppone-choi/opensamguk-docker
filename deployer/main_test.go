@@ -1935,7 +1935,7 @@ func TestResetRepairRestoresJournaledTargetAcrossPreparedCrashBoundaries(t *test
 				t.Fatalf("prepared crash repair retained journal: %v", err)
 			}
 			recorded := calls.snapshot()
-			if len(recorded) != 4 || !strings.Contains(recorded[0], "down --volumes --remove-orphans") || !strings.Contains(recorded[1], "up -d") || !strings.Contains(recorded[2], "up -d --no-deps web-gateway") || strings.Contains(recorded[2], "gateway-api") || !strings.Contains(recorded[3], "--force-recreate --no-deps nginx") {
+			if len(recorded) != 4 || !strings.Contains(recorded[0], "down --volumes --remove-orphans") || !strings.Contains(recorded[1], "up -d") || !strings.Contains(recorded[2], "up -d --no-deps web-gateway") || strings.Contains(recorded[2], "gateway-api") || !strings.Contains(recorded[3], "kill --signal HUP nginx") {
 				t.Fatalf("prepared crash repair calls = %#v", recorded)
 			}
 		})
@@ -2772,8 +2772,8 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	if !strings.Contains(recorded[0], "up -d --no-deps web-gateway") || strings.Contains(recorded[0], "gateway-api") || strings.Contains(recorded[0], " nginx") {
 		t.Fatalf("shared reload call = %q", recorded[0])
 	}
-	if !strings.Contains(recorded[1], "--force-recreate --no-deps nginx") {
-		t.Fatalf("nginx reload call = %q", recorded[1])
+	if !strings.Contains(recorded[1], "kill --signal HUP nginx") {
+		t.Fatalf("nginx HUP call = %q", recorded[1])
 	}
 }
 
@@ -3008,8 +3008,8 @@ func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 	if !strings.Contains(recorded[1], "up -d --no-deps web-gateway") || strings.Contains(recorded[1], "gateway-api") || strings.Contains(recorded[1], " nginx") {
 		t.Fatalf("shared reload call = %q", recorded[1])
 	}
-	if !strings.Contains(recorded[2], "--force-recreate --no-deps nginx") {
-		t.Fatalf("nginx reload call = %q", recorded[2])
+	if !strings.Contains(recorded[2], "kill --signal HUP nginx") {
+		t.Fatalf("nginx HUP call = %q", recorded[2])
 	}
 }
 
@@ -5415,8 +5415,8 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	if !strings.Contains(recorded[1], "up -d --no-deps web-gateway") || strings.Contains(recorded[1], "gateway-api") || strings.Contains(recorded[1], " nginx") {
 		t.Fatalf("shared reload call = %q", recorded[1])
 	}
-	if !strings.Contains(recorded[2], "--force-recreate --no-deps nginx") {
-		t.Fatalf("nginx reload call = %q", recorded[2])
+	if !strings.Contains(recorded[2], "kill --signal HUP nginx") {
+		t.Fatalf("nginx HUP call = %q", recorded[2])
 	}
 }
 
@@ -5656,8 +5656,8 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	if !strings.Contains(recorded[2], "up -d --no-deps web-gateway") || strings.Contains(recorded[2], "gateway-api") || strings.Contains(recorded[2], " nginx") {
 		t.Fatalf("shared reload call = %q", recorded[2])
 	}
-	if !strings.Contains(recorded[3], "--force-recreate --no-deps nginx") {
-		t.Fatalf("nginx reload call = %q", recorded[3])
+	if !strings.Contains(recorded[3], "kill --signal HUP nginx") {
+		t.Fatalf("nginx HUP call = %q", recorded[3])
 	}
 	serverEnv := readFile(t, filepath.Join(cfg.serversDir, "spep.env"))
 	if strings.Count(serverEnv, "SCENARIO_LOOKUP_DIR=\n") != 1 {
@@ -6679,7 +6679,7 @@ func TestResetRepairVerifiesRuntimeDataAndFinalRegistryBeforeJournalClear(t *tes
 		t.Fatalf("verification trace = %q, want %q", got, want)
 	}
 	recorded := calls.snapshot()
-	if len(recorded) != 4 || !strings.Contains(recorded[0], "down --volumes --remove-orphans") || !strings.Contains(recorded[1], "up -d") || !strings.Contains(recorded[2], "up -d --no-deps web-gateway") || strings.Contains(recorded[2], "gateway-api") || !strings.Contains(recorded[3], "--force-recreate --no-deps nginx") {
+	if len(recorded) != 4 || !strings.Contains(recorded[0], "down --volumes --remove-orphans") || !strings.Contains(recorded[1], "up -d") || !strings.Contains(recorded[2], "up -d --no-deps web-gateway") || strings.Contains(recorded[2], "gateway-api") || !strings.Contains(recorded[3], "kill --signal HUP nginx") {
 		t.Fatalf("repair call order = %#v", recorded)
 	}
 }
