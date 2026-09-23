@@ -88,7 +88,9 @@ var sharedEnvServices = envList("DEPLOYER_SHARED_ENV_SERVICES", []string{"gatewa
 // gateway-api owns the DB-backed registry and persists create/delete only after the deployer
 // returns confirmed success. Restarting it inside that request can sever the response before
 // the DB transaction runs. Only environment-backed web/nginx consumers are reloaded here.
-var sharedRegistryReloadServices = envList("DEPLOYER_SHARED_REGISTRY_RELOAD_SERVICES", []string{"web-gateway", "nginx"})
+// This set is intentionally fixed: an environment override must not put gateway-api
+// back into the lifecycle request path before it commits the registry transition.
+var sharedRegistryReloadServices = []string{"web-gateway", "nginx"}
 var reservedPublicServerIDs = map[string]struct{}{
 	"all": {},
 }
@@ -5455,11 +5457,13 @@ func (c config) reloadSharedRegistry(ctx context.Context) (string, error) {
 	if err != nil {
 		return detail, err
 	}
+	// A HUP makes nginx re-resolve the recreated web-gateway upstream while its
+	// existing workers keep serving gateway-api authentication requests.
 	nginxDetail, nginxErr := c.runDockerContext(ctx,
 		"compose",
 		"--env-file", c.sharedEnvFile(),
 		"-f", c.composeShared,
-		"up", "-d", "--force-recreate", "--no-deps", "nginx",
+		"kill", "--signal", "HUP", "nginx",
 	)
 	if nginxDetail != "" {
 		detail += "\n=== nginx reload ===\n" + nginxDetail
