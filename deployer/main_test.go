@@ -3186,6 +3186,11 @@ func TestPublicServerIDRejectsNonAlphanumericValues(t *testing.T) {
 }
 
 func TestPublicServerIDRejectsReservedGameRoutesAfterCanonicalization(t *testing.T) {
+	for _, route := range []string{"court", "hand", "orders", "posts", "retinue", "siege", "supply", "war-room", "yuedan", "v2-lab"} {
+		if _, ok := reservedGameRouteIDs[route]; !ok {
+			t.Fatalf("campaign screen %q is missing from reserved routes", route)
+		}
+	}
 	for route := range reservedGameRouteIDs {
 		for _, raw := range []string{route, strings.ToUpper(route)} {
 			if _, _, err := normalizeCreateServerID(raw); err == nil {
