@@ -10,6 +10,8 @@ on:
       - ".github/workflows/deployer-ci.yml"
       - "infra/nginx/**"
       - "docker-compose.shared.yml"
+      - "scripts/battle-ws-proxy-fixture.py"
+      - "scripts/test-battle-ws-proxy.sh"
   push:
     branches: [main]
     paths:
@@ -20,6 +22,8 @@ on:
       - ".github/workflows/deployer-ci.yml"
       - "infra/nginx/**"
       - "docker-compose.shared.yml"
+      - "scripts/battle-ws-proxy-fixture.py"
+      - "scripts/test-battle-ws-proxy.sh"
 
 concurrency:
   group: deployer-ci-${{ github.ref }}
@@ -68,6 +72,9 @@ jobs:
             -v "$PWD/infra/nginx/runtime:/etc/nginx/battle-ws:ro" \
             -v "$RUNNER_TEMP/battle-ws-certs:/etc/nginx/certs:ro" \
             nginx:1.27-alpine nginx -t
+      - name: battle WebSocket proxy Upgrade and deny checks
+        working-directory: .
+        run: bash scripts/test-battle-ws-proxy.sh
       - name: deploy orchestration admission boundary
         working-directory: .
         run: bash scripts/deploy-orchestration-admission-test.sh
