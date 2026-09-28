@@ -4109,6 +4109,48 @@ func TestNginxRouteReservationsAndApiProxyContract(t *testing.T) {
 	}
 }
 
+func TestBattleWebSocketProxyIsNarrowAndStripsLongCredentials(t *testing.T) {
+	nginx := readFile(t, filepath.Join("..", "infra", "nginx", "nginx.conf"))
+	const route = `location ~ "^/api/battle-ws/(?<battle_server_id>[a-z0-9]{1,48})/(?<battle_world_id>[1-9][0-9]{0,9})/(?<battle_id>[A-Za-z0-9_-]{1,128})$" {`
+	if strings.Count(nginx, route) != 2 {
+		t.Fatal("battle websocket requires matching HTTP and TLS locations")
+	}
+	for _, forbidden := range []string{"location ^~ /api/battle-ws/", "location /api/battle-ws/ {\n            proxy_pass"} {
+		if strings.Contains(nginx, forbidden) {
+			t.Fatalf("battle websocket path has broad proxy: %s", forbidden)
+		}
+	}
+	for _, block := range strings.Split(nginx, route)[1:] {
+		end := strings.Index(block, "\n        }")
+		if end < 0 {
+			t.Fatal("battle websocket location is unterminated")
+		}
+		location := block[:end]
+		for _, want := range []string{
+			`access_log off;`,
+			`proxy_set_header Upgrade $http_upgrade;`,
+			`proxy_set_header Connection "upgrade";`,
+			`proxy_set_header Authorization "";`,
+			`proxy_set_header Proxy-Authorization "";`,
+			`proxy_set_header Cookie "";`,
+			`if ($battle_ws_upstream = "") {`,
+			`proxy_pass $battle_ws_upstream/ws/battles/$battle_server_id/$battle_world_id/$battle_id$is_args$args;`,
+		} {
+			if !strings.Contains(location, want) {
+				t.Fatalf("battle websocket location missing %q", want)
+			}
+		}
+	}
+	if !strings.Contains(nginx, "map $battle_server_id $battle_ws_upstream {\n        default \"\";\n        include /etc/nginx/battle-ws/*.map;") {
+		t.Fatal("battle websocket proxy must use generated explicit allowlist")
+	}
+	for _, want := range []string{"location = /api/battle-ws {\n            access_log off;\n            return 404;", "location /api/battle-ws/ {\n            access_log off;\n            return 404;"} {
+		if strings.Count(nginx, want) != 2 {
+			t.Fatalf("battle websocket invalid path catch-all requires HTTP and TLS: %q", want)
+		}
+	}
+}
+
 func TestDeployOrchestrationValidatesCandidateBeforeReplacementAndFullCheckAfterRecovery(t *testing.T) {
 	workflow := readFile(t, filepath.Join("..", ".github", "workflows", "deploy-orchestration.yml"))
 

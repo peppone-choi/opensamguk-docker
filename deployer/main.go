@@ -310,6 +310,7 @@ type config struct {
 	lifecycleJournalFile      string
 	sharedEnvMu               *sync.Mutex
 	registryRewriteHook       func()
+	battleWSAllowlistEnabled  bool
 	lifecycleJournalWriteHook func(lifecycleJournal)
 	lifecycleJournalClearHook func()
 	operations                *operationCoordinator
@@ -1903,6 +1904,7 @@ func loadConfig() (config, error) {
 		maintenanceFile:          envOr("DEPLOYER_MAINTENANCE_FILE", "/workspace/servers/.deployer-maintenance"),
 		lifecycleJournalFile:     envOr("DEPLOYER_LIFECYCLE_JOURNAL_FILE", filepath.Join(serversDir, ".deployer-lifecycle-journal")),
 		sharedEnvMu:              &sync.Mutex{},
+		battleWSAllowlistEnabled: true,
 	}
 	c.operations = newOperationCoordinator(c.maintenanceFile, c.lifecycleJournalFile, jobs)
 	if err := c.recoverDurableLifecycleOperations(); err != nil {
@@ -2538,6 +2540,14 @@ func main() {
 	}
 	if len(os.Args) == 2 && os.Args[1] == "--check-registry" {
 		os.Exit(checkRegistryCommand(cfg, os.Stderr))
+	}
+	if len(os.Args) == 2 && os.Args[1] == "--sync-battle-ws-allowlist" {
+		degraded, err := cfg.syncBattleWSAllowlist(context.Background())
+		if err != nil || degraded {
+			fmt.Fprintln(os.Stderr, "battle websocket allowlist sync failed or registry unavailable")
+			os.Exit(1)
+		}
+		os.Exit(0)
 	}
 	if cfg.token == "" {
 		log.Fatal("DEPLOYER_TOKEN 미설정 — 인증 토큰 필수")
@@ -5446,6 +5456,14 @@ func (c config) downServerStack(ctx context.Context, project, envFile string) (s
 }
 
 func (c config) reloadSharedRegistry(ctx context.Context) (string, error) {
+	degraded := false
+	if c.battleWSAllowlistEnabled {
+		var err error
+		degraded, err = c.syncBattleWSAllowlist(ctx)
+		if err != nil {
+			return "", err
+		}
+	}
 	services := withoutService(sharedRegistryReloadServices, "nginx")
 	args := append([]string{
 		"compose",
@@ -5468,7 +5486,13 @@ func (c config) reloadSharedRegistry(ctx context.Context) (string, error) {
 	if nginxDetail != "" {
 		detail += "\n=== nginx reload ===\n" + nginxDetail
 	}
-	return detail, nginxErr
+	if nginxErr != nil {
+		return detail, nginxErr
+	}
+	if degraded {
+		return detail, errors.New("battle websocket registry unavailable; route disabled")
+	}
+	return detail, nil
 }
 
 func withoutService(values []string, remove string) []string {
