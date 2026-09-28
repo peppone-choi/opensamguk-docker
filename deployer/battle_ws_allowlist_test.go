@@ -86,12 +86,14 @@ func TestBattleWSAllowlistSyncDeniesMissingOrCorruptRegistryAndRestoresOnValidat
 	}
 	cfg.dockerRunnerContext = func(_ context.Context, args ...string) (string, error) {
 		if strings.Contains(strings.Join(args, " "), "nginx -t") {
-			return "", errors.New("bad config")
+			return "", errors.New("bad config leaked BTJ2-secret")
 		}
 		return "", nil
 	}
 	if _, err := cfg.syncBattleWSAllowlist(context.Background()); err == nil {
 		t.Fatal("invalid nginx config passed validation")
+	} else if strings.Contains(err.Error(), "BTJ2-secret") {
+		t.Fatalf("docker validation diagnostic leaked secret: %v", err)
 	}
 	if got, _ := os.ReadFile(cfg.battleWSAllowlistPath()); len(got) != 0 {
 		t.Fatalf("validation failure did not restore deny-all map: %q", got)

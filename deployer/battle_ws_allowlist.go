@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -83,7 +84,9 @@ func (c config) syncBattleWSAllowlist(ctx context.Context) (bool, error) {
 			}
 			_ = syncDirectory(filepath.Dir(path))
 		}
-		return degraded, fmt.Errorf("battle websocket nginx config validation failed: %w", validationErr)
+		// Docker diagnostics can contain interpolated environment values. Never
+		// return or log their text when a server-scoped signing key is configured.
+		return degraded, errors.New("battle websocket nginx config validation failed")
 	}
 	return degraded, nil
 }
