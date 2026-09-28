@@ -3529,6 +3529,9 @@ func TestServerComposeEnvironmentDropsAmbientDefinitionControls(t *testing.T) {
 		"COMPOSE_HOST_DIR=/ambient-host",
 		"SCENARIO_LOOKUP_DIR=/attacker",
 		"PWD=/ambient-working-directory",
+		"BATTLE_JOIN_TICKET_ENABLED=true",
+		"BATTLE_JOIN_TICKET_KEY_BASE64=ambient-secret",
+		"BATTLE_WS_ALLOWED_ORIGINS=https://ambient.invalid",
 	})
 	values := map[string]string{}
 	for _, entry := range environment {
@@ -3546,6 +3549,9 @@ func TestServerComposeEnvironmentDropsAmbientDefinitionControls(t *testing.T) {
 		"COMPOSE_ENV_FILES",
 		"SCENARIO_LOOKUP_DIR",
 		"PWD",
+		"BATTLE_JOIN_TICKET_ENABLED",
+		"BATTLE_JOIN_TICKET_KEY_BASE64",
+		"BATTLE_WS_ALLOWED_ORIGINS",
 	} {
 		if _, exists := values[key]; exists {
 			t.Fatalf("server compose child inherited %s", key)
@@ -3574,6 +3580,9 @@ printf 'COMPOSE_ENV_FILES=%s\n' "${COMPOSE_ENV_FILES-absent}"
 printf 'COMPOSE_HOST_DIR=%s\n' "${COMPOSE_HOST_DIR-absent}"
 printf 'SCENARIO_LOOKUP_DIR=%s\n' "${SCENARIO_LOOKUP_DIR-absent}"
 printf 'DOCKER_HOST=%s\n' "${DOCKER_HOST-absent}"
+printf 'BATTLE_JOIN_TICKET_ENABLED=%s\n' "${BATTLE_JOIN_TICKET_ENABLED-absent}"
+printf 'BATTLE_JOIN_TICKET_KEY_BASE64=%s\n' "${BATTLE_JOIN_TICKET_KEY_BASE64-absent}"
+printf 'BATTLE_WS_ALLOWED_ORIGINS=%s\n' "${BATTLE_WS_ALLOWED_ORIGINS-absent}"
 `)
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("SERVER_ID", "other")
@@ -3584,6 +3593,9 @@ printf 'DOCKER_HOST=%s\n' "${DOCKER_HOST-absent}"
 	t.Setenv("COMPOSE_HOST_DIR", "/ambient-host")
 	t.Setenv("SCENARIO_LOOKUP_DIR", "/attacker")
 	t.Setenv("DOCKER_HOST", "tcp://docker-proxy:2375")
+	t.Setenv("BATTLE_JOIN_TICKET_ENABLED", "true")
+	t.Setenv("BATTLE_JOIN_TICKET_KEY_BASE64", "ambient-secret")
+	t.Setenv("BATTLE_WS_ALLOWED_ORIGINS", "https://ambient.invalid")
 
 	out, err := cfg.runServerDockerContext(context.Background(), "version")
 	if err != nil {
@@ -3604,6 +3616,9 @@ printf 'DOCKER_HOST=%s\n' "${DOCKER_HOST-absent}"
 		"SPRING_PROFILES_ACTIVE",
 		"COMPOSE_ENV_FILES",
 		"SCENARIO_LOOKUP_DIR",
+		"BATTLE_JOIN_TICKET_ENABLED",
+		"BATTLE_JOIN_TICKET_KEY_BASE64",
+		"BATTLE_WS_ALLOWED_ORIGINS",
 	} {
 		if values[key] != "absent" {
 			t.Fatalf("docker child inherited %s", key)

@@ -178,6 +178,9 @@ var v2ServerDefinitionKeys = map[string]struct{}{
 // deployer process because Compose gives its shell environment precedence over
 // --env-file.
 var serverComposeInterpolationKeys = map[string]struct{}{
+	"BATTLE_JOIN_TICKET_ENABLED":     {},
+	"BATTLE_JOIN_TICKET_KEY_BASE64":  {},
+	"BATTLE_WS_ALLOWED_ORIGINS":      {},
 	"COMPOSE_HOST_DIR":               {},
 	"GATEWAY_API_URL":                {},
 	"INTERNAL_SERVICE_TOKEN":         {},
