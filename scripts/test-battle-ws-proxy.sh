@@ -31,6 +31,20 @@ docker run -d --name "$fixture" --network "$network" --network-alias spep-game-a
 docker run -d --name "$unregistered" --network "$network" --network-alias stest-game-api \
   -v "$repo_root/scripts/battle-ws-proxy-fixture.py:/fixture.py:ro" \
   python:3.12-alpine python /fixture.py >/dev/null
+for target in "$fixture" "$unregistered"; do
+  ready=0
+  for attempt in {1..30}; do
+    if docker exec "$target" python -c 'import socket; socket.create_connection(("127.0.0.1", 8081), 1).close()' >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 1
+  done
+  if (( ready == 0 )); then
+    echo 'battle WS fixture did not become ready' >&2
+    exit 1
+  fi
+done
 docker run -d --name "$nginx" --network "$network" -p 127.0.0.1:18080:80 \
   --add-host gateway-api:127.0.0.1 --add-host web-gateway:127.0.0.1 \
   -v "$repo_root/infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" \
