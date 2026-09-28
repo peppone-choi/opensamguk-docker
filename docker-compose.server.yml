@@ -133,6 +133,10 @@ services:
       JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY:?JWT_PUBLIC_KEY required — see .env.example}
       JWT_LEGACY_SECRET: ${JWT_LEGACY_SECRET:-}
       JWT_LEGACY_ACCESS_ACCEPT_UNTIL: ${JWT_LEGACY_ACCESS_ACCEPT_UNTIL:-}
+      # 전술 전투 JoinTicket/WS는 기본 비활성. 실제 키·Origin 설정은 별도 운영 승인 후 서버별 env에만 둔다.
+      BATTLE_JOIN_TICKET_ENABLED: ${BATTLE_JOIN_TICKET_ENABLED:-false}
+      BATTLE_JOIN_TICKET_KEY_BASE64: ${BATTLE_JOIN_TICKET_KEY_BASE64:-}
+      BATTLE_WS_ALLOWED_ORIGINS: ${BATTLE_WS_ALLOWED_ORIGINS:-}
       # 신원 SoT는 공유 gateway-api. 전용 내부 토큰으로만 프로필을 조회한다.
       GATEWAY_API_URL: ${GATEWAY_API_URL:-http://gateway-api:8080}
       INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?INTERNAL_SERVICE_TOKEN required}

@@ -4151,6 +4151,32 @@ func TestBattleWebSocketProxyIsNarrowAndStripsLongCredentials(t *testing.T) {
 	}
 }
 
+func TestBattleJoinConfigurationIsServerScopedAndDisabledByDefault(t *testing.T) {
+	compose := readFile(t, filepath.Join("..", "docker-compose.server.yml"))
+	example := readFile(t, filepath.Join("..", "servers", "s1.env.example"))
+	for _, want := range []string{
+		`BATTLE_JOIN_TICKET_ENABLED: ${BATTLE_JOIN_TICKET_ENABLED:-false}`,
+		`BATTLE_JOIN_TICKET_KEY_BASE64: ${BATTLE_JOIN_TICKET_KEY_BASE64:-}`,
+		`BATTLE_WS_ALLOWED_ORIGINS: ${BATTLE_WS_ALLOWED_ORIGINS:-}`,
+	} {
+		if !strings.Contains(compose, want) {
+			t.Fatalf("game-api compose missing %q", want)
+		}
+	}
+	for _, want := range []string{
+		"BATTLE_JOIN_TICKET_ENABLED=false\n",
+		"BATTLE_JOIN_TICKET_KEY_BASE64=\n",
+		"BATTLE_WS_ALLOWED_ORIGINS=\n",
+	} {
+		if !strings.Contains(example, want) {
+			t.Fatalf("server env example missing safe default %q", want)
+		}
+	}
+	if _, exposed := serverEnvAllowlist["BATTLE_JOIN_TICKET_KEY_BASE64"]; exposed {
+		t.Fatal("join ticket key must not be editable through admin env API")
+	}
+}
+
 func TestDeployOrchestrationValidatesCandidateBeforeReplacementAndFullCheckAfterRecovery(t *testing.T) {
 	workflow := readFile(t, filepath.Join("..", ".github", "workflows", "deploy-orchestration.yml"))
 
