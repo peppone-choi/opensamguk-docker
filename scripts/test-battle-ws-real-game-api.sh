@@ -22,7 +22,8 @@ git init -q "$product_dir"
 git -C "$product_dir" fetch -q --depth=1 \
   https://github.com/peppone-choi/opensamguk.git pull/1024/head
 git -C "$product_dir" checkout -q FETCH_HEAD
-echo "Product PR #1024 head: $(git -C "$product_dir" rev-parse --short HEAD)"
+echo "Docker PR #59 checkout: $(git -C "$repo_root" rev-parse HEAD)"
+echo "Product PR #1024 head: $(git -C "$product_dir" rev-parse HEAD)"
 cp "$repo_root/scripts/real-game-api/BattleWebSocketCrossRepoIT.kt" \
   "$product_dir/app/game-api/src/test/kotlin/opensamguk/battlewebsockettest/"
 
@@ -50,6 +51,16 @@ done
     ./gradlew --no-daemon :app:game-api:test \
       --tests 'opensamguk.battlewebsockettest.BattleWebSocketCrossRepoIT' --console=plain
 )
+
+python3 - "$product_dir/app/game-api/build/test-results/test/TEST-opensamguk.battlewebsockettest.BattleWebSocketCrossRepoIT.xml" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+result = ET.parse(sys.argv[1]).getroot()
+counts = {key: int(result.attrib.get(key, "0")) for key in ("tests", "failures", "errors", "skipped")}
+assert counts == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0}, counts
+print("cross-repository test XML: 1 passed, 0 failed, 0 skipped")
+PY
 
 if docker logs "$nginx" 2>&1 | grep -q 'BTJ2\.'; then
   echo 'JoinTicket leaked into nginx logs' >&2
