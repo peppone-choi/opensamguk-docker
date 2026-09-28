@@ -12,6 +12,8 @@ on:
       - "docker-compose.shared.yml"
       - "scripts/battle-ws-proxy-fixture.py"
       - "scripts/test-battle-ws-proxy.sh"
+      - "scripts/test-battle-ws-real-game-api.sh"
+      - "scripts/real-game-api/**"
   push:
     branches: [main]
     paths:
@@ -24,6 +26,8 @@ on:
       - "docker-compose.shared.yml"
       - "scripts/battle-ws-proxy-fixture.py"
       - "scripts/test-battle-ws-proxy.sh"
+      - "scripts/test-battle-ws-real-game-api.sh"
+      - "scripts/real-game-api/**"
 
 concurrency:
   group: deployer-ci-${{ github.ref }}
@@ -32,7 +36,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     permissions:
       contents: read
     defaults:
@@ -46,6 +50,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: deployer/go.mod
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
       - name: go build
         run: go build ./...
       - name: go vet
@@ -75,6 +84,9 @@ jobs:
       - name: battle WebSocket proxy Upgrade and deny checks
         working-directory: .
         run: bash scripts/test-battle-ws-proxy.sh
+      - name: real game-api through battle WebSocket proxy
+        working-directory: .
+        run: bash scripts/test-battle-ws-real-game-api.sh
       - name: deploy orchestration admission boundary
         working-directory: .
         run: bash scripts/deploy-orchestration-admission-test.sh
