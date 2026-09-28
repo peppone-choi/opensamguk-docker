@@ -86,6 +86,11 @@ class BattleWebSocketCrossRepoIT @Autowired constructor(
         lines.joinToString("\n")
     }
 
+    private fun assertStatus(response: String, code: Int, boundary: String) {
+        assertTrue(response.startsWith("HTTP/1.1 $code"),
+            "$boundary: ${response.lineSequence().firstOrNull()}")
+    }
+
     @Test
     fun `real signer admission through nginx and registry revocation`() {
         `when`(store.ticket(world, "battle-1")).thenReturn(ticket)
@@ -97,15 +102,15 @@ class BattleWebSocketCrossRepoIT @Autowired constructor(
         val path = "/api/battle-ws/pep/1/battle-1"
         val accepted = handshake(path, token,
             extra = "Authorization: Bearer long\r\nCookie: sam_access=long\r\nProxy-Authorization: Basic long\r\n")
-        assertContains(accepted, "101", "nginx -> game-api signed handshake")
+        assertStatus(accepted, 101, "nginx -> game-api signed handshake")
         assertContains(accepted.lowercase(), "sec-websocket-protocol: battle.v1")
         assertFalse(accepted.contains(token))
 
         val badSignature = token.dropLast(1) + if (token.last() == 'A') 'B' else 'A'
-        assertContains(handshake(path, badSignature), "403", "game-api signature boundary")
-        assertContains(handshake(path, token, origin = "http://foreign.example"), "403",
+        assertStatus(handshake(path, badSignature), 403, "game-api signature boundary")
+        assertStatus(handshake(path, token, origin = "http://foreign.example"), 403,
             "game-api Origin boundary")
-        assertContains(handshake("/api/battle-ws/other/1/battle-1", token), "403",
+        assertStatus(handshake("/api/battle-ws/other/1/battle-1", token), 403,
             "game-api server binding through an allowlisted nginx target")
 
         File(System.getenv("BATTLE_WS_MAP_FILE")).writeText("")
@@ -117,8 +122,8 @@ class BattleWebSocketCrossRepoIT @Autowired constructor(
         val deadline = System.nanoTime() + 5_000_000_000L
         while (true) {
             val response = handshake(path, token)
-            if (response.contains("404")) break
-            assertContains(response, "101", "old nginx worker during reload")
+            if (response.startsWith("HTTP/1.1 404")) break
+            assertStatus(response, 101, "old nginx worker during reload")
             assertTrue(System.nanoTime() < deadline, "nginx deletion did not revoke within 5s")
             Thread.sleep(100)
         }
