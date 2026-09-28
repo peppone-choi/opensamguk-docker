@@ -89,12 +89,27 @@ docker exec "$nginx" nginx -t >/dev/null
 docker exec "$nginx" nginx -s reload >/dev/null
 python3 - <<'PY'
 import socket
-request = ("GET /api/battle-ws/pep/1/battle-1 HTTP/1.1\r\nHost: localhost\r\n"
-           "Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
-with socket.create_connection(("127.0.0.1", 18080), timeout=5) as conn:
-    conn.sendall(request.encode("ascii"))
-    response = conn.recv(1024)
-assert response.startswith(b"HTTP/1.1 404"), response
+import time
+
+request = (
+    "GET /api/battle-ws/pep/1/battle-1 HTTP/1.1\r\nHost: localhost\r\n"
+    "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+    "Sec-WebSocket-Version: 13\r\n"
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    "Sec-WebSocket-Protocol: battle.v1, BTJ2.abc." + "A" * 43 + "\r\n"
+    "Origin: https://game.example\r\n\r\n"
+).encode("ascii")
+deadline = time.monotonic() + 5
+while True:
+    with socket.create_connection(("127.0.0.1", 18080), timeout=5) as conn:
+        conn.sendall(request)
+        response = conn.recv(1024)
+    if response.startswith(b"HTTP/1.1 404"):
+        break
+    assert response.startswith(b"HTTP/1.1 101"), response
+    if time.monotonic() >= deadline:
+        raise AssertionError("nginx reload did not revoke the deleted server within 5s")
+    time.sleep(0.1)
 print("battle WS proxy deletion revoke: PASS")
 PY
 
