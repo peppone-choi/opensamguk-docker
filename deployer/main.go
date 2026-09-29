@@ -5175,6 +5175,9 @@ func normalizeResetLifecycleTarget(target resetLifecycleTarget) (resetLifecycleT
 		if strings.ContainsAny(value, "\r\n") {
 			return resetLifecycleTarget{}, fmt.Errorf("reset target field %q is invalid", key)
 		}
+		if (key == "IMAGE_TAG" || key == "WEB_GAME_TAG") && !gitSHA40.MatchString(value) {
+			return resetLifecycleTarget{}, fmt.Errorf("reset image pin %q is invalid", key)
+		}
 		updates[key] = value
 	}
 	canonical := map[string]string{

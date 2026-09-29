@@ -5790,6 +5790,22 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	}
 }
 
+func TestResetJournalRejectsMutableImagePins(t *testing.T) {
+	for _, key := range []string{"IMAGE_TAG", "WEB_GAME_TAG"} {
+		t.Run(key, func(t *testing.T) {
+			_, err := normalizeResetLifecycleTarget(resetLifecycleTarget{
+				ScenarioCode:        "scenario_990002",
+				Generation:          2,
+				ScenarioSeedEnabled: true,
+				Updates:             map[string]string{key: "latest"},
+			})
+			if err == nil {
+				t.Fatal("mutable image pin was accepted during journal replay")
+			}
+		})
+	}
+}
+
 func TestResetOperationIDReplaysIdenticalRequestWithoutSecondDockerMutation(t *testing.T) {
 	cfg := configuredResetOperationTest(t)
 	calls := &dockerCallRecorder{}
