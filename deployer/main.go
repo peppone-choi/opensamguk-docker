@@ -506,6 +506,9 @@ func (c *operationCoordinator) prepare(kind lifecycleKind, operationID, subjectI
 		return nil, errMaintenanceClosed
 	}
 	leasedKind := kind == lifecycleKindCreate || (kind == lifecycleKindReset && subjectID == "pep")
+	if kind == lifecycleKindReset && token != "" && !c.closed {
+		return nil, errMaintenanceClosed
+	}
 	if c.closed && (!leasedKind || operationID == "" || token == "") {
 		return nil, errMaintenanceClosed
 	}
@@ -535,6 +538,9 @@ func (p *operationPreparation) promote(jobID string) (*operationLease, error) {
 	}
 	check := func() error {
 		if c.preparing != p || p.Context().Err() != nil || p.admissionErr != nil || c.preparationSettlementPending || (c.journalPending && c.active == nil) {
+			return errMaintenanceClosed
+		}
+		if p.kind == lifecycleKindReset && p.leaseAttempt != "" && !c.closed {
 			return errMaintenanceClosed
 		}
 		if c.closed {

@@ -5806,6 +5806,25 @@ func TestResetJournalRejectsMutableImagePins(t *testing.T) {
 	}
 }
 
+func TestPepLeasedResetRefusesOpenMaintenance(t *testing.T) {
+	cfg := configuredResetOperationTest(t)
+	newTag := strings.Repeat("b", 40)
+	body := `{"id":"pep","confirm":"RESET pep","operationId":"0123456789abcdef0123456789abcdef","generation":"2","scenarioCode":"scenario_990002","imageTag":"` + newTag + `","webGameTag":"` + newTag + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/servers/reset", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(maintenanceLeaseHeader, strings.Repeat("c", 32))
+	req.RemoteAddr = "127.0.0.1:31000"
+	res := httptest.NewRecorder()
+	cfg.withAuth(cfg.handleServerReset)(res, req)
+	if res.Code != http.StatusServiceUnavailable {
+		t.Fatalf("open maintenance accepted leased reset: status=%d body=%s", res.Code, res.Body.String())
+	}
+	if strings.Contains(readFile(t, filepath.Join(cfg.serversDir, "spep.env")), newTag) {
+		t.Fatal("open maintenance changed image pin")
+	}
+}
+
 func TestResetOperationIDReplaysIdenticalRequestWithoutSecondDockerMutation(t *testing.T) {
 	cfg := configuredResetOperationTest(t)
 	calls := &dockerCallRecorder{}
