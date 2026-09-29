@@ -69,6 +69,7 @@ var (
 	// Internal server key used only for Docker resources and server env filenames.
 	internalServerKeyRe = regexp.MustCompile(`^s[a-z0-9]+$`)
 	lifecycleJobIDRe    = regexp.MustCompile(`^[a-f0-9]{32}$`)
+	gitSHA40            = regexp.MustCompile(`^[a-f0-9]{40}$`)
 	// 이미지 태그 — 도커 태그 문자셋(영숫자/점/언더스코어/하이픈).
 	tagRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 )
@@ -222,6 +223,8 @@ var serverComposeProcessControlKeys = map[string]struct{}{
 }
 
 var resetLifecycleUpdateKeys = []string{
+	"IMAGE_TAG",
+	"WEB_GAME_TAG",
 	"SCENARIO_CODE",
 	"SCENARIO_SEED_ENABLED",
 	"SERVER_GENERATION",
@@ -502,7 +505,11 @@ func (c *operationCoordinator) prepare(kind lifecycleKind, operationID, subjectI
 	if c.preparationSettlementPending || (c.journalPending && c.active == nil) || c.preparing != nil {
 		return nil, errMaintenanceClosed
 	}
-	if c.closed && (kind != lifecycleKindCreate || operationID == "" || token == "") {
+	leasedKind := kind == lifecycleKindCreate || (kind == lifecycleKindReset && subjectID == "pep")
+	if kind == lifecycleKindReset && token != "" && !c.closed {
+		return nil, errMaintenanceClosed
+	}
+	if c.closed && (!leasedKind || operationID == "" || token == "") {
 		return nil, errMaintenanceClosed
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -533,9 +540,13 @@ func (p *operationPreparation) promote(jobID string) (*operationLease, error) {
 		if c.preparing != p || p.Context().Err() != nil || p.admissionErr != nil || c.preparationSettlementPending || (c.journalPending && c.active == nil) {
 			return errMaintenanceClosed
 		}
+		if p.kind == lifecycleKindReset && p.leaseAttempt != "" && !c.closed {
+			return errMaintenanceClosed
+		}
 		if c.closed {
 			lease := c.maintenanceLease
-			if p.kind != lifecycleKindCreate || p.operationID == "" || p.leaseAttempt == "" || lease == nil || lease.consumed || !secureEqual(lease.token, p.leaseAttempt) {
+			leasedKind := p.kind == lifecycleKindCreate || (p.kind == lifecycleKindReset && p.subjectID == "pep")
+			if !leasedKind || p.operationID == "" || p.leaseAttempt == "" || lease == nil || lease.consumed || !secureEqual(lease.token, p.leaseAttempt) {
 				return errMaintenanceClosed
 			}
 		}
@@ -2445,7 +2456,10 @@ type createServerRequest struct {
 type resetServerRequest struct {
 	ID                  string   `json:"id"`
 	OperationID         string   `json:"operationId"`
+	MaintenanceLease    string   `json:"maintenanceLease,omitempty"`
 	Confirm             string   `json:"confirm"`
+	ImageTag            string   `json:"imageTag,omitempty"`
+	WebGameTag          string   `json:"webGameTag,omitempty"`
 	Generation          string   `json:"generation"`
 	ScenarioCode        string   `json:"scenarioCode"`
 	ScenarioSeedEnabled *bool    `json:"scenarioSeedEnabled"`
@@ -3131,6 +3145,7 @@ func (c config) handleServerReset(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "POST only"})
 		return
 	}
+	headerLease := r.Header.Get(maintenanceLeaseHeader)
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<16))
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "body 읽기 실패"})
@@ -3147,7 +3162,20 @@ func (c config) handleServerReset(w http.ResponseWriter, r *http.Request) {
 	if rawID == "" {
 		rawID = req.ID
 	}
-	res, status := c.resetServer(rawID, req)
+	if headerLease != "" && req.MaintenanceLease != "" && headerLease != req.MaintenanceLease {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "maintenance lease 전달값이 일치하지 않습니다."})
+		return
+	}
+	maintenanceLease := req.MaintenanceLease
+	if headerLease != "" {
+		maintenanceLease = headerLease
+	}
+	if maintenanceLease != "" && !isLoopbackRequest(r) {
+		writeJSON(w, http.StatusForbidden, errorResponse{Error: "maintenance lease requires a loopback request"})
+		return
+	}
+	req.MaintenanceLease = ""
+	res, status := c.resetServerWithMaintenanceLease(rawID, req, maintenanceLease)
 	writeCreateServerResponse(w, status, res)
 }
 
@@ -4001,6 +4029,10 @@ func (c config) deleteServer(rawID string, confirm string, operationID string) (
 }
 
 func (c config) resetServer(rawID string, req resetServerRequest) (response createServerResponse, responseStatus int) {
+	return c.resetServerWithMaintenanceLease(rawID, req, "")
+}
+
+func (c config) resetServerWithMaintenanceLease(rawID string, req resetServerRequest, maintenanceLease string) (response createServerResponse, responseStatus int) {
 	target, err := c.serverTargetForID(rawID)
 	if err != nil {
 		return createServerResponse{OK: false, Detail: err.Error()}, http.StatusBadRequest
@@ -4008,6 +4040,14 @@ func (c config) resetServer(rawID string, req resetServerRequest) (response crea
 	id := target.ID
 	if req.Confirm != "RESET "+id {
 		return createServerResponse{OK: false, ID: id, Detail: "리셋 확인 문구가 일치하지 않습니다."}, http.StatusBadRequest
+	}
+	if maintenanceLease == "" {
+		if req.ImageTag != "" || req.WebGameTag != "" {
+			return createServerResponse{OK: false, ID: id, Detail: "이미지 pin은 유지보수 리셋에서만 변경할 수 있습니다."}, http.StatusBadRequest
+		}
+	} else if id != "pep" || req.OperationID == "" || req.ScenarioCode != "scenario_990002" ||
+		!gitSHA40.MatchString(req.ImageTag) || !gitSHA40.MatchString(req.WebGameTag) {
+		return createServerResponse{OK: false, ID: id, Detail: "PEP 유지보수 리셋에 정확한 후보 pin과 작업 ID가 필요합니다."}, http.StatusBadRequest
 	}
 	requestedOperationID, err := normalizeLifecycleOperationID(req.OperationID)
 	if err != nil {
@@ -4019,6 +4059,10 @@ func (c config) resetServer(rawID string, req resetServerRequest) (response crea
 	updates, err := resetEnvUpdates(req)
 	if err != nil {
 		return createServerResponse{OK: false, ID: id, Detail: err.Error()}, http.StatusBadRequest
+	}
+	if maintenanceLease != "" {
+		updates["IMAGE_TAG"] = req.ImageTag
+		updates["WEB_GAME_TAG"] = req.WebGameTag
 	}
 	entry, err := c.registryEntryByID(id)
 	if err != nil {
@@ -4043,7 +4087,7 @@ func (c config) resetServer(rawID string, req resetServerRequest) (response crea
 	}
 	fingerprint := resetRequestFingerprint(id, resetTarget)
 	operationID := requestedOperationID
-	preparation, replayRecord, replayExists, err := c.prepareLifecycleOperation(lifecycleKindReset, operationID, id, fingerprint, "")
+	preparation, replayRecord, replayExists, err := c.prepareLifecycleOperation(lifecycleKindReset, operationID, id, fingerprint, maintenanceLease)
 	if err != nil {
 		if errors.Is(err, errLifecycleOperationConflict) {
 			return createServerResponse{OK: false, ID: id, OperationID: operationID, Detail: "operationId는 다른 서버 리셋 요청에 이미 사용되었습니다."}, http.StatusConflict
@@ -4141,6 +4185,14 @@ func (c config) resetServer(rawID string, req resetServerRequest) (response crea
 		}
 		if _, err := c.validateServerTarget(target); err != nil {
 			return "", err
+		}
+		if maintenanceLease != "" {
+			// The old volumes must still exist if a candidate image cannot be
+			// fetched. Stage only a temporary env; do not publish the reset
+			// journal or mutate the canonical env until every pull succeeds.
+			if detail, err := c.pullResetCandidate(ctx, target, resetTarget); err != nil {
+				return detail, err
+			}
 		}
 		var journalErr error
 		if operationID != "" {
@@ -5088,6 +5140,13 @@ func resetLifecycleTargetForEnv(envFile string, requested map[string]string) (re
 	}
 	updates := make(map[string]string, len(resetLifecycleUpdateKeys))
 	for _, key := range resetLifecycleUpdateKeys {
+		// Ordinary reset fingerprints keep their old shape. Image pins are
+		// part of the target only when a leased reset requests them explicitly.
+		if key == "IMAGE_TAG" || key == "WEB_GAME_TAG" {
+			if _, requested := requested[key]; !requested {
+				continue
+			}
+		}
 		value, exists := values[key]
 		if !exists {
 			continue
@@ -5129,6 +5188,9 @@ func normalizeResetLifecycleTarget(target resetLifecycleTarget) (resetLifecycleT
 		value = strings.TrimSpace(value)
 		if strings.ContainsAny(value, "\r\n") {
 			return resetLifecycleTarget{}, fmt.Errorf("reset target field %q is invalid", key)
+		}
+		if (key == "IMAGE_TAG" || key == "WEB_GAME_TAG") && !gitSHA40.MatchString(value) {
+			return resetLifecycleTarget{}, fmt.Errorf("reset image pin %q is invalid", key)
 		}
 		updates[key] = value
 	}
@@ -5407,6 +5469,41 @@ func (c config) upServerStack(ctx context.Context, project, envFile string) (str
 		"--env-file", envFile,
 		"-f", c.composeServer,
 		"up", "-d",
+	)
+}
+
+func (c config) pullResetCandidate(ctx context.Context, target serverTarget, resetTarget resetLifecycleTarget) (string, error) {
+	if _, err := c.validateServerTarget(target); err != nil {
+		return "", err
+	}
+	original, err := os.ReadFile(target.EnvFile)
+	if err != nil {
+		return "", err
+	}
+	staged, err := os.CreateTemp(c.serversDir, ".reset-pull-*.env")
+	if err != nil {
+		return "", err
+	}
+	stagedPath := staged.Name()
+	defer os.Remove(stagedPath)
+	if _, err := staged.Write(original); err != nil {
+		_ = staged.Close()
+		return "", err
+	}
+	if err := staged.Close(); err != nil {
+		return "", err
+	}
+	if err := applyResetLifecycleTarget(stagedPath, resetTarget); err != nil {
+		return "", err
+	}
+	if _, err := c.validateDockerServerTarget(target.Project, stagedPath, true); err != nil {
+		return "", err
+	}
+	return c.runServerDockerContext(ctx,
+		"compose", "-p", target.Project,
+		"--env-file", stagedPath,
+		"-f", c.composeServer,
+		"pull", "game-engine", "game-api", "web-game",
 	)
 }
 
