@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -22,6 +24,627 @@ import (
 	"testing"
 	"time"
 )
+
+type preparationLifecycleCase struct {
+	name        string
+	kind        lifecycleKind
+	operationID string
+	body        string
+	setup       func(*testing.T) config
+	terminal    lifecycleJobStatus
+	mutation    string
+}
+
+func preparationLifecycleCases() []preparationLifecycleCase {
+	return []preparationLifecycleCase{
+		{"create", lifecycleKindCreate, "11111111111111111111111111111111", `{"id":"pep","name":"준비 서버","gameApiPort":"8101","webGamePort":"3101","operationId":"11111111111111111111111111111111"}`, func(t *testing.T) config {
+			cfg := testConfig(t)
+			writeEnv(t, filepath.Join(cfg.composeDir, ".env"), "IMAGE_TAG=v1\nJWT_PUBLIC_KEY=shared-public-key\nSERVER_REGISTRY_JSON=[]\n")
+			return cfg
+		}, lifecycleJobSucceeded, "up -d"},
+		{"close", lifecycleKindClose, "22222222222222222222222222222222", `{"id":"pep","confirm":"DELETE pep","operationId":"22222222222222222222222222222222"}`, configuredResetOperationTest, lifecycleJobSucceeded, "down --volumes --remove-orphans"},
+		{"reset", lifecycleKindReset, "33333333333333333333333333333333", `{"id":"pep","confirm":"RESET pep","scenarioCode":"scenario_1002","operationId":"33333333333333333333333333333333"}`, configuredResetOperationTest, lifecycleJobSucceeded, "down --volumes --remove-orphans"},
+	}
+}
+
+func (tc preparationLifecycleCase) post(t *testing.T, cfg config, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	var handler http.HandlerFunc
+	switch tc.kind {
+	case lifecycleKindCreate:
+		handler = cfg.handleServerCreate
+	case lifecycleKindClose:
+		handler = cfg.handleServerClose
+	case lifecycleKindReset:
+		handler = cfg.handleServerReset
+	}
+	return envRequest(t, cfg.withAuth(handler), http.MethodPost, "/servers/"+tc.name, body)
+}
+
+func preparationIdle(t *testing.T, cfg config) *httptest.ResponseRecorder {
+	t.Helper()
+	return loopbackRequest(t, cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance)), http.MethodPost, "/maintenance/enter-if-idle", "")
+}
+
+func assertPreparationBusy(t *testing.T, cfg config) {
+	t.Helper()
+	if res := preparationIdle(t, cfg); res.Code != http.StatusConflict {
+		t.Errorf("preparation admitted idle: %d %s", res.Code, res.Body.String())
+	}
+	cfg.operations.mu.Lock()
+	hasLease := cfg.operations.maintenanceLease != nil
+	cfg.operations.mu.Unlock()
+	if hasLease || stateFilePresent(cfg.maintenanceFile) {
+		t.Error("busy idle created marker or maintenance lease")
+	}
+}
+
+func awaitPreparationSignal(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatal("preparation barrier was not reached")
+	}
+}
+
+func awaitPreparationResponse(t *testing.T, ch <-chan *httptest.ResponseRecorder) *httptest.ResponseRecorder {
+	t.Helper()
+	select {
+	case res := <-ch:
+		return res
+	case <-time.After(5 * time.Second):
+		t.Fatal("preparation request remained blocked")
+		return nil
+	}
+}
+
+func assertPreparationCompletion(t *testing.T, cfg config, tc preparationLifecycleCase, res *httptest.ResponseRecorder, calls *dockerCallRecorder) {
+	t.Helper()
+	if res.Code != http.StatusOK {
+		t.Fatalf("lifecycle response = %d %s", res.Code, res.Body.String())
+	}
+	var body createServerResponse
+	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	waitForLifecycleJob(t, cfg.lifecycleJobs, body.JobID, tc.terminal)
+	cfg.operations.mu.Lock()
+	for cfg.operations.active != nil {
+		cfg.operations.cond.Wait()
+	}
+	cfg.operations.mu.Unlock()
+	record, ok := cfg.lifecycleOperationStore.Lookup(tc.operationID)
+	if !ok || record.Status != tc.terminal {
+		t.Fatalf("terminal operation = %#v", record)
+	}
+	if got := countDockerCallsContaining(calls.snapshot(), "opensamguk-spep"); got == 0 {
+		t.Fatal("lifecycle did not reach server Docker")
+	}
+	var primaryCalls []string
+	for _, call := range calls.snapshot() {
+		if strings.Contains(call, "opensamguk-spep") {
+			primaryCalls = append(primaryCalls, call)
+		}
+	}
+	if got := countDockerCallsContaining(primaryCalls, tc.mutation); got != 1 {
+		t.Errorf("primary mutations = %d, calls=%v", got, calls.snapshot())
+	}
+}
+
+func TestLifecyclePreparationRejectsIdleWhileDurableReservationSyncs(t *testing.T) {
+	for _, tc := range preparationLifecycleCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.setup(t)
+			reservationPersisted, releaseReservation := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			cfg.lifecycleOperationStore.fileOps.syncDirectory = func(dir string) error {
+				if err := syncDirectory(dir); err != nil {
+					return err
+				}
+				once.Do(func() { close(reservationPersisted); <-releaseReservation })
+				return nil
+			}
+			calls := &dockerCallRecorder{}
+			cfg.dockerRunner = func(args ...string) (string, error) { calls.record(args...); return "29.0.0\n", nil }
+			result := make(chan *httptest.ResponseRecorder, 1)
+			go func() { result <- tc.post(t, cfg, tc.body) }()
+			awaitPreparationSignal(t, reservationPersisted)
+			assertPreparationBusy(t, cfg)
+			if calls.count() != 0 {
+				t.Error("Docker ran before reservation sync returned")
+			}
+			close(releaseReservation)
+			assertPreparationCompletion(t, cfg, tc, awaitPreparationResponse(t, result), calls)
+		})
+	}
+}
+
+func TestLifecyclePreparationRejectsIdleThroughDockerPreflight(t *testing.T) {
+	for _, tc := range preparationLifecycleCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.setup(t)
+			preflight, release := make(chan struct{}), make(chan struct{})
+			calls := &dockerCallRecorder{}
+			var preflightContext context.Context
+			cfg.dockerRunnerContext = func(ctx context.Context, args ...string) (string, error) {
+				if dockerPreflightProbe(args) {
+					preflightContext = ctx
+					close(preflight)
+					<-release
+					return "29.0.0\n", nil
+				}
+				calls.record(args...)
+				return "ok\n", nil
+			}
+			result := make(chan *httptest.ResponseRecorder, 1)
+			go func() { result <- tc.post(t, cfg, tc.body) }()
+			awaitPreparationSignal(t, preflight)
+			record, ok := cfg.lifecycleOperationStore.Lookup(tc.operationID)
+			jobID := cfg.lifecycleJobs.jobIDForOperation(tc.operationID)
+			job, exists := cfg.lifecycleJobs.lookup(jobID)
+			if !ok || record.Status != lifecycleJobPending || record.Kind != tc.kind || record.SubjectID != "pep" || !exists || job.Status != lifecycleJobPending {
+				t.Errorf("pending state: %#v %#v", record, job)
+			}
+			retry := tc.post(t, cfg, tc.body)
+			var replay createServerResponse
+			if err := json.Unmarshal(retry.Body.Bytes(), &replay); err != nil {
+				t.Fatal(err)
+			}
+			if retry.Code != http.StatusOK || replay.OperationID != tc.operationID || replay.JobID != jobID || replay.OperationStatus != lifecycleJobPending {
+				t.Errorf("pending replay = %d %#v", retry.Code, replay)
+			}
+			assertPreparationBusy(t, cfg)
+			if preflightContext.Err() != nil || calls.count() != 0 {
+				t.Error("idle cancelled preparation or reached Docker mutation")
+			}
+			cfg.lifecycleJobs.mu.Lock()
+			pending := cfg.lifecycleJobs.jobs[jobID]
+			cfg.lifecycleJobs.mu.Unlock()
+			if pending.status != lifecycleJobPending || pending.cancelRequested {
+				t.Error("idle changed pending job")
+			}
+			close(release)
+			assertPreparationCompletion(t, cfg, tc, awaitPreparationResponse(t, result), calls)
+			idle := preparationIdle(t, cfg)
+			var drained maintenanceResponse
+			if err := json.Unmarshal(idle.Body.Bytes(), &drained); err != nil {
+				t.Fatal(err)
+			}
+			if idle.Code != http.StatusOK || drained.State != maintenanceStateDrained || !lifecycleJobIDRe.MatchString(drained.Lease) || !stateFilePresent(cfg.maintenanceFile) {
+				t.Errorf("completed idle = %d %#v", idle.Code, drained)
+			}
+		})
+	}
+}
+
+// Signal the precise Cond.Wait boundary, without choosing a winner by sleeping.
+type preparationWaitLocker struct {
+	mu            *sync.Mutex
+	waiting       chan struct{}
+	once          sync.Once
+	resumed       chan struct{}
+	releaseResume chan struct{}
+	resumeOnce    sync.Once
+}
+
+func (l *preparationWaitLocker) Lock() {
+	l.mu.Lock()
+	l.resumeOnce.Do(func() { close(l.resumed); <-l.releaseResume })
+}
+func (l *preparationWaitLocker) Unlock() { l.mu.Unlock(); l.once.Do(func() { close(l.waiting) }) }
+
+func TestLifecyclePreparationWaitsForActiveThenPromotesWithoutIdleGap(t *testing.T) {
+	for _, tc := range preparationLifecycleCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.setup(t)
+			old, err := cfg.operations.begin("")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer old.Done()
+			waiting := make(chan struct{})
+			resumed, releaseResume := make(chan struct{}), make(chan struct{})
+			cfg.operations.cond.L = &preparationWaitLocker{mu: &cfg.operations.mu, waiting: waiting, resumed: resumed, releaseResume: releaseResume}
+			work, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			calls := &dockerCallRecorder{}
+			cfg.dockerRunner = func(args ...string) (string, error) {
+				if dockerPreflightProbe(args) {
+					return "29.0.0\n", nil
+				}
+				calls.record(args...)
+				once.Do(func() { close(work); <-release })
+				return "ok\n", nil
+			}
+			result := make(chan *httptest.ResponseRecorder, 1)
+			go func() { result <- tc.post(t, cfg, tc.body) }()
+			awaitPreparationSignal(t, waiting)
+			cfg.operations.mu.Lock()
+			preparing := reflect.ValueOf(cfg.operations).Elem().FieldByName("preparing")
+			if cfg.operations.active != old || !preparing.IsValid() || preparing.IsNil() {
+				t.Error("active wait lost published preparation or overwrote active")
+			}
+			cfg.operations.mu.Unlock()
+			assertPreparationBusy(t, cfg)
+			if old.Context().Err() != nil {
+				t.Error("idle cancelled existing active")
+			}
+			select {
+			case res := <-result:
+				t.Errorf("promotion returned before old active released: %d", res.Code)
+			default:
+			}
+			old.Done()
+			awaitPreparationSignal(t, resumed)
+			// The waking promoter holds mu and is stopped at the channel barrier.
+			// This observes the handoff after old active release, before claiming.
+			if cfg.operations.active != nil || cfg.operations.preparing == nil {
+				t.Error("active release exposed an idle gap before promotion")
+			}
+			close(releaseResume)
+			awaitPreparationSignal(t, work)
+			cfg.operations.mu.Lock()
+			preparing = reflect.ValueOf(cfg.operations).Elem().FieldByName("preparing")
+			jobID := cfg.lifecycleJobs.jobIDForOperation(tc.operationID)
+			if cfg.operations.active == nil || cfg.operations.active == old || cfg.operations.active.jobID != jobID || (preparing.IsValid() && !preparing.IsNil()) {
+				t.Error("preparation did not atomically install its claimed active job")
+			}
+			cfg.operations.mu.Unlock()
+			assertPreparationBusy(t, cfg)
+			close(release)
+			assertPreparationCompletion(t, cfg, tc, awaitPreparationResponse(t, result), calls)
+		})
+	}
+}
+
+func TestLifecycleIdleWinnerCreatesNoPendingReservation(t *testing.T) {
+	for _, tc := range preparationLifecycleCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.setup(t)
+			calls := &dockerCallRecorder{}
+			cfg.dockerRunner = func(args ...string) (string, error) { calls.record(args...); return "ok\n", nil }
+			if res := preparationIdle(t, cfg); res.Code != http.StatusOK {
+				t.Fatal(res.Body.String())
+			}
+			res := tc.post(t, cfg, tc.body)
+			if res.Code != http.StatusServiceUnavailable {
+				t.Errorf("closed lifecycle = %d %s", res.Code, res.Body.String())
+			}
+			if _, ok := cfg.lifecycleOperationStore.Lookup(tc.operationID); ok {
+				t.Error("idle winner allowed durable reservation")
+			}
+			if cfg.lifecycleJobs.jobIDForOperation(tc.operationID) != "" || calls.count() != 0 {
+				t.Error("idle winner allowed job reservation or Docker")
+			}
+		})
+	}
+}
+
+func TestLifecycleTerminalPersistenceFailureWithoutJournalBlocksIdle(t *testing.T) {
+	for _, tc := range preparationLifecycleCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.setup(t)
+			mustReserveOperation(t, cfg.lifecycleOperationStore, durableOperationRecord{OperationID: tc.operationID, Kind: tc.kind, SubjectID: "pep", RequestFingerprint: strings.Repeat("a", 64), Status: lifecycleJobPending})
+			jobID, _, err := cfg.lifecycleJobs.reserveWithOperation(tc.operationID, strings.Repeat("a", 64), tc.kind)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lease, err := cfg.operations.begin(jobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeRelease := make(chan bool, 1)
+			cancel := lease.cancel
+			lease.cancel = func() {
+				cfg.operations.mu.Lock()
+				beforeRelease <- cfg.operations.active == lease && cfg.operations.preparationSettlementPending && cfg.operations.closed
+				cfg.operations.mu.Unlock()
+				cancel()
+			}
+			work, release := make(chan struct{}), make(chan struct{})
+			if err := cfg.startClaimedDurableLifecycleJob(lease, jobID, "no journal", tc.operationID, tc.kind, func(context.Context) (string, error) {
+				close(work)
+				<-release
+				return "", errors.New("failed before journal")
+			}); err != nil {
+				t.Fatal(err)
+			}
+			awaitPreparationSignal(t, work)
+			cfg.lifecycleOperationStore.mu.Lock()
+			cfg.lifecycleOperationStore.fileOps.createTemp = func(string, string) (*os.File, error) { return nil, errors.New("terminal persistence unavailable") }
+			cfg.lifecycleOperationStore.mu.Unlock()
+			close(release)
+			// Done cancels its context as the worker exits, then clears active under mu.
+			awaitPreparationSignal(t, lease.Context().Done())
+			if !<-beforeRelease {
+				t.Error("worker terminal failure was not fail-closed before Done began")
+			}
+			cfg.operations.mu.Lock()
+			for cfg.operations.active != nil {
+				cfg.operations.cond.Wait()
+			}
+			unsettled := reflect.ValueOf(cfg.operations).Elem().FieldByName("preparationSettlementPending")
+			if !unsettled.IsValid() || !unsettled.Bool() || !cfg.operations.closed {
+				t.Error("worker released active without installing unsettled fail-closed state")
+			}
+			cfg.operations.mu.Unlock()
+			if stateFilePresent(cfg.lifecycleJournalFile) {
+				t.Error("test work unexpectedly wrote journal")
+			}
+			record, _ := cfg.lifecycleOperationStore.Lookup(tc.operationID)
+			if record.Status != lifecycleJobRunning {
+				t.Errorf("unconfirmed terminal record = %#v", record)
+			}
+			assertPreparationBusy(t, cfg)
+			calls := &dockerCallRecorder{}
+			cfg.dockerRunner = func(args ...string) (string, error) { calls.record(args...); return "ok\n", nil }
+			otherID := "44444444444444444444444444444444"
+			res := tc.post(t, cfg, strings.ReplaceAll(tc.body, tc.operationID, otherID))
+			if res.Code != http.StatusServiceUnavailable {
+				t.Errorf("unsettled admission = %d", res.Code)
+			}
+			if _, ok := cfg.lifecycleOperationStore.Lookup(otherID); ok {
+				t.Error("unsettled worker allowed another reservation")
+			}
+			if cfg.lifecycleJobs.jobIDForOperation(otherID) != "" || calls.count() != 0 {
+				t.Error("unsettled worker allowed another job or Docker")
+			}
+		})
+	}
+}
+
+func TestLifecyclePreparationStartupSettlementFailureRetainsActive(t *testing.T) {
+	for _, tc := range preparationLifecycleCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.setup(t)
+			starting, release := make(chan struct{}), make(chan struct{})
+			original := cfg.lifecycleOperationStore.fileOps.createTemp
+			attempts := 0
+			cfg.lifecycleOperationStore.fileOps.createTemp = func(dir, pattern string) (*os.File, error) {
+				attempts++
+				if attempts == 2 {
+					close(starting)
+					<-release
+				}
+				if attempts >= 2 {
+					return nil, errors.New("startup settlement unavailable")
+				}
+				return original(dir, pattern)
+			}
+			calls := &dockerCallRecorder{}
+			cfg.dockerRunner = func(args ...string) (string, error) {
+				if !dockerPreflightProbe(args) {
+					calls.record(args...)
+				}
+				return "29.0.0\n", nil
+			}
+			result := make(chan *httptest.ResponseRecorder, 1)
+			go func() { result <- tc.post(t, cfg, tc.body) }()
+			awaitPreparationSignal(t, starting)
+			assertPreparationBusy(t, cfg)
+			cfg.operations.mu.Lock()
+			lease := cfg.operations.active
+			if lease == nil || cfg.operations.preparing != nil {
+				t.Fatal("startup did not own promoted active lease")
+			}
+			cancel := lease.cancel
+			beforeRelease := make(chan bool, 1)
+			lease.cancel = func() {
+				cfg.operations.mu.Lock()
+				beforeRelease <- cfg.operations.active == lease && cfg.operations.preparationSettlementPending && cfg.operations.closed
+				cfg.operations.mu.Unlock()
+				cancel()
+			}
+			cfg.operations.mu.Unlock()
+			close(release)
+			if res := awaitPreparationResponse(t, result); res.Code != http.StatusServiceUnavailable {
+				t.Errorf("startup rejection = %d %s", res.Code, res.Body.String())
+			}
+			if !<-beforeRelease {
+				t.Error("startup released active before sticky fail-closed state")
+			}
+			assertPreparationBusy(t, cfg)
+			if calls.count() != 0 || stateFilePresent(cfg.lifecycleJournalFile) {
+				t.Error("failed startup reached worker mutation")
+			}
+		})
+	}
+}
+
+func TestLifecycleStartupReplaySettlesRunningBeforeActiveRelease(t *testing.T) {
+	for _, tc := range preparationLifecycleCases() {
+		for _, failSettlement := range []bool{false, true} {
+			t.Run(tc.name+"/settlement-fails="+strconv.FormatBool(failSettlement), func(t *testing.T) {
+				cfg := tc.setup(t)
+				startupFailed, releaseCleanup := make(chan struct{}), make(chan struct{})
+				replayFlushed := make(chan struct{})
+				var startupFailure atomic.Bool
+				var finishBarrier sync.Once
+				// finish's clock runs only after the initial running-transition helper
+				// has returned its error, and before the caller's rejection lookup.
+				cfg.lifecycleJobs.now = func() time.Time {
+					if startupFailure.Load() {
+						finishBarrier.Do(func() { close(startupFailed); <-releaseCleanup })
+					}
+					return time.Now()
+				}
+				originalCreate := cfg.lifecycleOperationStore.fileOps.createTemp
+				persistAttempts := 0
+				cfg.lifecycleOperationStore.fileOps.createTemp = func(dir, pattern string) (*os.File, error) {
+					persistAttempts++
+					if persistAttempts == 2 {
+						startupFailure.Store(true)
+						return nil, errors.New("initial running transition unavailable")
+					}
+					if failSettlement && persistAttempts >= 4 {
+						return nil, errors.New("terminal rejection settlement unavailable")
+					}
+					return originalCreate(dir, pattern)
+				}
+				cfg.lifecycleOperationStore.fileOps.syncDirectory = func(dir string) error {
+					if err := syncDirectory(dir); err != nil {
+						return err
+					}
+					if persistAttempts == 3 {
+						close(replayFlushed)
+					}
+					return nil
+				}
+				calls := &dockerCallRecorder{}
+				cfg.dockerRunner = func(args ...string) (string, error) {
+					if !dockerPreflightProbe(args) {
+						calls.record(args...)
+					}
+					return "29.0.0\n", nil
+				}
+				firstResult := make(chan *httptest.ResponseRecorder, 1)
+				go func() { firstResult <- tc.post(t, cfg, tc.body) }()
+				awaitPreparationSignal(t, startupFailed)
+				pending, _ := cfg.lifecycleOperationStore.Lookup(tc.operationID)
+				if pending.Status != lifecycleJobPending {
+					t.Errorf("failed startup record = %#v", pending)
+				}
+				cfg.operations.mu.Lock()
+				lease := cfg.operations.active
+				if lease == nil {
+					cfg.operations.mu.Unlock()
+					t.Fatal("startup failure lost active ownership before cleanup")
+				}
+				cancel := lease.cancel
+				safeRelease := make(chan bool, 1)
+				lease.cancel = func() {
+					record, ok := cfg.lifecycleOperationStore.Lookup(tc.operationID)
+					cfg.operations.mu.Lock()
+					closed := cfg.operations.preparationSettlementPending && cfg.operations.closed
+					safeRelease <- cfg.operations.active == lease && ((ok && isTerminalLifecycleJob(record.Status)) || closed)
+					cfg.operations.mu.Unlock()
+					cancel()
+				}
+				cfg.operations.mu.Unlock()
+				retryResult := make(chan *httptest.ResponseRecorder, 1)
+				go func() { retryResult <- tc.post(t, cfg, tc.body) }()
+				awaitPreparationSignal(t, replayFlushed)
+				running, _ := cfg.lifecycleOperationStore.Lookup(tc.operationID)
+				if running.Status != lifecycleJobRunning {
+					t.Errorf("concurrent identical replay did not flush running: %#v", running)
+				}
+				assertPreparationBusy(t, cfg)
+				close(releaseCleanup)
+				first := awaitPreparationResponse(t, firstResult)
+				wantStatus := http.StatusInternalServerError
+				if failSettlement {
+					wantStatus = http.StatusServiceUnavailable
+				}
+				if first.Code != wantStatus {
+					t.Errorf("startup response = %d, want %d: %s", first.Code, wantStatus, first.Body.String())
+				}
+				if !<-safeRelease {
+					t.Error("startup cleanup released active with running record, no worker, and open admission")
+				}
+				retry := awaitPreparationResponse(t, retryResult)
+				var replay createServerResponse
+				if err := json.Unmarshal(retry.Body.Bytes(), &replay); err != nil {
+					t.Fatal(err)
+				}
+				if retry.Code != http.StatusOK || replay.OperationID != tc.operationID || replay.OperationStatus != lifecycleJobRunning {
+					t.Errorf("concurrent replay = %d %#v", retry.Code, replay)
+				}
+				if calls.count() != 0 || stateFilePresent(cfg.lifecycleJournalFile) {
+					t.Error("failed startup launched worker or Docker mutation")
+				}
+				record, _ := cfg.lifecycleOperationStore.Lookup(tc.operationID)
+				if failSettlement {
+					if record.Status != lifecycleJobRunning {
+						t.Errorf("unconfirmed rejection = %#v", record)
+					}
+					assertUnsettledPreparationBlocksNewMutation(t, cfg)
+					if calls.count() != 0 {
+						t.Error("distinct request reached Docker after unsettled startup")
+					}
+				} else {
+					if record.Status != lifecycleJobFailed || record.HTTPStatus != http.StatusInternalServerError {
+						t.Errorf("startup-owned running was not settled terminal: %#v", record)
+					}
+					if idle := preparationIdle(t, cfg); idle.Code != http.StatusOK {
+						t.Errorf("confirmed rejection did not release idle: %d", idle.Code)
+					}
+				}
+			})
+		}
+	}
+}
+
+func assertUnsettledPreparationBlocksNewMutation(t *testing.T, cfg config) {
+	t.Helper()
+	assertPreparationBusy(t, cfg)
+	otherID := "55555555555555555555555555555555"
+	_, status := cfg.deleteServer("pep", "DELETE pep", otherID)
+	if status != http.StatusServiceUnavailable {
+		t.Errorf("unsettled new mutation = %d", status)
+	}
+	if _, ok := cfg.lifecycleOperationStore.Lookup(otherID); ok {
+		t.Error("unsettled preparation reserved another durable operation")
+	}
+	if cfg.lifecycleJobs.jobIDForOperation(otherID) != "" {
+		t.Error("unsettled preparation reserved another job")
+	}
+}
+
+func TestMaintenanceEnterCancelsPreparationAndWaitsForSettlement(t *testing.T) {
+	for _, failSettlement := range []bool{false, true} {
+		t.Run(fmt.Sprint(failSettlement), func(t *testing.T) {
+			tc := preparationLifecycleCases()[0]
+			cfg := tc.setup(t)
+			preflight, cancelled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			cfg.dockerRunnerContext = func(ctx context.Context, args ...string) (string, error) {
+				if !dockerPreflightProbe(args) {
+					t.Error("cancelled preparation reached Docker mutation")
+					return "", nil
+				}
+				close(preflight)
+				<-ctx.Done()
+				close(cancelled)
+				<-release
+				return "", ctx.Err()
+			}
+			result := make(chan *httptest.ResponseRecorder, 1)
+			go func() { result <- tc.post(t, cfg, tc.body) }()
+			awaitPreparationSignal(t, preflight)
+			if failSettlement {
+				cfg.lifecycleOperationStore.mu.Lock()
+				cfg.lifecycleOperationStore.fileOps.createTemp = func(string, string) (*os.File, error) { return nil, errors.New("settlement unavailable") }
+				cfg.lifecycleOperationStore.mu.Unlock()
+			}
+			entered := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				entered <- loopbackRequest(t, cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance)), http.MethodPost, "/maintenance/enter", "")
+			}()
+			awaitPreparationSignal(t, cancelled)
+			select {
+			case <-entered:
+				t.Error("maintenance returned before preparation settled")
+			default:
+			}
+			close(release)
+			if res := awaitPreparationResponse(t, result); res.Code != http.StatusServiceUnavailable {
+				t.Errorf("cancelled preparation = %d", res.Code)
+			}
+			awaitPreparationResponse(t, entered)
+			record, _ := cfg.lifecycleOperationStore.Lookup(tc.operationID)
+			cfg.operations.mu.Lock()
+			unsettled := reflect.ValueOf(cfg.operations).Elem().FieldByName("preparationSettlementPending")
+			if failSettlement {
+				if !unsettled.IsValid() || !unsettled.Bool() || !cfg.operations.closed {
+					t.Error("enter drained before unsettled state installed")
+				}
+			} else if record.Status != lifecycleJobCancelled {
+				t.Errorf("enter drained before terminal cancellation: %#v", record)
+			}
+			cfg.operations.mu.Unlock()
+		})
+	}
+}
 
 func TestDefaultSharedServiceBoundaries(t *testing.T) {
 	if got, want := strings.Join(sharedEnvServices, ","), "gateway-api,board-api,web-gateway,nginx,deployer"; got != want {
@@ -639,6 +1262,259 @@ func TestMaintenanceAPIBearerLoopbackAndIdempotency(t *testing.T) {
 	}
 }
 
+func TestEnterMaintenanceIfIdleRejectsActiveWorkWithoutCancellationAndLaterSucceeds(t *testing.T) {
+	cfg := testConfig(t)
+	jobID, err := cfg.lifecycleJobs.reserve()
+	if err != nil {
+		t.Fatalf("reserve lifecycle job: %v", err)
+	}
+	lease, err := cfg.operations.begin(jobID)
+	if err != nil {
+		t.Fatalf("begin active operation: %v", err)
+	}
+
+	state, token, err := cfg.operations.enterMaintenanceIfIdle()
+	if !errors.Is(err, errMaintenanceIdleConflict) || state != maintenanceStateOpen || token != "" {
+		t.Fatalf("busy idle admission state=%q token=%q err=%v", state, token, err)
+	}
+	if lease.Context().Err() != nil {
+		t.Fatal("busy idle admission cancelled the active operation")
+	}
+	if cfg.operations.maintenanceState() != maintenanceStateOpen {
+		t.Fatal("busy idle admission changed the maintenance barrier")
+	}
+	if cfg.operations.maintenanceLease != nil {
+		t.Fatal("busy idle admission created a maintenance lease")
+	}
+	if _, err := os.Stat(cfg.maintenanceFile); !os.IsNotExist(err) {
+		t.Fatalf("busy idle admission created a marker: %v", err)
+	}
+	cfg.lifecycleJobs.mu.Lock()
+	job := cfg.lifecycleJobs.jobs[jobID]
+	cfg.lifecycleJobs.mu.Unlock()
+	if job.status != lifecycleJobRunning || job.cancelRequested {
+		t.Fatalf("busy idle admission changed lifecycle cancellation state: %#v", job)
+	}
+
+	lease.Done()
+	cfg.lifecycleJobs.finish(jobID, lifecycleJobSucceeded)
+	state, token, err = cfg.operations.enterMaintenanceIfIdle()
+	if err != nil || state != maintenanceStateDrained || !lifecycleJobIDRe.MatchString(token) {
+		t.Fatalf("later idle admission state=%q token=%q err=%v", state, token, err)
+	}
+}
+
+func TestEnterMaintenanceIfIdleRejectsExistingBarrierAndJournalStates(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		setup func(*testing.T, config)
+	}{
+		{
+			name: "closed coordinator",
+			setup: func(t *testing.T, cfg config) {
+				cfg.operations.closed = true
+			},
+		},
+		{
+			name: "persisted marker",
+			setup: func(t *testing.T, cfg config) {
+				writeEnv(t, cfg.maintenanceFile, "existing marker\n")
+			},
+		},
+		{
+			name: "journal pending",
+			setup: func(t *testing.T, cfg config) {
+				cfg.operations.journalPending = true
+			},
+		},
+		{
+			name: "persisted journal",
+			setup: func(t *testing.T, cfg config) {
+				writeEnv(t, cfg.lifecycleJournalFile, "existing journal\n")
+			},
+		},
+		{
+			name: "unreadable marker path",
+			setup: func(t *testing.T, cfg config) {
+				parentFile := filepath.Join(filepath.Dir(cfg.maintenanceFile), "not-a-directory")
+				writeEnv(t, parentFile, "file\n")
+				cfg.operations.markerPath = filepath.Join(parentFile, "marker")
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			cfg := testConfig(t)
+			testCase.setup(t, cfg)
+			state, token, err := cfg.operations.enterMaintenanceIfIdle()
+			if !errors.Is(err, errMaintenanceIdleConflict) || token != "" {
+				t.Fatalf("conflicting idle admission state=%q token=%q err=%v", state, token, err)
+			}
+			if cfg.operations.maintenanceLease != nil {
+				t.Fatal("conflicting idle admission created a lease")
+			}
+		})
+	}
+}
+
+func TestEnterMaintenanceIfIdlePersistsBeforeClosingAndRefusesDuplicate(t *testing.T) {
+	cfg := testConfig(t)
+	state, token, err := cfg.operations.enterMaintenanceIfIdle()
+	if err != nil || state != maintenanceStateDrained || !lifecycleJobIDRe.MatchString(token) {
+		t.Fatalf("idle admission state=%q token=%q err=%v", state, token, err)
+	}
+	if got := readFile(t, cfg.maintenanceFile); got != "{\"capability\":\"maintenance-v1\"}\n" {
+		t.Fatalf("maintenance marker = %q", got)
+	}
+	if cfg.operations.maintenanceState() != maintenanceStateDrained {
+		t.Fatal("successful idle admission did not close the barrier")
+	}
+	if lease, beginErr := cfg.operations.begin(""); !errors.Is(beginErr, errMaintenanceClosed) || lease != nil {
+		t.Fatalf("mutation began after idle admission lease=%#v err=%v", lease, beginErr)
+	}
+
+	duplicateState, duplicateToken, duplicateErr := cfg.operations.enterMaintenanceIfIdle()
+	if !errors.Is(duplicateErr, errMaintenanceIdleConflict) || duplicateState != maintenanceStateDrained || duplicateToken != "" {
+		t.Fatalf("duplicate idle admission state=%q token=%q err=%v", duplicateState, duplicateToken, duplicateErr)
+	}
+}
+
+func TestEnterMaintenanceIfIdleFailsClosedWhenDirectorySyncFailsAfterRename(t *testing.T) {
+	cfg := testConfig(t)
+	injected := errors.New("injected maintenance marker directory sync failure")
+	syncCalled := false
+	cfg.operations.writeMarker = func(path string) (bool, error) {
+		return writeMaintenanceMarkerDurableWithSync(path, func(string) error {
+			syncCalled = true
+			return injected
+		})
+	}
+
+	state, token, err := cfg.operations.enterMaintenanceIfIdle()
+	if !errors.Is(err, injected) || state != maintenanceStateDrained || token != "" {
+		t.Fatalf("post-rename sync failure state=%q token=%q err=%v", state, token, err)
+	}
+	if !syncCalled {
+		t.Fatal("durable marker write did not sync the containing directory")
+	}
+	if got := readFile(t, cfg.maintenanceFile); got != "{\"capability\":\"maintenance-v1\"}\n" {
+		t.Fatalf("committed marker after sync failure = %q", got)
+	}
+	if !cfg.operations.closed || cfg.operations.maintenanceLease != nil {
+		t.Fatal("post-rename sync failure left an admitting coordinator or usable lease")
+	}
+	if lease, beginErr := cfg.operations.begin(""); lease != nil || !errors.Is(beginErr, errMaintenanceClosed) {
+		t.Fatalf("mutation admitted beside post-rename marker lease=%#v err=%v", lease, beginErr)
+	}
+}
+
+func TestEnterMaintenanceIfIdleAdmissionIsAtomicWithBegin(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.operations.mu.Lock()
+	ready := make(chan struct{}, 2)
+	beginResult := make(chan error, 1)
+	idleResult := make(chan error, 1)
+	var admittedLease *operationLease
+	go func() {
+		ready <- struct{}{}
+		var err error
+		admittedLease, err = cfg.operations.begin("")
+		beginResult <- err
+	}()
+	go func() {
+		ready <- struct{}{}
+		_, _, err := cfg.operations.enterMaintenanceIfIdle()
+		idleResult <- err
+	}()
+	<-ready
+	<-ready
+	cfg.operations.mu.Unlock()
+
+	beginErr := <-beginResult
+	idleErr := <-idleResult
+	beginWon := beginErr == nil
+	idleWon := idleErr == nil
+	if beginWon == idleWon {
+		t.Fatalf("atomic admission winners begin=%t idle=%t beginErr=%v idleErr=%v", beginWon, idleWon, beginErr, idleErr)
+	}
+	if beginWon {
+		if !errors.Is(idleErr, errMaintenanceIdleConflict) {
+			t.Fatalf("begin winner got idle error %v", idleErr)
+		}
+		admittedLease.Done()
+	} else if !errors.Is(beginErr, errMaintenanceClosed) {
+		t.Fatalf("idle winner got begin error %v", beginErr)
+	}
+}
+
+func TestMaintenanceEnterIfIdleHTTPBoundaries(t *testing.T) {
+	cfg := testConfig(t)
+	handler := cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance))
+
+	unauthorized := httptest.NewRecorder()
+	unauthorizedRequest := httptest.NewRequest(http.MethodPost, "/maintenance/enter-if-idle", nil)
+	unauthorizedRequest.RemoteAddr = "127.0.0.1:31000"
+	handler(unauthorized, unauthorizedRequest)
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized idle admission = %d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+
+	nonLoopback := httptest.NewRecorder()
+	nonLoopbackRequest := httptest.NewRequest(http.MethodPost, "/maintenance/enter-if-idle", nil)
+	nonLoopbackRequest.Header.Set("Authorization", "Bearer test-token")
+	nonLoopbackRequest.RemoteAddr = "198.51.100.4:31000"
+	handler(nonLoopback, nonLoopbackRequest)
+	if nonLoopback.Code != http.StatusForbidden {
+		t.Fatalf("non-loopback idle admission = %d body=%s", nonLoopback.Code, nonLoopback.Body.String())
+	}
+
+	success := loopbackRequest(t, handler, http.MethodPost, "/maintenance/enter-if-idle", "")
+	var successPayload map[string]any
+	if err := json.Unmarshal(success.Body.Bytes(), &successPayload); err != nil {
+		t.Fatalf("decode idle admission success: %v", err)
+	}
+	if success.Code != http.StatusOK || len(successPayload) != 3 || successPayload["capability"] != "maintenance-v1" || successPayload["state"] != "drained" || !lifecycleJobIDRe.MatchString(fmt.Sprint(successPayload["lease"])) {
+		t.Fatalf("idle admission success = %d body=%s", success.Code, success.Body.String())
+	}
+
+	duplicate := loopbackRequest(t, handler, http.MethodPost, "/maintenance/enter-if-idle", "")
+	if duplicate.Code != http.StatusConflict || duplicate.Body.String() != "{\"error\":\"maintenance idle admission unavailable\"}\n" || strings.Contains(duplicate.Body.String(), fmt.Sprint(successPayload["lease"])) {
+		t.Fatalf("duplicate idle admission = %d body=%s", duplicate.Code, duplicate.Body.String())
+	}
+
+	wrongMethod := loopbackRequest(t, handler, http.MethodGet, "/maintenance/enter-if-idle", "")
+	if wrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("idle admission wrong method = %d body=%s", wrongMethod.Code, wrongMethod.Body.String())
+	}
+}
+
+func TestMaintenanceEnterIfIdleHTTPMapsUnavailableAndPersistenceFailure(t *testing.T) {
+	t.Run("nil coordinator", func(t *testing.T) {
+		cfg := testConfig(t)
+		cfg.operations = nil
+		response := loopbackRequest(t, cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance)), http.MethodPost, "/maintenance/enter-if-idle", "")
+		if response.Code != http.StatusServiceUnavailable || response.Body.String() != "{\"error\":\"maintenance coordinator unavailable\"}\n" {
+			t.Fatalf("nil coordinator = %d body=%s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("marker persistence failure", func(t *testing.T) {
+		cfg := testConfig(t)
+		unwritable := filepath.Join(filepath.Dir(cfg.maintenanceFile), "unwritable")
+		if err := os.Mkdir(unwritable, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(unwritable, 0o700) })
+		cfg.operations.markerPath = filepath.Join(unwritable, "marker")
+		response := loopbackRequest(t, cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance)), http.MethodPost, "/maintenance/enter-if-idle", "")
+		if response.Code != http.StatusInternalServerError || response.Body.String() != "{\"error\":\"maintenance idle admission failed\"}\n" {
+			t.Fatalf("persistence failure = %d body=%s", response.Code, response.Body.String())
+		}
+		if cfg.operations.closed || cfg.operations.maintenanceLease != nil {
+			t.Fatal("persistence failure mutated coordinator")
+		}
+	})
+}
+
 func TestMaintenanceRepairLogsInternalFailureWithoutReturningIt(t *testing.T) {
 	cfg := testConfig(t)
 	handler := cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance))
@@ -1006,7 +1882,7 @@ func TestResetRepairRestoresJournaledTargetAcrossPreparedCrashBoundaries(t *test
 			writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"scenarioCode":"scenario_1010","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
 			envFile := filepath.Join(cfg.serversDir, "spep.env")
-			writeEnv(t, envFile, "SERVER_ID=pep\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n")
+			writeEnv(t, envFile, "SERVER_ID=pep\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\nSCENARIO_LOOKUP_DIR=\n")
 			target, err := cfg.serverTargetForID("pep")
 			if err != nil {
 				t.Fatal(err)
@@ -1042,7 +1918,7 @@ func TestResetRepairRestoresJournaledTargetAcrossPreparedCrashBoundaries(t *test
 			if err := restarted.repairLifecycleJournal(); err != nil {
 				t.Fatalf("repair prepared crash boundary: %v", err)
 			}
-			if got := readFile(t, envFile); !strings.Contains(got, "SCENARIO_CODE=scenario_1002\n") || !strings.Contains(got, "SERVER_GENERATION=2\n") || !strings.Contains(got, "SCENARIO_SEED_ENABLED=true\n") || !strings.Contains(got, "RESET_TURNTERM=30\n") {
+			if got := readFile(t, envFile); !strings.Contains(got, "SCENARIO_CODE=scenario_1002\n") || !strings.Contains(got, "SERVER_GENERATION=2\n") || !strings.Contains(got, "SCENARIO_SEED_ENABLED=true\n") || !strings.Contains(got, "RESET_TURNTERM=30\n") || strings.Count(got, "SCENARIO_LOOKUP_DIR=\n") != 1 {
 				t.Fatalf("repaired env did not retain journaled reset target:\n%s", got)
 			}
 			entry, err := restarted.registryEntryByID("pep")
@@ -1052,11 +1928,14 @@ func TestResetRepairRestoresJournaledTargetAcrossPreparedCrashBoundaries(t *test
 			if entry.Generation != 2 || entry.ScenarioCode != "scenario_1002" || entry.RepairRequired {
 				t.Fatalf("repaired registry = %#v", entry)
 			}
+			if value, exists := entry.Env["SCENARIO_LOOKUP_DIR"]; !exists || value != "" {
+				t.Fatalf("repaired registry lost empty lookup snapshot: %#v", entry.Env)
+			}
 			if _, err := os.Stat(restarted.lifecycleJournalFile); !os.IsNotExist(err) {
 				t.Fatalf("prepared crash repair retained journal: %v", err)
 			}
 			recorded := calls.snapshot()
-			if len(recorded) != 4 || !strings.Contains(recorded[0], "down --volumes --remove-orphans") || !strings.Contains(recorded[1], "up -d") || !strings.Contains(recorded[2], "up -d --no-deps web-gateway") || strings.Contains(recorded[2], "gateway-api") || !strings.Contains(recorded[3], "--force-recreate --no-deps nginx") {
+			if len(recorded) != 4 || !strings.Contains(recorded[0], "down --volumes --remove-orphans") || !strings.Contains(recorded[1], "up -d") || !strings.Contains(recorded[2], "up -d --no-deps web-gateway") || strings.Contains(recorded[2], "gateway-api") || !strings.Contains(recorded[3], "kill --signal HUP nginx") {
 				t.Fatalf("prepared crash repair calls = %#v", recorded)
 			}
 		})
@@ -1893,8 +2772,117 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	if !strings.Contains(recorded[0], "up -d --no-deps web-gateway") || strings.Contains(recorded[0], "gateway-api") || strings.Contains(recorded[0], " nginx") {
 		t.Fatalf("shared reload call = %q", recorded[0])
 	}
-	if !strings.Contains(recorded[1], "--force-recreate --no-deps nginx") {
-		t.Fatalf("nginx reload call = %q", recorded[1])
+	if !strings.Contains(recorded[1], "kill --signal HUP nginx") {
+		t.Fatalf("nginx HUP call = %q", recorded[1])
+	}
+}
+
+func TestServerEnvScenarioLookupDirAllowsOnlyExactModes(t *testing.T) {
+	testCases := []struct {
+		name    string
+		value   string
+		allowed bool
+	}{
+		{name: "explicit_empty", value: "", allowed: true},
+		{name: "external_default", value: "/data/scenarios", allowed: true},
+		{name: "whitespace", value: " "},
+		{name: "arbitrary_path", value: "/tmp/scenarios"},
+		{name: "trailing_slash", value: "/data/scenarios/"},
+		{name: "interpolation", value: "${SCENARIO_DIR}"},
+		{name: "carriage_return", value: "\r"},
+		{name: "line_feed", value: "\n"},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			cfg := testConfig(t)
+			registryFile := filepath.Join(cfg.composeDir, ".env")
+			envFile := filepath.Join(cfg.serversDir, "spep.env")
+			writeEnv(t, registryFile, `SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
+`)
+			writeEnv(t, envFile, "SERVER_ID=pep\n")
+			envBefore := readFile(t, envFile)
+			registryBefore := readFile(t, registryFile)
+			calls := &dockerCallRecorder{}
+			cfg.dockerRunner = func(args ...string) (string, error) {
+				calls.record(args...)
+				return "ok\n", nil
+			}
+			payload, err := json.Marshal(map[string]any{
+				"values": map[string]string{"SCENARIO_LOOKUP_DIR": testCase.value},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			response := envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodPatch, "/env/server?id=pep", string(payload))
+			if !testCase.allowed {
+				if response.Code != http.StatusBadRequest {
+					t.Fatalf("PATCH status = %d body=%s", response.Code, response.Body.String())
+				}
+				if got := readFile(t, envFile); got != envBefore {
+					t.Fatalf("invalid PATCH mutated env: before=%q after=%q", envBefore, got)
+				}
+				if got := readFile(t, registryFile); got != registryBefore {
+					t.Fatalf("invalid PATCH mutated registry: before=%q after=%q", registryBefore, got)
+				}
+				if calls.count() != 0 {
+					t.Fatalf("invalid PATCH reached Docker: %#v", calls.snapshot())
+				}
+				return
+			}
+
+			if response.Code != http.StatusOK {
+				t.Fatalf("PATCH status = %d body=%s", response.Code, response.Body.String())
+			}
+			body := decodeEnvResponse(t, response)
+			if body.JobID == "" {
+				t.Fatal("successful lookup PATCH did not schedule registry reload")
+			}
+			if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, body.JobID, lifecycleJobSucceeded); completed.Status != lifecycleJobSucceeded {
+				t.Fatalf("lookup PATCH completion = %#v", completed)
+			}
+			if got := strings.Count(readFile(t, envFile), "SCENARIO_LOOKUP_DIR="+testCase.value+"\n"); got != 1 {
+				t.Fatalf("lookup env line count = %d in %q", got, readFile(t, envFile))
+			}
+			if testCase.value == "" {
+				if got := readFile(t, envFile); got != "SERVER_ID=pep\nSCENARIO_LOOKUP_DIR=\n" {
+					t.Fatalf("explicit empty env bytes = %q", got)
+				}
+			}
+			field := body.Fields["SCENARIO_LOOKUP_DIR"]
+			if field.Value == nil || *field.Value != testCase.value {
+				t.Fatalf("PATCH lookup field = %#v", field)
+			}
+			entry, err := cfg.registryEntryByID("pep")
+			if err != nil {
+				t.Fatalf("read registry: %v", err)
+			}
+			if value, exists := entry.Env["SCENARIO_LOOKUP_DIR"]; !exists || value != testCase.value {
+				t.Fatalf("registry lookup snapshot = %#v", entry.Env)
+			}
+			if testCase.value == "" {
+				if field.Configured {
+					t.Fatalf("explicit empty changed configured convention: %#v", field)
+				}
+				get := envRequest(t, cfg.withAuth(cfg.handleServerEnv), http.MethodGet, "/env/server?id=pep", "")
+				if get.Code != http.StatusOK {
+					t.Fatalf("GET status = %d body=%s", get.Code, get.Body.String())
+				}
+				readback := decodeEnvResponse(t, get).Fields["SCENARIO_LOOKUP_DIR"]
+				if readback.Value == nil || *readback.Value != "" || readback.Configured {
+					t.Fatalf("explicit empty GET field = %#v", readback)
+				}
+				if !strings.Contains(readFile(t, registryFile), `"SCENARIO_LOOKUP_DIR":""`) {
+					t.Fatalf("registry JSON lost explicit empty lookup: %s", readFile(t, registryFile))
+				}
+			}
+			for _, call := range calls.snapshot() {
+				if strings.Contains(call, "compose -p opensamguk-spep") {
+					t.Fatalf("lookup PATCH restarted game stack: %q", call)
+				}
+			}
+		})
 	}
 }
 
@@ -2020,8 +3008,8 @@ func TestCreateServerWritesEnvRegistryAndStartsCompose(t *testing.T) {
 	if !strings.Contains(recorded[1], "up -d --no-deps web-gateway") || strings.Contains(recorded[1], "gateway-api") || strings.Contains(recorded[1], " nginx") {
 		t.Fatalf("shared reload call = %q", recorded[1])
 	}
-	if !strings.Contains(recorded[2], "--force-recreate --no-deps nginx") {
-		t.Fatalf("nginx reload call = %q", recorded[2])
+	if !strings.Contains(recorded[2], "kill --signal HUP nginx") {
+		t.Fatalf("nginx HUP call = %q", recorded[2])
 	}
 }
 
@@ -2539,6 +3527,7 @@ func TestServerComposeEnvironmentDropsAmbientDefinitionControls(t *testing.T) {
 		"SPRING_PROFILES_ACTIVE=v2",
 		"COMPOSE_ENV_FILES=unexpected",
 		"COMPOSE_HOST_DIR=/ambient-host",
+		"SCENARIO_LOOKUP_DIR=/attacker",
 		"PWD=/ambient-working-directory",
 	})
 	values := map[string]string{}
@@ -2555,6 +3544,7 @@ func TestServerComposeEnvironmentDropsAmbientDefinitionControls(t *testing.T) {
 		"V2_ENABLED",
 		"SPRING_PROFILES_ACTIVE",
 		"COMPOSE_ENV_FILES",
+		"SCENARIO_LOOKUP_DIR",
 		"PWD",
 	} {
 		if _, exists := values[key]; exists {
@@ -2582,6 +3572,7 @@ printf 'V2_ENABLED=%s\n' "${V2_ENABLED-absent}"
 printf 'SPRING_PROFILES_ACTIVE=%s\n' "${SPRING_PROFILES_ACTIVE-absent}"
 printf 'COMPOSE_ENV_FILES=%s\n' "${COMPOSE_ENV_FILES-absent}"
 printf 'COMPOSE_HOST_DIR=%s\n' "${COMPOSE_HOST_DIR-absent}"
+printf 'SCENARIO_LOOKUP_DIR=%s\n' "${SCENARIO_LOOKUP_DIR-absent}"
 printf 'DOCKER_HOST=%s\n' "${DOCKER_HOST-absent}"
 `)
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -2591,6 +3582,7 @@ printf 'DOCKER_HOST=%s\n' "${DOCKER_HOST-absent}"
 	t.Setenv("SPRING_PROFILES_ACTIVE", "v2")
 	t.Setenv("COMPOSE_ENV_FILES", "unexpected")
 	t.Setenv("COMPOSE_HOST_DIR", "/ambient-host")
+	t.Setenv("SCENARIO_LOOKUP_DIR", "/attacker")
 	t.Setenv("DOCKER_HOST", "tcp://docker-proxy:2375")
 
 	out, err := cfg.runServerDockerContext(context.Background(), "version")
@@ -2611,6 +3603,7 @@ printf 'DOCKER_HOST=%s\n' "${DOCKER_HOST-absent}"
 		"V2_ENABLED",
 		"SPRING_PROFILES_ACTIVE",
 		"COMPOSE_ENV_FILES",
+		"SCENARIO_LOOKUP_DIR",
 	} {
 		if values[key] != "absent" {
 			t.Fatalf("docker child inherited %s", key)
@@ -2832,7 +3825,7 @@ func runInternalServiceTokenBootstrap(t *testing.T, sharedEnv, serversDir string
 
 func TestServerComposeMountsExternalScenarioOverridesReadOnly(t *testing.T) {
 	compose := readFile(t, filepath.Join("..", "docker-compose.server.yml"))
-	const scenarioDir = "SCENARIO_DIR: ${SCENARIO_DIR:-/data/scenarios}"
+	const scenarioDir = "SCENARIO_DIR: ${SCENARIO_LOOKUP_DIR-${SCENARIO_DIR:-/data/scenarios}}"
 	// 바인드 소스는 호스트 절대경로여야 한다 — deployer가 컨테이너 안에서 compose를 실행하므로
 	// 상대경로는 호스트 데몬에서 빈 /workspace/... 로 해석돼 외부 오버라이드가 조용히 죽는다.
 	const scenarioMount = "- ${COMPOSE_HOST_DIR:-${PWD:-.}}/data/scenarios:${SCENARIO_DIR:-/data/scenarios}:ro"
@@ -2871,6 +3864,74 @@ func TestServerComposeMountsExternalScenarioOverridesReadOnly(t *testing.T) {
 		if contract != want {
 			t.Fatalf("%s scenario override contract = %q, want exactly read-only %q", service.name, contract, want)
 		}
+	}
+}
+
+func TestServerComposeRendersScenarioLookupMatrix(t *testing.T) {
+	testCases := []struct {
+		name       string
+		scenario   string
+		wantLookup string
+		wantTarget string
+	}{
+		{name: "missing_uses_default", wantLookup: "/data/scenarios", wantTarget: "/data/scenarios"},
+		{name: "missing_uses_legacy_custom", scenario: "SCENARIO_DIR=/custom/scenarios\n", wantLookup: "/custom/scenarios", wantTarget: "/custom/scenarios"},
+		{name: "explicit_empty", scenario: "SCENARIO_DIR=/data/scenarios\nSCENARIO_LOOKUP_DIR=\n", wantLookup: "", wantTarget: "/data/scenarios"},
+		{name: "external_lookup", scenario: "SCENARIO_LOOKUP_DIR=/data/scenarios\n", wantLookup: "/data/scenarios", wantTarget: "/data/scenarios"},
+	}
+	const required = "SERVER_ID=pep\nGAME_POSTGRES_PASSWORD=fixture-password\nJWT_PUBLIC_KEY=fixture-public-key\nINTERNAL_SERVICE_TOKEN=fixture-internal-token\nGAME_API_PORT=8101\nWEB_GAME_PORT=3101\nCOMPOSE_HOST_DIR=/synthetic-host\n"
+	type renderedService struct {
+		Environment map[string]string `json:"environment"`
+		Volumes     []struct {
+			Target   string `json:"target"`
+			ReadOnly bool   `json:"read_only"`
+		} `json:"volumes"`
+	}
+	type renderedCompose struct {
+		Services map[string]renderedService `json:"services"`
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			cfg := config{composeHostDir: "/synthetic-host"}
+			fixtureDir := t.TempDir()
+			if err := os.Chmod(fixtureDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			fixture := filepath.Join(fixtureDir, "server.env")
+			writeEnv(t, fixture, required+testCase.scenario)
+			cmd := exec.Command("docker", "compose", "-f", filepath.Join("..", "docker-compose.server.yml"), "--env-file", fixture, "config", "--format", "json")
+			parentEnvironment := append(append([]string{}, os.Environ()...), "SCENARIO_LOOKUP_DIR=/attacker")
+			cmd.Env = cfg.serverComposeEnvironment(parentEnvironment)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("compose config: %v\n%s", err, output)
+			}
+			var rendered renderedCompose
+			if err := json.Unmarshal(output, &rendered); err != nil {
+				t.Fatalf("decode compose config: %v\n%s", err, output)
+			}
+			var canonical renderedService
+			for index, name := range []string{"game-engine", "game-api"} {
+				service, exists := rendered.Services[name]
+				if !exists {
+					t.Fatalf("compose config missing %s", name)
+				}
+				if got := service.Environment["SCENARIO_DIR"]; got != testCase.wantLookup {
+					t.Errorf("%s lookup = %q, want %q", name, got, testCase.wantLookup)
+				}
+				if len(service.Volumes) != 1 || service.Volumes[0].Target != testCase.wantTarget || !service.Volumes[0].ReadOnly {
+					t.Errorf("%s scenario mount = %#v, want target=%q read-only", name, service.Volumes, testCase.wantTarget)
+				}
+				if index == 0 {
+					canonical = service
+					continue
+				}
+				if service.Environment["SCENARIO_DIR"] != canonical.Environment["SCENARIO_DIR"] || !reflect.DeepEqual(service.Volumes, canonical.Volumes) {
+					t.Errorf("engine/API scenario contracts differ: engine=%#v api=%#v", canonical, service)
+				}
+			}
+		})
 	}
 }
 
@@ -3518,6 +4579,7 @@ func TestAuthenticatedHTTPCommandAllowsOnlyWorkflowRoutes(t *testing.T) {
 	}{
 		{method: http.MethodGet, path: "/maintenance"},
 		{method: http.MethodPost, path: "/maintenance/enter"},
+		{method: http.MethodPost, path: "/maintenance/enter-if-idle"},
 		{method: http.MethodPost, path: "/maintenance/leave"},
 		{method: http.MethodPost, path: "/maintenance/repair"},
 		{method: http.MethodGet, path: "/jobs/" + jobID},
@@ -3530,8 +4592,127 @@ func TestAuthenticatedHTTPCommandAllowsOnlyWorkflowRoutes(t *testing.T) {
 			t.Fatalf("allowed helper route method=%q path=%q status=%d output=%q diagnostics=%q", testCase.method, testCase.path, status, output.String(), diagnostics.String())
 		}
 	}
-	if got := requests.Load(); got != 7 {
-		t.Fatalf("allowed helper routes reached listener %d times, want 7", got)
+	if got := requests.Load(); got != 8 {
+		t.Fatalf("allowed helper routes reached listener %d times, want 8", got)
+	}
+}
+
+func TestAuthenticatedHTTPModeDoesNotRecoverDurableStoreBeforeExit(t *testing.T) {
+	buildDir := t.TempDir()
+	binary := filepath.Join(buildDir, "deployer")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build deployer subprocess: %v\n%s", err, output)
+	}
+	listener, err := net.Listen("tcp4", "127.0.0.1:9000")
+	if err != nil {
+		t.Fatalf("listen for authenticated HTTP subprocess: %v", err)
+	}
+	var requests atomic.Int32
+	requestDetails := make(chan [3]string, 1)
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		requestDetails <- [3]string{r.Method, r.URL.Path, r.Header.Get("Authorization")}
+		_, _ = w.Write([]byte(`{"capability":"maintenance-v1","state":"open"}`))
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+
+	operationID := "1234567890abcdef1234567890abcdef"
+	now := time.Date(2026, time.September, 5, 0, 0, 0, 0, time.UTC)
+	document := durableOperationDocument{
+		Version: durableOperationStoreVersion,
+		Operations: []durableOperationRecord{{
+			OperationID:        operationID,
+			Kind:               lifecycleKindReset,
+			SubjectID:          "pep",
+			RequestFingerprint: strings.Repeat("a", 64),
+			Status:             lifecycleJobRunning,
+			CreatedAt:          now,
+			UpdatedAt:          now,
+		}},
+	}
+	original, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original = append(original, '\n')
+
+	for _, testCase := range []struct {
+		name  string
+		args  []string
+		token string
+	}{
+		{name: "missing token", args: []string{"--authenticated-http", http.MethodGet, "/maintenance"}},
+		{name: "invalid timeout", args: []string{"--authenticated-http", http.MethodGet, "/maintenance", "invalid"}, token: "test-token"},
+		{name: "invalid route", args: []string{"--authenticated-http", http.MethodGet, "/status"}, token: "test-token"},
+		{name: "invalid usage", args: []string{"--unknown"}, token: "test-token"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			root := t.TempDir()
+			storePath := filepath.Join(root, durableOperationStoreFileName)
+			if err := os.WriteFile(storePath, original, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command(binary, testCase.args...)
+			command.Env = commandEnvironment(
+				"DEPLOYER_TOKEN="+testCase.token,
+				"SERVERS_DIR="+root,
+				"DEPLOYER_OPERATION_STORE_FILE="+storePath,
+				"DEPLOYER_MAINTENANCE_FILE="+filepath.Join(root, ".deployer-maintenance"),
+				"DEPLOYER_LIFECYCLE_JOURNAL_FILE="+filepath.Join(root, ".deployer-lifecycle-journal"),
+			)
+			if err := command.Run(); err == nil {
+				t.Fatal("invalid HTTP-only subprocess unexpectedly succeeded")
+			}
+			after, err := os.ReadFile(storePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(after, original) {
+				t.Fatalf("HTTP-only subprocess recovered durable store\nbefore=%s\nafter=%s", original, after)
+			}
+			if got := requests.Load(); got != 0 {
+				t.Fatalf("invalid HTTP-only subprocess made %d request(s)", got)
+			}
+		})
+	}
+
+	root := t.TempDir()
+	storePath := filepath.Join(root, durableOperationStoreFileName)
+	if err := os.WriteFile(storePath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	valid := exec.Command(binary, "--authenticated-http", http.MethodGet, "/maintenance")
+	valid.Env = commandEnvironment(
+		"DEPLOYER_TOKEN=test-token",
+		"SERVERS_DIR="+root,
+		"DEPLOYER_OPERATION_STORE_FILE="+storePath,
+		"DEPLOYER_MAINTENANCE_FILE="+filepath.Join(root, ".deployer-maintenance"),
+		"DEPLOYER_LIFECYCLE_JOURNAL_FILE="+filepath.Join(root, ".deployer-lifecycle-journal"),
+	)
+	var output bytes.Buffer
+	valid.Stdout = &output
+	if err := valid.Run(); err != nil {
+		t.Fatalf("valid authenticated HTTP subprocess: %v", err)
+	}
+	if output.String() != `{"capability":"maintenance-v1","state":"open"}` {
+		t.Fatalf("valid authenticated HTTP output = %q", output.String())
+	}
+	select {
+	case details := <-requestDetails:
+		if details != [3]string{http.MethodGet, "/maintenance", "Bearer test-token"} {
+			t.Fatalf("valid authenticated HTTP request = %#v", details)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("valid authenticated HTTP subprocess made no request")
+	}
+	after, err := os.ReadFile(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, original) {
+		t.Fatalf("valid authenticated HTTP subprocess recovered durable store\nbefore=%s\nafter=%s", original, after)
 	}
 }
 
@@ -3544,7 +4725,6 @@ func TestMaintenanceWorkflowsKeepCredentialsOutOfEverySpawnedProcessArgument(t *
 	for name, workflow := range workflows {
 		t.Run(name, func(t *testing.T) {
 			for _, forbidden := range []string{
-				"DEPLOYER_TOKEN",
 				"Authorization: Bearer",
 				"docker exec -e",
 				"-e DEPLOYER_TOKEN=",
@@ -3553,6 +4733,15 @@ func TestMaintenanceWorkflowsKeepCredentialsOutOfEverySpawnedProcessArgument(t *
 				if strings.Contains(workflow, forbidden) {
 					t.Fatalf("%s workflow exposes a credential in a spawned process argument with %q", name, forbidden)
 				}
+			}
+			if name == "deploy" {
+				if !strings.Contains(workflow, `token = os.environ.get("DEPLOYER_TOKEN", "")`) {
+					t.Fatal("deploy workflow does not read its token inside the container-side HTTP process")
+				}
+				return
+			}
+			if strings.Contains(workflow, "DEPLOYER_TOKEN") {
+				t.Fatalf("%s workflow exposes DEPLOYER_TOKEN outside the container-side helper", name)
 			}
 			if !strings.Contains(workflow, "/usr/local/bin/deployer --authenticated-http") {
 				t.Fatalf("%s workflow does not use the container-side authenticated HTTP helper", name)
@@ -3588,7 +4777,7 @@ func TestMaintenanceWorkflowOrderingAndLegacyFailClosedBoundary(t *testing.T) {
 	}
 	assertOrder(t, deploy,
 		"exec 9>/tmp/opensamguk-production.lock",
-		"maintenance_post /maintenance/enter",
+		"maintenance_post /maintenance/enter-if-idle",
 		"git merge --ff-only origin/main",
 		"$COMPOSE build deployer",
 		"opensamguk-deployer:local --check-registry-targets",
@@ -3615,7 +4804,11 @@ func TestMaintenanceWorkflowOrderingAndLegacyFailClosedBoundary(t *testing.T) {
 
 	for name, workflow := range map[string]string{"deploy": deploy, "start": start, "recreate": recreate} {
 		t.Run(name, func(t *testing.T) {
-			legacy := strings.Index(workflow, "running deployer lacks a valid maintenance-v1 capability")
+			legacyMessage := "running deployer lacks a valid maintenance-v1 capability"
+			if name == "deploy" {
+				legacyMessage = "running deployer is busy or lacks atomic idle admission"
+			}
+			legacy := strings.Index(workflow, legacyMessage)
 			marker := strings.Index(workflow, `: > "$STACK/servers/.deployer-maintenance"`)
 			merge := strings.Index(workflow, "git merge --ff-only origin/main")
 			if legacy < 0 || marker < 0 || merge < 0 || !(legacy < marker && marker < merge) {
@@ -3680,9 +4873,6 @@ func TestMaintenanceWorkflowsVerifyOrRepairLifecycleBeforeMutation(t *testing.T)
 				t.Fatalf("%s workflow lacks ready-or-repair lifecycle recovery contract", name)
 			}
 			for _, want := range []string{
-				`docker_exec_bounded "$WORKFLOW_DEADLINE" 300 opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST /maintenance/repair 285`,
-				`/usr/local/bin/deployer --help 2>&1`,
-				`docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST /maintenance/repair >/dev/null 2>&1 || true`,
 				`for ((attempt=1; attempt<=150; attempt++))`,
 				`maintenance_get`,
 				`docker logs --tail 200 opensamguk-deployer`,
@@ -3693,6 +4883,23 @@ func TestMaintenanceWorkflowsVerifyOrRepairLifecycleBeforeMutation(t *testing.T)
 			} {
 				if !strings.Contains(check.workflow, want) {
 					t.Fatalf("%s workflow lacks bounded lifecycle recovery diagnostic contract %q", name, want)
+				}
+			}
+			if name == "deploy" {
+				for _, want := range []string{`maintenance_post /maintenance/repair 285`, `python3 -c '`, `class NoRedirect`} {
+					if !strings.Contains(check.workflow, want) {
+						t.Fatalf("deploy workflow lacks container-direct lifecycle repair contract %q", want)
+					}
+				}
+			} else {
+				for _, want := range []string{
+					`docker_exec_bounded "$WORKFLOW_DEADLINE" 300 opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST /maintenance/repair 285`,
+					`/usr/local/bin/deployer --help 2>&1`,
+					`docker_exec_bounded "$WORKFLOW_DEADLINE" 15 opensamguk-deployer /usr/local/bin/deployer --authenticated-http POST /maintenance/repair >/dev/null 2>&1 || true`,
+				} {
+					if !strings.Contains(check.workflow, want) {
+						t.Fatalf("%s workflow lacks legacy-compatible lifecycle repair contract %q", name, want)
+					}
 				}
 			}
 			recovery := strings.LastIndex(check.workflow, "if ! ensure_lifecycle_recovery; then")
@@ -4208,8 +5415,8 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	if !strings.Contains(recorded[1], "up -d --no-deps web-gateway") || strings.Contains(recorded[1], "gateway-api") || strings.Contains(recorded[1], " nginx") {
 		t.Fatalf("shared reload call = %q", recorded[1])
 	}
-	if !strings.Contains(recorded[2], "--force-recreate --no-deps nginx") {
-		t.Fatalf("nginx reload call = %q", recorded[2])
+	if !strings.Contains(recorded[2], "kill --signal HUP nginx") {
+		t.Fatalf("nginx HUP call = %q", recorded[2])
 	}
 }
 
@@ -4408,7 +5615,7 @@ JWT_SECRET=shared-secret
 JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
-	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1010\nSCENARIO_SEED_ENABLED=true\nSCENARIO_LOOKUP_DIR=\n")
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
 		if dockerPreflightProbe(args) {
@@ -4449,10 +5656,13 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	if !strings.Contains(recorded[2], "up -d --no-deps web-gateway") || strings.Contains(recorded[2], "gateway-api") || strings.Contains(recorded[2], " nginx") {
 		t.Fatalf("shared reload call = %q", recorded[2])
 	}
-	if !strings.Contains(recorded[3], "--force-recreate --no-deps nginx") {
-		t.Fatalf("nginx reload call = %q", recorded[3])
+	if !strings.Contains(recorded[3], "kill --signal HUP nginx") {
+		t.Fatalf("nginx HUP call = %q", recorded[3])
 	}
 	serverEnv := readFile(t, filepath.Join(cfg.serversDir, "spep.env"))
+	if strings.Count(serverEnv, "SCENARIO_LOOKUP_DIR=\n") != 1 {
+		t.Fatalf("reset did not preserve exact empty lookup line:\n%s", serverEnv)
+	}
 	for _, want := range []string{
 		"SCENARIO_CODE=scenario_1002\n",
 		"SCENARIO_SEED_ENABLED=true\n",
@@ -4478,7 +5688,8 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	sharedEnv := readFile(t, filepath.Join(cfg.composeDir, ".env"))
 	if !strings.Contains(sharedEnv, `"id":"pep"`) ||
 		!strings.Contains(sharedEnv, `"generation":2`) ||
-		!strings.Contains(sharedEnv, `"scenarioCode":"scenario_1002"`) {
+		!strings.Contains(sharedEnv, `"scenarioCode":"scenario_1002"`) ||
+		!strings.Contains(sharedEnv, `"SCENARIO_LOOKUP_DIR":""`) {
 		t.Fatalf("registry generation/scenario was not updated:\n%s", sharedEnv)
 	}
 }
@@ -4832,6 +6043,7 @@ func TestRejectedDurableOperationsConvergeAfterTransientSettlementFailure(t *tes
 		if firstBody.Detail != durableOperationCreatePreparationFailedMessage || firstBody.OperationID != operationID || strings.Contains(first.Body.String(), injectedDiagnostic) {
 			t.Errorf("create settlement failure exposed an unsafe contract: %#v", firstBody)
 		}
+		assertUnsettledPreparationBlocksNewMutation(t, cfg)
 
 		retry := envRequest(t, cfg.withAuth(cfg.handleServerCreate), http.MethodPost, "/servers/create", body)
 		var replay createServerResponse
@@ -4841,6 +6053,7 @@ func TestRejectedDurableOperationsConvergeAfterTransientSettlementFailure(t *tes
 		if retry.Code != http.StatusOK || replay.OperationStatus != lifecycleJobFailed || replay.Detail != durableOperationCreatePreparationFailedMessage {
 			t.Errorf("create retry did not replay terminal rejection: status=%d body=%#v", retry.Code, replay)
 		}
+		assertPreparationBusy(t, cfg)
 		persisted := mustOpenOperationStore(t, cfg.lifecycleOperationStore.path)
 		record, ok := persisted.Lookup(operationID)
 		if !ok || record.Status != lifecycleJobFailed || record.HTTPStatus != http.StatusConflict || record.PublicMessage != durableOperationCreatePreparationFailedMessage {
@@ -4868,10 +6081,12 @@ func TestRejectedDurableOperationsConvergeAfterTransientSettlementFailure(t *tes
 		if firstStatus != http.StatusServiceUnavailable || first.Detail != durableOperationClosePreparationFailedMessage || first.OperationID != operationID || strings.Contains(first.Detail, injectedDiagnostic) {
 			t.Errorf("close settlement failure = %d %#v", firstStatus, first)
 		}
+		assertUnsettledPreparationBlocksNewMutation(t, cfg)
 		replay, retryStatus := cfg.deleteServer("pep", "DELETE pep", operationID)
 		if retryStatus != http.StatusOK || replay.OperationStatus != lifecycleJobFailed || replay.Detail != durableOperationClosePreparationFailedMessage {
 			t.Errorf("close retry did not replay terminal rejection: status=%d body=%#v", retryStatus, replay)
 		}
+		assertPreparationBusy(t, cfg)
 		persisted := mustOpenOperationStore(t, cfg.lifecycleOperationStore.path)
 		record, ok := persisted.Lookup(operationID)
 		if !ok || record.Status != lifecycleJobFailed || record.HTTPStatus != http.StatusConflict || record.PublicMessage != durableOperationClosePreparationFailedMessage {
@@ -4905,6 +6120,7 @@ func TestRejectedDurableOperationsConvergeAfterTransientSettlementFailure(t *tes
 		if first.Code != http.StatusServiceUnavailable || first.Header().Get("Retry-After") != "5" || firstBody.Detail != durableOperationResetPreparationFailedMessage || firstBody.OperationID != operationID || strings.Contains(first.Body.String(), injectedDiagnostic) {
 			t.Errorf("reset settlement failure = %d retry-after=%q body=%#v", first.Code, first.Header().Get("Retry-After"), firstBody)
 		}
+		assertUnsettledPreparationBlocksNewMutation(t, cfg)
 		retry := envRequest(t, cfg.withAuth(cfg.handleServerReset), http.MethodPost, "/servers/reset", body)
 		var replay createServerResponse
 		if err := json.NewDecoder(retry.Body).Decode(&replay); err != nil {
@@ -4913,6 +6129,7 @@ func TestRejectedDurableOperationsConvergeAfterTransientSettlementFailure(t *tes
 		if retry.Code != http.StatusOK || replay.OperationStatus != lifecycleJobFailed || replay.Detail != durableOperationResetPreparationFailedMessage {
 			t.Errorf("reset retry did not replay terminal rejection: status=%d body=%#v", retry.Code, replay)
 		}
+		assertPreparationBusy(t, cfg)
 		persisted := mustOpenOperationStore(t, cfg.lifecycleOperationStore.path)
 		record, ok := persisted.Lookup(operationID)
 		if !ok || record.Status != lifecycleJobFailed || record.HTTPStatus != http.StatusServiceUnavailable || record.PublicMessage != durableOperationResetPreparationFailedMessage {
@@ -5260,6 +6477,9 @@ func TestResetWritesDurableJournalBeforeDesiredStateMutation(t *testing.T) {
 	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, body.JobID, lifecycleJobSucceeded); completed.Status != lifecycleJobSucceeded {
 		t.Fatalf("reset completion after journal release = %#v", completed)
 	}
+	if got := readFile(t, envFile); strings.Contains(got, "SCENARIO_LOOKUP_DIR=") {
+		t.Fatalf("reset synthesized missing lookup key:\n%s", got)
+	}
 }
 
 func TestResetServerAllowsGenerationZeroForAlpha(t *testing.T) {
@@ -5555,7 +6775,7 @@ func TestResetRepairVerifiesRuntimeDataAndFinalRegistryBeforeJournalClear(t *tes
 		t.Fatalf("verification trace = %q, want %q", got, want)
 	}
 	recorded := calls.snapshot()
-	if len(recorded) != 4 || !strings.Contains(recorded[0], "down --volumes --remove-orphans") || !strings.Contains(recorded[1], "up -d") || !strings.Contains(recorded[2], "up -d --no-deps web-gateway") || strings.Contains(recorded[2], "gateway-api") || !strings.Contains(recorded[3], "--force-recreate --no-deps nginx") {
+	if len(recorded) != 4 || !strings.Contains(recorded[0], "down --volumes --remove-orphans") || !strings.Contains(recorded[1], "up -d") || !strings.Contains(recorded[2], "up -d --no-deps web-gateway") || strings.Contains(recorded[2], "gateway-api") || !strings.Contains(recorded[3], "kill --signal HUP nginx") {
 		t.Fatalf("repair call order = %#v", recorded)
 	}
 }
@@ -5796,7 +7016,7 @@ JWT_SECRET=shared-secret
 JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
-	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSCENARIO_CODE=scenario_1010\n")
+	writeEnv(t, filepath.Join(cfg.serversDir, "spep.env"), "SERVER_ID=pep\nSCENARIO_CODE=scenario_1010\nSCENARIO_LOOKUP_DIR=\n")
 	calls := &dockerCallRecorder{}
 	serverUpAttempts := 0
 	cfg.dockerRunner = func(args ...string) (string, error) {
@@ -5828,10 +7048,10 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","gameApiUrl":"http://sp
 	if serverUpAttempts != 2 {
 		t.Fatalf("server up attempts = %d, want 2; calls=%#v", serverUpAttempts, calls.snapshot())
 	}
-	if got := readFile(t, filepath.Join(cfg.serversDir, "spep.env")); !strings.Contains(got, "SCENARIO_CODE=scenario_1002\n") {
+	if got := readFile(t, filepath.Join(cfg.serversDir, "spep.env")); !strings.Contains(got, "SCENARIO_CODE=scenario_1002\n") || strings.Count(got, "SCENARIO_LOOKUP_DIR=\n") != 1 {
 		t.Fatalf("forward recovery did not retain new desired env:\n%s", got)
 	}
-	if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); strings.Contains(shared, `"repairRequired":true`) {
+	if shared := readFile(t, filepath.Join(cfg.composeDir, ".env")); strings.Contains(shared, `"repairRequired":true`) || !strings.Contains(shared, `"SCENARIO_LOOKUP_DIR":""`) {
 		t.Fatalf("successful forward recovery retained repair-required marker:\n%s", shared)
 	}
 }

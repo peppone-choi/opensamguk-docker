@@ -108,6 +108,10 @@ docker compose -p opensamguk-shared -f docker-compose.shared.yml --env-file .env
 기존 운영 환경에 DB 레지스트리 버전을 처음 올릴 때는 `SERVER_REGISTRY_JSON`을 지우거나 빈 배열로 바꾸면 안 된다.
 새 gateway-api는 `game_server` 테이블이 비어 있을 때만 이 값을 1회 seed로 사용한다. 배포 전 현재 실행 서버가
 `.env` 레지스트리와 `servers/s<id>.env`에 모두 들어 있는지 확인하고 다음 검사가 통과해야 한다.
+V62부터 시드 완료 상태를 DB에 기록해 마지막 서버 삭제 후 재기동해도 과거 JSON을 재적용하지 않는다.
+기존 DB에 서버와 계정이 모두 없다면 V62 적용 전에 JSON이 의도한 최초 시드인지 확인한다.
+구 gateway-api 버전으로 롤백할 때는 빈 DB에 남은 과거 JSON이 재적용될 수 있으므로
+`SERVER_REGISTRY_JSON=[]`을 먼저 확인한다.
 
 ```bash
 docker exec opensamguk-deployer /usr/local/bin/deployer --check-running-registry-targets
@@ -123,6 +127,16 @@ gateway-api readiness가 새 migration과 seed 완료를 증명한 뒤에만 boa
 초기 구축·복구 진단용이며, 이것만 실행해서는 DB 레지스트리에 서버가 추가되지 않는다.
 
 서버마다 `servers/s<public-id>.env`를 만들고(예시 복제) 포트/비밀번호/public `SERVER_ID`가 겹치지 않게 한다.
+
+서버별 시나리오 조회 소스는 deployer env PATCH에서 `SCENARIO_LOOKUP_DIR`로 선택한다. 허용되는 값은
+바이트 단위로 정확히 다음 두 개뿐이다.
+
+- `SCENARIO_LOOKUP_DIR=`: engine/API 프로세스에 빈 `SCENARIO_DIR`를 전달하여 내장 시나리오 조회 모드를 선택한다.
+- `SCENARIO_LOOKUP_DIR=/data/scenarios`: 읽기 전용으로 마운트된 외부 `/data/scenarios`를 조회한다.
+
+이 키가 없는 기존 env는 호환성을 위해 `SCENARIO_DIR`을 계속 사용하고, `SCENARIO_DIR`도 없으면
+`/data/scenarios`로 폴백한다. `SCENARIO_LOOKUP_DIR` 선택은 기존 bind mount를 바꾸지 않으며 mount 목적지는
+여전히 `SCENARIO_DIR` 또는 기본 `/data/scenarios`이다. 따라서 빈 조회 모드에서도 기존 읽기 전용 mount는 그대로 유지된다.
 
 ```bash
 cp servers/s1.env.example servers/spep.env  # SERVER_ID=pep (compose가 spep/opensamguk-spep로 합성),
@@ -177,12 +191,22 @@ nginx `/health`를 항상 확인하고,
 호스트 workflow끼리는 `/tmp/opensamguk-production.lock`으로 직렬화하지만, 직접 deployer API 호출까지 이 lock을
 공유하지는 않는다. 그래서 deployer는 `servers/.deployer-maintenance`라는 영속 marker를 별도로 사용한다. marker가
 있으면 새 deployer 프로세스도 closed 상태로 부팅하며, 새 mutation은 `503`과 `Retry-After`를 받고, 진행 중인
-mutation은 취소된 context가 Docker runner에서 실제 반환할 때까지 drain한다.
+mutation은 취소된 context가 Docker runner에서 실제 반환할 때까지 drain한다. 일반 `enter`는 이 취소·drain 동작을
+가지지만, Deploy Orchestration은 활성 작업이 없을 때만 원자적으로 marker를 잡는 `enter-if-idle`만 사용한다.
+생성·종료·리셋은 영속 operation이나 메모리 job을 예약하기 전부터 preparation을 게시해 busy로 취급한다.
+preparation은 Docker 프리플라이트와 기존 active 작업의 종료 대기 동안 유지되며, 같은 잠금 안에서 job을 claim하고
+새 active로 넘기므로 중간에 idle 틈이 생기지 않는다. 활성 작업이나 preparation, 이미 닫힌 barrier, marker, 복구 journal
+중 하나라도 있으면 `409`로 거부하며 작업을 취소하거나
+새 marker·lease를 만들지 않는다.
+일반 `enter`는 preparation context도 취소하고, 영속 종료 결과 확인 또는 미확정 정산의 fail-closed 상태 설치까지 기다린다.
+이 동기화는 controller가 소유하는 marker와 journal 변경을 전제로 한다. 외부에서 호스트 파일을 직접 만드는 작업에는
+별도의 운영자 fence가 필요하다.
 
 deployer는 socket-proxy 경유로만 Docker에 닿으므로, 모든 mutation admission(`create`/`delete`/`reset`/`deploy`/env
 patch)과 maintenance repair는 journal·env를 건드리기 전에 `docker version` 도달성 프리플라이트(3초)를 먼저 통과해야
-한다. Docker에 닿지 못하면 아무 일도 일어나지 않은 상태이므로 `503`과 한국어 사유로 깨끗이 실패하며, journal이나
-repair-required 잠금을 남기지 않는다. socket-proxy가 돌아오면 수동 repair 없이 그대로 다시 열린다. 같은 이유로
+한다. Docker에 닿지 못하면 Docker mutation 없이 `503`과 한국어 사유로 실패하며, journal이나
+repair-required 잠금을 남기지 않는다. 영속 거절 정산까지 확인된 경우 socket-proxy가 돌아오면 수동 repair 없이 다시
+시도할 수 있다. 같은 이유로
 `/readyz`도 Docker 도달성을 확인한다(`/healthz`는 liveness 그대로). 결과는 캐시하지 않는다 — workflow 폴링은 2초
 간격뿐이고, 캐시는 바로 그 게이트에서 진행 중인 장애를 숨긴다.
 
@@ -201,9 +225,15 @@ workflow는 deployer 컨테이너의 loopback에서만 다음 Bearer API를 호�
 ```text
 GET  /maintenance        -> {"capability":"maintenance-v1","state":"open|draining|drained"}
 POST /maintenance/enter  -> drained 후 32-hex 단발 lease를 포함해 반환
+POST /maintenance/enter-if-idle -> idle일 때만 marker를 영속하고 drained + 32-hex lease 반환; busy/기존 상태는 409
 POST /maintenance/leave  -> 성공한 workflow가 마지막에만 open
 POST /maintenance/repair -> 남은 lifecycle journal을 recovery·runtime/data·shared reload까지 검증한 뒤에만 지움 (marker가 없을 때만 open)
 ```
+
+Deploy Orchestration은 실행 중 deployer에서 `enter-if-idle`이 성공한 경우에만 checkout·build·replacement로 진행한다.
+`409`, 연결 실패, 알 수 없는 응답, 또는 이 route가 없는 구버전 controller에서는 기존의 취소하는
+`/maintenance/enter`로 fallback하지 않고 checkout 전에 종료한다. 사전 admission HTTP는 설치된 구버전 deployer 바이너를
+실행하지 않고 컨테이너 내 Python이 자신의 `DEPLOYER_TOKEN`을 읽어 loopback으로만 전송한다.
 
 **처음 설치되어 deployer 컨테이너가 전혀 없는 경우**에는 workflow가 marker를 먼저 만들고 deployer를 closed로
 기동한 뒤 확인한다. Deploy Orchestration과 Start Existing Game Server는 성공 검증 뒤에만 leave 한다. Recreate Game
@@ -219,6 +249,10 @@ operation id가 있는 lifecycle 요청은 Docker 작업 전에 `${SERVERS_DIR}/
 `pending`, `running`, `recovery_required` 기록은 자동 삭제하지 않는다. POST의 `pending` 응답은 접수일 뿐 완료가 아니다.
 호출자는 인증된 `GET /operations/{operationId}`를 폴링해 `pending|running|recovery_required` 동안 기다리고,
 `succeeded`에서만 완료로 처리하며 `failed|cancelled`는 `publicMessage`의 제한된 공개 문구로 종료해야 한다.
+동기적 준비·시작 거절 또는 worker의 terminal 결과를 영속했다고 확인하지 못하면, preparation이나 active를 해제하기
+전에 admission을 fail-closed로 고정한다. journal을 쓰기 전 실패도 동일하게 처리한다. 이 상태에서는 idle과 leave 및
+새 mutation을 거부하며, 동일 operation 재시도는 기존 terminal 결과를 정산·재생할 수 있지만 coordinator를 다시 열지는
+않는다. 재시작 또는 운영자 처리가 필요하다.
 
 journal에는 새 lifecycle 요청의 `operationId`와 `operationKind`가 함께 기록된다. deployer 재시작 시 journal과 연결된 미완료
 operation은 `recovery_required`, journal이 없는 미완료 operation은 Docker 재실행 없이 `cancelled`가 된다. worker와 repair는
@@ -245,15 +279,19 @@ Workflow polling deadline이 끝나면 "제한 시간 안에 완료를 확인하
 
 #### 구버전 deployer의 1회 bridge
 
-기존 deployer에 `/maintenance`가 없거나 404/잘못된 JSON을 반환하면 workflow는 **git merge, build, force-recreate
+기존 deployer에 `/maintenance/enter-if-idle`이 없거나 404/잘못된 JSON을 반환하면 workflow는 **git merge, build, force-recreate
 전에 중단**한다. unknown in-memory job을 자동으로 drain했다고 간주하거나 marker만 만들어 구버전을 조용히
-업그레이드하면 안 된다. 다음 증거가 있을 때만 계획된 control-plane downtime으로 1회 bridge를 수행한다.
+업그레이드하면 안 된다. 자동 fallback은 없으며, 초기 승격에는 다음 증거를 준비한 수동 1회 legacy bootstrap가
+선행되어야 한다. 이 절은 절차를 임의로 자동화하는 허가가 아니다.
 
 1. gateway가 deployer mutation을 호출하지 못하게 차단한다.
 2. host-lock workflow가 실행 중이 아님을 확인한다.
 3. 알고 있는 lifecycle job ID를 모두 cancel하고 terminal 상태까지 확인한다.
 4. unknown accepted request가 없다는 운영 증거를 확보한 뒤에만 `servers/.deployer-maintenance`를 만들고 deployer-only bridge 교체를 수행한다.
-5. 새 deployer의 loopback `/maintenance`가 `maintenance-v1` + `drained`임을 확인한 뒤 정상 Deploy Orchestration을 다시 실행한다.
+5. 새 deployer의 loopback `GET /maintenance`가 `maintenance-v1` + `drained`임을 확인하고 증거를 남긴다.
+
+이후 첫 정상 workflow 실행을 위한 barrier 상태 전환은 별도로 검토·승인된 1회 bootstrap runbook이 필요하다.
+이 문서는 marker 자동 삭제, 취소 endpoint fallback, 미확인 작업 강제 종료를 그 절차로 규정하지 않는다.
 
 unknown job이 없다는 증거를 만들 수 없으면 bridge하지 말고 control-plane downtime을 유지한다. 이 절차는 persistent
 job queue로의 자동 migration이 아니며, 기존 job 상태를 추측하거나 replay하지 않는다.
@@ -288,7 +326,7 @@ GCP의 shared/per-server orchestration 배포는 GitHub Actions **Deploy Orchest
 호출을 지난 뒤에는 볼륨이 일부라도 제거되었을 수 있으므로 이전 desired state를 되살리지 않는다. down 결과가 불확실하면
 원래 job은 임의의 forward re-up을 주장하지 않고 새 desired state와 `repairRequired=true` journal을 남긴다. 명시적
 maintenance repair가 reset을 다시 끝까지 수행해 seeded `world_state`의 시나리오와 game-api 기수를 확인하고,
-`repairRequired`를 durable하게 지운 최종 registry로 `web-gateway`·`nginx`를 reload하고 기존 `gateway-api`도 health-verify한 뒤에만
+`repairRequired`를 durable하게 지운 최종 registry로 `web-gateway`를 재생성하고 nginx에 HUP을 보내 새 upstream을 반영하며, 기존 `gateway-api`도 health-verify한 뒤에만
 journal과 closed barrier를 해제한다. `SCENARIO_SEED_ENABLED=false`인 reset은 fresh world data를 검증할 수 없으므로
 repair 완료로 처리되지 않는다.
 
@@ -330,7 +368,21 @@ POST deployer/deploy  {"project":"opensamguk-spep","tag":"v1.3.0"}
 반환되지 않는다. `SERVER_NAME`, `SERVER_GENERATION`, `GAME_API_URL`처럼 로비와
 어드민이 직접 쓰는 값은 registry의 top-level 필드도 함께 갱신하고, 공유 스택 registry reload 대상
 (`web-gateway`, `nginx`)을 `affectedServices`에 포함한다. `gateway-api`는 deployer 성공 응답 뒤 DB 레지스트리를
-영속화하는 요청 주체이므로 이 reload에서 재시작하지 않는다.
+영속화하는 요청 주체이므로 이 reload에서 재시작하지 않는다. 이 목록은 환경변수로 확장할 수 없다.
+`web-gateway`는 `SERVER_REGISTRY_JSON`을 런타임 env로 읽으므로 재생성한다. nginx는 정적
+`web-gateway` upstream의 새 주소를 읽어야 하므로 HUP으로 worker를 교체한다. nginx 컨테이너는
+유지되어 `/api/gateway/auth/me`의 gateway-api 직접 경로를 계속 제공한다. 반면
+`/api/auth/me`는 web-gateway를 경유하므로 이 경로의 무중단은 별도로 보장하지 않는다.
+
+격리 스택에서 인증된 `GET /api/gateway/auth/me`를 연속 측정할 때는 헤더가 들어 있는
+`0600` curl config 파일을 별도로 준비하고
+`python3 scripts/poll-auth-me.py URL PRIVATE_CURL_CONFIG auth-poll.tsv`를 실행한다.
+기본 간격은 3초다. nginx의 `/api/gateway/` 요청 제한은 클라이언트 IP당 분당 60회이고
+작업 상태 폴링도 같은 제한을 공유하므로, 더 빠른 인증 폴링은 가용성 장애가 없어도 503을 만들 수 있다.
+스크립트는 시각·HTTP 상태·소요 시간·성공 여부만 기록한다. 생성→삭제→리셋 작업의
+operation 상태를 각각 `succeeded`까지 확인한 뒤 폴링을 중지하고 마지막 줄의
+`failures=0`을 확인한다. `gateway-api` 컨테이너 ID를 전후에 비교해 재기동이 없었는지
+별도로 기록한다. 이 파일과 인증 config에는 토큰 원문을 넣어 보고하지 않는다.
 
 ```text
 GET   deployer/env/shared
@@ -442,3 +494,10 @@ GCP Compute Engine **e2-standard-2**(2 vCPU / 8 GiB) 기준(단일서버). LLM·
 ---
 
 > 이미지·로직의 단일 출처는 소스 저장소다. 이 저장소는 오케스트레이션(compose/nginx/env)만 둔다.
+
+
+### 전콘 원본 업로드 용량
+
+수동 전콘 편집은 원본8MiB와 자르기 좌표를 전송합니다. nginx는 HTTP·HTTPS의
+`/api/account/profile-icon` 및 직접 API 경로 `/api/gateway/auth/account/profile-icon`만9MiB까지 허용합니다.
+그 외 API의2MiB 한도와 요청 속도 제한은 유지합니다. 대응하는 앱 이미지가 배포되어야 원본과 세 구도 저장 기능을 사용할 수 있습니다.
