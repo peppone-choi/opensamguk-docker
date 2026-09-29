@@ -4186,6 +4186,14 @@ func (c config) resetServerWithMaintenanceLease(rawID string, req resetServerReq
 		if _, err := c.validateServerTarget(target); err != nil {
 			return "", err
 		}
+		if maintenanceLease != "" {
+			// The old volumes must still exist if a candidate image cannot be
+			// fetched. Stage only a temporary env; do not publish the reset
+			// journal or mutate the canonical env until every pull succeeds.
+			if detail, err := c.pullResetCandidate(ctx, target, resetTarget); err != nil {
+				return detail, err
+			}
+		}
 		var journalErr error
 		if operationID != "" {
 			journalErr = c.writeLinkedResetLifecycleJournal(target, resetTarget, operationID, lifecycleKindReset)
@@ -5461,6 +5469,41 @@ func (c config) upServerStack(ctx context.Context, project, envFile string) (str
 		"--env-file", envFile,
 		"-f", c.composeServer,
 		"up", "-d",
+	)
+}
+
+func (c config) pullResetCandidate(ctx context.Context, target serverTarget, resetTarget resetLifecycleTarget) (string, error) {
+	if _, err := c.validateServerTarget(target); err != nil {
+		return "", err
+	}
+	original, err := os.ReadFile(target.EnvFile)
+	if err != nil {
+		return "", err
+	}
+	staged, err := os.CreateTemp(c.serversDir, ".reset-pull-*.env")
+	if err != nil {
+		return "", err
+	}
+	stagedPath := staged.Name()
+	defer os.Remove(stagedPath)
+	if _, err := staged.Write(original); err != nil {
+		_ = staged.Close()
+		return "", err
+	}
+	if err := staged.Close(); err != nil {
+		return "", err
+	}
+	if err := applyResetLifecycleTarget(stagedPath, resetTarget); err != nil {
+		return "", err
+	}
+	if _, err := c.validateDockerServerTarget(target.Project, stagedPath, true); err != nil {
+		return "", err
+	}
+	return c.runServerDockerContext(ctx,
+		"compose", "-p", target.Project,
+		"--env-file", stagedPath,
+		"-f", c.composeServer,
+		"pull", "game-engine", "game-api", "web-game",
 	)
 }
 

@@ -5774,6 +5774,11 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, acceptedBody.JobID, lifecycleJobSucceeded); completed.Status != lifecycleJobSucceeded {
 		t.Fatalf("leased reset completion=%#v", completed)
 	}
+	recorded := calls.snapshot()
+	if len(recorded) < 2 || !strings.Contains(recorded[0], "pull game-engine game-api web-game") ||
+		!strings.Contains(recorded[1], "down --volumes --remove-orphans") {
+		t.Fatalf("candidate images were not pulled before volume removal: %#v", recorded)
+	}
 	serverEnv := readFile(t, envFile)
 	for _, field := range []string{"IMAGE_TAG=" + newTag, "WEB_GAME_TAG=" + newTag,
 		"SCENARIO_CODE=scenario_990002", "SERVER_GENERATION=2"} {
@@ -5787,6 +5792,70 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	}
 	if state := decodeMaintenanceResponse(t, loopbackRequest(t, maintenance, http.MethodGet, "/maintenance", "")); state.State != maintenanceStateDrained || state.Lease != "" {
 		t.Fatal("successful reset opened maintenance or exposed lease")
+	}
+}
+
+func TestPepMaintenanceResetPullFailurePreservesOldVolumesAndEnv(t *testing.T) {
+	cfg := testConfig(t)
+	oldShared := `IMAGE_TAG=old
+JWT_SECRET=shared-secret
+JWT_PUBLIC_KEY=shared-public-key
+SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
+`
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), oldShared)
+	envFile := filepath.Join(cfg.serversDir, "spep.env")
+	oldEnv := "SERVER_ID=pep\nIMAGE_TAG=" + strings.Repeat("a", 40) + "\nWEB_GAME_TAG=" + strings.Repeat("a", 40) + "\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1020\nSCENARIO_SEED_ENABLED=true\n"
+	writeEnv(t, envFile, oldEnv)
+	calls := &dockerCallRecorder{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
+		calls.record(args...)
+		if strings.Contains(strings.Join(args, " "), "pull game-engine game-api web-game") {
+			return "candidate image unavailable", errors.New("pull failed")
+		}
+		return "ok\n", nil
+	}
+	maintenance := cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance))
+	entered := decodeMaintenanceResponse(t, loopbackRequest(t, maintenance, http.MethodPost, "/maintenance/enter", ""))
+	if entered.State != maintenanceStateDrained || entered.Lease == "" {
+		t.Fatal("maintenance did not drain")
+	}
+	tag := strings.Repeat("b", 40)
+	body := `{"id":"pep","confirm":"RESET pep","operationId":"0123456789abcdef0123456789abcdef","generation":"2","scenarioCode":"scenario_990002","imageTag":"` + tag + `","webGameTag":"` + tag + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/servers/reset", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(maintenanceLeaseHeader, entered.Lease)
+	req.RemoteAddr = "127.0.0.1:31000"
+	res := httptest.NewRecorder()
+	cfg.withAuth(cfg.handleServerReset)(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("leased reset request=%d body=%s", res.Code, res.Body.String())
+	}
+	var accepted createServerResponse
+	if err := json.Unmarshal(res.Body.Bytes(), &accepted); err != nil {
+		t.Fatal(err)
+	}
+	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, accepted.JobID, lifecycleJobFailed); completed.Status != lifecycleJobFailed {
+		t.Fatalf("pull failure status=%#v", completed)
+	}
+	recorded := calls.snapshot()
+	if len(recorded) != 1 || !strings.Contains(recorded[0], "pull game-engine game-api web-game") {
+		t.Fatalf("pull failure reached a destructive Docker call: %#v", recorded)
+	}
+	if current := readFile(t, envFile); current != oldEnv {
+		t.Fatalf("pull failure changed canonical env: %s", current)
+	}
+	if current := readFile(t, filepath.Join(cfg.composeDir, ".env")); current != oldShared {
+		t.Fatal("pull failure changed shared registry")
+	}
+	if stateFilePresent(cfg.operations.journalPath) {
+		t.Fatal("pull failure published a reset journal")
+	}
+	if temporary, err := filepath.Glob(filepath.Join(cfg.serversDir, ".reset-pull-*.env")); err != nil || len(temporary) != 0 {
+		t.Fatalf("staged env left behind: paths=%#v err=%v", temporary, err)
 	}
 }
 
