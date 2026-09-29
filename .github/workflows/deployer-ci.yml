@@ -8,6 +8,12 @@ on:
       - ".github/workflows/deploy-orchestration.yml"
       - ".gitignore"
       - ".github/workflows/deployer-ci.yml"
+      - "infra/nginx/**"
+      - "docker-compose.shared.yml"
+      - "scripts/battle-ws-proxy-fixture.py"
+      - "scripts/test-battle-ws-proxy.sh"
+      - "scripts/test-battle-ws-real-game-api.sh"
+      - "scripts/real-game-api/**"
   push:
     branches: [main]
     paths:
@@ -16,6 +22,12 @@ on:
       - ".github/workflows/deploy-orchestration.yml"
       - ".gitignore"
       - ".github/workflows/deployer-ci.yml"
+      - "infra/nginx/**"
+      - "docker-compose.shared.yml"
+      - "scripts/battle-ws-proxy-fixture.py"
+      - "scripts/test-battle-ws-proxy.sh"
+      - "scripts/test-battle-ws-real-game-api.sh"
+      - "scripts/real-game-api/**"
 
 concurrency:
   group: deployer-ci-${{ github.ref }}
@@ -24,7 +36,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     permissions:
       contents: read
     defaults:
@@ -32,18 +44,51 @@ jobs:
         working-directory: deployer
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: runtime state is gitignored
         working-directory: .
         run: git check-ignore -q --no-index servers/.deployer-operations.json
       - uses: actions/setup-go@v5
         with:
           go-version-file: deployer/go.mod
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
       - name: go build
         run: go build ./...
       - name: go vet
         run: go vet ./...
       - name: go test
         run: go test ./...
+      - name: nginx syntax with empty and registered WS maps
+        working-directory: .
+        run: |
+          mkdir -p "$RUNNER_TEMP/battle-ws-certs"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj /CN=localhost \
+            -keyout "$RUNNER_TEMP/battle-ws-certs/opensamguk.key" \
+            -out "$RUNNER_TEMP/battle-ws-certs/opensamguk.crt" >/dev/null 2>&1
+          trap 'rm -f infra/nginx/runtime/battle-ws-allowlist.map' EXIT
+          docker run --rm --add-host gateway-api:127.0.0.1 --add-host web-gateway:127.0.0.1 \
+            -v "$PWD/infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" \
+            -v "$PWD/infra/nginx/runtime:/etc/nginx/battle-ws:ro" \
+            -v "$RUNNER_TEMP/battle-ws-certs:/etc/nginx/certs:ro" \
+            nginx:1.27-alpine nginx -t
+          printf 'pep http://spep-game-api:8081;\n' > infra/nginx/runtime/battle-ws-allowlist.map
+          docker run --rm --add-host gateway-api:127.0.0.1 --add-host web-gateway:127.0.0.1 \
+            -v "$PWD/infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" \
+            -v "$PWD/infra/nginx/runtime:/etc/nginx/battle-ws:ro" \
+            -v "$RUNNER_TEMP/battle-ws-certs:/etc/nginx/certs:ro" \
+            nginx:1.27-alpine nginx -t
+      - name: battle WebSocket proxy Upgrade and deny checks
+        working-directory: .
+        run: bash scripts/test-battle-ws-proxy.sh
+      - name: real game-api through battle WebSocket proxy
+        working-directory: .
+        run: bash scripts/test-battle-ws-real-game-api.sh
       - name: deploy orchestration admission boundary
         working-directory: .
         run: bash scripts/deploy-orchestration-admission-test.sh

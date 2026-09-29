@@ -12,6 +12,7 @@ servers/.deployer-operations.json
 
 # 런타임 TLS 인증서 — 운영 호스트에서만 생성·갱신, 절대 커밋 금지
 infra/nginx/certs/
+infra/nginx/runtime/*.map
 
 # OS / 에디터
 .DS_Store

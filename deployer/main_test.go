@@ -3529,6 +3529,9 @@ func TestServerComposeEnvironmentDropsAmbientDefinitionControls(t *testing.T) {
 		"COMPOSE_HOST_DIR=/ambient-host",
 		"SCENARIO_LOOKUP_DIR=/attacker",
 		"PWD=/ambient-working-directory",
+		"BATTLE_JOIN_TICKET_ENABLED=true",
+		"BATTLE_JOIN_TICKET_KEY_BASE64=ambient-secret",
+		"BATTLE_WS_ALLOWED_ORIGINS=https://ambient.invalid",
 	})
 	values := map[string]string{}
 	for _, entry := range environment {
@@ -3546,6 +3549,9 @@ func TestServerComposeEnvironmentDropsAmbientDefinitionControls(t *testing.T) {
 		"COMPOSE_ENV_FILES",
 		"SCENARIO_LOOKUP_DIR",
 		"PWD",
+		"BATTLE_JOIN_TICKET_ENABLED",
+		"BATTLE_JOIN_TICKET_KEY_BASE64",
+		"BATTLE_WS_ALLOWED_ORIGINS",
 	} {
 		if _, exists := values[key]; exists {
 			t.Fatalf("server compose child inherited %s", key)
@@ -3574,6 +3580,9 @@ printf 'COMPOSE_ENV_FILES=%s\n' "${COMPOSE_ENV_FILES-absent}"
 printf 'COMPOSE_HOST_DIR=%s\n' "${COMPOSE_HOST_DIR-absent}"
 printf 'SCENARIO_LOOKUP_DIR=%s\n' "${SCENARIO_LOOKUP_DIR-absent}"
 printf 'DOCKER_HOST=%s\n' "${DOCKER_HOST-absent}"
+printf 'BATTLE_JOIN_TICKET_ENABLED=%s\n' "${BATTLE_JOIN_TICKET_ENABLED-absent}"
+printf 'BATTLE_JOIN_TICKET_KEY_BASE64=%s\n' "${BATTLE_JOIN_TICKET_KEY_BASE64-absent}"
+printf 'BATTLE_WS_ALLOWED_ORIGINS=%s\n' "${BATTLE_WS_ALLOWED_ORIGINS-absent}"
 `)
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("SERVER_ID", "other")
@@ -3584,6 +3593,9 @@ printf 'DOCKER_HOST=%s\n' "${DOCKER_HOST-absent}"
 	t.Setenv("COMPOSE_HOST_DIR", "/ambient-host")
 	t.Setenv("SCENARIO_LOOKUP_DIR", "/attacker")
 	t.Setenv("DOCKER_HOST", "tcp://docker-proxy:2375")
+	t.Setenv("BATTLE_JOIN_TICKET_ENABLED", "true")
+	t.Setenv("BATTLE_JOIN_TICKET_KEY_BASE64", "ambient-secret")
+	t.Setenv("BATTLE_WS_ALLOWED_ORIGINS", "https://ambient.invalid")
 
 	out, err := cfg.runServerDockerContext(context.Background(), "version")
 	if err != nil {
@@ -3604,6 +3616,9 @@ printf 'DOCKER_HOST=%s\n' "${DOCKER_HOST-absent}"
 		"SPRING_PROFILES_ACTIVE",
 		"COMPOSE_ENV_FILES",
 		"SCENARIO_LOOKUP_DIR",
+		"BATTLE_JOIN_TICKET_ENABLED",
+		"BATTLE_JOIN_TICKET_KEY_BASE64",
+		"BATTLE_WS_ALLOWED_ORIGINS",
 	} {
 		if values[key] != "absent" {
 			t.Fatalf("docker child inherited %s", key)
@@ -4106,6 +4121,74 @@ func TestNginxRouteReservationsAndApiProxyContract(t *testing.T) {
 	}
 	if got := strings.Count(nginx, "location /api/ {\n            proxy_pass http://web_gateway/api/;"); got != 2 {
 		t.Fatalf("web-gateway API proxy count = %d, want 2", got)
+	}
+}
+
+func TestBattleWebSocketProxyIsNarrowAndStripsLongCredentials(t *testing.T) {
+	nginx := readFile(t, filepath.Join("..", "infra", "nginx", "nginx.conf"))
+	const route = `location ~ "^/api/battle-ws/(?<battle_server_id>[a-z0-9]{1,48})/(?<battle_world_id>[1-9][0-9]{0,9})/(?<battle_id>[A-Za-z0-9_-]{1,128})$" {`
+	if strings.Count(nginx, route) != 2 {
+		t.Fatal("battle websocket requires matching HTTP and TLS locations")
+	}
+	for _, forbidden := range []string{"location ^~ /api/battle-ws/", "location /api/battle-ws/ {\n            proxy_pass"} {
+		if strings.Contains(nginx, forbidden) {
+			t.Fatalf("battle websocket path has broad proxy: %s", forbidden)
+		}
+	}
+	for _, block := range strings.Split(nginx, route)[1:] {
+		end := strings.Index(block, "\n        }")
+		if end < 0 {
+			t.Fatal("battle websocket location is unterminated")
+		}
+		location := block[:end]
+		for _, want := range []string{
+			`access_log off;`,
+			`proxy_set_header Upgrade $http_upgrade;`,
+			`proxy_set_header Connection "upgrade";`,
+			`proxy_set_header Authorization "";`,
+			`proxy_set_header Proxy-Authorization "";`,
+			`proxy_set_header Cookie "";`,
+			`if ($battle_ws_upstream = "") {`,
+			`proxy_pass $battle_ws_upstream/ws/battles/$battle_server_id/$battle_world_id/$battle_id$is_args$args;`,
+		} {
+			if !strings.Contains(location, want) {
+				t.Fatalf("battle websocket location missing %q", want)
+			}
+		}
+	}
+	if !strings.Contains(nginx, "map $battle_server_id $battle_ws_upstream {\n        default \"\";\n        include /etc/nginx/battle-ws/*.map;") {
+		t.Fatal("battle websocket proxy must use generated explicit allowlist")
+	}
+	for _, want := range []string{"location = /api/battle-ws {\n            access_log off;\n            return 404;", "location /api/battle-ws/ {\n            access_log off;\n            return 404;"} {
+		if strings.Count(nginx, want) != 2 {
+			t.Fatalf("battle websocket invalid path catch-all requires HTTP and TLS: %q", want)
+		}
+	}
+}
+
+func TestBattleJoinConfigurationIsServerScopedAndDisabledByDefault(t *testing.T) {
+	compose := readFile(t, filepath.Join("..", "docker-compose.server.yml"))
+	example := readFile(t, filepath.Join("..", "servers", "s1.env.example"))
+	for _, want := range []string{
+		`BATTLE_JOIN_TICKET_ENABLED: ${BATTLE_JOIN_TICKET_ENABLED:-false}`,
+		`BATTLE_JOIN_TICKET_KEY_BASE64: ${BATTLE_JOIN_TICKET_KEY_BASE64:-}`,
+		`BATTLE_WS_ALLOWED_ORIGINS: ${BATTLE_WS_ALLOWED_ORIGINS:-}`,
+	} {
+		if !strings.Contains(compose, want) {
+			t.Fatalf("game-api compose missing %q", want)
+		}
+	}
+	for _, want := range []string{
+		"BATTLE_JOIN_TICKET_ENABLED=false\n",
+		"BATTLE_JOIN_TICKET_KEY_BASE64=\n",
+		"BATTLE_WS_ALLOWED_ORIGINS=\n",
+	} {
+		if !strings.Contains(example, want) {
+			t.Fatalf("server env example missing safe default %q", want)
+		}
+	}
+	if _, exposed := serverEnvAllowlist["BATTLE_JOIN_TICKET_KEY_BASE64"]; exposed {
+		t.Fatal("join ticket key must not be editable through admin env API")
 	}
 }
 
