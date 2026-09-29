@@ -4483,6 +4483,102 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	}
 }
 
+func TestPepMaintenanceResetPinsImageAndConsumesOnlyOneLoopbackLease(t *testing.T) {
+	cfg := testConfig(t)
+	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), `IMAGE_TAG=old
+JWT_SECRET=shared-secret
+JWT_PUBLIC_KEY=shared-public-key
+SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
+`)
+	envFile := filepath.Join(cfg.serversDir, "spep.env")
+	writeEnv(t, envFile, "SERVER_ID=pep\nIMAGE_TAG="+strings.Repeat("a", 40)+"\nWEB_GAME_TAG="+strings.Repeat("a", 40)+"\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1020\nSCENARIO_SEED_ENABLED=true\n")
+	ordinary, err := resetLifecycleTargetForEnv(envFile, map[string]string{"SCENARIO_CODE": "scenario_990002"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present := ordinary.Updates["IMAGE_TAG"]; present {
+		t.Fatal("ordinary reset unexpectedly rewrites the image pin")
+	}
+	if _, present := ordinary.Updates["WEB_GAME_TAG"]; present {
+		t.Fatal("ordinary reset unexpectedly rewrites the web image pin")
+	}
+	calls := &dockerCallRecorder{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
+		calls.record(args...)
+		return "ok\n", nil
+	}
+	maintenance := cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance))
+	entered := decodeMaintenanceResponse(t, loopbackRequest(t, maintenance, http.MethodPost, "/maintenance/enter", ""))
+	if entered.State != maintenanceStateDrained || entered.Lease == "" {
+		t.Fatal("maintenance did not drain with a private lease")
+	}
+	operationID := "0123456789abcdef0123456789abcdef"
+	newTag := strings.Repeat("b", 40)
+	body := `{"id":"pep","confirm":"RESET pep","operationId":"` + operationID + `","generation":"2","scenarioCode":"scenario_990002","imageTag":"` + newTag + `","webGameTag":"` + newTag + `"}`
+	reset := cfg.withAuth(cfg.handleServerReset)
+	request := func(remote, lease, payload string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/servers/reset", bytes.NewBufferString(payload))
+		req.Header.Set("Authorization", "Bearer test-token")
+		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = remote
+		if lease != "" {
+			req.Header.Set(maintenanceLeaseHeader, lease)
+		}
+		res := httptest.NewRecorder()
+		reset(res, req)
+		return res
+	}
+	for _, probe := range []struct {
+		name, remote, lease, payload string
+		want                         int
+	}{
+		{"non-loopback", "198.51.100.4:31000", entered.Lease, body, http.StatusForbidden},
+		{"no lease", "127.0.0.1:31000", "", body, http.StatusBadRequest},
+		{"wrong lease", "127.0.0.1:31000", strings.Repeat("c", 32),
+			strings.Replace(body, operationID, "11111111111111111111111111111111", 1), http.StatusServiceUnavailable},
+		{"wrong scenario", "127.0.0.1:31000", entered.Lease, strings.Replace(body, "scenario_990002", "scenario_1020", 1), http.StatusBadRequest},
+		{"mutable image", "127.0.0.1:31000", entered.Lease, strings.Replace(body, newTag, "latest", 1), http.StatusBadRequest},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			res := request(probe.remote, probe.lease, probe.payload)
+			if res.Code != probe.want || strings.Contains(res.Body.String(), entered.Lease) {
+				t.Fatalf("refusal=%d body=%s", res.Code, res.Body.String())
+			}
+		})
+	}
+	if calls.count() != 0 || strings.Contains(readFile(t, envFile), newTag) {
+		t.Fatal("rejected maintenance requests changed the server")
+	}
+	accepted := request("127.0.0.1:31000", entered.Lease, body)
+	if accepted.Code != http.StatusOK || strings.Contains(accepted.Body.String(), entered.Lease) {
+		t.Fatalf("leased reset=%d body=%s", accepted.Code, accepted.Body.String())
+	}
+	var acceptedBody createServerResponse
+	if err := json.NewDecoder(accepted.Body).Decode(&acceptedBody); err != nil {
+		t.Fatal(err)
+	}
+	if completed := waitForLifecycleJob(t, cfg.lifecycleJobs, acceptedBody.JobID, lifecycleJobSucceeded); completed.Status != lifecycleJobSucceeded {
+		t.Fatalf("leased reset completion=%#v", completed)
+	}
+	serverEnv := readFile(t, envFile)
+	for _, field := range []string{"IMAGE_TAG=" + newTag, "WEB_GAME_TAG=" + newTag,
+		"SCENARIO_CODE=scenario_990002", "SERVER_GENERATION=2"} {
+		if !strings.Contains(serverEnv, field+"\n") {
+			t.Fatalf("missing atomic reset field %q", field)
+		}
+	}
+	if second := request("127.0.0.1:31000", entered.Lease,
+		strings.Replace(body, operationID, "fedcba9876543210fedcba9876543210", 1)); second.Code != http.StatusServiceUnavailable {
+		t.Fatalf("reused maintenance lease=%d body=%s", second.Code, second.Body.String())
+	}
+	if state := decodeMaintenanceResponse(t, loopbackRequest(t, maintenance, http.MethodGet, "/maintenance", "")); state.State != maintenanceStateDrained || state.Lease != "" {
+		t.Fatal("successful reset opened maintenance or exposed lease")
+	}
+}
+
 func TestResetOperationIDReplaysIdenticalRequestWithoutSecondDockerMutation(t *testing.T) {
 	cfg := configuredResetOperationTest(t)
 	calls := &dockerCallRecorder{}
