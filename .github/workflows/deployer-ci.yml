@@ -40,6 +40,8 @@ jobs:
         working-directory: deployer
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: runtime state is gitignored
         working-directory: .
         run: git check-ignore -q --no-index servers/.deployer-operations.json
