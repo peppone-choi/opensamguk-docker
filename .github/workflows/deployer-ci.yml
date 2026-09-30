@@ -5,6 +5,10 @@ on:
     paths:
       - "deployer/**"
       - "scripts/deploy-orchestration-admission-test.sh"
+      - "scripts/test_web_game_promotion.py"
+      - "scripts/web_game_native_probe.py"
+      - ".github/workflows/promote-web-game.yml"
+      - "docker-compose.server.yml"
       - ".github/workflows/deploy-orchestration.yml"
       - ".gitignore"
       - ".github/workflows/deployer-ci.yml"
@@ -13,6 +17,10 @@ on:
     paths:
       - "deployer/**"
       - "scripts/deploy-orchestration-admission-test.sh"
+      - "scripts/test_web_game_promotion.py"
+      - "scripts/web_game_native_probe.py"
+      - ".github/workflows/promote-web-game.yml"
+      - "docker-compose.server.yml"
       - ".github/workflows/deploy-orchestration.yml"
       - ".gitignore"
       - ".github/workflows/deployer-ci.yml"
@@ -24,7 +32,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     permissions:
       contents: read
     defaults:
@@ -44,6 +52,20 @@ jobs:
         run: go vet ./...
       - name: go test
         run: go test ./...
+      - name: web-game workflow contract
+        working-directory: .
+        run: python3 scripts/test_web_game_promotion.py
+      - name: web-game native race, guard mutations and Compose digest config
+        working-directory: .
+        run: python3 scripts/web_game_native_probe.py
+      - name: web-game native evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-game-native-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/web-game-native/
+          if-no-files-found: warn
+          retention-days: 7
       - name: deploy orchestration admission boundary
         working-directory: .
         run: bash scripts/deploy-orchestration-admission-test.sh

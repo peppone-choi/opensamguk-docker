@@ -501,3 +501,46 @@ GCP Compute Engine **e2-standard-2**(2 vCPU / 8 GiB) 기준(단일서버). LLM·
 수동 전콘 편집은 원본8MiB와 자르기 좌표를 전송합니다. nginx는 HTTP·HTTPS의
 `/api/account/profile-icon` 및 직접 API 경로 `/api/gateway/auth/account/profile-icon`만9MiB까지 허용합니다.
 그 외 API의2MiB 한도와 요청 속도 제한은 유지합니다. 대응하는 앱 이미지가 배포되어야 원본과 세 구도 저장 기능을 사용할 수 있습니다.
+
+### web-game만 digest로 승격
+
+**Promote Web Game Only**는 별도 운영 승인을 받은 frontend 승격용이다. 먼저 이를 지원하는 control/deployer
+릴리스를 검토·배포해야 하며, 이전 deployer의 미지원 응답을 기존 `/deploy`로 우회하지 않는다. workflow는 host production
+lock 아래 인증된 loopback `POST /deploy/web-game`만 호출하고, deployer의 mutation admission을 함께 사용한다.
+등록 public id/project/URL, process world id와 기수, 현재 web pin을 승인된 입력과 대조한다. DB 등록/world 내용은 조회하지 않는다.
+
+입력은 `server`, `source_sha`, `image_digest`, `expected_web_game_tag`, `expected_world_id`, `expected_generation`이다.
+최종 source SHA와 digest는 검증된 빌드 근거로 함께 고정한다. 이 API가 tag와 digest의 CI 출처 관계를 별도로 증명하는 것은 아니다.
+`WEB_GAME_TAG=<40자리 source SHA>@sha256:<64자리 digest>` 한 키만 저장하므로 원래 compose는
+`repo:web-game-<SHA>@sha256:<digest>`를 선택한다. 기본 compose·다른 env·IMAGE_TAG·registry·시나리오를 수정하지 않는다.
+일반 재생성에서도 이 web pin을 사용하며, 별도 승인된 기존 전체 승격은 기존처럼 API/web 태그를 새 태그로 함께 바꾼다.
+
+pull은 임시 env로 web-game만 수행한다. pull 전후 expected web pin을 다시 검사하고, 성공 후 `deploy-web` journal과
+WEB_GAME_TAG를 영속 기록한 뒤 web-game만 `--force-recreate --no-deps --no-build --pull never`로 교체한다.
+web pin 기록은 파일과 부모 디렉터리를 fsync하는 atomic writer를 사용한다. web/API fallback pin·world·기수 키의
+중복은 거절하며 나머지 env 줄은 유지한다.
+실행 이미지의 digest reference를 확인하고 journal을 정산하지만, 실제 화면의 progressive/초점/수동 pan 검증은 별도다.
+기존 `/deploy`의 API/web 선택과 engine 제외는 유지된다. API-only·migration·bundle 활성화는 이 경로의 기능이 아니다.
+
+pull 실패는 이전 pin을 유지한다. pin write 이후 실패는 journal을 남기고 admission을 닫는다. 승인된 repair는
+journal에 기록한 같은 world/기수/web digest만 복구하며, 예기치 않은 pin 변경은 거부한다. prepared 단계에서 pin write가
+일어나지 않았다면 이전 실행 이미지를 확인하고 정산하며 recreate하지 않는다. 이전 control 버전은 `deploy-web` journal을
+지원하지 않아 fail closed하므로, 미정산 journal을 둔 채 control을 다운그레이드하거나 삭제하지 않는다.
+rollback은 새 expected pin을 조건으로 이전 **승인된 SHA/digest**를 같은 web 전용 경로에 넣는다. journal 미정산 시 먼저
+승인된 scoped repair가 필요하다. PNG API까지 바뀐 뒤 old web으로 복원할 때는 호환 API를 먼저 복구·검증하고 web을 복원한다.
+각 대상의 운영 승인 없이 rollback·repair·maintenance 해제를 수행하지 않는다.
+
+### Web 단독 승격의 PR 검증과 control release
+
+기존 `Deployer CI`의 ubuntu runner에서 전체 Go build/vet/test에 더해
+`python3 scripts/web_game_native_probe.py`가 지정 10개 Go 회귀의 race 실행,
+실제 서비스 선택·인증·loopback 제거의 적색 회귀와 원본 byte 복원,
+실제 Compose `config`의 `40sha@sha256:digest` 소비를 검사한다.
+Compose 입력은 합성 값이며 pull/up·운영 runner·배포 자격증명을 사용하지 않는다.
+실행 JSON과 로그는 `web-game-native-<sha>-<attempt>` artifact로 7일 보존한다.
+
+현재 `deploy-orchestration.yml`은 deployer 변경의 main push에서 운영 control을 자동 교체한다.
+따라서 PR CI 성공·독립 source 리뷰와 **운영 control release 승인**은 별도 관문이다.
+운영 대상 승인이 없으면 이 control PR은 draft를 유지하며 main에 병합하지 않는다.
+control 배포가 확인된 후에도 pep web-game 승격에는 exact source/registry digest,
+현재 expected pin/world/generation 및 rollback 범위의 별도 승인이 필요하다.
