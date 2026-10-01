@@ -26,7 +26,7 @@ def fixtures():
           'configDigest':OLD_CONFIG,'os':'linux','architecture':'amd64','metadataAndBlobAccess':True}
          for r in [OLD_MANIFEST,'web-game-'+OLD]]
     old_raw=json.dumps({'references':old}).encode()
-    card={'schema':'direct-web-promotion/v1','serverId':'pep','worldId':1,'generation':1,
+    card={'vmInstanceId':'2561415917368202513','gcpProject':'opensamguk','gcpZone':'asia-northeast3-c','schema':'direct-web-promotion/v1','serverId':'pep','worldId':1,'generation':1,
           'operations':p.OPS,'executorSha256':p.digest(Path(p.__file__).read_bytes()),
           'candidateSha256':p.digest(cr),'probeSha256':p.digest(pr),'sourceSha':NEW,'platformDigest':MANIFEST,
           'configDigest':CONFIG,'oldPlatformDigest':OLD_MANIFEST,'oldConfigDigest':OLD_CONFIG,'oldSourceSha':OLD,
@@ -44,6 +44,8 @@ class FakeHost(p.Host):
         self.other={'id':'engine-original','imageId':'engine-img','configuredImage':'engine-pin','startedAt':'engine-start','running':True}
         card.update(controlContainerId='control-id',controlStartedAt='start',oldWebContainer=copy.deepcopy(self.web),
                     expectedSelectedEnv=p.selected_env(self.env),expectedComposeImages=[promotion['oldReference'],'engine-pin'])
+    def verify_instance(self):
+        p.require(self.card['vmInstanceId']=='2561415917368202513','fixture VM identity')
     def maintenance(self,method='GET',path='/maintenance'):
         self.calls.append((method,path))
         if path=='/maintenance/enter-if-idle':
@@ -108,7 +110,7 @@ class DirectWebPromotionTest(unittest.TestCase):
         with patch.object(sys,'argv',argv+['--execute']),patch.object(p.subprocess,'run',side_effect=AssertionError('Docker')),redirect_stdout(StringIO()):
             self.assertEqual(1,p.main())
     def test_byte_source_platform_and_native_proof_pins_fail_closed(self):
-        for key,value in [('sourceSha','9'*40),('platformDigest',CONFIG),('configDigest',MANIFEST),
+        for key,value in [('vmInstanceId','wrong'),('sourceSha','9'*40),('platformDigest',CONFIG),('configDigest',MANIFEST),
                           ('probeSha256','9'*64),('executorSha256','9'*64),('oldRegistryVerified',False),('operations',[])]:
             card=dict(self.card);card[key]=value
             with self.subTest(key=key),self.assertRaises(p.Halt):p.plan(card,self.cr,self.pr)

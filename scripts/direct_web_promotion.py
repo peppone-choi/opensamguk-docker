@@ -49,6 +49,8 @@ def plan(card, candidate_raw, probe_raw):
     candidate = json.loads(candidate_raw)
     probe = json.loads(probe_raw)
     require(card.get('schema') == 'direct-web-promotion/v1', '카드 schema')
+    require(card.get('vmInstanceId') == '2561415917368202513' and card.get('gcpProject') == 'opensamguk'
+            and card.get('gcpZone') == 'asia-northeast3-c', '승인된 VM identity')
     require(card.get('serverId') == 'pep' and card.get('worldId') == 1 and card.get('generation') == 1,
             '승인된 pep world/generation 범위')
     require(card.get('operations') == OPS, '웹 단독 작업 범위')
@@ -168,6 +170,14 @@ class Host:
     def docker(self, *args, timeout=30):
         return self.run(['/usr/bin/docker', *args], timeout)
 
+    def verify_instance(self):
+        fields={'instance/id':'vmInstanceId','project/project-id':'gcpProject','instance/zone':'gcpZone'}
+        for path,key in fields.items():
+            value=self.run(['/usr/bin/curl','--fail','--silent','--noproxy','*','--max-time','3',
+                            '-H','Metadata-Flavor: Google','http://169.254.169.254/computeMetadata/v1/'+path],timeout=5).strip()
+            if key=='gcpZone':value=value.rsplit('/',1)[-1]
+            require(value==self.card[key], 'VM metadata identity 불일치')
+
     def maintenance(self, method='GET', path='/maintenance'):
         raw = self.docker('exec', 'opensamguk-deployer', '/usr/local/bin/deployer', '--authenticated-http', method, path, '10')
         obj = json.loads(raw)
@@ -224,6 +234,7 @@ class Host:
         return record
 
 def perform(host, receipt_path, card_hash, promotion):
+    host.verify_instance()
     require(not receipt_path.exists(), '기존 receipt: 재진입 금지, 복구 카드 필요')
     require(not host.marker.exists() and not host.lifecycle.exists(), '기존 maintenance/journal')
     require(host.maintenance()['state'] == 'open', '기존 창 소유 금지')
@@ -290,6 +301,7 @@ def perform(host, receipt_path, card_hash, promotion):
     return receipt['stage']
 
 def recover(host, receipt_path, card_hash, approval):
+    host.verify_instance()
     raw, receipt = read_json(receipt_path)
     require(approval.get('schema')=='direct-web-recovery/v1' and approval.get('approved') is True
             and approval.get('approvalId') and approval.get('receiptSha256')==digest(raw)
@@ -317,6 +329,7 @@ def recover(host, receipt_path, card_hash, approval):
     return receipt['stage']
 
 def finish(host, receipt_path, card_hash, approval):
+    host.verify_instance()
     raw, receipt = read_json(receipt_path)
     require(approval.get('schema')=='direct-web-finish/v1' and approval.get('approved') is True
             and approval.get('approvalId') and approval.get('receiptSha256')==digest(raw)
