@@ -59,3 +59,7 @@ runner 자원을 별도 source 검토/승인해야 한다. 지금 등록 가능�
 `python3 -B -m unittest discover -s scripts -p 'test_web_game_candidate_probe.py' -v`는
 정확한 command와 admission·wrong digest/Config.Image·ownership·cleanup·metadata 투영을
 가짜 runner로 검사한다. 실제 pull 성공이나 Go template/Docker 버전 호환 검증으로 세지 않는다.
+
+## 발급 source 갱신
+
+source SHA와 Dockerfile SHA는 코드에 고정하지 않고 실제 발급 후보와 명시적 probe 승인 카드에서 함께 확인한다. 카드의 candidate/probe byte SHA, issuer/run/attempt, platform/config digest, OCI source label은 계속 일치해야 한다. source만 다른 후보로 바꾸면 byte/source 승인 불일치로 거절한다. 운영 권한은 이 hosted probe에 포함되지 않는다.

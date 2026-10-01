@@ -14,12 +14,10 @@ import subprocess
 import tempfile
 import uuid
 
-SOURCE = "cf7a1968993e41a98940031c60683129e9ae919a"
 REPO = "ghcr.io/peppone-choi/opensamguk"
 SOURCE_URL = "https://github.com/peppone-choi/opensamguk"
 PLATFORM = "linux/amd64"
 LABEL = "io.opensamguk.c8-candidate-probe"
-DOCKERFILE_SHA = "e122a4e0f079a97ba470c088a8569e29a7ab9a2c67bb941200b5fb17245103bd"
 SHA = re.compile(r"[0-9a-f]{64}")
 SHA40 = re.compile(r"[0-9a-f]{40}")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -68,7 +66,8 @@ def make_plan(candidate_bytes, approval):
     require(candidate.get("schema") == "web-game-image-candidate/v1"
             and candidate.get("status") == "VERIFIED_CANDIDATE", "unverified candidate")
     require(candidate.get("deployment_approved") is False, "issuance must not grant deployment")
-    require(candidate.get("source_sha") == approval.get("source_sha") == SOURCE, "source pin")
+    source = candidate.get("source_sha")
+    require(isinstance(source, str) and SHA40.fullmatch(source) and source == approval.get("source_sha"), "source pin")
     issuer = candidate.get("issuer_sha")
     require(isinstance(issuer, str) and SHA40.fullmatch(issuer)
             and issuer == approval.get("issuer_sha"), "issuer pin")
@@ -78,7 +77,7 @@ def make_plan(candidate_bytes, approval):
                 and value == approval.get(key), "issuance identity pin")
     require(candidate.get("repository") == REPO and candidate.get("platform") == PLATFORM,
             "repository/platform pin")
-    require(candidate.get("tag") == f"{REPO}:web-game-candidate-{SOURCE}-{candidate['run_id']}-{candidate['run_attempt']}",
+    require(candidate.get("tag") == f"{REPO}:web-game-candidate-{source}-{candidate['run_id']}-{candidate['run_attempt']}",
             "candidate tag shape")
     keys = ("index_digest", "platform_manifest_digest", "config_digest", "attestation_manifest_digest")
     digests = [candidate.get(key) for key in keys]
@@ -90,18 +89,20 @@ def make_plan(candidate_bytes, approval):
             and candidate.get("platform_reference") == REPO + "@" + candidate["platform_manifest_digest"],
             "canonical reference")
     pins = candidate.get("source_pins_sha256")
-    require(isinstance(pins, dict) and pins.get("docker/web-game.Dockerfile") == DOCKERFILE_SHA,
+    require(isinstance(pins, dict) and isinstance(approval.get("dockerfile_source_sha256"), str)
+            and SHA.fullmatch(approval["dockerfile_source_sha256"])
+            and pins.get("docker/web-game.Dockerfile") == approval["dockerfile_source_sha256"],
             "Dockerfile source pin")
     require(candidate.get("build_args") == {"ASSET_PREFIX": "/game", "GATEWAY_WEB_URL": "http://web-gateway:3000",
                                             "NEXT_PUBLIC_GATEWAY_URL": ""}, "public build arguments")
     runtime = candidate.get("runtime_check")
     require(isinstance(runtime, dict) and runtime.get("NODE_ENV") == "production", "candidate runtime contract")
-    return {"schema": "web-game-image-probe-plan/v1", "source_sha": SOURCE, "issuer_sha": issuer,
+    return {"schema": "web-game-image-probe-plan/v1", "source_sha": source, "issuer_sha": issuer,
             "candidate_sha256": sha256(candidate_bytes), "platform": PLATFORM,
             "platform_reference": candidate["platform_reference"],
             "platform_manifest_digest": candidate["platform_manifest_digest"],
             "config_digest": candidate["config_digest"],
-            "control_reference": f"{REPO}:web-game-{SOURCE}@{candidate['platform_manifest_digest']}",
+            "control_reference": f"{REPO}:web-game-{source}@{candidate['platform_manifest_digest']}",
             "rollback_reference": f"{REPO}:web-game-d50177b207897fc6c466095ec9699aab03f57536@sha256:2a927e3633f9285428e55a9fdaed1fce445cd88e445f01fd98f81be11de46a29",
             "rollback_pull_in_this_probe": False, "containers_started": 0,
             "operating_target_verified": False}
@@ -156,7 +157,7 @@ def probe(plan, run):
         image = json.loads(run(["image", "inspect", reference, "--format", IMAGE_FORMAT], 30))
         require(image.get("os") == "linux" and image.get("arch") == "amd64", "pulled platform")
         require(plan["platform_reference"] in (image.get("repoDigests") or []), "pulled manifest digest")
-        require(image.get("revision") == SOURCE and image.get("source") == SOURCE_URL, "pulled OCI source labels")
+        require(image.get("revision") == plan["source_sha"] and image.get("source") == SOURCE_URL, "pulled OCI source labels")
         # Classic image store uses config IDs; other stores may use manifest IDs.
         # Preserve and identify both; do not conflate Docker ID with registry digest.
         image_id = image.get("id")

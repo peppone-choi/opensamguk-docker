@@ -13,12 +13,12 @@ import web_game_candidate_probe as probe
 
 def fixture():
     candidate = {"schema": "web-game-image-candidate/v1", "status": "VERIFIED_CANDIDATE",
-                 "deployment_approved": False, "source_sha": probe.SOURCE, "issuer_sha": "a" * 40,
+                 "deployment_approved": False, "source_sha": "1" * 40, "issuer_sha": "a" * 40,
                  "run_id": "123", "run_attempt": "1", "repository": probe.REPO, "platform": probe.PLATFORM,
-                 "tag": f"{probe.REPO}:web-game-candidate-{probe.SOURCE}-123-1",
+                 "tag": probe.REPO + ":web-game-candidate-" + "1" * 40 + "-123-1",
                  "index_digest": "sha256:" + "b" * 64, "platform_manifest_digest": "sha256:" + "c" * 64,
                  "config_digest": "sha256:" + "d" * 64, "attestation_manifest_digest": "sha256:" + "e" * 64,
-                 "source_pins_sha256": {"docker/web-game.Dockerfile": probe.DOCKERFILE_SHA},
+                 "source_pins_sha256": {"docker/web-game.Dockerfile": "9" * 64},
                  "build_args": {"ASSET_PREFIX": "/game", "GATEWAY_WEB_URL": "http://web-gateway:3000",
                                 "NEXT_PUBLIC_GATEWAY_URL": ""}, "runtime_check": {"NODE_ENV": "production"}}
     candidate["index_reference"] = probe.REPO + "@" + candidate["index_digest"]
@@ -29,6 +29,7 @@ def fixture():
                 "operating_actions_authorized": False, "execution_authorized": True,
                 "probe_source_sha256": probe.sha256(Path(probe.__file__).read_bytes()),
                 "candidate_sha256": probe.sha256(data),
+                "dockerfile_source_sha256": "9" * 64,
                 **{key: candidate[key] for key in ("source_sha", "issuer_sha", "run_id", "run_attempt",
                                                    "platform_manifest_digest", "config_digest")}}
     return candidate, data, approval
@@ -58,7 +59,7 @@ class FakeDocker:
             return "synthetic discarded pull output"
         if argv[:2] == ["image", "inspect"]:
             return json.dumps({"id": self.image_id, "os": "linux", "arch": "amd64",
-                               "repoDigests": [self.plan["platform_reference"]], "revision": probe.SOURCE,
+                               "repoDigests": [self.plan["platform_reference"]], "revision": "1" * 40,
                                "source": probe.SOURCE_URL, **self.image_change})
         if argv[:2] == ["container", "create"]:
             name = argv[argv.index("--name") + 1]
@@ -97,8 +98,22 @@ class CandidateProbeTests(unittest.TestCase):
         approval = {**self.approval, "candidate_sha256": probe.sha256(data)}
         return data, approval
 
+    def test_new_source_is_allowed_only_when_explicit_byte_and_source_approval_match(self):
+        candidate=copy.deepcopy(self.candidate)
+        candidate['source_sha']='2'*40
+        candidate['tag']=probe.REPO+':web-game-candidate-'+candidate['source_sha']+'-123-1'
+        data=json.dumps(candidate).encode()
+        approval=dict(self.approval,candidate_sha256=probe.sha256(data))
+        with self.assertRaises(probe.Rejected):probe.make_plan(data,approval)
+        approval['source_sha']=candidate['source_sha']
+        plan=probe.make_plan(data,approval)
+        result=probe.probe(plan,FakeDocker(plan))
+        self.assertEqual('PASS',result['status'])
+        self.assertEqual(candidate['source_sha'],result['plan']['source_sha'])
+        approval['dockerfile_source_sha256']='8'*64
+        with self.assertRaises(probe.Rejected):probe.make_plan(data,approval)
     def test_plan_binds_platform_digest_and_preserves_unknown_operating_identity(self):
-        self.assertEqual(self.plan["control_reference"], probe.REPO + ":web-game-" + probe.SOURCE + "@" + self.candidate["platform_manifest_digest"])
+        self.assertEqual(self.plan["control_reference"], probe.REPO + ":web-game-" + self.candidate["source_sha"] + "@" + self.candidate["platform_manifest_digest"])
         self.assertFalse(self.plan["operating_target_verified"])
         self.assertFalse(self.plan["rollback_pull_in_this_probe"])
 
