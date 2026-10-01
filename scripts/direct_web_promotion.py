@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 import argparse
+from collections import Counter
 import fcntl
 import hashlib
 import json
@@ -239,7 +240,7 @@ def perform(host, receipt_path, card_hash, promotion):
     require(promotion['oldRepoDigest'] in old['repoDigests'] and old['id'] == baseline['spep-web-game']['imageId']
             and old['os']=='linux' and old['architecture']=='amd64', 'old rollback local image')
     configured = host.compose('config', '--images').splitlines()
-    require(configured == host.card['expectedComposeImages'], 'Compose 이미지 구성 변경')
+    require(Counter(configured) == Counter(host.card['expectedComposeImages']), 'Compose 이미지 구성 변경')
     receipt = {'schema':'direct-web-receipt/v1', 'cardSha256':card_hash, 'stage':'ENTER_PENDING',
                'control':control, 'baseline':baseline, 'selectedEnv':env, 'envIdentity':file_identity(host.env),
                'oldLocalImageId':old['id'], 'promotion':promotion}
@@ -262,7 +263,7 @@ def perform(host, receipt_path, card_hash, promotion):
         receipt['stage']='WEB_RECREATE_PENDING'; atomic_private_json(receipt_path, receipt)
         changed = host.compose('config', '--images').splitlines()
         expected = [promotion['newReference'] if image == promotion['oldReference'] else image for image in configured]
-        require(expected.count(promotion['newReference'])==1 and changed == expected, 'web 외 Compose 이미지 변화')
+        require(expected.count(promotion['newReference'])==1 and Counter(changed) == Counter(expected), 'web 외 Compose 이미지 변화')
         host.owned(receipt)
         host.compose('up', '-d', '--no-deps', '--pull', 'never', '--force-recreate', 'web-game', timeout=180)
         host.owned(receipt)

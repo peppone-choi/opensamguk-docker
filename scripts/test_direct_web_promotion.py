@@ -133,6 +133,13 @@ class DirectWebPromotionTest(unittest.TestCase):
         self.assertEqual(0o600,self.receipt.stat().st_mode & 0o777)
         self.assertIn(('up','-d','--no-deps','--pull','never','--force-recreate','web-game'),self.host.calls)
         self.assertEqual(1,self.host.recreate_count)
+    def test_compose_image_order_changes_do_not_reject_identical_configuration(self):
+        original=self.host.compose
+        def reordered(*args,**kwargs):
+            result=original(*args,**kwargs)
+            return '\n'.join(reversed(result.splitlines())) if args[0]=='config' else result
+        self.host.compose=reordered
+        self.assertEqual('CANDIDATE_VERIFIED_DRAINED',self.run_promotion())
     def test_preexisting_other_window_never_enters_or_leaves(self):
         self.host.marker.write_text('other')
         with self.assertRaises(p.Halt):self.run_promotion()
