@@ -59,7 +59,7 @@ class FakeDocker:
             return "synthetic discarded pull output"
         if argv[:2] == ["image", "inspect"]:
             return json.dumps({"id": self.image_id, "os": "linux", "arch": "amd64",
-                               "repoDigests": [self.plan["platform_reference"]], "revision": "1" * 40,
+                               "repoDigests": [self.plan["platform_reference"]], "revision": self.plan["source_sha"],
                                "source": probe.SOURCE_URL, **self.image_change})
         if argv[:2] == ["container", "create"]:
             name = argv[argv.index("--name") + 1]
