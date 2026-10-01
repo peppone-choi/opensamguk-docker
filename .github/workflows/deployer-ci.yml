@@ -5,6 +5,10 @@ on:
     paths:
       - "deployer/**"
       - "scripts/deploy-orchestration-admission-test.sh"
+      - "scripts/direct_web_promotion.py"
+      - "scripts/test_direct_web_promotion.py"
+      - "scripts/web_game_candidate_probe.py"
+      - "scripts/test_web_game_candidate_probe.py"
       - ".github/workflows/deploy-orchestration.yml"
       - ".gitignore"
       - ".github/workflows/deployer-ci.yml"
@@ -13,6 +17,10 @@ on:
     paths:
       - "deployer/**"
       - "scripts/deploy-orchestration-admission-test.sh"
+      - "scripts/direct_web_promotion.py"
+      - "scripts/test_direct_web_promotion.py"
+      - "scripts/web_game_candidate_probe.py"
+      - "scripts/test_web_game_candidate_probe.py"
       - ".github/workflows/deploy-orchestration.yml"
       - ".gitignore"
       - ".github/workflows/deployer-ci.yml"
@@ -47,5 +55,25 @@ jobs:
       - name: deploy orchestration admission boundary
         working-directory: .
         run: bash scripts/deploy-orchestration-admission-test.sh
+      - name: web operation tool contracts
+        working-directory: .
+        run: |
+          python3 - <<'PYTHON'
+          import pathlib, sys, unittest
+          suite = unittest.TestSuite()
+          for name in ("direct_web_promotion", "web_game_candidate_probe"):
+              source = pathlib.Path("scripts") / (name + ".py")
+              test = pathlib.Path("scripts") / ("test_" + name + ".py")
+              if not source.exists() and not test.exists():
+                  continue
+              if not source.is_file() or not test.is_file():
+                  sys.exit("web operation source/test pair is incomplete")
+              discovered = unittest.defaultTestLoader.discover("scripts", pattern=test.name)
+              if discovered.countTestCases() == 0:
+                  sys.exit("web operation contract tests were not discovered")
+              suite.addTests(discovered)
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          sys.exit(0 if result.wasSuccessful() and not result.skipped else 1)
+          PYTHON
       - name: container build
         run: docker build --tag opensamguk-deployer:ci .
