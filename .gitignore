@@ -22,3 +22,9 @@ infra/nginx/certs/
 # 내용물(RTK14 생성 시나리오)은 앱 레포에서도 gitignore 대상이며,
 # untracked로 남으면 deploy.yml의 sync 가드가 이후 모든 배포를 차단한다.
 /data/
+
+# D101 private backups and content-addressed approval/execution receipts.
+/backups/
+/servers/.deployer-reset-approvals/
+/servers/.deployer-reset-preflights/
+/servers/.deployer-publication-receipts/
