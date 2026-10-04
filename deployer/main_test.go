@@ -5702,7 +5702,7 @@ JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
 	envFile := filepath.Join(cfg.serversDir, "spep.env")
-	writeEnv(t, envFile, "SERVER_ID=pep\nIMAGE_TAG="+strings.Repeat("a", 40)+"\nWEB_GAME_TAG="+strings.Repeat("a", 40)+"\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1020\nSCENARIO_SEED_ENABLED=true\n")
+	writeEnv(t, envFile, "SERVER_ID=pep\nGHCR_OWNER=owner\nIMAGE_TAG="+strings.Repeat("a", 40)+"\nWEB_GAME_TAG="+strings.Repeat("a", 40)+"\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1020\nSCENARIO_SEED_ENABLED=true\n")
 	ordinary, err := resetLifecycleTargetForEnv(envFile, map[string]string{"SCENARIO_CODE": "scenario_990002"})
 	if err != nil {
 		t.Fatal(err)
@@ -5778,9 +5778,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 		t.Fatalf("leased reset completion=%#v", completed)
 	}
 	recorded := calls.snapshot()
-	if len(recorded) < 5 || !strings.Contains(recorded[0], "pull game-engine game-api web-game") ||
-		!strings.Contains(recorded[4], "down --volumes --remove-orphans") {
-		t.Fatalf("candidate images were not pulled before volume removal: %#v", recorded)
+	if len(recorded) < 4 || !strings.HasPrefix(recorded[0], "image inspect ") ||
+		!strings.Contains(recorded[3], "down --volumes --remove-orphans") {
+		t.Fatalf("candidate images were not verified before volume removal: %#v", recorded)
 	}
 	serverEnv := readFile(t, envFile)
 	for _, field := range []string{"IMAGE_TAG=" + newTag, "WEB_GAME_TAG=" + newTag,
@@ -5807,7 +5807,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 `
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), oldShared)
 	envFile := filepath.Join(cfg.serversDir, "spep.env")
-	oldEnv := "SERVER_ID=pep\nIMAGE_TAG=" + strings.Repeat("a", 40) + "\nWEB_GAME_TAG=" + strings.Repeat("a", 40) + "\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1020\nSCENARIO_SEED_ENABLED=true\n"
+	oldEnv := "SERVER_ID=pep\nGHCR_OWNER=owner\nIMAGE_TAG=" + strings.Repeat("a", 40) + "\nWEB_GAME_TAG=" + strings.Repeat("a", 40) + "\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1020\nSCENARIO_SEED_ENABLED=true\n"
 	writeEnv(t, envFile, oldEnv)
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
@@ -5845,7 +5845,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 		t.Fatalf("pull failure status=%#v", completed)
 	}
 	recorded := calls.snapshot()
-	if len(recorded) != 1 || !strings.Contains(recorded[0], "pull game-engine game-api web-game") {
+	if len(recorded) != 2 || !strings.HasPrefix(recorded[0], "image inspect ") || !strings.Contains(recorded[1], "pull game-engine game-api web-game") {
 		t.Fatalf("pull failure reached a destructive Docker call: %#v", recorded)
 	}
 	if current := readFile(t, envFile); current != oldEnv {

@@ -1162,7 +1162,7 @@ func (c config) readLifecycleJournal() (lifecycleJournal, bool, error) {
 		return lifecycleJournal{}, false, errors.New("lifecycle journal has an invalid reset target")
 	}
 	if journal.ResetTarget != nil {
-		normalized, err := normalizeResetLifecycleTarget(*journal.ResetTarget)
+		normalized, err := normalizeResetLifecycleJournalTarget(*journal.ResetTarget)
 		if err != nil {
 			return lifecycleJournal{}, false, err
 		}
@@ -1219,6 +1219,11 @@ func (c config) repairLifecycleJournal() (repairErr error) {
 			repairErr = fmt.Errorf("%v; persist recovery-required operation: %w", repairErr, transitionErr)
 		}
 	}()
+	if journal.ResetTarget != nil {
+		if _, err := normalizeResetLifecycleTarget(*journal.ResetTarget); err != nil {
+			return err
+		}
+	}
 	target, err := c.serverTargetForID(journal.ServerID)
 	if err != nil || target.Project != journal.Project {
 		return errors.New("lifecycle recovery target is invalid")
@@ -5526,6 +5531,9 @@ func (c config) pullResetCandidate(ctx context.Context, target serverTarget, res
 	}
 	if _, err := c.validateDockerServerTarget(target.Project, stagedPath, true); err != nil {
 		return "", err
+	}
+	if err := c.verifyResetCandidateImages(ctx, stagedPath, resetTarget); err == nil {
+		return "candidate images verified locally", nil
 	}
 	detail, err := c.runServerDockerContext(ctx,
 		"compose", "-p", target.Project,
