@@ -418,3 +418,148 @@ func TestResetCandidateVerifiesAllImageDigestsBeforePublishing(t *testing.T) {
 		})
 	}
 }
+
+// The exact service tag is part of the approved candidate; a correct digest
+// returned for service-latest must not make a mutable tag acceptable.
+func TestResetCandidatePinsExactServiceTagsForInspectAndPull(t *testing.T) {
+	cfg := testConfig(t)
+	envFile := filepath.Join(cfg.serversDir, "spep.env")
+	writeEnv(t, envFile, "SERVER_ID=pep\nGHCR_OWNER=owner\nIMAGE_TAG=old\nWEB_GAME_TAG=old\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1020\nSCENARIO_SEED_ENABLED=true\n")
+	target, err := cfg.serverTargetForID("pep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := resetDigestFixture(t, resetDigestPins())
+	pulled := false
+	inspected := map[string]bool{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		if len(args) > 1 && args[0] == "image" && args[1] == "inspect" {
+			ref := args[len(args)-1]
+			service := ""
+			for _, name := range resetImageServices {
+				if ref == "ghcr.io/owner/opensamguk:"+name+"-"+candidate.Updates["IMAGE_TAG"] {
+					service = name
+				}
+			}
+			if service == "" {
+				t.Fatalf("inspection did not use exact approved tag: %s", ref)
+			}
+			if !pulled {
+				return "null", nil
+			}
+			inspected[service] = true
+			out, ok := resetDigestInspectFixture(t, args)
+			if !ok {
+				t.Fatal("missing image fixture")
+			}
+			return out, nil
+		}
+		if strings.Contains(strings.Join(args, " "), "pull game-engine game-api web-game") {
+			staged := ""
+			for i, arg := range args {
+				if arg == "--env-file" && i+1 < len(args) {
+					staged = args[i+1]
+				}
+			}
+			values, err := readEnvValues(staged)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if values["IMAGE_TAG"] != candidate.Updates["IMAGE_TAG"] || values["WEB_GAME_TAG"] != candidate.Updates["WEB_GAME_TAG"] {
+				t.Fatal("pull did not use exact approved tags")
+			}
+			pulled = true
+			return "ok", nil
+		}
+		t.Fatalf("unexpected candidate command: %v", args)
+		return "", nil
+	}
+	if _, err := cfg.pullResetCandidate(context.Background(), target, candidate); err != nil {
+		t.Fatal(err)
+	}
+	if !pulled || len(inspected) != 3 {
+		t.Fatalf("exact candidate not verified: pulled=%v inspected=%v", pulled, inspected)
+	}
+}
+
+func TestLinkedLegacyPinnedJournalCleanupRequiresBoundSuccess(t *testing.T) {
+	for _, mode := range []string{"running", "succeeded", "wrong-subject", "wrong-kind", "wrong-fingerprint", "postcondition-failure"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := configuredResetOperationTest(t)
+			operationID := "8899aabbccddeeff0011223344556677"
+			legacy, err := normalizeResetLifecycleJournalTarget(resetDigestFixture(t, nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			record := durableOperationRecord{OperationID: operationID, Kind: lifecycleKindReset, SubjectID: "pep", RequestFingerprint: resetRequestFingerprint("pep", legacy), Status: lifecycleJobRunning}
+			if mode == "wrong-subject" {
+				record.SubjectID = "uni"
+			}
+			if mode == "wrong-kind" {
+				record.Kind = lifecycleKindCreate
+			}
+			if mode == "wrong-fingerprint" {
+				record.RequestFingerprint = strings.Repeat("f", 64)
+			}
+			mustReserveOperation(t, cfg.lifecycleOperationStore, record)
+			if mode != "running" {
+				mustTransitionOperation(t, cfg.lifecycleOperationStore, operationID, lifecycleJobSucceeded, http.StatusOK, durableOperationResetSucceededMessage)
+			}
+			target, err := cfg.serverTargetForID("pep")
+			if err != nil {
+				t.Fatal(err)
+			}
+			// A completed legacy reset has already published its env and registry.
+			// Apply the explicit old settings without the new strict execution gate.
+			values := map[string]string{"IMAGE_TAG": legacy.Updates["IMAGE_TAG"], "WEB_GAME_TAG": legacy.Updates["WEB_GAME_TAG"], "SERVER_GENERATION": "0", "SCENARIO_CODE": "scenario_990002", "SCENARIO_SEED_ENABLED": "true"}
+			if _, err := patchEnvFile(target.EnvFile, serverEnvAllowlist, values); err != nil {
+				t.Fatal(err)
+			}
+			if err := cfg.reconcileServerRegistry(target); err != nil {
+				t.Fatal(err)
+			}
+			wire, err := json.Marshal(lifecycleJournal{Version: lifecycleJournalVersion, Operation: "reset", OperationID: operationID, OperationKind: lifecycleKindReset, Stage: lifecycleJournalStageDown, ServerID: "pep", Project: target.Project, ResetTarget: &legacy})
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeEnv(t, cfg.lifecycleJournalFile, string(wire))
+			configureLoadConfigTest(t, cfg)
+			restarted, err := loadConfig()
+			if err != nil {
+				t.Fatal(err)
+			}
+			restarted.httpGet = cfg.httpGet
+			if mode == "postcondition-failure" {
+				restarted.httpGet = func(context.Context, string) (int, []byte, error) { return 0, nil, errors.New("synthetic unavailable") }
+				restarted.resetVerifyTimeout = 20 * time.Millisecond
+				restarted.resetVerifyPollInterval = time.Millisecond
+			}
+			calls := &dockerCallRecorder{}
+			restarted.dockerRunner = func(args ...string) (string, error) { calls.record(args...); return "ok", nil }
+			oldEnv, oldShared := readFile(t, target.EnvFile), readFile(t, cfg.sharedEnvFile())
+			repairErr := restarted.repairLifecycleJournal()
+			if mode == "succeeded" {
+				if repairErr != nil || stateFilePresent(cfg.lifecycleJournalFile) {
+					t.Fatalf("bound completed journal not cleared: %v", repairErr)
+				}
+			} else {
+				if repairErr == nil || readFile(t, cfg.lifecycleJournalFile) != string(wire) {
+					t.Fatalf("unsafe legacy repair/clear in %s: %v", mode, repairErr)
+				}
+			}
+			if calls.count() != 0 {
+				t.Fatalf("legacy cleanup/refusal reached Docker: %v", calls.snapshot())
+			}
+			if readFile(t, target.EnvFile) != oldEnv || readFile(t, cfg.sharedEnvFile()) != oldShared {
+				t.Fatal("legacy cleanup/refusal changed env or registry")
+			}
+			after, ok := restarted.lifecycleOperationStore.Lookup(operationID)
+			if !ok {
+				t.Fatal("linked operation lost")
+			}
+			if mode != "running" && after.Status != lifecycleJobSucceeded {
+				t.Fatal("terminal linked operation changed on cleanup refusal")
+			}
+		})
+	}
+}
