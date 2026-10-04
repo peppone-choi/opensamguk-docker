@@ -61,7 +61,7 @@ func TestResetEvidencePlanIdentityWindowAndUnknownFailClosed(t *testing.T) {
 		"wrong-server":      func(p *resetApprovalPlan) { p.ServerID = "uni" },
 		"wrong-operation":   func(p *resetApprovalPlan) { p.OperationID = strings.Repeat("b", 32) },
 		"wrong-fingerprint": func(p *resetApprovalPlan) { p.TargetFingerprint = strings.Repeat("b", 64) },
-		"source-mismatch":   func(p *resetApprovalPlan) { p.AppSourceSHA = strings.Repeat("b", 40) },
+		"source-mismatch":   func(p *resetApprovalPlan) { p.AppSourceSHA = strings.Repeat("f", 40) },
 		"missing-approval":  func(p *resetApprovalPlan) { p.ApprovalReceiptSHA = "" },
 		"missing-bound":     func(p *resetApprovalPlan) { p.SpaceBudget.RecoveryBytes = nil },
 		"not-open":          func(p *resetApprovalPlan) { p.WindowOpensAtUnix = now.Unix() + 1 },
