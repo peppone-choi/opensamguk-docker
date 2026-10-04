@@ -4,10 +4,42 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func withResetDigestPins(t *testing.T, body string) string {
+	t.Helper()
+	var fields map[string]any
+	if err := json.Unmarshal([]byte(body), &fields); err != nil {
+		t.Fatal(err)
+	}
+	fields["imageDigests"] = resetDigestPins()
+	payload, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(payload)
+}
+
+func resetDigestInspectFixture(t *testing.T, args []string) (string, bool) {
+	t.Helper()
+	if len(args) < 2 || args[0] != "image" || args[1] != "inspect" {
+		return "", false
+	}
+	ref := args[len(args)-1]
+	for _, service := range resetImageServices {
+		if strings.Contains(ref, ":"+service+"-") {
+			out, _ := json.Marshal(map[string]any{"repoDigests": []string{"ghcr.io/owner/opensamguk@" + resetDigestPins()[service]}, "os": "linux", "architecture": "amd64"})
+			return string(out), true
+		}
+	}
+	t.Fatalf("unexpected image reference: %s", ref)
+	return "", false
+}
 
 func resetDigestFixture(t *testing.T, digests map[string]string) resetLifecycleTarget {
 	t.Helper()
@@ -24,6 +56,97 @@ func resetDigestFixture(t *testing.T, digests map[string]string) resetLifecycleT
 		t.Fatal(err)
 	}
 	return target
+}
+
+func TestLeasedResetDigestFailureSettlesWithoutPublishingTarget(t *testing.T) {
+	cfg := configuredResetOperationTest(t)
+	envFile := filepath.Join(cfg.serversDir, "spep.env")
+	oldEnv := readFile(t, envFile)
+	oldShared := readFile(t, cfg.sharedEnvFile())
+	calls := &dockerCallRecorder{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
+		calls.record(args...)
+		if len(args) > 1 && args[0] == "image" && args[1] == "inspect" {
+			return `{"repoDigests":[],"os":"linux","architecture":"amd64"}`, nil
+		}
+		return "ok", nil
+	}
+	maintenance := cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance))
+	entered := decodeMaintenanceResponse(t, loopbackRequest(t, maintenance, http.MethodPost, "/maintenance/enter", ""))
+	tag := strings.Repeat("b", 40)
+	body := withResetDigestPins(t, `{"id":"pep","confirm":"RESET pep","operationId":"0123456789abcdef0123456789abcdef","scenarioCode":"scenario_990002","generation":"0","imageTag":"`+tag+`","webGameTag":"`+tag+`"}`)
+	request := httptest.NewRequest(http.MethodPost, "/servers/reset", strings.NewReader(body))
+	request.Header.Set("Authorization", "Bearer test-token")
+	request.Header.Set(maintenanceLeaseHeader, entered.Lease)
+	request.RemoteAddr = "127.0.0.1:31000"
+	response := httptest.NewRecorder()
+	cfg.withAuth(cfg.handleServerReset)(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("reset submission: %d %s", response.Code, response.Body.String())
+	}
+	var accepted createServerResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &accepted); err != nil {
+		t.Fatal(err)
+	}
+	waitForLifecycleJob(t, cfg.lifecycleJobs, accepted.JobID, lifecycleJobFailed)
+	operation, ok := cfg.lifecycleOperationStore.Lookup(accepted.OperationID)
+	if !ok || operation.Status != lifecycleJobFailed {
+		t.Fatalf("operation did not settle: %#v", operation)
+	}
+	for _, call := range calls.snapshot() {
+		if strings.Contains(call, "down ") || strings.Contains(call, "up ") {
+			t.Fatalf("unverified images reached mutation: %s", call)
+		}
+	}
+	if readFile(t, envFile) != oldEnv || readFile(t, cfg.sharedEnvFile()) != oldShared || stateFilePresent(cfg.lifecycleJournalFile) {
+		t.Fatal("failed verification published reset state")
+	}
+	state := decodeMaintenanceResponse(t, loopbackRequest(t, maintenance, http.MethodGet, "/maintenance", ""))
+	if state.State != maintenanceStateDrained {
+		t.Fatal("failed verification reopened maintenance")
+	}
+}
+
+func TestResetRecoveryVerifiesPinnedImagesBeforeEnvMutation(t *testing.T) {
+	cfg := configuredResetOperationTest(t)
+	envFile := filepath.Join(cfg.serversDir, "spep.env")
+	oldEnv := readFile(t, envFile)
+	oldShared := readFile(t, cfg.sharedEnvFile())
+	target, err := cfg.serverTargetForID("pep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.writeResetLifecycleJournal(target, resetDigestFixture(t, resetDigestPins())); err != nil {
+		t.Fatal(err)
+	}
+	calls := &dockerCallRecorder{}
+	cfg.dockerRunner = func(args ...string) (string, error) {
+		if dockerPreflightProbe(args) {
+			return "29.0.0\n", nil
+		}
+		calls.record(args...)
+		if len(args) > 1 && args[0] == "image" && args[1] == "inspect" {
+			return "null", nil
+		}
+		return "ok", nil
+	}
+	if err := cfg.repairLifecycleJournal(); err == nil {
+		t.Fatal("unverified recovery succeeded")
+	}
+	if readFile(t, envFile) != oldEnv || readFile(t, cfg.sharedEnvFile()) != oldShared {
+		t.Fatal("recovery verification changed env or registry")
+	}
+	if !stateFilePresent(cfg.lifecycleJournalFile) {
+		t.Fatal("failed recovery discarded evidence")
+	}
+	for _, call := range calls.snapshot() {
+		if strings.Contains(call, "down ") || strings.Contains(call, "up ") {
+			t.Fatalf("unverified recovery reached mutation: %s", call)
+		}
+	}
 }
 
 func resetDigestPins() map[string]string {

@@ -988,6 +988,7 @@ type resetLifecycleTarget struct {
 	Generation          int               `json:"generation"`
 	ScenarioSeedEnabled bool              `json:"scenarioSeedEnabled"`
 	Updates             map[string]string `json:"updates,omitempty"`
+	ImageDigests        map[string]string `json:"imageDigests,omitempty"`
 }
 
 const (
@@ -1278,6 +1279,11 @@ func (c config) repairLifecycleJournal() (repairErr error) {
 			return err
 		}
 	case "reset":
+		if journal.ResetTarget != nil && hasResetImagePins(*journal.ResetTarget) {
+			if _, err := c.pullResetCandidate(lease.Context(), target, *journal.ResetTarget); err != nil {
+				return err
+			}
+		}
 		if err := c.prepareResetRecovery(journal, target); err != nil {
 			return err
 		}
@@ -2454,28 +2460,29 @@ type createServerRequest struct {
 }
 
 type resetServerRequest struct {
-	ID                  string   `json:"id"`
-	OperationID         string   `json:"operationId"`
-	MaintenanceLease    string   `json:"maintenanceLease,omitempty"`
-	Confirm             string   `json:"confirm"`
-	ImageTag            string   `json:"imageTag,omitempty"`
-	WebGameTag          string   `json:"webGameTag,omitempty"`
-	Generation          string   `json:"generation"`
-	ScenarioCode        string   `json:"scenarioCode"`
-	ScenarioSeedEnabled *bool    `json:"scenarioSeedEnabled"`
-	TurnTerm            string   `json:"turnTerm"`
-	Sync                string   `json:"sync"`
-	Fiction             string   `json:"fiction"`
-	Extend              string   `json:"extend"`
-	BlockGeneralCreate  string   `json:"blockGeneralCreate"`
-	NPCMode             string   `json:"npcMode"`
-	ShowImgLevel        string   `json:"showImgLevel"`
-	AutorunUserOptions  []string `json:"autorunUserOptions"`
-	AutorunUserMinutes  string   `json:"autorunUserMinutes"`
-	JoinMode            string   `json:"joinMode"`
-	TournamentTrig      string   `json:"tournamentTrig"`
-	ReserveOpen         string   `json:"reserveOpen"`
-	PreReserveOpen      string   `json:"preReserveOpen"`
+	ID                  string            `json:"id"`
+	OperationID         string            `json:"operationId"`
+	MaintenanceLease    string            `json:"maintenanceLease,omitempty"`
+	Confirm             string            `json:"confirm"`
+	ImageTag            string            `json:"imageTag,omitempty"`
+	WebGameTag          string            `json:"webGameTag,omitempty"`
+	ImageDigests        map[string]string `json:"imageDigests,omitempty"`
+	Generation          string            `json:"generation"`
+	ScenarioCode        string            `json:"scenarioCode"`
+	ScenarioSeedEnabled *bool             `json:"scenarioSeedEnabled"`
+	TurnTerm            string            `json:"turnTerm"`
+	Sync                string            `json:"sync"`
+	Fiction             string            `json:"fiction"`
+	Extend              string            `json:"extend"`
+	BlockGeneralCreate  string            `json:"blockGeneralCreate"`
+	NPCMode             string            `json:"npcMode"`
+	ShowImgLevel        string            `json:"showImgLevel"`
+	AutorunUserOptions  []string          `json:"autorunUserOptions"`
+	AutorunUserMinutes  string            `json:"autorunUserMinutes"`
+	JoinMode            string            `json:"joinMode"`
+	TournamentTrig      string            `json:"tournamentTrig"`
+	ReserveOpen         string            `json:"reserveOpen"`
+	PreReserveOpen      string            `json:"preReserveOpen"`
 }
 
 type createServerResponse struct {
@@ -4042,12 +4049,17 @@ func (c config) resetServerWithMaintenanceLease(rawID string, req resetServerReq
 		return createServerResponse{OK: false, ID: id, Detail: "리셋 확인 문구가 일치하지 않습니다."}, http.StatusBadRequest
 	}
 	if maintenanceLease == "" {
-		if req.ImageTag != "" || req.WebGameTag != "" {
+		if req.ImageTag != "" || req.WebGameTag != "" || len(req.ImageDigests) != 0 {
 			return createServerResponse{OK: false, ID: id, Detail: "이미지 pin은 유지보수 리셋에서만 변경할 수 있습니다."}, http.StatusBadRequest
 		}
 	} else if id != "pep" || req.OperationID == "" || req.ScenarioCode != "scenario_990002" ||
-		!gitSHA40.MatchString(req.ImageTag) || !gitSHA40.MatchString(req.WebGameTag) {
+		!gitSHA40.MatchString(req.ImageTag) || req.ImageTag != req.WebGameTag {
 		return createServerResponse{OK: false, ID: id, Detail: "PEP 유지보수 리셋에 정확한 후보 pin과 작업 ID가 필요합니다."}, http.StatusBadRequest
+	}
+	if maintenanceLease != "" {
+		if _, err := normalizeResetImageDigests(req.ImageDigests); err != nil {
+			return createServerResponse{OK: false, ID: id, Detail: err.Error()}, http.StatusBadRequest
+		}
 	}
 	requestedOperationID, err := normalizeLifecycleOperationID(req.OperationID)
 	if err != nil {
@@ -4081,7 +4093,7 @@ func (c config) resetServerWithMaintenanceLease(rawID string, req resetServerReq
 	if _, err := os.Stat(envFile); err != nil {
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: fmt.Sprintf("서버 env 확인 실패: %v", err)}, http.StatusInternalServerError
 	}
-	resetTarget, err := resetLifecycleTargetForEnv(envFile, updates)
+	resetTarget, err := resetLifecycleTargetForEnvWithImageDigests(envFile, updates, req.ImageDigests)
 	if err != nil {
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: err.Error()}, http.StatusBadRequest
 	}
@@ -5111,6 +5123,10 @@ func isResetLifecycleUpdateKey(key string) bool {
 }
 
 func resetLifecycleTargetForEnv(envFile string, requested map[string]string) (resetLifecycleTarget, error) {
+	return resetLifecycleTargetForEnvWithImageDigests(envFile, requested, nil)
+}
+
+func resetLifecycleTargetForEnvWithImageDigests(envFile string, requested map[string]string, digests map[string]string) (resetLifecycleTarget, error) {
 	current, err := readEnvValues(envFile)
 	if err != nil {
 		return resetLifecycleTarget{}, err
@@ -5164,6 +5180,7 @@ func resetLifecycleTargetForEnv(envFile string, requested map[string]string) (re
 		Generation:          expected.generation,
 		ScenarioSeedEnabled: true,
 		Updates:             updates,
+		ImageDigests:        digests,
 	}
 	return normalizeResetLifecycleTarget(target)
 }
@@ -5207,6 +5224,9 @@ func normalizeResetLifecycleTarget(target resetLifecycleTarget) (resetLifecycleT
 	}
 	target.Generation = generation
 	target.Updates = updates
+	if err := normalizeResetImageTarget(&target); err != nil {
+		return resetLifecycleTarget{}, err
+	}
 	return target, nil
 }
 
@@ -5473,6 +5493,14 @@ func (c config) upServerStack(ctx context.Context, project, envFile string) (str
 }
 
 func (c config) pullResetCandidate(ctx context.Context, target serverTarget, resetTarget resetLifecycleTarget) (string, error) {
+	var err error
+	resetTarget, err = normalizeResetLifecycleTarget(resetTarget)
+	if err != nil {
+		return "", err
+	}
+	if !hasResetImagePins(resetTarget) {
+		return "", errors.New("candidate pull requires approved image pins")
+	}
 	if _, err := c.validateServerTarget(target); err != nil {
 		return "", err
 	}
@@ -5499,12 +5527,19 @@ func (c config) pullResetCandidate(ctx context.Context, target serverTarget, res
 	if _, err := c.validateDockerServerTarget(target.Project, stagedPath, true); err != nil {
 		return "", err
 	}
-	return c.runServerDockerContext(ctx,
+	detail, err := c.runServerDockerContext(ctx,
 		"compose", "-p", target.Project,
 		"--env-file", stagedPath,
 		"-f", c.composeServer,
 		"pull", "game-engine", "game-api", "web-game",
 	)
+	if err != nil {
+		return detail, err
+	}
+	if err := c.verifyResetCandidateImages(ctx, stagedPath, resetTarget); err != nil {
+		return "", err
+	}
+	return detail, nil
 }
 
 func (c config) reconcileServerRegistry(target serverTarget) error {

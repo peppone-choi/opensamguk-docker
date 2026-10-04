@@ -5719,6 +5719,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 			return "29.0.0\n", nil
 		}
 		calls.record(args...)
+		if out, ok := resetDigestInspectFixture(t, args); ok {
+			return out, nil
+		}
 		return "ok\n", nil
 	}
 	maintenance := cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance))
@@ -5728,7 +5731,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	}
 	operationID := "0123456789abcdef0123456789abcdef"
 	newTag := strings.Repeat("b", 40)
-	body := `{"id":"pep","confirm":"RESET pep","operationId":"` + operationID + `","generation":"2","scenarioCode":"scenario_990002","imageTag":"` + newTag + `","webGameTag":"` + newTag + `"}`
+	body := withResetDigestPins(t, `{"id":"pep","confirm":"RESET pep","operationId":"`+operationID+`","generation":"2","scenarioCode":"scenario_990002","imageTag":"`+newTag+`","webGameTag":"`+newTag+`"}`)
 	reset := cfg.withAuth(cfg.handleServerReset)
 	request := func(remote, lease, payload string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/servers/reset", bytes.NewBufferString(payload))
@@ -5775,8 +5778,8 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 		t.Fatalf("leased reset completion=%#v", completed)
 	}
 	recorded := calls.snapshot()
-	if len(recorded) < 2 || !strings.Contains(recorded[0], "pull game-engine game-api web-game") ||
-		!strings.Contains(recorded[1], "down --volumes --remove-orphans") {
+	if len(recorded) < 5 || !strings.Contains(recorded[0], "pull game-engine game-api web-game") ||
+		!strings.Contains(recorded[4], "down --volumes --remove-orphans") {
 		t.Fatalf("candidate images were not pulled before volume removal: %#v", recorded)
 	}
 	serverEnv := readFile(t, envFile)
@@ -5823,7 +5826,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 		t.Fatal("maintenance did not drain")
 	}
 	tag := strings.Repeat("b", 40)
-	body := `{"id":"pep","confirm":"RESET pep","operationId":"0123456789abcdef0123456789abcdef","generation":"2","scenarioCode":"scenario_990002","imageTag":"` + tag + `","webGameTag":"` + tag + `"}`
+	body := withResetDigestPins(t, `{"id":"pep","confirm":"RESET pep","operationId":"0123456789abcdef0123456789abcdef","generation":"2","scenarioCode":"scenario_990002","imageTag":"`+tag+`","webGameTag":"`+tag+`"}`)
 	req := httptest.NewRequest(http.MethodPost, "/servers/reset", bytes.NewBufferString(body))
 	req.Header.Set("Authorization", "Bearer test-token")
 	req.Header.Set("Content-Type", "application/json")
@@ -5878,7 +5881,7 @@ func TestResetJournalRejectsMutableImagePins(t *testing.T) {
 func TestPepLeasedResetRefusesOpenMaintenance(t *testing.T) {
 	cfg := configuredResetOperationTest(t)
 	newTag := strings.Repeat("b", 40)
-	body := `{"id":"pep","confirm":"RESET pep","operationId":"0123456789abcdef0123456789abcdef","generation":"2","scenarioCode":"scenario_990002","imageTag":"` + newTag + `","webGameTag":"` + newTag + `"}`
+	body := withResetDigestPins(t, `{"id":"pep","confirm":"RESET pep","operationId":"0123456789abcdef0123456789abcdef","generation":"2","scenarioCode":"scenario_990002","imageTag":"`+newTag+`","webGameTag":"`+newTag+`"}`)
 	req := httptest.NewRequest(http.MethodPost, "/servers/reset", bytes.NewBufferString(body))
 	req.Header.Set("Authorization", "Bearer test-token")
 	req.Header.Set("Content-Type", "application/json")
