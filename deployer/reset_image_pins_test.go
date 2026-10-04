@@ -483,7 +483,7 @@ func TestResetCandidatePinsExactServiceTagsForInspectAndPull(t *testing.T) {
 }
 
 func TestLinkedLegacyPinnedJournalCleanupRequiresBoundSuccess(t *testing.T) {
-	for _, mode := range []string{"running", "succeeded", "wrong-subject", "wrong-kind", "wrong-fingerprint", "postcondition-failure"} {
+	for _, mode := range []string{"running", "succeeded", "wrong-subject", "wrong-kind", "wrong-fingerprint", "wrong-env", "postcondition-failure"} {
 		t.Run(mode, func(t *testing.T) {
 			cfg := configuredResetOperationTest(t)
 			operationID := "8899aabbccddeeff0011223344556677"
@@ -503,7 +503,7 @@ func TestLinkedLegacyPinnedJournalCleanupRequiresBoundSuccess(t *testing.T) {
 			}
 			mustReserveOperation(t, cfg.lifecycleOperationStore, record)
 			if mode != "running" {
-				mustTransitionOperation(t, cfg.lifecycleOperationStore, operationID, lifecycleJobSucceeded, http.StatusOK, durableOperationResetSucceededMessage)
+				mustTransitionOperation(t, cfg.lifecycleOperationStore, operationID, lifecycleJobSucceeded, http.StatusOK, durableOperationSuccessMessage(record.Kind))
 			}
 			target, err := cfg.serverTargetForID("pep")
 			if err != nil {
@@ -517,6 +517,14 @@ func TestLinkedLegacyPinnedJournalCleanupRequiresBoundSuccess(t *testing.T) {
 			}
 			if err := cfg.reconcileServerRegistry(target); err != nil {
 				t.Fatal(err)
+			}
+			if mode == "wrong-env" {
+				if _, err := patchEnvFile(target.EnvFile, serverEnvAllowlist, map[string]string{"SCENARIO_CODE": "scenario_1010"}); err != nil {
+					t.Fatal(err)
+				}
+				if err := cfg.reconcileServerRegistry(target); err != nil {
+					t.Fatal(err)
+				}
 			}
 			wire, err := json.Marshal(lifecycleJournal{Version: lifecycleJournalVersion, Operation: "reset", OperationID: operationID, OperationKind: lifecycleKindReset, Stage: lifecycleJournalStageDown, ServerID: "pep", Project: target.Project, ResetTarget: &legacy})
 			if err != nil {
