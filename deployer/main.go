@@ -154,6 +154,8 @@ var serverEnvAllowlist = map[string]envFieldSpec{
 	"JWT_PUBLIC_KEY":                 {Description: "JWT 검증 공개키(비밀 아님, gateway-api와 동일 값)"},
 	"JWT_LEGACY_SECRET":              {Description: "레거시 HS256 검증 시크릿", WriteOnly: true},
 	"JWT_LEGACY_ACCESS_ACCEPT_UNTIL": {Description: "레거시 토큰 수용 만료 시각"},
+	"RESET_MAXGENERAL":               {Description: "리셋: 사람 조작 장수 정원"},
+	"RESET_FIRST_TURN":               {Description: "리셋: 첫 턴 정책"},
 	"RESET_TURNTERM":                 {Description: "리셋: 턴 시간(분)"},
 	"RESET_SYNC":                     {Description: "리셋: 시간 동기화"},
 	"RESET_FICTION":                  {Description: "리셋: NPC 상성"},
@@ -179,6 +181,8 @@ var v2ServerDefinitionKeys = map[string]struct{}{
 // deployer process because Compose gives its shell environment precedence over
 // --env-file.
 var serverComposeInterpolationKeys = map[string]struct{}{
+	"RESET_MAXGENERAL":               {},
+	"RESET_FIRST_TURN":               {},
 	"COMPOSE_HOST_DIR":               {},
 	"GATEWAY_API_URL":                {},
 	"INTERNAL_SERVICE_TOKEN":         {},
@@ -223,6 +227,10 @@ var serverComposeProcessControlKeys = map[string]struct{}{
 }
 
 var resetLifecycleUpdateKeys = []string{
+	"SERVER_NAME",
+	"RESET_MAXGENERAL",
+	"RESET_FIRST_TURN",
+	"SCENARIO_LOOKUP_DIR",
 	"IMAGE_TAG",
 	"WEB_GAME_TAG",
 	"SCENARIO_CODE",
@@ -244,6 +252,8 @@ var resetLifecycleUpdateKeys = []string{
 }
 
 var registryEnvAllowlist = map[string]struct{}{
+	"RESET_MAXGENERAL":           {},
+	"RESET_FIRST_TURN":           {},
 	"IMAGE_TAG":                  {},
 	"GAME_API_PORT":              {},
 	"WEB_GAME_PORT":              {},
@@ -1210,6 +1220,21 @@ func (c config) repairLifecycleJournal() (repairErr error) {
 	if !exists {
 		return errors.New("lifecycle recovery journal is unavailable")
 	}
+	var linkedOperation durableOperationRecord
+	if journal.OperationID != "" {
+		if c.lifecycleOperationStore == nil {
+			return errors.New("linked lifecycle operation store is unavailable")
+		}
+		var found bool
+		linkedOperation, found = c.lifecycleOperationStore.Lookup(journal.OperationID)
+		if !found || linkedOperation.Kind != journal.OperationKind || linkedOperation.SubjectID != journal.ServerID {
+			return errors.New("linked lifecycle operation identity is invalid")
+		}
+		if linkedOperation.Status == lifecycleJobSucceeded && journal.ResetTarget != nil &&
+			linkedOperation.RequestFingerprint != resetRequestFingerprint(journal.ServerID, *journal.ResetTarget) {
+			return errors.New("completed reset operation target is invalid")
+		}
+	}
 	linkedOperationSettled := false
 	defer func() {
 		if repairErr == nil || journal.OperationID == "" || linkedOperationSettled {
@@ -1219,22 +1244,22 @@ func (c config) repairLifecycleJournal() (repairErr error) {
 			repairErr = fmt.Errorf("%v; persist recovery-required operation: %w", repairErr, transitionErr)
 		}
 	}()
-	if journal.ResetTarget != nil {
-		if _, err := normalizeResetLifecycleTarget(*journal.ResetTarget); err != nil {
-			return err
-		}
-	}
 	target, err := c.serverTargetForID(journal.ServerID)
 	if err != nil || target.Project != journal.Project {
 		return errors.New("lifecycle recovery target is invalid")
 	}
-	if journal.OperationID != "" {
-		if operation, ok := c.lifecycleOperationStore.Lookup(journal.OperationID); ok && operation.Status == lifecycleJobSucceeded {
-			if err := c.verifySucceededLifecycleJournal(journal, target); err != nil {
-				return err
-			}
-			linkedOperationSettled = true
-			return c.clearLifecycleJournal()
+	if journal.OperationID != "" && linkedOperation.Status == lifecycleJobSucceeded {
+		// This path only verifies the bound completed state and clears its journal.
+		// It must not replay legacy images, or rewrite a terminal operation on refusal.
+		linkedOperationSettled = true
+		if err := c.verifySucceededLifecycleJournal(journal, target); err != nil {
+			return err
+		}
+		return c.clearLifecycleJournal()
+	}
+	if journal.ResetTarget != nil {
+		if _, err := normalizeResetLifecycleTarget(*journal.ResetTarget); err != nil {
+			return err
 		}
 	}
 	if _, envErr := os.Stat(target.EnvFile); envErr == nil {
@@ -1395,8 +1420,16 @@ func (c config) verifySucceededLifecycleJournal(journal lifecycleJournal, target
 			return errors.New("completed close retained its registry entry")
 		}
 	case "reset":
-		if _, err := c.validateServerTarget(target); err != nil {
+		values, err := c.validateServerTarget(target)
+		if err != nil {
 			return err
+		}
+		if journal.ResetTarget != nil {
+			for key, expected := range journal.ResetTarget.Updates {
+				if actual, exists := values[key]; !exists || actual != expected {
+					return errors.New("completed reset env does not match its journal target")
+				}
+			}
 		}
 		if err := c.verifyResetRuntime(context.Background(), target); err != nil {
 			return err
@@ -2473,6 +2506,10 @@ type resetServerRequest struct {
 	WebGameTag          string            `json:"webGameTag,omitempty"`
 	ImageDigests        map[string]string `json:"imageDigests,omitempty"`
 	Generation          string            `json:"generation"`
+	ServerName          *string           `json:"serverName,omitempty"`
+	MaxGeneral          *int              `json:"maxGeneral,omitempty"`
+	FirstTurn           *string           `json:"firstTurn,omitempty"`
+	ScenarioLookupDir   *string           `json:"scenarioLookupDir,omitempty"`
 	ScenarioCode        string            `json:"scenarioCode"`
 	ScenarioSeedEnabled *bool             `json:"scenarioSeedEnabled"`
 	TurnTerm            string            `json:"turnTerm"`
@@ -4053,6 +4090,9 @@ func (c config) resetServerWithMaintenanceLease(rawID string, req resetServerReq
 	if req.Confirm != "RESET "+id {
 		return createServerResponse{OK: false, ID: id, Detail: "리셋 확인 문구가 일치하지 않습니다."}, http.StatusBadRequest
 	}
+	if req.ScenarioCode == "scenario_3190" && maintenanceLease == "" {
+		return createServerResponse{OK: false, ID: id, Detail: "3190 리셋은 검증된 유지보수 실행 경로가 필요합니다."}, http.StatusBadRequest
+	}
 	if maintenanceLease == "" {
 		if req.ImageTag != "" || req.WebGameTag != "" || len(req.ImageDigests) != 0 {
 			return createServerResponse{OK: false, ID: id, Detail: "이미지 pin은 유지보수 리셋에서만 변경할 수 있습니다."}, http.StatusBadRequest
@@ -5054,7 +5094,10 @@ func envValuesFromLines(lines []envLine) map[string]string {
 }
 
 func resetEnvUpdates(req resetServerRequest) (map[string]string, error) {
-	values := map[string]string{}
+	values, err := explicitResetSettings(req)
+	if err != nil {
+		return nil, err
+	}
 	putSafe := func(key, value string) error {
 		value = strings.TrimSpace(value)
 		if value == "" {
@@ -5161,6 +5204,11 @@ func resetLifecycleTargetForEnvWithImageDigests(envFile string, requested map[st
 	}
 	updates := make(map[string]string, len(resetLifecycleUpdateKeys))
 	for _, key := range resetLifecycleUpdateKeys {
+		if key == "SERVER_NAME" || key == "RESET_MAXGENERAL" || key == "RESET_FIRST_TURN" || key == "SCENARIO_LOOKUP_DIR" {
+			if _, explicit := requested[key]; !explicit {
+				continue
+			}
+		}
 		// Ordinary reset fingerprints keep their old shape. Image pins are
 		// part of the target only when a leased reset requests them explicitly.
 		if key == "IMAGE_TAG" || key == "WEB_GAME_TAG" {
@@ -5191,6 +5239,9 @@ func resetLifecycleTargetForEnvWithImageDigests(envFile string, requested map[st
 }
 
 func normalizeResetLifecycleTarget(target resetLifecycleTarget) (resetLifecycleTarget, error) {
+	if err := validateExplicitResetTargetSettings(target.Updates); err != nil {
+		return resetLifecycleTarget{}, err
+	}
 	target.ScenarioCode = strings.TrimSpace(target.ScenarioCode)
 	if !isSafeToken(target.ScenarioCode) {
 		return resetLifecycleTarget{}, errors.New("reset scenario code is invalid")

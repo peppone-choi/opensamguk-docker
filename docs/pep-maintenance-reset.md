@@ -16,11 +16,13 @@ Deployer는 임시 env로 같은 SHA 태그의 로컬 이미지를 먼저 inspec
 정확한 repository digest와 `linux/amd64`이면 재pull 없이 진행합니다. 로컬 이미지가 없거나 검증이
 안 되면 후보 세 서비스를 pull하고 다시 inspect합니다. 검증 전 canonical env/저널을 쓰거나 볼륨을 내리지 않습니다.
 승인된 digest는 reset target·요청 fingerprint·영속 journal에 포함됩니다. 같은 작업 ID에 다른
-이미지 digest를 넣으면 다른 요청으로 취급합니다. lease는 한 번 쓰면 재사용할 수 없고 maintenance는 자동으로 열리지 않습니다.
+이미지 digest를 넣으면 HTTP 409로 거절합니다. lease는 한 번 쓰면 재사용할 수 없고 maintenance는 자동으로 열리지 않습니다.
 일반 reset은 이미지 pin을 변경할 수 없습니다.
 
 pin만 있고 digest는 없는 legacy journal은 읽기와 Deployer 기동을 허용합니다. 해당 journal의
-복구 실행은 거절하고 journal과 닫힌 barrier를 보존합니다. 이를 지워 새 요청으로 대체하지 않고
+미완료 작업의 복구 실행은 거절하고 journal과 닫힌 barrier를 보존합니다. 이미 성공한 연결 작업은
+작업 종류·서버·요청 fingerprint 및 게시된 env/runtime/registry 사후 조건을 확인한 뒤 저널만 정리합니다.
+이 정리 경로는 옛 이미지 재실행을 허용하지 않습니다. 이를 지워 새 요청으로 대체하지 않고
 정확한 목표 이미지·데이터 상태를 확인한 복구 절차를 준비합니다.
 
 이 API의 source/CI attestation, 외부 시나리오 선택 바이트, writer quiesce, 백업·공간·PG/Redis pin은

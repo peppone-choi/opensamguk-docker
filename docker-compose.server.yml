@@ -84,6 +84,9 @@ services:
       # 기본값을 비워 두는 것은 의도적이다 — 미설정의 의미(60분)는 게임 엔진
       # (SeedBootstrap.DEFAULT_TURN_TERM)이 단독으로 소유해야 두 곳이 갈라지지 않는다.
       RESET_TURNTERM: ${RESET_TURNTERM:-}
+      # Consumer-owned defaults apply only to an existing/legacy world.
+      RESET_MAXGENERAL: ${RESET_MAXGENERAL:-}
+      RESET_FIRST_TURN: ${RESET_FIRST_TURN:-}
       # 같은 리셋이 고른 나머지 시나리오 옵션. 위와 같은 이유로 기본값을 비워 둔다 —
       # 미설정의 의미(PHP install.php 기본값)는 게임 엔진(SeedBootstrap의 PHP_DEFAULT_*)이
       # 단독으로 소유해야 compose와 엔진이 갈라지지 않는다.
