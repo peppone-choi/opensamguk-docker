@@ -4,12 +4,91 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestLegacyPinnedResetJournalLoadsButCannotRepair(t *testing.T) {
+	for _, stage := range []string{lifecycleJournalStagePrepared, lifecycleJournalStageEnv, lifecycleJournalStageRegistry, lifecycleJournalStageDown} {
+		t.Run(stage, func(t *testing.T) {
+			cfg := configuredResetOperationTest(t)
+			legacy := resetDigestFixture(t, nil)
+			legacy.Updates["WEB_GAME_TAG"] = strings.Repeat("c", 40)
+			wire, err := json.Marshal(lifecycleJournal{
+				Version: lifecycleJournalVersion, Operation: "reset", Stage: stage,
+				ServerID: "pep", Project: "opensamguk-spep", ResetTarget: &legacy,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeEnv(t, cfg.lifecycleJournalFile, string(wire))
+			if _, exists, err := cfg.readLifecycleJournal(); err != nil || !exists {
+				t.Fatalf("legacy journal is not readable: exists=%v err=%v", exists, err)
+			}
+			configureLoadConfigTest(t, cfg)
+			restarted, err := loadConfig()
+			if err != nil {
+				t.Fatalf("legacy journal prevented startup: %v", err)
+			}
+			envFile := filepath.Join(cfg.serversDir, "spep.env")
+			oldEnv := readFile(t, envFile)
+			oldShared := readFile(t, cfg.sharedEnvFile())
+			calls := &dockerCallRecorder{}
+			restarted.dockerRunner = func(args ...string) (string, error) { calls.record(args...); return "ok", nil }
+			if err := restarted.repairLifecycleJournal(); err == nil {
+				t.Fatal("legacy unbound images were replayed")
+			}
+			if calls.count() != 0 {
+				t.Fatal("legacy replay reached Docker")
+			}
+			if readFile(t, envFile) != oldEnv || readFile(t, cfg.sharedEnvFile()) != oldShared || readFile(t, cfg.lifecycleJournalFile) != string(wire) {
+				t.Fatal("legacy refusal changed reset state or discarded journal")
+			}
+		})
+	}
+}
+
+func TestResetCandidateUsesVerifiedLocalImagesBeforePull(t *testing.T) {
+	for _, cached := range []bool{true, false} {
+		t.Run(fmt.Sprintf("cached=%v", cached), func(t *testing.T) {
+			cfg := testConfig(t)
+			envFile := filepath.Join(cfg.serversDir, "spep.env")
+			writeEnv(t, envFile, "SERVER_ID=pep\nIMAGE_TAG=old\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1020\nSCENARIO_SEED_ENABLED=true\n")
+			target, err := cfg.serverTargetForID("pep")
+			if err != nil {
+				t.Fatal(err)
+			}
+			pulls, inspections := 0, 0
+			cfg.dockerRunner = func(args ...string) (string, error) {
+				if len(args) > 1 && args[0] == "image" && args[1] == "inspect" {
+					inspections++
+					if !cached && pulls == 0 {
+						return "null", nil
+					}
+					out, _ := resetDigestInspectFixture(t, args)
+					return out, nil
+				}
+				if strings.Contains(strings.Join(args, " "), "pull game-engine game-api web-game") {
+					pulls++
+				}
+				return "ok", nil
+			}
+			if _, err := cfg.pullResetCandidate(context.Background(), target, resetDigestFixture(t, resetDigestPins())); err != nil {
+				t.Fatal(err)
+			}
+			if cached && (pulls != 0 || inspections != 3) {
+				t.Fatalf("verified local images were pulled again: pulls=%d inspections=%d", pulls, inspections)
+			}
+			if !cached && (pulls != 1 || inspections != 4) {
+				t.Fatalf("missing local images were not checked before and after pull: pulls=%d inspections=%d", pulls, inspections)
+			}
+		})
+	}
+}
 
 func withResetDigestPins(t *testing.T, body string) string {
 	t.Helper()
