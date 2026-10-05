@@ -24,6 +24,12 @@ func selectedD101Fixture(t *testing.T) (resetD101SelectedBytePins, map[string][]
 	if err := os.Chmod(directory, 0700); err != nil {
 		t.Fatal(err)
 	}
+	// Run before TempDir cleanup, including tests that remove directory write permission.
+	t.Cleanup(func() {
+		if err := os.Chmod(directory, 0700); err != nil {
+			t.Error(err)
+		}
+	})
 	pins := resetD101SelectedBytePins{Directory: directory, Pins: make(map[string]resetD101RawBytePin)}
 	originals := make(map[string][]byte)
 	for _, leaf := range []string{"tiles.json", "world.json", "roads.json", "selected-scenario.json", "classpath-scenario.json"} {
