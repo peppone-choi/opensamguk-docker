@@ -71,6 +71,10 @@ func resetD101PurposeRoute(action, op string) (string, string, error) {
 		return "POST", base + "/dispatch-intent", nil
 	case "SETTLE_REGISTRY":
 		return "POST", base + "/terminal", nil
+	case "RECOVERY_BEGIN":
+		return "POST", base + "/recovery-begin", nil
+	case "RECOVERY_CLOSE":
+		return "POST", base + "/recovery-close", nil
 	}
 	return "", "", errResetExecutionEvidence
 }
@@ -89,7 +93,7 @@ func requireResetD101Authority(authority resetD101VerifiedPurposeAuthority, requ
 		if now.Unix() < intent.Intent.WindowOpensAtUnix || now.Unix() >= intent.Intent.DestructiveCutoffUnix {
 			return resetDecodedApprovalIntent{}, errResetExecutionEvidence
 		}
-	case "SETTLE_REGISTRY":
+	case "SETTLE_REGISTRY", "RECOVERY_BEGIN", "RECOVERY_CLOSE":
 		if now.Unix() < intent.Intent.WindowOpensAtUnix || now.Unix() >= intent.Intent.RecoveryDeadlineUnix {
 			return resetDecodedApprovalIntent{}, errResetExecutionEvidence
 		}

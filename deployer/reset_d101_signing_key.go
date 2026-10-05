@@ -87,7 +87,7 @@ func readResetD101SigningKeyWithUID(pins resetD101SigningKeyPins, uid uint32) (r
 func (key *resetD101SigningKey) close() { clear(key.private); key.private = nil }
 func (key *resetD101SigningKey) sign(domain string, original []byte) ([]byte, error) {
 	if len(key.private) != ed25519.PrivateKeySize || !resetD101KeyID.MatchString(key.keyID) ||
-		(domain != "OPENSAMGUK-D101-GRANT-V1\n" && domain != "OPENSAMGUK-D101-RESULT-V1\n") {
+		(domain != "OPENSAMGUK-D101-GRANT-V1\n" && domain != "OPENSAMGUK-D101-RESULT-V1\n" && domain != resetD101RecoveryResultDomain) {
 		return nil, errResetExecutionEvidence
 	}
 	message := append([]byte(domain), original...)
