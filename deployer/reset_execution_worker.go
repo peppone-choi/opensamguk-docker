@@ -61,11 +61,9 @@ func (c config) runResetD101PhysicalWorker(lease *operationLease, target serverT
 	// finish inside the original cutoff. Admission and retries never renew it.
 	bounded, cancel := context.WithDeadline(ctx, time.Unix(evidence.Plan.DestructiveCutoffUnix, 0))
 	defer cancel()
-	prepared, err := c.observeResetExecutionPhase(bounded, binding, source)
-	if err != nil {
-		return "", err
-	}
-	chain, err := newResetExecutionJournal(binding, prepared)
+	// Reuse the preparation verified by Gateway before dispatch. Observing a
+	// new initial phase here would break the signed first-admission chain.
+	_, chain, err := c.readResetD101PreparedPhase(binding, record, evidence, 0)
 	if err != nil {
 		return "", err
 	}

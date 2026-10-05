@@ -66,3 +66,42 @@ Still unconnected: the approved authority producer and installation card,
 physical D101 worker, coordinator, and approved physical recovery path.
 The result route remains unavailable in production configuration. Local tests
 use public synthetic keys and isolated files, not operating trust or keys.
+# First admission and PREPARED proof
+
+Root preparation now reserves the D101 intent identity in the existing durable
+operation store before observing an actual phase. The published maintenance
+preparation and unconsumed lease are pinned to that operation. First `CreatedAt`,
+original plan/preflight references, target, R/V and cutoffs remain unchanged.
+The first actual phase chain and its 20-field proof are separate immutable
+private files under `.deployer-reset-prepared-phases` and
+`.deployer-reset-prepared-proofs`. The directories must already have approved
+root-private custody; this code does not create them or install keys.
+
+`GET /operations/{operationId}/prepared-proof/{approvalPlanSha256}/{executionReceiptSha256}`
+returns the original proof bytes with `X-D101-Prepared-Sha256` and
+`X-D101-Prepared-Proof` (`keyId.signature`, Ed25519 over
+`OPENSAMGUK-D101-PREPARED-V1\n` plus those original bytes). The route is subject
+to existing Root authentication, exact identity, body/query/encoded-path refusal,
+16 KiB, two-second deadline and the shared two-reader limit. A timed-out reader
+holds its slot until it actually exits. `preparedAtUtc` is the actual snapshot's
+observation time; reads require it to remain younger than 30 seconds and inside
+the original destructive cutoff. Signing does not renew that time.
+
+The proof fields are schemaVersion, serverId, worldId, operationId, phase,
+approvalIntentSha256, approvalPlanSha256, executionReceiptSha256,
+targetFingerprint, rootRequestFingerprint, gatewayPayloadSha256,
+initialPublicRevision, verifyingRevision, appSourceSha, imageDigests,
+acceptedAtUtc, preparedAtUtc, preparedJournalSha256, destructiveCutoffUnix and
+recoveryDeadlineUnix. It describes actual preparation, not operating approval.
+
+Gateway must verify this proof and commit DISPATCH_INTENT before Root activation.
+Activation reads that actual Gateway state before consuming the same lease.
+The physical worker reuses the persisted initial chain, then observes its later
+phases freshly. Preparation does not pull, write env, advance the lifecycle
+journal, down or up. A durable admission with incomplete proof cannot repeat its
+initial observation. Restart loses the in-memory preparation and closes proof
+issuance/activation while retaining the durable identity for explicit recovery.
+
+Actual approved authority, phase source, host custody, key provisioning and
+request/CLI wiring remain required. Their unavailable defaults remain closed;
+source tests and CI do not attest a physical reset or operating readiness.

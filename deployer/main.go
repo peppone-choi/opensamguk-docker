@@ -531,7 +531,7 @@ func (c *operationCoordinator) prepare(kind lifecycleKind, operationID, subjectI
 	p := &operationPreparation{coordinator: c, kind: kind, operationID: operationID, subjectID: subjectID, fingerprint: fingerprint, leaseAttempt: token, ctx: ctx, cancel: cancel}
 	if c.closed {
 		lease := c.maintenanceLease
-		if lease == nil || lease.consumed || !secureEqual(lease.token, token) {
+		if lease == nil || lease.consumed || !secureEqual(lease.token, token) || (lease.operationID != "" && lease.operationID != operationID) {
 			p.admissionErr = errMaintenanceClosed
 		}
 	}
@@ -561,7 +561,7 @@ func (p *operationPreparation) promote(jobID string) (*operationLease, error) {
 		if c.closed {
 			lease := c.maintenanceLease
 			leasedKind := p.kind == lifecycleKindCreate || (p.kind == lifecycleKindReset && p.subjectID == "pep")
-			if !leasedKind || p.operationID == "" || p.leaseAttempt == "" || lease == nil || lease.consumed || !secureEqual(lease.token, p.leaseAttempt) {
+			if !leasedKind || p.operationID == "" || p.leaseAttempt == "" || lease == nil || lease.consumed || !secureEqual(lease.token, p.leaseAttempt) || (lease.operationID != "" && lease.operationID != p.operationID) {
 				return errMaintenanceClosed
 			}
 		}
@@ -2869,6 +2869,10 @@ func (c config) handleOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/operations/")
+	if isResetD101PreparedPath(path) {
+		c.handleResetD101PreparedProof(w, r, strings.Split(path, "/"))
+		return
+	}
 	if isResetD101ResultPath(path) {
 		c.handleResetD101ExecutionResult(w, r, strings.Split(path, "/"))
 		return
