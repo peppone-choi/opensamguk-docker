@@ -35,7 +35,7 @@ func (c config) requireResetD101WorkerLease(lease *operationLease, binding reset
 // It does not settle Gateway canonical metadata or publish PUBLIC.
 func (c config) runResetD101PhysicalWorker(lease *operationLease, target serverTarget, binding resetExecutionPhaseBinding, source resetExecutionPhaseSource) (string, error) {
 	expectedTarget, targetErr := c.serverTargetForID("pep")
-	if source == nil || c.d101PurposeAuthority == nil || c.d101CandidatePipeline == nil || target.ID != "pep" || target.Project != "opensamguk-spep" ||
+	if source == nil || c.d101PurposeAuthority == nil || c.d101CandidatePipeline == nil || c.d101SeedMaterialInputs == nil || target.ID != "pep" || target.Project != "opensamguk-spep" ||
 		targetErr != nil || target != expectedTarget || !resetRuntimeRepository.MatchString("ghcr.io/"+c.ghcrOwner+"/opensamguk") ||
 		binding.Phase != "prepared" || binding.PreviousAttestationSHA != "" || c.requireResetD101WorkerLease(lease, binding) != nil {
 		return "", errResetExecutionEvidence
@@ -56,7 +56,7 @@ func (c config) runResetD101PhysicalWorker(lease *operationLease, target serverT
 		return "", errResetExecutionEvidence
 	}
 	admission, err := newResetD101CandidateAdmission(intent, evidence, binding, target)
-	if err != nil || c.d101CandidatePipeline.requireAdmission(admission, authority) != nil {
+	if err != nil || c.d101CandidatePipeline.requireAdmission(admission, authority) != nil || c.requireResetD101SeedMaterialInputs(admission) != nil {
 		return "", errResetExecutionEvidence
 	}
 	if err := c.observeResetD101GatewayDispatch(ctx, binding, evidence); err != nil {

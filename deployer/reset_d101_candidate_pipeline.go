@@ -35,13 +35,14 @@ var resetD101CandidateStages = []string{"verify-current-authority-dispatch-freez
 const resetD101CandidateSeedEntrypoint = "opensamguk.engine.boot.D101SeedOnlyCli"
 
 type resetD101CandidatePipeline struct {
-	commandOriginal []byte
-	commandSHA      string
-	cardSHA         string
-	plan            resetD101CandidateCommandPlan
-	caps            *resetD101CandidateCapsReader
-	selected        resetD101VerifiedSelectedReceipt
-	seeder          resetD101CandidateSeeder
+	selectedEnvelopeDirectory string
+	commandOriginal           []byte
+	commandSHA                string
+	cardSHA                   string
+	plan                      resetD101CandidateCommandPlan
+	caps                      *resetD101CandidateCapsReader
+	selected                  resetD101VerifiedSelectedReceipt
+	seeder                    resetD101CandidateSeeder
 }
 
 func newResetD101CandidatePipeline(command []byte, card resetDecodedDeploymentCard, intent resetDecodedApprovalIntent, capsOriginal, selectedEnvelope, selectedSPKI []byte, producer string, seeder resetD101CandidateSeeder) (*resetD101CandidatePipeline, error) {
@@ -81,7 +82,7 @@ func newResetD101CandidatePipeline(command []byte, card resetDecodedDeploymentCa
 	}
 	plan.NewImageDigests = cloneResetD101Strings(plan.NewImageDigests)
 	plan.Stages = append([]string(nil), plan.Stages...)
-	return &resetD101CandidatePipeline{append([]byte(nil), command...), card.Card.CommandPlanSHA, card.SHA, plan, caps, selected, seeder}, nil
+	return &resetD101CandidatePipeline{commandOriginal: append([]byte(nil), command...), commandSHA: card.Card.CommandPlanSHA, cardSHA: card.SHA, plan: plan, caps: caps, selected: selected, seeder: seeder}, nil
 }
 
 // Native installation reads the actual card, command, DB reader and signed
@@ -154,6 +155,7 @@ func (c config) installResetD101CandidatePipeline(ctx context.Context, pins rese
 	if err != nil || ctx.Err() != nil || pins.ProducerIdentity != authority.KeyPins.KeyID {
 		return closed, errResetExecutionEvidence
 	}
+	pipeline.selectedEnvelopeDirectory = pins.SelectedEnvelopeDirectory
 	c.d101CandidatePipeline = pipeline
 	return c, nil
 }

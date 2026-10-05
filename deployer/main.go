@@ -302,6 +302,7 @@ var sharedEnvAllowlist = map[string]envFieldSpec{
 
 // 환경변수 묶음.
 type config struct {
+	d101SeedMaterialInputs    *resetD101SeedMaterialInputs    // Independent fixed native inputs; nil closes before any physical command.
 	d101CandidatePipeline     *resetD101CandidatePipeline     // Fixed native installation; nil fails before any physical command.
 	d101PurposeAuthority      resetD101PurposeAuthoritySource // Fixed approved host source; no request/env enablement.
 	d101RecoveryClosureReader resetD101RecoveryClosureReader  // Fixed retained restore1 reader; nil until actual producer installation.
