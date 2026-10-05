@@ -55,18 +55,40 @@ func TestCandidateAdmissionRefusesDifferentOriginalOrUnspecifiedDefaultOptions(t
 	for _, mode := range []string{"missing-npc", "missing-image-level", "changed-plan", "changed-binding", "wrong-project"} {
 		intent, evidence, binding, server := candidateAdmissionFixture(t)
 		switch mode {
-		case "missing-npc":
-			// Use the actual prior original whose omitted defaults remain unapproved.
-			wire, sha, plan := resetIntentFixture(t)
-			var err error
-			intent, err = decodeResetApprovalIntent(wire, sha)
+		case "missing-npc", "missing-image-level":
+			key := "RESET_NPCMODE"
+			if mode == "missing-image-level" {
+				key = "RESET_SHOW_IMG_LEVEL"
+			}
+			// Remove the option from the actual approved target original, then
+			// rebuild all scope hashes. Changing a decoded copy is insufficient.
+			var original resetApprovalIntent
+			if json.Unmarshal(intent.originalBytes(), &original) != nil {
+				t.Fatal("synthetic original")
+			}
+			delete(evidence.Plan.Target.Updates, key)
+			target, err := json.Marshal(struct {
+				ID     string               `json:"id"`
+				Target resetLifecycleTarget `json:"target"`
+			}{"pep", evidence.Plan.Target})
 			if err != nil {
 				t.Fatal(err)
 			}
-			evidence.Plan = plan
-			binding.Target = plan.Target
-		case "missing-image-level":
-			delete(intent.Target.Updates, "RESET_SHOW_IMG_LEVEL")
+			original.RootTargetBytesBase64url = base64.RawURLEncoding.EncodeToString(target)
+			original.TargetFingerprint = resetRequestFingerprint("pep", evidence.Plan.Target)
+			wire, err := json.Marshal(original)
+			if err != nil {
+				t.Fatal(err)
+			}
+			intent, err = decodeResetApprovalIntent(wire, resetD101OriginalSHA(wire))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, present := intent.Target.Updates[key]; present {
+				t.Fatal("missing option fixture retained approved input")
+			}
+			evidence.Plan.TargetFingerprint = original.TargetFingerprint
+			evidence.Plan.ApprovalIntentSHA = intent.SHA
 			binding.Target = intent.Target
 		case "changed-plan":
 			evidence.Plan.AppSourceSHA = strings.Repeat("f", 40)
