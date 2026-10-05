@@ -38,6 +38,15 @@ path without Docker or registry replay. The runtime writer uses the actual
 Docker/raw ADMIN collector before the durable terminal transition; the physical
 worker call site is still pending.
 
+The physical worker body requires the current RUNNING record and consumed
+maintenance lease. It collects prepared/before-journal/before-down observations,
+checks all candidate pins, persists the phase chain, and applies the approved
+target. Down and the first up share the original cutoff; there is no automatic
+retry. A fresh authority is required again before env/down/up, and the actual
+runtime is persisted before physical success. This body is not yet connected to
+ingress or a real Gateway dispatch observation/provider. Negative lease/source
+tests do not establish a successful physical execution.
+
 D101 durable records carry an immutable intent reference and are exempt from
 ordinary terminal pruning, including restart and capacity pruning. Same-ID
 legacy or changed-intent admission conflicts. The bounded store can refuse new
