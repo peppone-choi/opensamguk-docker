@@ -31,6 +31,7 @@ type resetD101CommittedRecoveryBegin struct {
 	gatewayOriginal []byte
 	gateway         resetD101GatewayExecution
 	value           resetD101RecoveryBeginOriginal
+	preReset        resetD101PreResetCapture
 }
 
 func (b resetD101CommittedRecoveryBegin) Original() []byte { return append([]byte(nil), b.original...) }
@@ -39,7 +40,7 @@ func (b resetD101CommittedRecoveryBegin) SHA() string      { return b.sha }
 func decodeResetD101GatewayRecoveryBegin(wire []byte, intent resetDecodedApprovalIntent, evidence resetExecutionEvidence, binding resetExecutionPhaseBinding, gatewaySHA, rootResultSHA string, now time.Time) (resetD101CommittedRecoveryBegin, error) {
 	closed := resetD101CommittedRecoveryBegin{}
 	var fields map[string]json.RawMessage
-	if len(wire) == 0 || len(wire) > 64*1024 || decodeResetPrivateJSON(wire, &fields) != nil || len(fields) != reflect.TypeOf(resetD101GatewayExecution{}).NumField()+2 {
+	if len(wire) == 0 || len(wire) > 64*1024 || decodeResetPrivateJSON(wire, &fields) != nil || len(fields) != reflect.TypeOf(resetD101GatewayExecution{}).NumField()+4 {
 		return closed, errResetExecutionEvidence
 	}
 	var encoded, beginSHA string
@@ -51,9 +52,7 @@ func decodeResetD101GatewayRecoveryBegin(wire []byte, intent resetDecodedApprova
 	if err != nil || len(original) == 0 || len(original) > 16*1024 || base64.RawURLEncoding.EncodeToString(original) != encoded || resetD101OriginalSHA(original) != beginSHA || requireResetIntentShape(original, reflect.TypeOf(begin)) != nil || decodeResetPrivateJSON(original, &begin) != nil {
 		return closed, errResetExecutionEvidence
 	}
-	delete(fields, "recoveryBeginReceiptBytesBase64url")
-	delete(fields, "recoveryBeginReceiptSha256")
-	executionWire, err := json.Marshal(fields)
+	executionWire, preReset, err := decodeResetD101GatewayQueryCapture(wire, true)
 	if err != nil {
 		return closed, errResetExecutionEvidence
 	}
@@ -84,7 +83,7 @@ func decodeResetD101GatewayRecoveryBegin(wire []byte, intent resetDecodedApprova
 	if err != nil || updatedErr != nil || created.Unix() < intent.Intent.WindowOpensAtUnix || updated.Before(created) || updated.After(now) || now.Unix() >= intent.Intent.RecoveryDeadlineUnix {
 		return closed, errResetExecutionEvidence
 	}
-	return resetD101CommittedRecoveryBegin{append([]byte(nil), original...), beginSHA, append([]byte(nil), wire...), value, begin}, nil
+	return resetD101CommittedRecoveryBegin{original: append([]byte(nil), original...), sha: beginSHA, gatewayOriginal: append([]byte(nil), wire...), gateway: value, value: begin, preReset: preReset}, nil
 }
 
 // Actual signed QUERY + existing private service credential; no caller body,
@@ -141,6 +140,13 @@ func (c config) readResetD101GatewayRecoveryBegin(ctx context.Context, op, inten
 	if err != nil || cache != "no-store" || decodeErr != nil {
 		return closed, errResetExecutionEvidence
 	}
+	// A recovery QUERY may only consume the pre-reset original retained during
+	// authenticated dispatch, never create an old snapshot after destruction.
+	captureDirectory := filepath.Join(c.serversDir, ".deployer-reset-pre-reset-originals")
+	captureBefore, captureErr := readResetPrivateCustody(captureDirectory, op, 0)
+	if captureErr != nil || !bytes.Equal(captureBefore, observed.preReset.Original()) || resetD101OriginalSHA(captureBefore) != observed.preReset.sha {
+		return closed, errResetExecutionEvidence
+	}
 	expectedFailure := "RECOVERY_REQUIRED"
 	if rootResult.Status == string(lifecycleJobFailed) {
 		expectedFailure = "ROOT_FAILED"
@@ -152,8 +158,9 @@ func (c config) readResetD101GatewayRecoveryBegin(ctx context.Context, op, inten
 	}
 	rootAfter, rootErr := readResetPrivateCustody(filepath.Join(c.serversDir, ".deployer-reset-results"), op, 0)
 	credentialAfter, credentialErr := readResetPrivateCustody(filepath.Join(c.serversDir, ".deployer-reset-gateway"), op, 0)
+	captureAfter, captureAfterErr := readResetPrivateCustody(captureDirectory, op, 0)
 	current, exists := c.lifecycleOperationStore.Lookup(op)
-	if rootErr != nil || credentialErr != nil || !bytes.Equal(rootWire, rootAfter) || !bytes.Equal(credentialWire, credentialAfter) || !exists || current != record || bounded.Err() != nil || credential.ExpiresAtUnix <= time.Now().Unix() {
+	if captureAfterErr != nil || !bytes.Equal(captureBefore, captureAfter) || rootErr != nil || credentialErr != nil || !bytes.Equal(rootWire, rootAfter) || !bytes.Equal(credentialWire, credentialAfter) || !exists || current != record || bounded.Err() != nil || credential.ExpiresAtUnix <= time.Now().Unix() {
 		return closed, errResetExecutionEvidence
 	}
 	if _, err := requireResetD101RecoveryAuthority(authority, op, intentSHA, time.Now()); err != nil {

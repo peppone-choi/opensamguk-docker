@@ -67,7 +67,11 @@ func decodeResetD101GatewayExecution(wire []byte) (resetD101GatewayExecution, er
 }
 
 func decodeResetD101GatewayDispatch(wire []byte, intent resetDecodedApprovalIntent, evidence resetExecutionEvidence, binding resetExecutionPhaseBinding, gatewaySHA string, now time.Time) error {
-	value, err := decodeResetD101GatewayExecution(wire)
+	executionWire, _, err := decodeResetD101GatewayQueryCapture(wire, false)
+	if err != nil {
+		return errResetExecutionEvidence
+	}
+	value, err := decodeResetD101GatewayExecution(executionWire)
 	if err != nil {
 		return errResetExecutionEvidence
 	}
@@ -89,11 +93,21 @@ func decodeResetD101GatewayDispatch(wire []byte, intent resetDecodedApprovalInte
 }
 
 func getResetD101GatewayDispatch(ctx context.Context, endpoint, serviceToken, grant string, intent resetDecodedApprovalIntent, evidence resetExecutionEvidence, binding resetExecutionPhaseBinding, gatewaySHA string) error {
-	wire, _, err := readResetD101GatewayQuery(ctx, endpoint, serviceToken, grant, 16*1024)
-	if err != nil || decodeResetD101GatewayDispatch(wire, intent, evidence, binding, gatewaySHA, time.Now()) != nil {
-		return errResetExecutionEvidence
+	_, err := getResetD101GatewayDispatchOriginal(ctx, endpoint, serviceToken, grant, intent, evidence, binding, gatewaySHA)
+	return err
+}
+
+func getResetD101GatewayDispatchOriginal(ctx context.Context, endpoint, serviceToken, grant string, intent resetDecodedApprovalIntent, evidence resetExecutionEvidence, binding resetExecutionPhaseBinding, gatewaySHA string) (resetD101PreResetCapture, error) {
+	closed := resetD101PreResetCapture{}
+	wire, cache, err := readResetD101GatewayQuery(ctx, endpoint, serviceToken, grant, 64*1024)
+	if err != nil || cache != "no-store" || decodeResetD101GatewayDispatch(wire, intent, evidence, binding, gatewaySHA, time.Now()) != nil {
+		return closed, errResetExecutionEvidence
 	}
-	return nil
+	_, capture, err := decodeResetD101GatewayQueryCapture(wire, false)
+	if err != nil {
+		return closed, errResetExecutionEvidence
+	}
+	return capture, nil
 }
 
 func readResetD101GatewayQuery(ctx context.Context, endpoint, serviceToken, grant string, limit int64) ([]byte, string, error) {
@@ -180,7 +194,8 @@ func (c config) observeResetD101GatewayDispatch(ctx context.Context, binding res
 		return errResetExecutionEvidence
 	}
 	endpoint := strings.TrimRight(origin.String(), "/") + "/internal/d101/servers/pep/operations/" + binding.OperationID
-	if getResetD101GatewayDispatch(ctx, endpoint, credential.ServiceToken, grant, intent, evidence, binding, request.GatewayPayloadSHA) != nil ||
+	capture, err := getResetD101GatewayDispatchOriginal(ctx, endpoint, credential.ServiceToken, grant, intent, evidence, binding, request.GatewayPayloadSHA)
+	if err != nil || ctx.Err() != nil || credential.ExpiresAtUnix <= time.Now().Unix() || c.retainResetD101PreResetCapture(capture) != nil ||
 		ctx.Err() != nil || credential.ExpiresAtUnix <= time.Now().Unix() {
 		return errResetExecutionEvidence
 	}

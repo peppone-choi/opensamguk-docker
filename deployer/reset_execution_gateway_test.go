@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -29,6 +30,17 @@ func resetD101GatewayDispatchFixture(t *testing.T) ([]byte, resetDecodedApproval
 		ApprovalIntentSHA: sha, GatewayPayloadSHA: bodySHA, InitialPublicRevision: "1", VerifyingRevision: "2", RootRequestFingerprint: &fingerprint,
 		CreatedAtUTC: accepted.UTC().Format(time.RFC3339Nano), UpdatedAtUTC: accepted.Add(time.Second).UTC().Format(time.RFC3339Nano)}
 	wire, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(wire, &fields) != nil {
+		t.Fatal("execution fixture")
+	}
+	capture := resetD101PreResetFixture(t, value)
+	fields["preResetOriginalsSha256"], _ = json.Marshal(resetD101OriginalSHA(capture))
+	fields["preResetOriginalsBytesBase64url"], _ = json.Marshal(base64.RawURLEncoding.EncodeToString(capture))
+	wire, err = json.Marshal(fields)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,22 +110,26 @@ func TestResetD101GatewayDispatchHTTPBoundsAndUsesExistingCredentialAndGrant(t *
 			t.Error("HTTP source changed route/auth/body")
 		}
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
 		_, _ = w.Write(wire)
 	}))
 	defer server.Close()
 	if getResetD101GatewayDispatch(context.Background(), server.URL+path, "synthetic-service", "synthetic-purpose-proof", intent, evidence, binding, bodySHA) != nil || calls != 1 {
 		t.Fatal("bounded actual HTTP fixture failed")
 	}
-	for _, mode := range []string{"oversize", "redirect", "error-status", "wrong-state"} {
+	for _, mode := range []string{"oversize", "redirect", "error-status", "wrong-state", "cacheable"} {
 		t.Run(mode, func(t *testing.T) {
 			source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch mode {
 				case "oversize":
-					_, _ = w.Write([]byte(strings.Repeat("x", 16*1024+1)))
+					_, _ = w.Write([]byte(strings.Repeat("x", 64*1024+1)))
 				case "redirect":
 					http.Redirect(w, r, server.URL+path, http.StatusTemporaryRedirect)
 				case "error-status":
 					w.WriteHeader(http.StatusServiceUnavailable)
+				case "cacheable":
+					w.Header().Set("Cache-Control", "max-age=1")
+					_, _ = w.Write(wire)
 				case "wrong-state":
 					_, _ = w.Write([]byte(strings.Replace(string(wire), "DISPATCH_INTENT", "PREPARED", 1)))
 				}

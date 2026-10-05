@@ -39,7 +39,7 @@ func TestCommittedRecoveryBeginRequiresActualOriginalAndSameRootResult(t *testin
 	if decodeResetD101GatewayDispatch(wire, intent, evidence, binding, payloadSHA, time.Now()) == nil {
 		t.Fatal("recovery enabled dispatch")
 	}
-	for _, mode := range []string{"hash-only", "wrong-state", "wrong-op", "wrong-target", "wrong-payload", "wrong-revision", "padded", "wrong-original-sha", "different-root", "duplicate-begin", "different-begin-op", "null-stored-after-success", "published"} {
+	for _, mode := range []string{"hash-only", "wrong-state", "wrong-op", "wrong-target", "wrong-payload", "wrong-revision", "padded", "wrong-original-sha", "different-root", "duplicate-begin", "different-begin-op", "null-stored-after-success", "published", "missing-capture", "wrong-capture"} {
 		var changed map[string]any
 		if json.Unmarshal(wire, &changed) != nil {
 			t.Fatal("fixture")
@@ -70,6 +70,10 @@ func TestCommittedRecoveryBeginRequiresActualOriginalAndSameRootResult(t *testin
 			newBegin.LastSafeState = "REMOTE_SUCCEEDED"
 		case "published":
 			changed["publishedRevision"] = "3"
+		case "missing-capture":
+			delete(changed, "preResetOriginalsBytesBase64url")
+		case "wrong-capture":
+			changed["preResetOriginalsSha256"] = strings.Repeat("b", 64)
 		}
 		if mode == "different-root" || mode == "different-begin-op" || mode == "null-stored-after-success" || mode == "duplicate-begin" {
 			raw, _ := json.Marshal(newBegin)
