@@ -151,7 +151,7 @@ func (c config) installResetD101CandidatePipeline(ctx context.Context, pins rese
 		return closed, errResetExecutionEvidence
 	}
 	pipeline, err := newResetD101CandidatePipeline(command, card, intent, caps, selected, spki, pins.ProducerIdentity, seeder)
-	if err != nil || ctx.Err() != nil {
+	if err != nil || ctx.Err() != nil || pins.ProducerIdentity != authority.KeyPins.KeyID {
 		return closed, errResetExecutionEvidence
 	}
 	c.d101CandidatePipeline = pipeline
@@ -173,6 +173,7 @@ const resetD101CandidateSeedOutputPrefix = "D101_SEED_ONLY_RESULT_V1\t"
 type resetD101CandidateSeedReceipt struct {
 	SchemaVersion            int               `json:"schemaVersion"`
 	Kind                     string            `json:"kind"`
+	ApprovalIntentSHA        string            `json:"approvalIntentSha256"`
 	OriginalOp               string            `json:"originalOp"`
 	TargetFingerprint        string            `json:"typedTargetFingerprint"`
 	AppSourceSHA             string            `json:"appSourceSha"`
@@ -197,7 +198,7 @@ func (p *resetD101CandidatePipeline) requireSeed(a resetD101CandidateAdmission, 
 	var value resetD101CandidateSeedReceipt
 	// Null generation is UNKNOWN, even if the approved input requested zero.
 	if p == nil || len(e.Original) == 0 || len(e.Original) > 32*1024 || requireResetIntentShape(e.Original, reflect.TypeOf(value)) != nil || decodeResetPrivateJSON(e.Original, &value) != nil ||
-		value.SchemaVersion != 1 || value.Kind != "D101_SEED_ONLY_RESULT_V1" || value.OriginalOp != a.OperationID() || value.TargetFingerprint != a.TargetFingerprint() || value.AppSourceSHA != a.AppSourceSHA() || !reflect.DeepEqual(value.ImagePins, a.ImagePins()) ||
+		value.SchemaVersion != 1 || value.Kind != "D101_SEED_ONLY_RESULT_V1" || value.ApprovalIntentSHA != a.ApprovalIntentSHA() || value.OriginalOp != a.OperationID() || value.TargetFingerprint != a.TargetFingerprint() || value.AppSourceSHA != a.AppSourceSHA() || !reflect.DeepEqual(value.ImagePins, a.ImagePins()) ||
 		value.SelectedSourceReceiptSHA != p.selected.sha || value.SelectedSourceReceiptSHA != e.SelectedSourceReceiptSHA || !reflect.DeepEqual(value.EffectiveOptions, p.selected.value.EffectiveOptions) || !reflect.DeepEqual(value.OptionProvenance, p.selected.value.OptionProvenance) ||
 		value.ObservedGeneration == nil || *value.ObservedGeneration != 0 || e.ActualGeneration != "0" || e.GenerationProvenanceSHA != p.selected.value.OptionProvenance["SERVER_GENERATION"] || value.ConfigMaxGeneral != 50 || value.GameEnvMaxGeneral != 50 ||
 		!resetEvidenceSHA.MatchString(value.ConfigOriginalSHA) || !resetEvidenceSHA.MatchString(value.MetaOriginalSHA) || !resetEvidenceSHA.MatchString(value.GameEnvOriginalSHA) || value.ActiveGeneralRows != 384 || value.ActiveRetainerRows > 384 {

@@ -147,7 +147,7 @@ func (c config) readResetD101CandidatePromotion(op string, uid uint32) (resetD10
 		return proof, errResetExecutionEvidence
 	}
 	var seedValue resetD101CandidateSeedReceipt
-	if requireResetIntentShape(seed, reflect.TypeOf(seedValue)) != nil || decodeResetPrivateJSON(seed, &seedValue) != nil || seedValue.SchemaVersion != 1 || seedValue.Kind != "D101_SEED_ONLY_RESULT_V1" || seedValue.OriginalOp != op || seedValue.AppSourceSHA != proof.AppSourceSHA || seedValue.TargetFingerprint != proof.TargetFingerprint || seedValue.SelectedSourceReceiptSHA != proof.SelectedSourceReceiptSHA || seedValue.ObservedGeneration == nil || *seedValue.ObservedGeneration != 0 || seedValue.ConfigMaxGeneral != 50 || seedValue.GameEnvMaxGeneral != 50 || !validResetFiveImageDigests(seedValue.ImagePins) {
+	if requireResetIntentShape(seed, reflect.TypeOf(seedValue)) != nil || decodeResetPrivateJSON(seed, &seedValue) != nil || seedValue.SchemaVersion != 1 || seedValue.Kind != "D101_SEED_ONLY_RESULT_V1" || seedValue.ApprovalIntentSHA != proof.ApprovalIntentSHA || seedValue.OriginalOp != op || seedValue.AppSourceSHA != proof.AppSourceSHA || seedValue.TargetFingerprint != proof.TargetFingerprint || seedValue.SelectedSourceReceiptSHA != proof.SelectedSourceReceiptSHA || seedValue.ObservedGeneration == nil || *seedValue.ObservedGeneration != 0 || seedValue.ConfigMaxGeneral != 50 || seedValue.GameEnvMaxGeneral != 50 || !validResetFiveImageDigests(seedValue.ImagePins) {
 		return proof, errResetExecutionEvidence
 	}
 	var capsValue resetD101CandidateCapsObservation
@@ -155,7 +155,7 @@ func (c config) readResetD101CandidatePromotion(op string, uid uint32) (resetD10
 	if err != nil || requireResetIntentShape(caps, reflect.TypeOf(capsValue)) != nil || decodeResetPrivateJSON(caps, &capsValue) != nil {
 		return proof, errResetExecutionEvidence
 	}
-	if _, err = decodeResetD101CandidateCaps(caps, capsValue.DatabaseName, capsValue.DatabaseUser, capsValue.ServerAddress, observed.Add(-29*time.Second), observed); err != nil {
+	if _, err = decodeResetD101CandidateCaps(caps, capsValue.DatabaseName, capsValue.DatabaseUser, capsValue.ServerAddress, proof.ApprovalIntentSHA, observed.Add(-29*time.Second), observed); err != nil {
 		return proof, errResetExecutionEvidence
 	}
 	return proof, nil

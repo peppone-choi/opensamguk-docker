@@ -69,6 +69,7 @@ SELECT json_build_object(
  'worldRowCount',(SELECT count(*) FROM world_state),'worldId',w.id,
  'scenarioCode',w.scenario_code,'tickSeconds',w.tick_seconds,
  'generationType',jsonb_typeof(w.meta->'server_generation'),'generationRaw',(w.meta->'server_generation')::text,
+ 'generationApprovalIntentSha256',w.meta->>'server_generation_approval_intent_sha256',
  'configMaxGeneralType',jsonb_typeof(w.config->'maxgeneral'),
  'configMaxGeneralRaw',left((w.config->'maxgeneral')::text,128),
  'gameEnvRowCount',(SELECT count(*) FROM game_kv WHERE world_id=1 AND "table"='game_env' AND namespace='game_env' AND key='maxgeneral'),
@@ -79,35 +80,36 @@ FROM world_state w WHERE w.id=1;
 ROLLBACK;`
 
 type resetD101CandidateCapsObservation struct {
-	SchemaVersion         int    `json:"schemaVersion"`
-	Kind                  string `json:"kind"`
-	DatabaseName          string `json:"databaseName"`
-	DatabaseUser          string `json:"databaseUser"`
-	ServerAddress         string `json:"serverAddress"`
-	ServerPort            int    `json:"serverPort"`
-	TransactionReadOnly   string `json:"transactionReadOnly"`
-	TransactionIsolation  string `json:"transactionIsolation"`
-	WorldRowCount         int    `json:"worldRowCount"`
-	WorldID               int    `json:"worldId"`
-	ScenarioCode          string `json:"scenarioCode"`
-	TickSeconds           int    `json:"tickSeconds"`
-	GenerationType        string `json:"generationType"`
-	GenerationRaw         string `json:"generationRaw"`
-	ConfigMaxGeneralType  string `json:"configMaxGeneralType"`
-	ConfigMaxGeneralRaw   string `json:"configMaxGeneralRaw"`
-	GameEnvRowCount       int    `json:"gameEnvRowCount"`
-	GameEnvMaxGeneralType string `json:"gameEnvMaxGeneralType"`
-	GameEnvMaxGeneralRaw  string `json:"gameEnvMaxGeneralRaw"`
-	ObservedAtUTC         string `json:"observedAtUtc"`
+	SchemaVersion               int    `json:"schemaVersion"`
+	Kind                        string `json:"kind"`
+	DatabaseName                string `json:"databaseName"`
+	DatabaseUser                string `json:"databaseUser"`
+	ServerAddress               string `json:"serverAddress"`
+	ServerPort                  int    `json:"serverPort"`
+	TransactionReadOnly         string `json:"transactionReadOnly"`
+	TransactionIsolation        string `json:"transactionIsolation"`
+	WorldRowCount               int    `json:"worldRowCount"`
+	WorldID                     int    `json:"worldId"`
+	ScenarioCode                string `json:"scenarioCode"`
+	TickSeconds                 int    `json:"tickSeconds"`
+	GenerationType              string `json:"generationType"`
+	GenerationRaw               string `json:"generationRaw"`
+	GenerationApprovalIntentSHA string `json:"generationApprovalIntentSha256"`
+	ConfigMaxGeneralType        string `json:"configMaxGeneralType"`
+	ConfigMaxGeneralRaw         string `json:"configMaxGeneralRaw"`
+	GameEnvRowCount             int    `json:"gameEnvRowCount"`
+	GameEnvMaxGeneralType       string `json:"gameEnvMaxGeneralType"`
+	GameEnvMaxGeneralRaw        string `json:"gameEnvMaxGeneralRaw"`
+	ObservedAtUTC               string `json:"observedAtUtc"`
 }
 
-func decodeResetD101CandidateCaps(wire []byte, database, user, address string, started, completed time.Time) (resetD101CandidateCapsObservation, error) {
+func decodeResetD101CandidateCaps(wire []byte, database, user, address, intentSHA string, started, completed time.Time) (resetD101CandidateCapsObservation, error) {
 	var value resetD101CandidateCapsObservation
 	if len(wire) == 0 || len(wire) > 16*1024 || !utf8.Valid(wire) || requireResetIntentShape(wire, reflect.TypeOf(value)) != nil ||
 		decodeResetPrivateJSON(wire, &value) != nil || value.SchemaVersion != 1 || value.Kind != "D101_CANDIDATE_DB_CAPS_V1" ||
 		value.DatabaseName != database || value.DatabaseUser != user || value.ServerAddress != address || value.ServerPort != 5432 || value.TransactionReadOnly != "on" || value.TransactionIsolation != "repeatable read" ||
 		value.WorldRowCount != 1 || value.WorldID != 1 || value.ScenarioCode != "scenario_3190" || value.TickSeconds != 3600 ||
-		value.GenerationType != "number" || value.GenerationRaw != "0" || value.ConfigMaxGeneralType != "number" || value.ConfigMaxGeneralRaw != "50" || value.GameEnvRowCount != 1 ||
+		value.GenerationApprovalIntentSHA != intentSHA || !resetEvidenceSHA.MatchString(intentSHA) || value.GenerationType != "number" || value.GenerationRaw != "0" || value.ConfigMaxGeneralType != "number" || value.ConfigMaxGeneralRaw != "50" || value.GameEnvRowCount != 1 ||
 		value.GameEnvMaxGeneralType != "number" || value.GameEnvMaxGeneralRaw != "50" {
 		return resetD101CandidateCapsObservation{}, errResetExecutionEvidence
 	}
@@ -266,7 +268,7 @@ func (reader *resetD101CandidateCapsReader) observe(ctx context.Context, c confi
 		!completed.Before(a.Cutoff()) {
 		return closed, errResetExecutionEvidence
 	}
-	if _, err := decodeResetD101CandidateCaps([]byte(wire), p.DatabaseName, p.DatabaseUser, address, started, completed); err != nil {
+	if _, err := decodeResetD101CandidateCaps([]byte(wire), p.DatabaseName, p.DatabaseUser, address, a.ApprovalIntentSHA(), started, completed); err != nil {
 		return closed, err
 	}
 	return resetD101VerifiedCandidateCaps{append([]byte(nil), []byte(wire)...), resetD101OriginalSHA([]byte(wire)), before.ID, completed, reader.sha}, nil

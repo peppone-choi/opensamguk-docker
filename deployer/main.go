@@ -2871,6 +2871,10 @@ func (c config) handleOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/operations/")
+	if strings.Contains(path, "/seed-approval") {
+		c.handleResetD101SeedApproval(w, r, strings.Split(path, "/"))
+		return
+	}
 	if isResetD101PreparedPath(path) {
 		c.handleResetD101PreparedProof(w, r, strings.Split(path, "/"))
 		return
