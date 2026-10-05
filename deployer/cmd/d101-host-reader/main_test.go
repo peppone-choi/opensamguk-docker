@@ -99,3 +99,66 @@ func TestExactJSONRejectsDuplicateNestedNullAliasTrailingAndInvalidUTF8(t *testi
 		}
 	}
 }
+
+func commandFixture(t *testing.T) (map[string]d101custody.Original, privateReader) {
+	t.Helper()
+	files, read := fixture(t)
+	raw := func(wire []byte) d101custody.Original {
+		sum := sha256.Sum256(wire)
+		return d101custody.Original{Bytes: wire, SHA256: hex.EncodeToString(sum[:])}
+	}
+	for _, path := range []string{"/fixed/caps", "/fixed/candidate", "/fixed/live"} {
+		files[path] = raw([]byte("SYNTHETIC_ONLY " + path))
+	}
+	resources := map[string]string{"project": "d101-candidate-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "network": "d101-candidate-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-net", "postgresVolume": "candidate-pgdata", "redisVolume": "candidate-redisdata", "candidateComposeFile": "/fixed/candidate", "candidateComposeSha256": files["/fixed/candidate"].SHA256, "liveComposeFile": "/fixed/live", "liveComposeSha256": files["/fixed/live"].SHA256, "capsReaderFile": "/fixed/caps"}
+	plan := map[string]any{"schemaVersion": 1, "kind": "D101_ROOT_CANDIDATE_COMMAND_PLAN_V1", "operationId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "approvalIntentSha256": "synthetic", "targetFingerprint": "synthetic", "appSourceSha": "synthetic", "dockerSourceSha": "synthetic", "newImageDigests": map[string]string{}, "selectedSourceReceiptSha256": "synthetic", "selectedEnvelopeSha256": files["/fixed/selected"].SHA256, "capsReaderSha256": files["/fixed/caps"].SHA256, "seedEntrypoint": "synthetic", "stages": []string{}, "destructiveCutoffUnix": 1, "resources": resources}
+	wire, _ := json.Marshal(plan)
+	files["/fixed/commandPlan"] = raw(wire)
+	return files, read
+}
+func TestCommandNativeReaderCapturesOnlyFourReferencedOriginals(t *testing.T) {
+	files, read := commandFixture(t)
+	wire, err := readFixed("read-command-originals", installationPath, read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response struct {
+		SchemaVersion   int               `json:"schemaVersion"`
+		InstallationSHA string            `json:"installationSha256"`
+		CommandPlanSHA  string            `json:"commandPlanSha256"`
+		Originals       map[string]string `json:"originals"`
+	}
+	if json.Unmarshal(wire, &response) != nil || response.CommandPlanSHA != files["/fixed/commandPlan"].SHA256 || len(response.Originals) != 4 {
+		t.Fatal("unbound command original")
+	}
+	for id, path := range map[string]string{"capsReaderOriginal": "/fixed/caps", "selectedEnvelope": "/fixed/selected", "candidateCompose": "/fixed/candidate", "liveCompose": "/fixed/live"} {
+		decoded, err := base64.RawURLEncoding.DecodeString(response.Originals[id])
+		if err != nil || string(decoded) != string(files[path].Bytes) {
+			t.Fatal("original changed")
+		}
+	}
+}
+func TestCommandNativeReaderRejectsMissingOrDriftingCustody(t *testing.T) {
+	for _, mode := range []string{"missing", "drift"} {
+		files, read := commandFixture(t)
+		if mode == "missing" {
+			delete(files, "/fixed/caps")
+		} else {
+			base := read
+			calls := 0
+			read = func(path string, limit int64) (d101custody.Original, error) {
+				value, err := base(path, limit)
+				if path == "/fixed/live" {
+					calls++
+					if calls > 1 {
+						value.SHA256 = "changed"
+					}
+				}
+				return value, err
+			}
+		}
+		if _, err := readFixed("read-command-originals", installationPath, read); err == nil {
+			t.Fatal("accepted " + mode)
+		}
+	}
+}

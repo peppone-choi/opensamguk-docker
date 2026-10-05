@@ -146,6 +146,10 @@ func (c config) installResetD101CandidatePipeline(ctx context.Context, pins rese
 	if err != nil || resetD101OriginalSHA(spki) != authority.KeyPins.PublicKeySpkiSHA {
 		return closed, errResetExecutionEvidence
 	}
+	var commandPlan resetD101CandidateCommandPlan
+	if decodeResetPrivateJSON(command, &commandPlan) != nil || commandPlan.Resources.CapsReaderFile != filepath.Join(pins.CapsDirectory, pins.OperationID+".json") {
+		return closed, errResetExecutionEvidence
+	}
 	pipeline, err := newResetD101CandidatePipeline(command, card, intent, caps, selected, spki, pins.ProducerIdentity, seeder)
 	if err != nil || ctx.Err() != nil {
 		return closed, errResetExecutionEvidence

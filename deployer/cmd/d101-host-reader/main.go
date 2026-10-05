@@ -9,6 +9,7 @@ import (
 	"io"
 	"opensamguk-deployer/internal/d101custody"
 	"os"
+	"regexp"
 	"unicode/utf8"
 )
 
@@ -113,7 +114,7 @@ func exactJSON(wire []byte, keys []string, target any) error {
 }
 
 func readFixed(action, path string, read privateReader) ([]byte, error) {
-	if read == nil || action != "read-originals" && action != "read-token" && action != "read-selected" {
+	if read == nil || action != "read-originals" && action != "read-token" && action != "read-selected" && action != "read-command-originals" {
 		return nil, d101custody.ErrUnavailable
 	}
 	original, err := read(path, 64<<10)
@@ -130,6 +131,9 @@ func readFixed(action, path string, read privateReader) ([]byte, error) {
 		if config.OriginalFiles[id] == "" {
 			return nil, d101custody.ErrUnavailable
 		}
+	}
+	if action == "read-command-originals" {
+		return readCommandOriginals(config, original, path, read)
 	}
 	if action == "read-selected" {
 		selected, err := read(config.SelectedEnvelopeFile, 96<<10)
@@ -210,3 +214,76 @@ func main() {
 	}
 }
 func fail() { _, _ = io.WriteString(os.Stderr, "D101 private source unavailable\n"); os.Exit(1) }
+
+// Read only the four fixed native originals required by the pinned commandPlan.
+// Their paths are selected by that original, not by a request or shell argument.
+func readCommandOriginals(config installation, installationOriginal d101custody.Original, path string, read privateReader) ([]byte, error) {
+	command, err := read(config.OriginalFiles["commandPlan"], 32<<10)
+	if err != nil {
+		return nil, err
+	}
+	var fields map[string]json.RawMessage
+	keys := []string{"schemaVersion", "kind", "operationId", "approvalIntentSha256", "targetFingerprint", "appSourceSha", "dockerSourceSha", "newImageDigests", "selectedSourceReceiptSha256", "selectedEnvelopeSha256", "capsReaderSha256", "seedEntrypoint", "stages", "destructiveCutoffUnix", "resources"}
+	if exactJSON(command.Bytes, keys, &fields) != nil {
+		return nil, d101custody.ErrUnavailable
+	}
+	var scope struct {
+		SchemaVersion       int    `json:"schemaVersion"`
+		Kind                string `json:"kind"`
+		OperationID         string `json:"operationId"`
+		CapsReaderSHA       string `json:"capsReaderSha256"`
+		SelectedEnvelopeSHA string `json:"selectedEnvelopeSha256"`
+	}
+	// Select exact fields without silently coercing null/string/unknown values.
+	if json.Unmarshal(fields["schemaVersion"], &scope.SchemaVersion) != nil || json.Unmarshal(fields["kind"], &scope.Kind) != nil || json.Unmarshal(fields["operationId"], &scope.OperationID) != nil || json.Unmarshal(fields["capsReaderSha256"], &scope.CapsReaderSHA) != nil || json.Unmarshal(fields["selectedEnvelopeSha256"], &scope.SelectedEnvelopeSHA) != nil || scope.SchemaVersion != 1 || scope.Kind != "D101_ROOT_CANDIDATE_COMMAND_PLAN_V1" || !regexp.MustCompile(`^[a-f0-9]{32}$`).MatchString(scope.OperationID) {
+		return nil, d101custody.ErrUnavailable
+	}
+	var resources struct {
+		Project              string `json:"project"`
+		Network              string `json:"network"`
+		PostgresVolume       string `json:"postgresVolume"`
+		RedisVolume          string `json:"redisVolume"`
+		CandidateComposeFile string `json:"candidateComposeFile"`
+		CandidateComposeSHA  string `json:"candidateComposeSha256"`
+		LiveComposeFile      string `json:"liveComposeFile"`
+		LiveComposeSHA       string `json:"liveComposeSha256"`
+		CapsReaderFile       string `json:"capsReaderFile"`
+	}
+	if exactJSON(fields["resources"], []string{"project", "network", "postgresVolume", "redisVolume", "candidateComposeFile", "candidateComposeSha256", "liveComposeFile", "liveComposeSha256", "capsReaderFile"}, &resources) != nil {
+		return nil, d101custody.ErrUnavailable
+	}
+	originals := map[string]string{}
+	captured := map[string]d101custody.Original{}
+	locations := map[string]struct {
+		path, sha string
+		limit     int64
+	}{"capsReaderOriginal": {resources.CapsReaderFile, scope.CapsReaderSHA, 16 << 10}, "selectedEnvelope": {config.SelectedEnvelopeFile, scope.SelectedEnvelopeSHA, 96 << 10}, "candidateCompose": {resources.CandidateComposeFile, resources.CandidateComposeSHA, 32 << 10}, "liveCompose": {resources.LiveComposeFile, resources.LiveComposeSHA, 32 << 10}}
+	for id, location := range locations {
+		raw, err := read(location.path, location.limit)
+		if err != nil || raw.SHA256 != location.sha {
+			return nil, d101custody.ErrUnavailable
+		}
+		captured[id] = raw
+		originals[id] = base64.RawURLEncoding.EncodeToString(raw.Bytes)
+	}
+	for id, location := range locations {
+		after, err := read(location.path, location.limit)
+		if err != nil || after.SHA256 != captured[id].SHA256 || !bytes.Equal(after.Bytes, captured[id].Bytes) {
+			return nil, d101custody.ErrUnavailable
+		}
+	}
+	afterCommand, err := read(config.OriginalFiles["commandPlan"], 32<<10)
+	if err != nil || afterCommand.SHA256 != command.SHA256 || !bytes.Equal(afterCommand.Bytes, command.Bytes) {
+		return nil, d101custody.ErrUnavailable
+	}
+	after, err := read(path, 64<<10)
+	if err != nil || after.SHA256 != installationOriginal.SHA256 || !bytes.Equal(after.Bytes, installationOriginal.Bytes) {
+		return nil, d101custody.ErrUnavailable
+	}
+	return json.Marshal(struct {
+		SchemaVersion   int               `json:"schemaVersion"`
+		InstallationSHA string            `json:"installationSha256"`
+		CommandPlanSHA  string            `json:"commandPlanSha256"`
+		Originals       map[string]string `json:"originals"`
+	}{1, installationOriginal.SHA256, command.SHA256, originals})
+}

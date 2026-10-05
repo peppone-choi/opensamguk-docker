@@ -281,6 +281,7 @@ func installSyntheticCandidatePromotion(t *testing.T, c config, plan resetApprov
 	resources := resetD101CandidateResourceNames(plan.OperationID)
 	resources.CandidateComposeFile = "/synthetic/candidate.json"
 	resources.LiveComposeFile = "/synthetic/live.json"
+	resources.CapsReaderFile = "/synthetic/caps-reader.json"
 	resources.CandidateComposeSHA = strings.Repeat("a", 64)
 	resources.LiveComposeSHA = strings.Repeat("b", 64)
 	generation := 0

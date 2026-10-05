@@ -22,6 +22,7 @@ type resetD101CandidateResources struct {
 	CandidateComposeSHA  string `json:"candidateComposeSha256"`
 	LiveComposeFile      string `json:"liveComposeFile"`
 	LiveComposeSHA       string `json:"liveComposeSha256"`
+	CapsReaderFile       string `json:"capsReaderFile"`
 }
 
 func resetD101CandidateResourceNames(op string) resetD101CandidateResources {
@@ -39,7 +40,7 @@ func validResetD101CandidateResources(r resetD101CandidateResources, op string) 
 	names := resetD101CandidateResourceNames(op)
 	return lifecycleJobIDRe.MatchString(op) && r.Project == names.Project && r.Network == names.Network && r.PostgresVolume == names.PostgresVolume && r.RedisVolume == names.RedisVolume &&
 		filepath.IsAbs(r.CandidateComposeFile) && filepath.Clean(r.CandidateComposeFile) == r.CandidateComposeFile && filepath.IsAbs(r.LiveComposeFile) && filepath.Clean(r.LiveComposeFile) == r.LiveComposeFile && r.CandidateComposeFile != r.LiveComposeFile &&
-		resetEvidenceSHA.MatchString(r.CandidateComposeSHA) && resetEvidenceSHA.MatchString(r.LiveComposeSHA)
+		resetEvidenceSHA.MatchString(r.CandidateComposeSHA) && resetEvidenceSHA.MatchString(r.LiveComposeSHA) && filepath.IsAbs(r.CapsReaderFile) && filepath.Clean(r.CapsReaderFile) == r.CapsReaderFile
 }
 
 // Actual fixed source producer for the two reviewed Compose originals. The
