@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"time"
 )
@@ -43,9 +44,10 @@ func validResetD101CandidateCommandAdmission(admission resetD101CandidateAdmissi
 		!admission.Cutoff().IsZero() && now.Before(admission.Cutoff())
 }
 
-// This checks only the fixed outer evidence fields. It does not parse the seed
-// child Original, prove exit code zero, or authorize live stack promotion. The
-// child command and its raw output codec are still being fixed with C4/C8.
+// This checks only the fixed outer evidence fields. C8 compares the actual CLI
+// option/provenance maps with the signed selected original; the unused options
+// receipt field is not an authority and may be empty. This does not prove the
+// child exit code or authorize live stack promotion.
 func requireResetD101CandidateEvidenceEnvelope(admission resetD101CandidateAdmission,
 	evidence resetD101CandidateSeedEvidence) error {
 	if !validResetD101CandidateCommandAdmission(admission, evidence.StartedAt) ||
@@ -56,7 +58,6 @@ func requireResetD101CandidateEvidenceEnvelope(admission resetD101CandidateAdmis
 		evidence.WorkerContainerID == evidence.RedisContainerID ||
 		evidence.PostgresContainerID == evidence.RedisContainerID ||
 		!resetManifestDigest.MatchString(evidence.WorkerImageID) ||
-		!resetEvidenceSHA.MatchString(evidence.EffectiveOptionsReceiptSHA) ||
 		!resetEvidenceSHA.MatchString(evidence.GenerationProvenanceSHA) ||
 		evidence.SelectedSourceReceiptSHA != admission.SelectedSourceReceiptSHA() ||
 		evidence.ActualGeneration != "0" ||
@@ -72,4 +73,66 @@ func requireResetD101CandidateEvidenceEnvelope(admission resetD101CandidateAdmis
 		return errResetExecutionEvidence
 	}
 	return nil
+}
+
+// The approved native candidate Compose contains only the two storage
+// services. Its operation-scoped project, volumes and private network are
+// checked against the immutable command plan before the first Docker command.
+func resetD101CandidateStorageUpArgs(admission resetD101CandidateAdmission) []string {
+	r := admission.CandidateResources()
+	return []string{"compose", "-p", r.Project, "--env-file", admission.Server().EnvFile,
+		"-f", r.CandidateComposeFile, "up", "-d", "--wait", "--no-deps", "game-postgres", "game-redis"}
+}
+
+func (c config) prepareResetD101CandidateStorage(ctx context.Context, admission resetD101CandidateAdmission,
+	beforeCommand func(context.Context) error) (string, string, error) {
+	r := admission.CandidateResources()
+	if !validResetD101CandidateCommandAdmission(admission, time.Now()) ||
+		!validResetD101CandidateResources(r, admission.OperationID()) ||
+		requireResetD101CandidateCompose(r, admission.OperationID(), admission.ImagePins()) != nil {
+		return "", "", errResetExecutionEvidence
+	}
+	if _, err := c.validateServerTarget(admission.Server()); err != nil {
+		return "", "", errResetExecutionEvidence
+	}
+	if _, err := runResetD101CandidateCommand(ctx, admission, beforeCommand, func(ctx context.Context) (string, error) {
+		// Re-read the fixed native original after fresh authority, immediately
+		// before Compose consumes it. The server env still belongs to the core.
+		if requireResetD101CandidateCompose(r, admission.OperationID(), admission.ImagePins()) != nil {
+			return "", errResetExecutionEvidence
+		}
+		return c.runServerDockerContext(ctx, resetD101CandidateStorageUpArgs(admission)...)
+	}); err != nil {
+		return "", "", err
+	}
+	ids := map[string]string{}
+	for _, service := range []string{"game-postgres", "game-redis"} {
+		var observed resetRuntimeContainer
+		_, err := runResetD101CandidateCommand(ctx, admission, beforeCommand, func(ctx context.Context) (string, error) {
+			var err error
+			observed, err = c.observeResetRuntimeContainerProject(ctx, service, r.Project)
+			return "", err
+		})
+		if err != nil || !resetEvidenceSHA.MatchString(observed.ID) {
+			return "", "", errResetExecutionEvidence
+		}
+		ids[service] = observed.ID
+		var image resetRuntimeImage
+		_, err = runResetD101CandidateCommand(ctx, admission, beforeCommand, func(ctx context.Context) (string, error) {
+			out, err := c.runServerDockerContext(ctx, "image", "inspect", "--format",
+				`{"repoDigests":{{json .RepoDigests}},"os":{{json .Os}},"architecture":{{json .Architecture}}}`, observed.ImageID)
+			if err != nil || len(out) > resetEvidenceMaxBytes || json.Unmarshal([]byte(out), &image) != nil {
+				return "", errResetExecutionEvidence
+			}
+			return "", nil
+		})
+		if err != nil || image.OS != "linux" || image.Architecture != "amd64" ||
+			!resetRuntimePinMatches(image.RepoDigests, service, "", admission.ImagePins()[service]) {
+			return "", "", errResetExecutionEvidence
+		}
+	}
+	if ids["game-postgres"] == ids["game-redis"] {
+		return "", "", errResetExecutionEvidence
+	}
+	return ids["game-postgres"], ids["game-redis"], nil
 }

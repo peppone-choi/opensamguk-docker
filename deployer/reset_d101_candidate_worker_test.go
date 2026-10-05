@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -84,13 +85,14 @@ func TestResetD101CandidateUnknownOrExpiredAuthorityExecutesNoCommand(t *testing
 func TestResetD101CandidateEvidenceEnvelopeIsOnlyStructural(t *testing.T) {
 	admission := workerAdmissionFixture(t)
 	valid := resetD101CandidateSeedEvidence{
-		WorkerContainerID:          strings.Repeat("a", 64),
-		PostgresContainerID:        strings.Repeat("b", 64),
-		RedisContainerID:           strings.Repeat("c", 64),
-		WorkerImageID:              "sha256:" + strings.Repeat("d", 64),
-		WorkerRepoDigest:           "ghcr.io/owner/opensamguk@" + admission.ImagePins()["game-engine"],
-		SelectedSourceReceiptSHA:   admission.SelectedSourceReceiptSHA(),
-		EffectiveOptionsReceiptSHA: strings.Repeat("e", 64),
+		WorkerContainerID:        strings.Repeat("a", 64),
+		PostgresContainerID:      strings.Repeat("b", 64),
+		RedisContainerID:         strings.Repeat("c", 64),
+		WorkerImageID:            "sha256:" + strings.Repeat("d", 64),
+		WorkerRepoDigest:         "ghcr.io/owner/opensamguk@" + admission.ImagePins()["game-engine"],
+		SelectedSourceReceiptSHA: admission.SelectedSourceReceiptSHA(),
+		// The CLI does not issue a separate effective-options receipt SHA.
+		EffectiveOptionsReceiptSHA: "",
 		GenerationProvenanceSHA:    strings.Repeat("f", 64),
 		ActualGeneration:           "0",
 		StartedAt:                  time.Now().Add(-time.Minute),
@@ -121,5 +123,42 @@ func TestResetD101CandidateEvidenceEnvelopeIsOnlyStructural(t *testing.T) {
 				t.Fatal("invalid outer evidence accepted")
 			}
 		})
+	}
+}
+
+func TestResetD101CandidateStoragePlanIncludesOnlyCandidatePostgresAndRedis(t *testing.T) {
+	admission := workerAdmissionFixture(t)
+	r := resetD101CandidateResourceNames(admission.OperationID())
+	r.CandidateComposeFile = "/private/candidate.json"
+	r.LiveComposeFile = "/private/live.json"
+	r.CandidateComposeSHA = strings.Repeat("a", 64)
+	r.LiveComposeSHA = strings.Repeat("b", 64)
+	admission = admission.withCandidateResources(r)
+	if !validResetD101CandidateResources(admission.CandidateResources(), admission.OperationID()) {
+		t.Fatal("candidate resources")
+	}
+	want := []string{"compose", "-p", r.Project, "--env-file", admission.Server().EnvFile,
+		"-f", r.CandidateComposeFile, "up", "-d", "--wait", "--no-deps", "game-postgres", "game-redis"}
+	if got := resetD101CandidateStorageUpArgs(admission); !reflect.DeepEqual(got, want) {
+		t.Fatalf("candidate storage command: %v", got)
+	}
+}
+
+func TestResetD101CandidateStorageMissingNativeOriginalExecutesNoDocker(t *testing.T) {
+	admission := workerAdmissionFixture(t)
+	r := resetD101CandidateResourceNames(admission.OperationID())
+	r.CandidateComposeFile = "/missing/d101-candidate.json"
+	r.LiveComposeFile = "/missing/d101-live.json"
+	r.CandidateComposeSHA = strings.Repeat("a", 64)
+	r.LiveComposeSHA = strings.Repeat("b", 64)
+	admission = admission.withCandidateResources(r)
+	commands := 0
+	c := config{dockerRunnerContext: func(context.Context, ...string) (string, error) {
+		commands++
+		return "", nil
+	}}
+	_, _, err := c.prepareResetD101CandidateStorage(context.Background(), admission, func(context.Context) error { return nil })
+	if err == nil || commands != 0 {
+		t.Fatalf("missing native plan reached Docker: err=%v commands=%d", err, commands)
 	}
 }
