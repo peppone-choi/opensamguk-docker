@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"io"
 	"opensamguk-deployer/internal/d101custody"
+	"opensamguk-deployer/internal/d101preinput"
 	"os"
 	"regexp"
 	"time"
@@ -115,6 +116,9 @@ func exactJSON(wire []byte, keys []string, target any) error {
 }
 
 func readFixed(action, path string, read privateReader) ([]byte, error) {
+	if action == d101preinput.Action {
+		return readPreIntentInputs(read)
+	}
 	if read == nil || action != "read-originals" && action != "read-token" && action != "read-selected" && action != "read-command-originals" && !selectedTransportAction(action) {
 		return nil, d101custody.ErrUnavailable
 	}
