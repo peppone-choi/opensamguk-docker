@@ -184,7 +184,11 @@ func Decode(wire []byte, now time.Time) (Index, error) {
 			return closed, d101custody.ErrUnavailable
 		}
 		class := id == "parserClass" || id == "topologyRootClass"
-		if (class && (ref.MediaType != "application/octet-stream" || ref.ByteLength > 2<<20)) || (!class && ref.MediaType != "application/json") {
+		binary := class || id == "topologyCanonical"
+		input := strings.HasPrefix(id, "topology-input:")
+		if (binary && ref.MediaType != "application/octet-stream") || (class && ref.ByteLength > 2<<20) ||
+			(input && ref.MediaType != "application/json" && ref.MediaType != "application/octet-stream") ||
+			(!binary && !input && ref.MediaType != "application/json") {
 			return closed, d101custody.ErrUnavailable
 		}
 		limit := uint64(64 << 20)

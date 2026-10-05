@@ -37,7 +37,7 @@ func selectedFixture(t *testing.T) (map[string]d101custody.Original, privateRead
 		path := transport.OriginalPath(op, id)
 		files[path] = selectedWire(wire)
 		media := "application/json"
-		if id == "parserClass" || id == "topologyRootClass" {
+		if id == "parserClass" || id == "topologyRootClass" || id == "topologyCanonical" {
 			media = "application/octet-stream"
 		}
 		index.Originals[id] = transport.SourceReference{FilePath: path, RawSHA: files[path].SHA256, ByteLength: uint64(len(wire)), Snapshot: d101custody.PrivateSnapshot{Device: 1, Inode: uint64(len(index.Originals) + 1), ByteLength: uint64(len(wire)), ModifiedAtUnixNano: 3}, MediaType: media}

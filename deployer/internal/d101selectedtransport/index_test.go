@@ -17,7 +17,7 @@ func indexFixture() Index {
 	}
 	for _, id := range RequiredOriginalIDs {
 		media := "application/json"
-		if id == "parserClass" || id == "topologyRootClass" {
+		if id == "parserClass" || id == "topologyRootClass" || id == "topologyCanonical" {
 			media = "application/octet-stream"
 		}
 		value.Originals[id] = SourceReference{OriginalPath(op, id), sha, 8, d101custody.PrivateSnapshot{1, 2, 8, 3}, media}
@@ -26,8 +26,8 @@ func indexFixture() Index {
 }
 func TestSelectedIndexExactPreIntentShape(t *testing.T) {
 	value := indexFixture()
-	id := "topology-input:actual/callback/selected-map.bin"
-	value.Originals[id] = SourceReference{OriginalPath(value.OriginalOp, id), strings.Repeat("d", 64), 64 << 20, d101custody.PrivateSnapshot{1, 4, 64 << 20, 5}, "application/json"}
+	id := "topology-input:dryLandProjectionPolicy"
+	value.Originals[id] = SourceReference{OriginalPath(value.OriginalOp, id), strings.Repeat("d", 64), 64 << 20, d101custody.PrivateSnapshot{1, 4, 64 << 20, 5}, "application/octet-stream"}
 	canonical := value.Originals["topologyCanonical"]
 	canonical.ByteLength, canonical.Snapshot.ByteLength = 64<<20, 64<<20
 	value.Originals["topologyCanonical"] = canonical
