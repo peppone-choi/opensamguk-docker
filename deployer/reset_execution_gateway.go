@@ -45,23 +45,34 @@ type resetD101GatewayExecution struct {
 	UpdatedAtUTC           string  `json:"updatedAtUtc"`
 }
 
-func decodeResetD101GatewayDispatch(wire []byte, intent resetDecodedApprovalIntent, evidence resetExecutionEvidence, binding resetExecutionPhaseBinding, gatewaySHA string, now time.Time) error {
+func decodeResetD101GatewayExecution(wire []byte) (resetD101GatewayExecution, error) {
 	var value resetD101GatewayExecution
 	var fields map[string]json.RawMessage
 	shape := reflect.TypeOf(value)
 	if len(wire) == 0 || len(wire) > 16*1024 || json.Unmarshal(wire, &fields) != nil || len(fields) != shape.NumField() {
-		return errResetExecutionEvidence
+		return value, errResetExecutionEvidence
 	}
 	nullable := map[string]bool{"publishedRevision": true, "rootRequestFingerprint": true, "rootResultReceiptSha256": true, "validationReceiptSha256": true}
 	for i := 0; i < shape.NumField(); i++ {
 		field := shape.Field(i)
 		raw, ok := fields[field.Tag.Get("json")]
 		if !ok || (!nullable[field.Tag.Get("json")] && requireResetIntentShape(raw, field.Type) != nil) {
-			return errResetExecutionEvidence
+			return value, errResetExecutionEvidence
 		}
 	}
+	if decodeResetPrivateJSON(wire, &value) != nil {
+		return value, errResetExecutionEvidence
+	}
+	return value, nil
+}
+
+func decodeResetD101GatewayDispatch(wire []byte, intent resetDecodedApprovalIntent, evidence resetExecutionEvidence, binding resetExecutionPhaseBinding, gatewaySHA string, now time.Time) error {
+	value, err := decodeResetD101GatewayExecution(wire)
+	if err != nil {
+		return errResetExecutionEvidence
+	}
 	fingerprint, err := resetExecutionRequestFingerprint("pep", binding.Target, binding.Evidence)
-	if err != nil || decodeResetPrivateJSON(wire, &value) != nil || value.SchemaVersion != 1 || value.ServerID != "pep" || value.State != "DISPATCH_INTENT" ||
+	if err != nil || value.SchemaVersion != 1 || value.ServerID != "pep" || value.State != "DISPATCH_INTENT" ||
 		value.OperationID != binding.OperationID || value.OperationID != intent.Intent.OperationID || value.TargetFingerprint != intent.Intent.TargetFingerprint ||
 		value.ApprovalIntentSHA != intent.SHA || value.GatewayPayloadSHA != gatewaySHA || !resetEvidenceSHA.MatchString(gatewaySHA) ||
 		value.InitialPublicRevision != intent.Intent.InitialPublicRevision || value.VerifyingRevision != evidence.Preflight.PublicationRevision ||
@@ -78,20 +89,28 @@ func decodeResetD101GatewayDispatch(wire []byte, intent resetDecodedApprovalInte
 }
 
 func getResetD101GatewayDispatch(ctx context.Context, endpoint, serviceToken, grant string, intent resetDecodedApprovalIntent, evidence resetExecutionEvidence, binding resetExecutionPhaseBinding, gatewaySHA string) error {
-	if ctx == nil || ctx.Err() != nil || !validResetD101ServiceToken(serviceToken) || len(grant) == 0 || len(grant) > 8192 {
+	wire, _, err := readResetD101GatewayQuery(ctx, endpoint, serviceToken, grant, 16*1024)
+	if err != nil || decodeResetD101GatewayDispatch(wire, intent, evidence, binding, gatewaySHA, time.Now()) != nil {
 		return errResetExecutionEvidence
+	}
+	return nil
+}
+
+func readResetD101GatewayQuery(ctx context.Context, endpoint, serviceToken, grant string, limit int64) ([]byte, string, error) {
+	if ctx == nil || ctx.Err() != nil || !validResetD101ServiceToken(serviceToken) || len(grant) == 0 || len(grant) > 8192 || limit <= 0 || limit > 64*1024 {
+		return nil, "", errResetExecutionEvidence
 	}
 	select {
 	case resetD101GatewayReadSlots <- struct{}{}:
 	default:
-		return errResetExecutionEvidence
+		return nil, "", errResetExecutionEvidence
 	}
 	defer func() { <-resetD101GatewayReadSlots }()
 	bounded, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(bounded, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return errResetExecutionEvidence
+		return nil, "", errResetExecutionEvidence
 	}
 	req.Header.Set("Authorization", "Bearer "+serviceToken)
 	req.Header.Set("X-D101-Grant", grant)
@@ -101,17 +120,17 @@ func getResetD101GatewayDispatch(ctx context.Context, endpoint, serviceToken, gr
 	client := &http.Client{Transport: transport, Timeout: 2 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	response, err := client.Do(req)
 	if err != nil {
-		return errResetExecutionEvidence
+		return nil, "", errResetExecutionEvidence
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return errResetExecutionEvidence
+		return nil, "", errResetExecutionEvidence
 	}
-	wire, err := io.ReadAll(io.LimitReader(response.Body, 16*1024+1))
-	if err != nil || bounded.Err() != nil || decodeResetD101GatewayDispatch(wire, intent, evidence, binding, gatewaySHA, time.Now()) != nil {
-		return errResetExecutionEvidence
+	wire, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
+	if err != nil || bounded.Err() != nil || int64(len(wire)) > limit {
+		return nil, "", errResetExecutionEvidence
 	}
-	return nil
+	return wire, response.Header.Get("Cache-Control"), nil
 }
 
 func validResetD101ServiceToken(token string) bool {
