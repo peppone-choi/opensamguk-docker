@@ -40,6 +40,81 @@ func resetPrivateWireSHA(wire []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func TestResetExclusivePrivateClaimIdenticalConcurrentCallsHaveOneWinner(t *testing.T) {
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil || os.Chmod(directory, 0700) != nil {
+		t.Fatal("fixture private directory")
+	}
+	op := strings.Repeat("e", 32)
+	wire := []byte(`{"version":1,"attempt":1}`)
+	uid := uint32(os.Getuid())
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var group sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			results <- createResetImmutablePrivateBytes(directory, op, resetPrivateWireSHA(wire), wire, uid)
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(results)
+	winners := 0
+	for err := range results {
+		if err == nil {
+			winners++
+		}
+	}
+	before, err := os.Stat(filepath.Join(directory, op+".json"))
+	if winners != 1 || err != nil {
+		t.Fatal("identical recovery claims did not have exactly one winner")
+	}
+	// A restart sees only the original leaf, never another permitted attempt.
+	if createResetImmutablePrivateBytes(directory, op, resetPrivateWireSHA(wire), wire, uid) == nil {
+		t.Fatal("identical existing claim admitted another recovery")
+	}
+	after, err := os.Stat(filepath.Join(directory, op+".json"))
+	observed, readErr := readResetPrivateCustody(directory, op, uid)
+	entries, listErr := os.ReadDir(directory)
+	if err != nil || readErr != nil || listErr != nil || !os.SameFile(before, after) || !bytes.Equal(observed, wire) || len(entries) != 1 {
+		t.Fatal("loser or replay changed original recovery claim")
+	}
+}
+
+func TestResetExclusivePrivateClaimUnknownCommitNeverRetries(t *testing.T) {
+	for _, failAt := range []int{1, 2} {
+		t.Run(string(rune('0'+failAt)), func(t *testing.T) {
+			directory, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil || os.Chmod(directory, 0700) != nil {
+				t.Fatal("fixture private directory")
+			}
+			op := strings.Repeat("f", 32)
+			wire := []byte(`{"version":1,"attempt":1}`)
+			uid := uint32(os.Getuid())
+			calls := 0
+			err = publishResetImmutablePrivateBytes(directory, op, resetPrivateWireSHA(wire), wire, uid, func(path string) error {
+				calls++
+				if calls == failAt {
+					return errors.New("synthetic sync uncertainty")
+				}
+				return syncResetPrivateDirectory(path)
+			}, false)
+			if err == nil || calls != failAt {
+				t.Fatal("unconfirmed claim was reported committed")
+			}
+			if createResetImmutablePrivateBytes(directory, op, resetPrivateWireSHA(wire), wire, uid) == nil {
+				t.Fatal("uncertain commit was admitted again")
+			}
+			if _, err := os.Lstat(filepath.Join(directory, op+".json")); err != nil {
+				t.Fatal("unknown canonical claim was removed")
+			}
+		})
+	}
+}
+
 func TestResetImmutablePrivateBytesPublishExactOnceWithoutRenewal(t *testing.T) {
 	directory := t.TempDir()
 	if os.Chmod(directory, 0700) != nil {

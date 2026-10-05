@@ -23,6 +23,16 @@ func writeResetImmutablePrivateBytesWithUID(directory, operationID, expectedSHA 
 
 // Directory sync injection is only for an isolated post-link failure fixture.
 func writeResetImmutablePrivateBytesWithSync(directory, operationID, expectedSHA string, wire []byte, uid uint32, syncDirectory func(string) error) error {
+	return publishResetImmutablePrivateBytes(directory, operationID, expectedSHA, wire, uid, syncDirectory, true)
+}
+
+// A physical recovery claim must never replay, including identical original
+// bytes. Existing or uncertain custody consumes the one attempt and stays closed.
+func createResetImmutablePrivateBytes(directory, operationID, expectedSHA string, wire []byte, uid uint32) error {
+	return publishResetImmutablePrivateBytes(directory, operationID, expectedSHA, wire, uid, syncResetPrivateDirectory, false)
+}
+
+func publishResetImmutablePrivateBytes(directory, operationID, expectedSHA string, wire []byte, uid uint32, syncDirectory func(string) error, allowReplay bool) error {
 	op, err := normalizeLifecycleOperationID(operationID)
 	sum := sha256.Sum256(wire)
 	if syncDirectory == nil || err != nil || op == "" || op != operationID || !filepath.IsAbs(directory) || !resetEvidenceSHA.MatchString(expectedSHA) ||
@@ -43,6 +53,9 @@ func writeResetImmutablePrivateBytesWithSync(directory, operationID, expectedSHA
 	}
 	leaf := filepath.Join(directory, operationID+".json")
 	if _, err = os.Lstat(leaf); err == nil {
+		if !allowReplay {
+			return errResetExecutionEvidence
+		}
 		existing, readErr := readResetPrivateCustody(directory, operationID, uid)
 		if readErr != nil || !bytes.Equal(existing, wire) {
 			return errResetExecutionEvidence
@@ -81,7 +94,7 @@ func writeResetImmutablePrivateBytesWithSync(directory, operationID, expectedSHA
 	// operation issuer. Readers require nlink=1, so the temporary 2-link phase
 	// fails closed until the exact temporary leaf is unlinked and dir fsynced.
 	if err = os.Link(temporary, leaf); err != nil {
-		if !os.IsExist(err) {
+		if !os.IsExist(err) || !allowReplay {
 			return errResetExecutionEvidence
 		}
 		existing, readErr := readResetPrivateCustody(directory, operationID, uid)

@@ -303,6 +303,7 @@ var sharedEnvAllowlist = map[string]envFieldSpec{
 // 환경변수 묶음.
 type config struct {
 	d101PurposeAuthority      resetD101PurposeAuthoritySource // Fixed approved host source; no request/env enablement.
+	d101RecoveryVerifier      resetD101RecoveryVerifier       // Fixed actual backup/metadata verifier; nil until supplied.
 	token                     string                          // Bearer 인증 토큰
 	composeDir                string                          // compose 파일 디렉터리(/workspace)
 	composeHostDir            string
