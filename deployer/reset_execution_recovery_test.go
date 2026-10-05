@@ -39,9 +39,32 @@ func resetD101RecoveryFixture(t *testing.T) (config, *operationLease, lifecycleJ
 	evidence.Plan.SpaceBudget.BackupBytes = budget.BackupBytes
 	evidence.Plan.SpaceBudget.RecoveryBytes = budget.RecoveryBytes
 	evidence.Plan.OldImageDigests = pins
+	// The shared receipt-only fixture uses a fixed historical admission. This
+	// recovery claim requires a current original recovery window. Move the whole
+	// synthetic history together; never change the production cutoff checks.
+	deltaSeconds := time.Now().Unix() - record.CreatedAt.Unix() - 20
+	delta := time.Duration(deltaSeconds) * time.Second
+	record.CreatedAt = record.CreatedAt.Add(delta)
+	record.UpdatedAt = record.UpdatedAt.Add(delta)
+	evidence.Plan.WindowOpensAtUnix += deltaSeconds
+	evidence.Plan.DestructiveCutoffUnix += deltaSeconds
+	evidence.Plan.RecoveryDeadlineUnix += deltaSeconds
+	evidence.Preflight.ObservedAtUnix += deltaSeconds
+	evidence.Preflight.ExpiresAtUnix += deltaSeconds
+	evidence.Preflight.BackupRetainUntilUnix += deltaSeconds
+	journal.ResetExecution.AcceptedAtUnix = record.CreatedAt.Unix()
+	for i := range journal.ResetExecution.Attestations {
+		a := &journal.ResetExecution.Attestations[i]
+		a.StartedAt = a.StartedAt.Add(delta)
+		a.CompletedAt = a.CompletedAt.Add(delta)
+		a.Snapshot.ObservedAt = a.Snapshot.ObservedAt.Add(delta)
+	}
 	intent := authority.Intent.Intent
 	intent.SpaceBudget = evidence.Plan.SpaceBudget
 	intent.OldImageDigests = pins
+	intent.WindowOpensAtUnix = evidence.Plan.WindowOpensAtUnix
+	intent.DestructiveCutoffUnix = evidence.Plan.DestructiveCutoffUnix
+	intent.RecoveryDeadlineUnix = evidence.Plan.RecoveryDeadlineUnix
 	intentWire, _ := json.Marshal(intent)
 	intentSHA := resetD101OriginalSHA(intentWire)
 	decoded, err := decodeResetApprovalIntent(intentWire, intentSHA)
