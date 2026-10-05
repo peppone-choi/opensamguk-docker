@@ -68,6 +68,22 @@ func resetD101HostAuthorityFixture(t *testing.T) *resetD101HostFixture {
 	if json.Unmarshal(cardWire, &card) != nil {
 		t.Fatal("synthetic card")
 	}
+	// Pure fixture originals satisfy the production recovery binding. Other
+	// producer-owned semantics stay deliberately synthetic in this unit test.
+	_, commandWire, _, _ := resetD101RecoveryPlanFixture(t)
+	var command resetD101CandidateCommandPlan
+	if json.Unmarshal(commandWire, &command) != nil {
+		t.Fatal("fixture command")
+	}
+	command.OperationID, command.ApprovalIntentSHA, command.TargetFingerprint = intent.Intent.OperationID, intent.SHA, intent.Intent.TargetFingerprint
+	command.AppSourceSHA, command.DockerSourceSHA = intent.Intent.AppSourceSHA, card.DockerSourceSHA
+	command.NewImageDigests, command.SelectedSourceReceiptSHA = intent.Intent.NewImageDigests, intent.Intent.SelectedSourceReceiptSHA
+	command.DestructiveCutoffUnix = intent.Intent.DestructiveCutoffUnix
+	originals["commandPlan"], _ = json.Marshal(command)
+	originals["recoveryPlan"], _, err = produceResetD101RecoveryPlan(intent, originals["commandPlan"])
+	if err != nil {
+		t.Fatal(err)
+	}
 	card.ApprovalIntentSHA = intent.SHA
 	card.ConfigInventorySHA = resetD101OriginalSHA(originals["configInventory"])
 	card.CommandPlanSHA = resetD101OriginalSHA(originals["commandPlan"])
@@ -191,6 +207,78 @@ func TestResetD101HostAuthorityRejectsOriginalDriftAndCustodyBeforeProducer(t *t
 			}
 			if mode == "producer-unavailable" && calls != 1 {
 				t.Fatal("semantic verifier skipped")
+			}
+		})
+	}
+}
+
+func TestResetD101HostAuthorityRecoveryPlanSemanticAndNativeRebindingStayClosed(t *testing.T) {
+	for _, mode := range []string{"normal", "restore-attempt", "future-receipt", "native-plan-after", "native-command-after"} {
+		t.Run(mode, func(t *testing.T) {
+			f := resetD101HostAuthorityFixture(t)
+			write := func(directory string, wire []byte) {
+				path := filepath.Join(directory, f.pins.OperationID+".json")
+				if os.Chmod(path, 0600) != nil || os.WriteFile(path, wire, 0400) != nil || os.Chmod(path, 0400) != nil {
+					t.Fatal("fixture native write")
+				}
+			}
+			if mode == "restore-attempt" || mode == "future-receipt" {
+				var plan map[string]any
+				if json.Unmarshal(f.originals["recoveryPlan"], &plan) != nil {
+					t.Fatal("fixture plan")
+				}
+				if mode == "restore-attempt" {
+					plan["restore"].(map[string]any)["maxAttempts"] = 2
+				} else {
+					plan["backupManifestSha256"] = strings.Repeat("f", 64)
+				}
+				f.originals["recoveryPlan"], _ = json.Marshal(plan)
+				write(f.pins.OriginalDirectories["recoveryPlan"], f.originals["recoveryPlan"])
+				var card resetD101DeploymentCard
+				json.Unmarshal(f.originals["deploymentCard"], &card)
+				card.RecoveryPlanSHA = resetD101OriginalSHA(f.originals["recoveryPlan"])
+				f.originals["deploymentCard"], _ = json.Marshal(card)
+				write(f.pins.OriginalDirectories["deploymentCard"], f.originals["deploymentCard"])
+				envelopeBytes, err := os.ReadFile(filepath.Join(f.pins.ManifestDirectory, f.pins.OperationID+".json"))
+				var envelope resetD101SignedHostOriginal
+				if err != nil || json.Unmarshal(envelopeBytes, &envelope) != nil {
+					t.Fatal("fixture signed manifest")
+				}
+				original, err := base64.RawURLEncoding.DecodeString(envelope.OriginalBytesBase64url)
+				var manifest resetD101HostTrustManifest
+				if err != nil || json.Unmarshal(original, &manifest) != nil {
+					t.Fatal("fixture original manifest")
+				}
+				manifest.DeploymentCardSHA = resetD101OriginalSHA(f.originals["deploymentCard"])
+				original, _ = json.Marshal(manifest)
+				f.pins.ManifestSHA = resetD101OriginalSHA(original)
+				write(f.pins.ManifestDirectory, resetD101SignedHostFixture(t, f.signing, resetD101HostTrustDomain, original))
+			}
+			calls := 0
+			source, err := newResetD101HostAuthorityWithUID(f.pins, func(context.Context, *resetD101HostEvidence) error {
+				calls++
+				if mode == "native-plan-after" || mode == "native-command-after" {
+					id := "recoveryPlan"
+					if mode == "native-command-after" {
+						id = "commandPlan"
+					}
+					write(f.pins.OriginalDirectories[id], append(append([]byte{}, f.originals[id]...), ' '))
+				}
+				return nil
+			}, func() time.Time { return f.now }, f.uid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = source(context.Background(), f.pins.OperationID, f.pins.ApprovalIntentSHA)
+			if mode == "normal" {
+				if err != nil || calls != 1 {
+					t.Fatal("normal native plan refused", err)
+				}
+			} else if err == nil {
+				t.Fatal("SHA/signature label replaced same-op plan semantics or current custody")
+			}
+			if (mode == "restore-attempt" || mode == "future-receipt") && calls != 0 {
+				t.Fatal("invalid plan reached independent producer")
 			}
 		})
 	}

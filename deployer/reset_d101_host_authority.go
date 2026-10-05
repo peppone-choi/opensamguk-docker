@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"net/url"
 	"path/filepath"
@@ -149,6 +150,12 @@ func newResetD101HostAuthorityWithUID(pins resetD101HostAuthorityPins, verify re
 				return closed, errResetExecutionEvidence
 			}
 		}
+		// Same-op plan semantics are mandatory before granting QUERY/PREPARE.
+		// Native SHA/signature labels cannot replace the exact intent/command/
+		// card binding. Actual backup/restore receipts remain separate checks.
+		if _, err := requireResetD101RecoveryPlanCard(originals["recoveryPlan"], card, intent, originals["commandPlan"]); err != nil {
+			return closed, errResetExecutionEvidence
+		}
 		signedClock, err := read(pins.ClockDirectory)
 		if err != nil {
 			return closed, errResetExecutionEvidence
@@ -175,6 +182,15 @@ func newResetD101HostAuthorityWithUID(pins resetD101HostAuthorityPins, verify re
 		}
 		if verify(ctx, producerInput) != nil || ctx.Err() != nil {
 			return closed, errResetExecutionEvidence
+		}
+		// Re-read the installed same-operation originals after the separate
+		// semantic producer. A changed native capture/plan cannot inherit the
+		// earlier labels or callback result.
+		for id, directory := range directories {
+			after, err := read(directory)
+			if err != nil || !bytes.Equal(after, originals[id]) {
+				return closed, errResetExecutionEvidence
+			}
 		}
 		completed := clock()
 		observed, err := decodeResetD101ClockAgreement(clockWire, op, intentSHA, completed)
