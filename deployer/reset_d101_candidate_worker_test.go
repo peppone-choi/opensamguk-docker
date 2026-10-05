@@ -133,9 +133,15 @@ func TestResetD101CandidateStoragePlanIncludesOnlyCandidatePostgresAndRedis(t *t
 	r.LiveComposeFile = "/private/live.json"
 	r.CandidateComposeSHA = strings.Repeat("a", 64)
 	r.LiveComposeSHA = strings.Repeat("b", 64)
+	r.CapsReaderFile = "/private/caps-reader.json"
 	admission = admission.withCandidateResources(r)
 	if !validResetD101CandidateResources(admission.CandidateResources(), admission.OperationID()) {
 		t.Fatal("candidate resources")
+	}
+	missingCapsReader := r
+	missingCapsReader.CapsReaderFile = ""
+	if validResetD101CandidateResources(missingCapsReader, admission.OperationID()) {
+		t.Fatal("missing fixed caps reader accepted")
 	}
 	want := []string{"compose", "-p", r.Project, "--env-file", admission.Server().EnvFile,
 		"-f", r.CandidateComposeFile, "up", "-d", "--wait", "--no-deps", "game-postgres", "game-redis"}
@@ -151,6 +157,7 @@ func TestResetD101CandidateStorageMissingNativeOriginalExecutesNoDocker(t *testi
 	r.LiveComposeFile = "/missing/d101-live.json"
 	r.CandidateComposeSHA = strings.Repeat("a", 64)
 	r.LiveComposeSHA = strings.Repeat("b", 64)
+	r.CapsReaderFile = "/missing/d101-caps-reader.json"
 	admission = admission.withCandidateResources(r)
 	commands := 0
 	c := config{dockerRunnerContext: func(context.Context, ...string) (string, error) {
