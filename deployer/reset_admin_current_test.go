@@ -63,13 +63,15 @@ func TestResetAdminCredentialIsPrivateOperationBoundAndNeverAnApproval(t *testin
 	token := "header.payload.signature"
 	credential := resetAdminCredential{Version: 1, ServerID: "pep", WorldID: 1, OperationID: plan.OperationID,
 		TargetFingerprint: plan.TargetFingerprint, ApprovalPlanSHA: binding.Evidence.ApprovalPlanSHA, ExpiresAtUnix: now.Unix() + 60, AccessToken: token}
-	write := func(value resetAdminCredential) {
+	write := func(test *testing.T, value resetAdminCredential) {
+		test.Helper()
 		wire, _ := json.Marshal(value)
-		if os.WriteFile(path, wire, 0400) != nil {
-			t.Fatal("fixture file")
+		temporary := path + ".next"
+		if os.WriteFile(temporary, wire, 0600) != nil || os.Chmod(temporary, 0400) != nil || os.Rename(temporary, path) != nil {
+			test.Fatal("fixture file")
 		}
 	}
-	write(credential)
+	write(t, credential)
 	value, err := readResetAdminCredential(directory, binding, now, uint32(os.Getuid()))
 	if err != nil || value != token {
 		t.Fatal("private fixture credential refused")
@@ -87,14 +89,14 @@ func TestResetAdminCredentialIsPrivateOperationBoundAndNeverAnApproval(t *testin
 		t.Run(name, func(t *testing.T) {
 			bad := credential
 			change(&bad)
-			write(bad)
+			write(t, bad)
 			got, err := readResetAdminCredential(directory, binding, now, uint32(os.Getuid()))
 			if err == nil || got != "" || strings.Contains(err.Error(), token) {
 				t.Fatal("invalid credential accepted or disclosed")
 			}
 		})
 	}
-	write(credential)
+	write(t, credential)
 	if os.Chmod(path, 0600) != nil {
 		t.Fatal("fixture chmod")
 	}
