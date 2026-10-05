@@ -23,6 +23,9 @@ RUN apk add --no-cache bash curl python3
 COPY --from=build /out/deployer /usr/local/bin/deployer
 # compose 파일/서버 env는 호스트에서 /workspace로 마운트(compose.shared.yml 참조).
 WORKDIR /workspace
+# The host issuer owns the private proof files as root:0400.
+# Explicit candidate UID; no claim about the currently deployed container.
+USER 0:0
 EXPOSE 9000
 # docker 접근은 DOCKER_HOST(tcp://socket-proxy:2375)로 — sock 직접 마운트 없음.
 ENTRYPOINT ["/usr/local/bin/deployer"]

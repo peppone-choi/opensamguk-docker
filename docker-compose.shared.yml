@@ -229,6 +229,11 @@ services:
     volumes:
       # compose 파일 + 서버 env 파일을 read-write로 마운트(IMAGE_TAG 갱신 + compose 실행).
       - ./:/workspace:rw
+      # Host issuer is the only writer of approval/preflight/backup custody.
+      # Missing/unissued private files remain a closed D101 gate.
+      - ./servers/.deployer-reset-approvals:/workspace/servers/.deployer-reset-approvals:ro
+      - ./servers/.deployer-reset-preflights:/workspace/servers/.deployer-reset-preflights:ro
+      - ./backups:/workspace/backups:ro
     expose:
       - "9000"
     depends_on:

@@ -2498,33 +2498,35 @@ type createServerRequest struct {
 }
 
 type resetServerRequest struct {
-	ID                  string            `json:"id"`
-	OperationID         string            `json:"operationId"`
-	MaintenanceLease    string            `json:"maintenanceLease,omitempty"`
-	Confirm             string            `json:"confirm"`
-	ImageTag            string            `json:"imageTag,omitempty"`
-	WebGameTag          string            `json:"webGameTag,omitempty"`
-	ImageDigests        map[string]string `json:"imageDigests,omitempty"`
-	Generation          string            `json:"generation"`
-	ServerName          *string           `json:"serverName,omitempty"`
-	MaxGeneral          *int              `json:"maxGeneral,omitempty"`
-	FirstTurn           *string           `json:"firstTurn,omitempty"`
-	ScenarioLookupDir   *string           `json:"scenarioLookupDir,omitempty"`
-	ScenarioCode        string            `json:"scenarioCode"`
-	ScenarioSeedEnabled *bool             `json:"scenarioSeedEnabled"`
-	TurnTerm            string            `json:"turnTerm"`
-	Sync                string            `json:"sync"`
-	Fiction             string            `json:"fiction"`
-	Extend              string            `json:"extend"`
-	BlockGeneralCreate  string            `json:"blockGeneralCreate"`
-	NPCMode             string            `json:"npcMode"`
-	ShowImgLevel        string            `json:"showImgLevel"`
-	AutorunUserOptions  []string          `json:"autorunUserOptions"`
-	AutorunUserMinutes  string            `json:"autorunUserMinutes"`
-	JoinMode            string            `json:"joinMode"`
-	TournamentTrig      string            `json:"tournamentTrig"`
-	ReserveOpen         string            `json:"reserveOpen"`
-	PreReserveOpen      string            `json:"preReserveOpen"`
+	ApprovalPlanSHA256     string            `json:"approvalPlanSha256,omitempty"`
+	ExecutionReceiptSHA256 string            `json:"executionReceiptSha256,omitempty"`
+	ID                     string            `json:"id"`
+	OperationID            string            `json:"operationId"`
+	MaintenanceLease       string            `json:"maintenanceLease,omitempty"`
+	Confirm                string            `json:"confirm"`
+	ImageTag               string            `json:"imageTag,omitempty"`
+	WebGameTag             string            `json:"webGameTag,omitempty"`
+	ImageDigests           map[string]string `json:"imageDigests,omitempty"`
+	Generation             string            `json:"generation"`
+	ServerName             *string           `json:"serverName,omitempty"`
+	MaxGeneral             *int              `json:"maxGeneral,omitempty"`
+	FirstTurn              *string           `json:"firstTurn,omitempty"`
+	ScenarioLookupDir      *string           `json:"scenarioLookupDir,omitempty"`
+	ScenarioCode           string            `json:"scenarioCode"`
+	ScenarioSeedEnabled    *bool             `json:"scenarioSeedEnabled"`
+	TurnTerm               string            `json:"turnTerm"`
+	Sync                   string            `json:"sync"`
+	Fiction                string            `json:"fiction"`
+	Extend                 string            `json:"extend"`
+	BlockGeneralCreate     string            `json:"blockGeneralCreate"`
+	NPCMode                string            `json:"npcMode"`
+	ShowImgLevel           string            `json:"showImgLevel"`
+	AutorunUserOptions     []string          `json:"autorunUserOptions"`
+	AutorunUserMinutes     string            `json:"autorunUserMinutes"`
+	JoinMode               string            `json:"joinMode"`
+	TournamentTrig         string            `json:"tournamentTrig"`
+	ReserveOpen            string            `json:"reserveOpen"`
+	PreReserveOpen         string            `json:"preReserveOpen"`
 }
 
 type createServerResponse struct {
@@ -4089,6 +4091,14 @@ func (c config) resetServerWithMaintenanceLease(rawID string, req resetServerReq
 	id := target.ID
 	if req.Confirm != "RESET "+id {
 		return createServerResponse{OK: false, ID: id, Detail: "리셋 확인 문구가 일치하지 않습니다."}, http.StatusBadRequest
+	}
+	if req.ApprovalPlanSHA256 != "" || req.ExecutionReceiptSHA256 != "" {
+		if _, err := normalizeResetExecutionEvidenceRefs(resetExecutionEvidenceRefs{req.ApprovalPlanSHA256, req.ExecutionReceiptSHA256}); err != nil {
+			return createServerResponse{OK: false, ID: id, Detail: "실행 증거 SHA 형식이 올바르지 않습니다."}, http.StatusBadRequest
+		}
+		// Do not silently ignore supplied proofs while their mandatory worker,
+		// journal and phase source are not connected. This is a closed gate.
+		return createServerResponse{OK: false, ID: id, Detail: "실행 증거와 단계별 검증 경로가 아직 연결되지 않았습니다."}, http.StatusServiceUnavailable
 	}
 	if req.ScenarioCode == "scenario_3190" && maintenanceLease == "" {
 		return createServerResponse{OK: false, ID: id, Detail: "3190 리셋은 검증된 유지보수 실행 경로가 필요합니다."}, http.StatusBadRequest
