@@ -304,6 +304,7 @@ var sharedEnvAllowlist = map[string]envFieldSpec{
 type config struct {
 	d101CandidatePipeline     *resetD101CandidatePipeline     // Fixed native installation; nil fails before any physical command.
 	d101PurposeAuthority      resetD101PurposeAuthoritySource // Fixed approved host source; no request/env enablement.
+	d101RecoveryClosureReader resetD101RecoveryClosureReader  // Fixed retained restore1 reader; nil until actual producer installation.
 	d101RecoveryVerifier      resetD101RecoveryVerifier       // Fixed actual backup/metadata verifier; nil until supplied.
 	token                     string                          // Bearer 인증 토큰
 	composeDir                string                          // compose 파일 디렉터리(/workspace)
@@ -2873,6 +2874,10 @@ func (c config) handleOperation(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/operations/")
 	if strings.Contains(path, "/seed-approval") {
 		c.handleResetD101SeedApproval(w, r, strings.Split(path, "/"))
+		return
+	}
+	if strings.Contains(path, "/recovery-result") {
+		c.handleResetD101RecoveryResult(w, r, strings.Split(path, "/"))
 		return
 	}
 	if isResetD101PreparedPath(path) {

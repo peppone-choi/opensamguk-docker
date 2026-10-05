@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
@@ -91,5 +92,34 @@ func TestRecoveryResultSeparateDomainAndMissingActualProducerClosed(t *testing.T
 		if err != nil || method != "POST" || !strings.HasSuffix(path, map[string]string{"RECOVERY_BEGIN": "/recovery-begin", "RECOVERY_CLOSE": "/recovery-close"}[action]) {
 			t.Fatal("wrong recovery route")
 		}
+	}
+}
+
+func TestRecoveryOriginalIssuerPreservesBytesAndFreezesSourceSlice(t *testing.T) {
+	intent, result, now := recoveryFixture(t)
+	pins, public := resetD101KeyFixture(t)
+	authority := resetD101VerifiedPurposeAuthority{intent, pins, strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64), now}
+	source := func(context.Context, string, string) (resetD101VerifiedPurposeAuthority, error) {
+		return authority, nil
+	}
+	original, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	original = append(original, '\n')
+	retained := append([]byte(nil), original...)
+	actual := func(context.Context, string, string) ([]byte, error) { return original, nil }
+	key := func(p resetD101SigningKeyPins) (resetD101SigningKey, error) {
+		original[0] = 'X'
+		return readResetD101SigningKeyWithUID(p, uint32(os.Getuid()))
+	}
+	wire, proof, err := issueResetD101RecoveryResultOriginalWithKeyReader(context.Background(), source, actual, result.OperationID, intent.SHA, result.RecoveryBeginReceiptSHA, func() time.Time { return now }, key)
+	if err != nil || !bytes.Equal(wire, retained) {
+		t.Fatal("retained original was changed", err)
+	}
+	parts := strings.Split(proof, ".")
+	signature, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil || !ed25519.Verify(public, append([]byte(resetD101RecoveryResultDomain), retained...), signature) {
+		t.Fatal("signature does not bind actual original")
 	}
 }

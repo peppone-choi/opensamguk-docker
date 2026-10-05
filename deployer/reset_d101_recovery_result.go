@@ -51,6 +51,10 @@ type resetD101RecoveryResult struct {
 // native original custody and deadline. No production producer is installed.
 type resetD101RecoveryResultSource func(context.Context, string, string) (resetD101RecoveryResult, error)
 
+// A retained closure producer supplies the complete immutable bytes, including
+// their original formatting. Signing must not marshal them into another SHA.
+type resetD101RecoveryResultOriginalSource func(context.Context, string, string) ([]byte, error)
+
 func validateResetD101RecoveryResult(wire []byte, intent resetDecodedApprovalIntent, beginSHA string,
 	now time.Time) (resetD101RecoveryResult, error) {
 	var result resetD101RecoveryResult
@@ -100,6 +104,25 @@ func issueResetD101RecoveryResult(ctx context.Context, authoritySource resetD101
 func issueResetD101RecoveryResultWithKeyReader(ctx context.Context, authoritySource resetD101PurposeAuthoritySource,
 	actualSource resetD101RecoveryResultSource, operationID, intentSHA, beginSHA string, clock func() time.Time,
 	readKey func(resetD101SigningKeyPins) (resetD101SigningKey, error)) ([]byte, string, error) {
+	if actualSource == nil {
+		return nil, "", errResetExecutionEvidence
+	}
+	// Compatibility for typed source fixtures. The production original reader
+	// calls the byte-preserving issuer below directly.
+	originals := func(ctx context.Context, op, begin string) ([]byte, error) {
+		value, err := actualSource(ctx, op, begin)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(value)
+	}
+	return issueResetD101RecoveryResultOriginalWithKeyReader(ctx, authoritySource, originals,
+		operationID, intentSHA, beginSHA, clock, readKey)
+}
+
+func issueResetD101RecoveryResultOriginalWithKeyReader(ctx context.Context, authoritySource resetD101PurposeAuthoritySource,
+	actualSource resetD101RecoveryResultOriginalSource, operationID, intentSHA, beginSHA string, clock func() time.Time,
+	readKey func(resetD101SigningKeyPins) (resetD101SigningKey, error)) ([]byte, string, error) {
 	if ctx == nil || ctx.Err() != nil || authoritySource == nil || actualSource == nil || clock == nil || readKey == nil ||
 		!lifecycleJobIDRe.MatchString(operationID) || !resetEvidenceSHA.MatchString(intentSHA) || !resetEvidenceSHA.MatchString(beginSHA) {
 		return nil, "", errResetExecutionEvidence
@@ -114,12 +137,14 @@ func issueResetD101RecoveryResultWithKeyReader(ctx context.Context, authoritySou
 	startedMonotonic := time.Now()
 	ctx, cancel := context.WithTimeout(ctx, resetPreflightMaxAge)
 	defer cancel()
-	observation, err := actualSource(ctx, operationID, beginSHA)
-	if err != nil || ctx.Err() != nil {
+	original, err := actualSource(ctx, operationID, beginSHA)
+	if err != nil || len(original) == 0 || len(original) > 16*1024 || ctx.Err() != nil {
 		return nil, "", errResetExecutionEvidence
 	}
-	wire, err := json.Marshal(observation)
-	if err != nil {
+	// Freeze the actual original before validation/signing. No caller-owned
+	// slice can change the bytes between the receipt SHA and the signature.
+	wire := append([]byte(nil), original...)
+	if err != nil || ctx.Err() != nil {
 		return nil, "", errResetExecutionEvidence
 	}
 	if _, err = validateResetD101RecoveryResult(wire, intent, beginSHA, clock()); err != nil {
