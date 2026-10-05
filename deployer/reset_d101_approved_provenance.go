@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
-	"encoding/json"
 	"path/filepath"
 	"reflect"
 	"regexp"
