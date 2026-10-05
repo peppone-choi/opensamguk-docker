@@ -99,10 +99,19 @@ type resetD101CandidateInstallation struct {
 	ProducerIdentity          string
 }
 
-func (c config) installResetD101CandidatePipeline(ctx context.Context, pins resetD101CandidateInstallation, seeder resetD101CandidateSeeder) (config, error) {
+func (c config) installResetD101CandidatePipeline(ctx context.Context, pins resetD101CandidateInstallation) (config, error) {
 	closed := c
-	if c.d101PurposeAuthority == nil || seeder == nil || ctx == nil || ctx.Err() != nil {
+	if c.d101PurposeAuthority == nil || c.d101SeedMaterialInputs == nil || ctx == nil || ctx.Err() != nil {
 		return closed, errResetExecutionEvidence
+	}
+	// Capture the installed copy, not a method value from the pre-install config.
+	// The constructor never executes this callback. Its final pipeline is set
+	// before publication and the static input paths/pins are copied by value.
+	installed := c
+	seedInputs := *c.d101SeedMaterialInputs
+	installed.d101SeedMaterialInputs = &seedInputs
+	seeder := func(ctx context.Context, a resetD101CandidateAdmission, guard func(context.Context) error) (resetD101CandidateSeedEvidence, error) {
+		return installed.runResetD101CandidateSeed(ctx, a, guard)
 	}
 	for _, dir := range []string{pins.CardDirectory, pins.CommandDirectory, pins.CapsDirectory, pins.SelectedEnvelopeDirectory} {
 		if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir {
@@ -156,8 +165,8 @@ func (c config) installResetD101CandidatePipeline(ctx context.Context, pins rese
 		return closed, errResetExecutionEvidence
 	}
 	pipeline.selectedEnvelopeDirectory = pins.SelectedEnvelopeDirectory
-	c.d101CandidatePipeline = pipeline
-	return c, nil
+	installed.d101CandidatePipeline = pipeline
+	return installed, nil
 }
 func (p *resetD101CandidatePipeline) requireAdmission(a resetD101CandidateAdmission, authority resetD101VerifiedPurposeAuthority) error {
 	if p == nil || p.seeder == nil || p.caps == nil || resetD101OriginalSHA(p.commandOriginal) != p.commandSHA || authority.DeploymentCardSHA != p.cardSHA ||

@@ -3,10 +3,50 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestCandidatePipelineFixedWorkerInstallationStaysClosedWithoutNativeAuthority(t *testing.T) {
+	for _, mode := range []string{"missing-material", "missing-authority", "nil-context", "cancelled-context", "authority-denied"} {
+		t.Run(mode, func(t *testing.T) {
+			physical, authorityCalls := 0, 0
+			previous := &resetD101CandidatePipeline{}
+			c := config{
+				d101CandidatePipeline:  previous,
+				d101SeedMaterialInputs: &resetD101SeedMaterialInputs{},
+				dockerRunnerContext:    func(context.Context, ...string) (string, error) { physical++; return "", nil },
+				d101PurposeAuthority: func(context.Context, string, string) (resetD101VerifiedPurposeAuthority, error) {
+					authorityCalls++
+					return resetD101VerifiedPurposeAuthority{}, errors.New("native authority unavailable")
+				},
+			}
+			ctx := context.Background()
+			wantAuthorityCalls := 0
+			switch mode {
+			case "missing-material":
+				c.d101SeedMaterialInputs = nil
+			case "missing-authority":
+				c.d101PurposeAuthority = nil
+			case "nil-context":
+				ctx = nil
+			case "cancelled-context":
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelled
+			case "authority-denied":
+				wantAuthorityCalls = 1
+			}
+			pins := resetD101CandidateInstallation{CardDirectory: "/native/card", CommandDirectory: "/native/command", CapsDirectory: "/native/caps", SelectedEnvelopeDirectory: "/native/selected"}
+			installed, err := c.installResetD101CandidatePipeline(ctx, pins)
+			if err == nil || physical != 0 || authorityCalls != wantAuthorityCalls || installed.d101CandidatePipeline != previous || installed.d101SeedMaterialInputs != c.d101SeedMaterialInputs {
+				t.Fatal("failed installation invoked a physical worker or replaced the prior configuration")
+			}
+		})
+	}
+}
 
 func TestCandidatePipelineMissingInstallationStopsBeforeAnyPhysicalCommand(t *testing.T) {
 	calls := 0
