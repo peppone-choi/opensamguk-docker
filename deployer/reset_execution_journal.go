@@ -27,6 +27,20 @@ type resetExecutionSpaceSnapshot struct {
 	AvailableInodes uint64 `json:"availableInodes"`
 }
 
+func (s *resetExecutionSpaceSnapshot) UnmarshalJSON(wire []byte) error {
+	var observed struct {
+		Device          *uint64 `json:"device"`
+		AvailableBytes  *uint64 `json:"availableBytes"`
+		AvailableInodes *uint64 `json:"availableInodes"`
+	}
+	if decodeResetPrivateJSON(wire, &observed) != nil || observed.Device == nil ||
+		observed.AvailableBytes == nil || observed.AvailableInodes == nil {
+		return errResetExecutionEvidence
+	}
+	*s = resetExecutionSpaceSnapshot{*observed.Device, *observed.AvailableBytes, *observed.AvailableInodes}
+	return nil
+}
+
 type resetExecutionAttestation struct {
 	Phase       string                      `json:"phase"`
 	PreviousSHA string                      `json:"previousSha256,omitempty"`

@@ -211,3 +211,49 @@ func TestResetEvidenceDuplicateJSONValidator(t *testing.T) {
 		}
 	}
 }
+
+func TestResetApprovalPrivateJSONDoesNotDefaultUnknownToZeroOrEmpty(t *testing.T) {
+	plan, _, _ := resetEvidenceFixture(t)
+	original, _ := json.Marshal(plan)
+	for _, mode := range []string{"missing-generation", "null-generation", "null-lookup"} {
+		t.Run(mode, func(t *testing.T) {
+			var root map[string]any
+			_ = json.Unmarshal(original, &root)
+			target := root["target"].(map[string]any)
+			switch mode {
+			case "missing-generation":
+				delete(target, "generation")
+			case "null-generation":
+				target["generation"] = nil
+			case "null-lookup":
+				target["updates"].(map[string]any)["SCENARIO_LOOKUP_DIR"] = nil
+			}
+			wire, _ := json.Marshal(root)
+			var parsed resetApprovalPlan
+			if decodeResetPrivateJSON(wire, &parsed) == nil {
+				t.Fatal("unknown target was normalized to zero/empty")
+			}
+		})
+	}
+	var parsed resetApprovalPlan
+	if decodeResetPrivateJSON(original, &parsed) != nil || parsed.Target.Generation != 0 ||
+		parsed.Target.Updates["SCENARIO_LOOKUP_DIR"] != "" {
+		t.Fatal("explicit zero/empty refused")
+	}
+}
+
+func TestResetPhaseSpacePrivateJSONRequiresAllObservedFields(t *testing.T) {
+	for _, wire := range []string{`{}`, `{"device":null,"availableBytes":1,"availableInodes":1}`,
+		`{"availableBytes":1,"availableInodes":1}`, `{"device":0,"availableBytes":null,"availableInodes":1}`,
+		`{"device":0,"availableBytes":1,"availableInodes":1,"accessToken":"forbidden"}`} {
+		var observed resetExecutionSpaceSnapshot
+		if json.Unmarshal([]byte(wire), &observed) == nil {
+			t.Fatal("unknown/extra space observation accepted")
+		}
+	}
+	var observed resetExecutionSpaceSnapshot
+	if json.Unmarshal([]byte(`{"device":0,"availableBytes":1,"availableInodes":1}`), &observed) != nil ||
+		observed.Device != 0 {
+		t.Fatal("explicit device zero refused")
+	}
+}

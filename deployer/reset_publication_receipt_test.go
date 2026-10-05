@@ -20,7 +20,8 @@ func resetPublicationReceiptFixture(t *testing.T) (resetPublicationReceipt, rese
 	plan, _, execution := resetExecutionChainFixture(t, 3)
 	_, preflight, _ := resetEvidenceFixture(t)
 	issued := execution.Attestations[2].CompletedAt.Add(time.Second)
-	receipt := resetPublicationReceipt{Version: 1, ServerID: "pep", WorldID: 1, OperationID: plan.OperationID, Generation: 0,
+	generation := 0
+	receipt := resetPublicationReceipt{Version: 1, ServerID: "pep", WorldID: 1, OperationID: plan.OperationID, Generation: &generation,
 		ScenarioCode: "scenario_3190", TargetFingerprint: plan.TargetFingerprint, PublicationRevision: preflight.PublicationRevision,
 		AppSourceSHA: plan.AppSourceSHA, ImageDigests: plan.NewImageDigests, SelectedSourceReceiptSHA: plan.SelectedSourceReceiptSHA,
 		IsolatedSeedTickReceiptSHA: plan.IsolatedSeedTickReceiptSHA, ActualRuntimeReceiptSHA: strings.Repeat("e", 64),
@@ -44,13 +45,14 @@ func TestResetPublicationReceiptCannotSubstituteSuccessForExactProof(t *testing.
 		return value
 	}
 	cases := map[string]func(*resetPublicationReceipt){
-		"world":          func(r *resetPublicationReceipt) { r.WorldID = 2 },
-		"operation":      func(r *resetPublicationReceipt) { r.OperationID = strings.Repeat("e", 32) },
-		"target":         func(r *resetPublicationReceipt) { r.TargetFingerprint = strings.Repeat("e", 64) },
-		"generation":     func(r *resetPublicationReceipt) { r.Generation = 1 },
-		"revision":       func(r *resetPublicationReceipt) { r.PublicationRevision = "3" },
-		"app-source":     func(r *resetPublicationReceipt) { r.AppSourceSHA = strings.Repeat("e", 40) },
-		"selected-bytes": func(r *resetPublicationReceipt) { r.SelectedSourceReceiptSHA = strings.Repeat("e", 64) },
+		"world":              func(r *resetPublicationReceipt) { r.WorldID = 2 },
+		"operation":          func(r *resetPublicationReceipt) { r.OperationID = strings.Repeat("e", 32) },
+		"target":             func(r *resetPublicationReceipt) { r.TargetFingerprint = strings.Repeat("e", 64) },
+		"generation":         func(r *resetPublicationReceipt) { generation := 1; r.Generation = &generation },
+		"generation-missing": func(r *resetPublicationReceipt) { r.Generation = nil },
+		"revision":           func(r *resetPublicationReceipt) { r.PublicationRevision = "3" },
+		"app-source":         func(r *resetPublicationReceipt) { r.AppSourceSHA = strings.Repeat("e", 40) },
+		"selected-bytes":     func(r *resetPublicationReceipt) { r.SelectedSourceReceiptSHA = strings.Repeat("e", 64) },
 		"candidate-pin": func(r *resetPublicationReceipt) {
 			r.ImageDigests["game-postgres"] = "sha256:" + strings.Repeat("f", 64)
 		},

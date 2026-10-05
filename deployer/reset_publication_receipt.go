@@ -16,7 +16,7 @@ type resetPublicationReceipt struct {
 	ServerID                   string                `json:"serverId"`
 	WorldID                    int                   `json:"worldId"`
 	OperationID                string                `json:"operationId"`
-	Generation                 int                   `json:"generation"`
+	Generation                 *int                  `json:"generation"`
 	ScenarioCode               string                `json:"scenarioCode"`
 	TargetFingerprint          string                `json:"targetFingerprint"`
 	PublicationRevision        string                `json:"publicationRevision"`
@@ -39,7 +39,7 @@ func validateResetPublicationReceipt(receipt resetPublicationReceipt, evidence r
 	plan, preflight := evidence.Plan, evidence.Preflight
 	if receipt.Version != 1 || receipt.ServerID != "pep" || receipt.WorldID != 1 || receipt.OperationID != plan.OperationID ||
 		record.OperationID != plan.OperationID || record.Kind != lifecycleKindReset || record.SubjectID != "pep" || record.Status != lifecycleJobSucceeded ||
-		receipt.Generation != 0 || receipt.ScenarioCode != "scenario_3190" || receipt.TargetFingerprint != plan.TargetFingerprint ||
+		receipt.Generation == nil || *receipt.Generation != 0 || receipt.ScenarioCode != "scenario_3190" || receipt.TargetFingerprint != plan.TargetFingerprint ||
 		receipt.PublicationRevision != preflight.PublicationRevision || receipt.AppSourceSHA != plan.AppSourceSHA ||
 		receipt.SelectedSourceReceiptSHA != plan.SelectedSourceReceiptSHA || receipt.IsolatedSeedTickReceiptSHA != plan.IsolatedSeedTickReceiptSHA ||
 		receipt.BackupManifestSHA != preflight.BackupManifestSHA || !validResetFiveImageDigests(receipt.ImageDigests) ||

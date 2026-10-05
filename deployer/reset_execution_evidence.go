@@ -237,11 +237,20 @@ func readResetPrivateCustody(directory, operationID string, uid uint32) ([]byte,
 		!info.ModTime().Equal(after.ModTime()) || !os.SameFile(dirInfo, dirAfter) {
 		return nil, errResetExecutionEvidence
 	}
+	afterStat, fileOK := after.Sys().(*syscall.Stat_t)
+	dirAfterStat, dirOK := dirAfter.Sys().(*syscall.Stat_t)
+	if !fileOK || !dirOK || after.Mode().Perm() != 0400 || afterStat.Uid != uid || afterStat.Nlink != 1 ||
+		!dirAfter.IsDir() || dirAfter.Mode().Perm()&0077 != 0 || dirAfterStat.Uid != uid {
+		return nil, errResetExecutionEvidence
+	}
 	return wire, nil
 }
 
 func decodeResetPrivateJSON(wire []byte, into any) error {
 	if rejectResetDuplicateJSONKeys(wire) != nil {
+		return errResetExecutionEvidence
+	}
+	if _, plan := into.(*resetApprovalPlan); plan && requireResetApprovalTargetJSON(wire) != nil {
 		return errResetExecutionEvidence
 	}
 	decoder := json.NewDecoder(bytes.NewReader(wire))
@@ -251,6 +260,21 @@ func decodeResetPrivateJSON(wire []byte, into any) error {
 	}
 	if err := decoder.Decode(new(any)); err != io.EOF {
 		return errResetExecutionEvidence
+	}
+	return nil
+}
+
+func requireResetApprovalTargetJSON(wire []byte) error {
+	var root, target, updates map[string]json.RawMessage
+	if json.Unmarshal(wire, &root) != nil || json.Unmarshal(root["target"], &target) != nil ||
+		len(target["generation"]) == 0 || bytes.Equal(bytes.TrimSpace(target["generation"]), []byte("null")) ||
+		json.Unmarshal(target["updates"], &updates) != nil {
+		return errResetExecutionEvidence
+	}
+	for _, value := range updates {
+		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return errResetExecutionEvidence
+		}
 	}
 	return nil
 }
