@@ -45,6 +45,16 @@ func capturePrivateOriginal(path string, limit int64, uid uint32) (Original, Pri
 func ReadPrivatePart(path string, expected PrivateSnapshot, partIndex uint64) (PrivatePart, error) {
 	return readPrivateSegment(path, int64(PrivateOriginalMaxBytes), &expected, partIndex, 0, false)
 }
+
+// Inspect actual descriptor/path custody without reading or hashing the whole
+// original. It is an identity audit, never a whole-content SHA attestation.
+func InspectPrivateSnapshot(path string, expected PrivateSnapshot) error {
+	return inspectPrivateSnapshot(path, expected, 0)
+}
+func inspectPrivateSnapshot(path string, expected PrivateSnapshot, uid uint32) error {
+	_, err := readPrivateSegmentMode(path, int64(PrivateOriginalMaxBytes), &expected, 0, uid, false, true)
+	return err
+}
 func privateSnapshot(info os.FileInfo) (PrivateSnapshot, error) {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || info.Size() <= 0 || uint64(info.Size()) > PrivateOriginalMaxBytes || uint64(stat.Dev) == 0 || uint64(stat.Ino) == 0 || info.ModTime().UnixNano() <= 0 {
@@ -55,6 +65,9 @@ func privateSnapshot(info os.FileInfo) (PrivateSnapshot, error) {
 
 // UID injection stays package-private and is used only by isolated file tests.
 func readPrivateSegment(path string, limit int64, expected *PrivateSnapshot, partIndex uint64, uid uint32, full bool) (PrivatePart, error) {
+	return readPrivateSegmentMode(path, limit, expected, partIndex, uid, full, false)
+}
+func readPrivateSegmentMode(path string, limit int64, expected *PrivateSnapshot, partIndex uint64, uid uint32, full, inspect bool) (PrivatePart, error) {
 	closed := PrivatePart{}
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path || limit <= 0 || uint64(limit) > PrivateOriginalMaxBytes || (full && (expected != nil || partIndex != 0)) || (!full && expected == nil) {
 		return closed, ErrUnavailable
@@ -100,9 +113,12 @@ func readPrivateSegment(path string, limit int64, expected *PrivateSnapshot, par
 	}
 	// SectionReader/Pread reads only this fixed part; repeated transport calls
 	// do not reread/hash a 64MiB original to emit each 1MiB part.
-	wire, err := io.ReadAll(io.NewSectionReader(file, int64(offset), int64(count)))
-	if err != nil || uint64(len(wire)) != count {
-		return closed, ErrUnavailable
+	var wire []byte
+	if !inspect {
+		wire, err = io.ReadAll(io.NewSectionReader(file, int64(offset), int64(count)))
+		if err != nil || uint64(len(wire)) != count {
+			return closed, ErrUnavailable
+		}
 	}
 	after, err := file.Stat()
 	afterPath, pathErr := os.Lstat(path)

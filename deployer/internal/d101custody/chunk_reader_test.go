@@ -32,6 +32,9 @@ func TestPrivatePartAssemblesExactOriginalBeyondHelperPipeLimit(t *testing.T) {
 	if err != nil || !bytes.Equal(original.Bytes, wire) || snapshot.ByteLength <= 2<<20 {
 		t.Fatal("whole fixture snapshot refused", err)
 	}
+	if inspectPrivateSnapshot(path, snapshot, uid) != nil {
+		t.Fatal("actual snapshot audit refused")
+	}
 	combined := []byte{}
 	for partIndex := uint64(0); partIndex <= (snapshot.ByteLength-1)/PrivateOriginalPartBytes; partIndex++ {
 		part, err := readPrivateSegment(path, int64(PrivateOriginalMaxBytes), &snapshot, partIndex, uid, false)
@@ -79,6 +82,9 @@ func TestPrivatePartRejectsUnknownSnapshotReplacementAndInvalidPart(t *testing.T
 					t.Fatal("fixture replacement")
 				}
 			}
+			if mode != "part-range" && mode != "overflow" && inspectPrivateSnapshot(path, snapshot, uid) == nil {
+				t.Fatal("changed snapshot accepted by audit")
+			}
 			if part, err := readPrivateSegment(path, int64(PrivateOriginalMaxBytes), &snapshot, partIndex, uid, false); err == nil || len(part.Bytes) != 0 {
 				t.Fatal("unobserved snapshot emitted bytes")
 			}
@@ -124,6 +130,9 @@ func TestPrivatePartRetainsNativeCustodyRules(t *testing.T) {
 				if os.Remove(path) != nil {
 					t.Fatal("fixture remove")
 				}
+			}
+			if inspectPrivateSnapshot(path, snapshot, uid) == nil {
+				t.Fatal("unsafe snapshot audit accepted")
 			}
 			if part, err := readPrivateSegment(path, int64(PrivateOriginalMaxBytes), &snapshot, 0, uid, false); err == nil || len(part.Bytes) != 0 {
 				t.Fatal("unsafe native bytes emitted")

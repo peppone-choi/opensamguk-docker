@@ -10,6 +10,7 @@ import (
 	"opensamguk-deployer/internal/d101custody"
 	"os"
 	"regexp"
+	"time"
 	"unicode/utf8"
 )
 
@@ -114,7 +115,7 @@ func exactJSON(wire []byte, keys []string, target any) error {
 }
 
 func readFixed(action, path string, read privateReader) ([]byte, error) {
-	if read == nil || action != "read-originals" && action != "read-token" && action != "read-selected" && action != "read-command-originals" {
+	if read == nil || action != "read-originals" && action != "read-token" && action != "read-selected" && action != "read-command-originals" && !selectedTransportAction(action) {
 		return nil, d101custody.ErrUnavailable
 	}
 	original, err := read(path, 64<<10)
@@ -131,6 +132,9 @@ func readFixed(action, path string, read privateReader) ([]byte, error) {
 		if config.OriginalFiles[id] == "" {
 			return nil, d101custody.ErrUnavailable
 		}
+	}
+	if selectedTransportAction(action) {
+		return readSelectedSources(action, path, original, read, d101custody.InspectPrivateSnapshot, d101custody.ReadPrivatePart, time.Now())
 	}
 	if action == "read-command-originals" {
 		return readCommandOriginals(config, original, path, read)
