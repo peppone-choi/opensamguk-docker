@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -157,5 +159,30 @@ func TestResetD101ResultHttpDeadlineRetainsSlotUntilReaderExits(t *testing.T) {
 	}
 	if len(resetD101ResultReadSlots) != 0 {
 		t.Fatal("reader slot leaked")
+	}
+}
+
+func TestResetD101ResultCliExactRouteAndBoundedReply(t *testing.T) {
+	op, sha := strings.Repeat("a", 32), strings.Repeat("b", 64)
+	path := "/operations/" + op + "/execution-result/" + sha
+	if !isAuthenticatedHTTPRouteAllowed("GET", path) {
+		t.Fatal("exact result route unavailable")
+	}
+	for _, bad := range []string{path + "?x=1", path + "/", strings.Replace(path, op, "pep", 1), strings.Replace(path, sha, "not-sha", 1)} {
+		if isAuthenticatedHTTPRouteAllowed("GET", bad) {
+			t.Fatal("nonexact result route allowed")
+		}
+	}
+	if isAuthenticatedHTTPRouteAllowed("POST", path) {
+		t.Fatal("result mutation route allowed")
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, strings.Repeat("x", resetD101ResultMaxBytes+1))
+	}))
+	defer server.Close()
+	cfg := config{token: "synthetic-service-token", localHTTPBaseURL: server.URL}
+	var out, errors bytes.Buffer
+	if code := authenticatedHTTPCommand(cfg, "GET", path, strings.NewReader(""), &out, &errors); code != 1 || out.Len() != 0 {
+		t.Fatal("oversized result leaked partial output")
 	}
 }

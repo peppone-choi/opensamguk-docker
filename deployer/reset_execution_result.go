@@ -247,7 +247,7 @@ func (c config) handleResetD101ExecutionResult(w http.ResponseWriter, r *http.Re
 func serveResetD101ExecutionResult(w http.ResponseWriter, r *http.Request, parts []string, read func(context.Context, string, string) ([]byte, string, error)) {
 	w.Header().Set("Cache-Control", "no-store")
 	if len(parts) != 3 || !lifecycleJobIDRe.MatchString(parts[0]) || parts[1] != "execution-result" || !resetEvidenceSHA.MatchString(parts[2]) ||
-		r.URL.RawQuery != "" || r.URL.RawPath != "" || r.URL.Path != "/operations/"+strings.Join(parts, "/") {
+		r.URL.RawQuery != "" || r.URL.RawPath != "" || r.URL.Path != "/operations/"+strings.Join(parts, "/") || r.ContentLength != 0 {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid result identity"})
 		return
 	}

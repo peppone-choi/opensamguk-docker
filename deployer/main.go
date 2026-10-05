@@ -2746,7 +2746,17 @@ func authenticatedHTTPCommand(c config, method, requestPath string, input io.Rea
 		return 1
 	}
 	defer response.Body.Close()
-	if _, err := io.Copy(output, response.Body); err != nil {
+	if isResetD101ResultPath(strings.TrimPrefix(requestPath, "/operations/")) {
+		original, err := io.ReadAll(io.LimitReader(response.Body, resetD101ResultMaxBytes+1))
+		if err != nil || len(original) > resetD101ResultMaxBytes {
+			fmt.Fprintln(errOutput, "authenticated HTTP response read failed")
+			return 1
+		}
+		if _, err := output.Write(original); err != nil {
+			fmt.Fprintln(errOutput, "authenticated HTTP response read failed")
+			return 1
+		}
+	} else if _, err := io.Copy(output, response.Body); err != nil {
 		fmt.Fprintln(errOutput, "authenticated HTTP response read failed")
 		return 1
 	}
@@ -2761,6 +2771,11 @@ func isAuthenticatedHTTPRouteAllowed(method, requestPath string) bool {
 	switch method {
 	case http.MethodGet:
 		if requestPath == "/maintenance" {
+			return true
+		}
+		parts := strings.Split(strings.TrimPrefix(requestPath, "/operations/"), "/")
+		if strings.HasPrefix(requestPath, "/operations/") && len(parts) == 3 && lifecycleJobIDRe.MatchString(parts[0]) &&
+			parts[1] == "execution-result" && resetEvidenceSHA.MatchString(parts[2]) {
 			return true
 		}
 		return strings.HasPrefix(requestPath, "/jobs/") && lifecycleJobIDRe.MatchString(strings.TrimPrefix(requestPath, "/jobs/"))

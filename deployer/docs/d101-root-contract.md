@@ -12,6 +12,10 @@ only after the independent approved source validates intent, source provenance,
 deployment trust and current clock agreement. No provider is installed by
 `loadConfig`; there is no request or environment switch that enables issuance.
 
+The existing authenticated CLI admits only the exact GET result route and
+buffers at most 16 KiB before writing any result bytes. It does not add a reset
+route before the worker and trusted physical sources are connected.
+
 The separately authenticated result route is
 `GET /operations/{operationId}/execution-result/{originalResultSha256}`.
 It rechecks the current durable reset record, accepted/completed times, immutable
