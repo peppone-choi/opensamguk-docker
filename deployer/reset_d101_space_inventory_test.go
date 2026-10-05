@@ -78,11 +78,11 @@ func resetD101SpaceInventoryFixture(t *testing.T) (resetD101SpaceInventoryPins, 
 
 func TestSpaceInventoryPreIntentLeafUsesActualFilesystemIdentityAndExactBudget(t *testing.T) {
 	pins, budget, verify, observe := resetD101SpaceInventoryFixture(t)
-	wire, sha, err := produceResetD101SpaceInventoryWithSources(context.Background(), pins, verify, uint32(os.Getuid()), observe, time.Now)
+	wire, sha, err := produceResetD101HostSpaceCollectionWithSources(context.Background(), pins, verify, uint32(os.Getuid()), observe, time.Now)
 	if err != nil {
 		t.Fatal("synthetic bound inventory refused", err)
 	}
-	value, err := decodeResetD101SpaceInventoryReceipt(wire, sha, pins, budget, time.Now())
+	value, err := decodeResetD101HostSpaceCollection(wire, sha, pins, budget, time.Now())
 	if err != nil || value.RequiredBytes != resetDiskReserveBytes+1000 || value.RequiredInodes != 60 {
 		t.Fatal("budget changed", err)
 	}
@@ -138,7 +138,7 @@ func TestSpaceInventoryMissingVerifierOrSourcesProducesNoObservation(t *testing.
 			}
 			calls := 0
 			observe := func(path string) (uint64, resetSpaceObservation, error) { calls++; return observer(path) }
-			wire, sha, err := produceResetD101SpaceInventoryWithSources(ctx, pins, verify, uint32(os.Getuid()), observe, time.Now)
+			wire, sha, err := produceResetD101HostSpaceCollectionWithSources(ctx, pins, verify, uint32(os.Getuid()), observe, time.Now)
 			if err == nil || wire != nil || sha != "" || calls != 0 {
 				t.Fatal("missing source released inventory")
 			}
@@ -181,7 +181,7 @@ func TestSpaceInventoryRejectsCapacityDeviceCustodyAndSourceDrift(t *testing.T) 
 				}
 				return device, space, err
 			}
-			wire, sha, err := produceResetD101SpaceInventoryWithSources(context.Background(), pins, verify, uint32(os.Getuid()), observe, time.Now)
+			wire, sha, err := produceResetD101HostSpaceCollectionWithSources(context.Background(), pins, verify, uint32(os.Getuid()), observe, time.Now)
 			if err == nil || wire != nil || sha != "" {
 				t.Fatal("unobserved inventory released")
 			}
@@ -191,7 +191,7 @@ func TestSpaceInventoryRejectsCapacityDeviceCustodyAndSourceDrift(t *testing.T) 
 
 func TestSpaceInventoryDecoderRejectsForgedStageBudgetAndDevice(t *testing.T) {
 	pins, budget, verify, observe := resetD101SpaceInventoryFixture(t)
-	wire, _, err := produceResetD101SpaceInventoryWithSources(context.Background(), pins, verify, uint32(os.Getuid()), observe, time.Now)
+	wire, _, err := produceResetD101HostSpaceCollectionWithSources(context.Background(), pins, verify, uint32(os.Getuid()), observe, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +225,7 @@ func TestSpaceInventoryDecoderRejectsForgedStageBudgetAndDevice(t *testing.T) {
 			if mode == "duplicate" {
 				changed = []byte(strings.Replace(string(changed), `"schemaVersion":1`, `"schemaVersion":1,"schemaVersion":1`, 1))
 			}
-			if _, err := decodeResetD101SpaceInventoryReceipt(changed, resetD101OriginalSHA(changed), pins, budget, time.Now()); err == nil {
+			if _, err := decodeResetD101HostSpaceCollection(changed, resetD101OriginalSHA(changed), pins, budget, time.Now()); err == nil {
 				t.Fatal("forged inventory accepted")
 			}
 		})

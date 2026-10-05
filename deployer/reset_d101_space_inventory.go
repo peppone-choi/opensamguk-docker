@@ -37,7 +37,12 @@ type resetD101SpaceFilesystem struct {
 	AvailableInodes uint64 `json:"availableInodes"`
 	ObservedAtUTC   string `json:"observedAtUtc"`
 }
-type resetD101SpaceInventoryReceipt struct {
+
+// Backing raw Statfs collection18, not original14.spaceInventoryReceipt.
+// The final C9 receipt9 additionally needs scope12, issuer7, an actual host
+// identity and independent same-device/native-custody attestations.
+// No adapter may relabel this unsigned raw collection as that final receipt.
+type resetD101HostSpaceCollection struct {
 	SchemaVersion          int                                 `json:"schemaVersion"`
 	Kind                   string                              `json:"kind"`
 	OperationID            string                              `json:"operationId"`
@@ -118,19 +123,19 @@ func decodeResetD101SpaceBudgetInventory(wire []byte, pins resetD101SpaceInvento
 	return value, nil
 }
 
-func decodeResetD101SpaceInventoryReceipt(wire []byte, sha string, pins resetD101SpaceInventoryPins, budget resetD101SpaceBudgetInventory, now time.Time) (resetD101SpaceInventoryReceipt, error) {
-	var value resetD101SpaceInventoryReceipt
+func decodeResetD101HostSpaceCollection(wire []byte, sha string, pins resetD101SpaceInventoryPins, budget resetD101SpaceBudgetInventory, now time.Time) (resetD101HostSpaceCollection, error) {
+	var value resetD101HostSpaceCollection
 	if len(wire) == 0 || len(wire) > 32*1024 || !utf8.Valid(wire) || !resetEvidenceSHA.MatchString(sha) || resetD101OriginalSHA(wire) != sha ||
-		requireResetIntentShape(wire, reflect.TypeOf(value)) != nil || decodeResetPrivateJSON(wire, &value) != nil || value.SchemaVersion != 1 || value.Kind != "D101_SPACE_INVENTORY_V1" || value.Stage != "BEFORE_ADMISSION" || value.Scope != "HOST_STATFS_ONLY" ||
+		requireResetIntentShape(wire, reflect.TypeOf(value)) != nil || decodeResetPrivateJSON(wire, &value) != nil || value.SchemaVersion != 1 || value.Kind != "D101_HOST_SPACE_COLLECTION_V1" || value.Stage != "BEFORE_ADMISSION" || value.Scope != "HOST_STATFS_ONLY" ||
 		value.OperationID != budget.OperationID || value.TargetFingerprint != budget.TargetFingerprint || value.AppSourceSHA != budget.AppSourceSHA || value.DockerSourceSHA != budget.DockerSourceSHA ||
 		!reflect.DeepEqual(value.OldImageDigests, budget.OldImageDigests) || !reflect.DeepEqual(value.NewImageDigests, budget.NewImageDigests) || value.BudgetInventorySHA != pins.BudgetSHA || !reflect.DeepEqual(value.SpaceBudget, budget.SpaceBudget) ||
 		value.ProducerIdentity != pins.ProducerIdentity || !resetD101KeyID.MatchString(value.ProducerIdentity) || !reflect.DeepEqual(value.FilesystemPaths, pins.FilesystemPaths) || len(value.FilesystemPaths) != 4 || len(value.FilesystemObservations) != 4 || now.Unix() <= 0 {
-		return resetD101SpaceInventoryReceipt{}, errResetExecutionEvidence
+		return resetD101HostSpaceCollection{}, errResetExecutionEvidence
 	}
 	required, err := resetRequiredSpace(budget.SpaceBudget)
 	observed, timeErr := resetD101RecoveryUTC(value.ObservedAtUTC)
 	if err != nil || timeErr != nil || observed.After(now) || value.RequiredBytes != required.Bytes || value.RequiredInodes != required.Inodes {
-		return resetD101SpaceInventoryReceipt{}, errResetExecutionEvidence
+		return resetD101HostSpaceCollection{}, errResetExecutionEvidence
 	}
 	device := ""
 	for _, id := range resetD101SpaceFilesystemIDs {
@@ -140,20 +145,20 @@ func decodeResetD101SpaceInventoryReceipt(wire []byte, sha string, pins resetD10
 		at, atErr := resetD101RecoveryUTC(fs.ObservedAtUTC)
 		if !exists || !ok || !filepath.IsAbs(path) || filepath.Clean(path) != path || devErr != nil || dev == 0 || strconv.FormatUint(dev, 10) != fs.Device || (device != "" && device != fs.Device) || atErr != nil || at.After(observed) || observed.Sub(at) >= resetPreflightMaxAge ||
 			fs.AvailableBytes < required.Bytes || fs.AvailableInodes < required.Inodes {
-			return resetD101SpaceInventoryReceipt{}, errResetExecutionEvidence
+			return resetD101HostSpaceCollection{}, errResetExecutionEvidence
 		}
 		device = fs.Device
 	}
 	return value, nil
 }
 
-func produceResetD101SpaceInventory(ctx context.Context, pins resetD101SpaceInventoryPins, verify resetD101SpaceBudgetVerifier) ([]byte, string, error) {
-	return produceResetD101SpaceInventoryWithSources(ctx, pins, verify, 0, observeResetFilesystem, time.Now)
+func produceResetD101HostSpaceCollection(ctx context.Context, pins resetD101SpaceInventoryPins, verify resetD101SpaceBudgetVerifier) ([]byte, string, error) {
+	return produceResetD101HostSpaceCollectionWithSources(ctx, pins, verify, 0, observeResetFilesystem, time.Now)
 }
 
 // UID/observer/clock seams belong to isolated fixtures. Production always uses
 // UID0 and current native Statfs/Stat, including the actual Docker data root.
-func produceResetD101SpaceInventoryWithSources(ctx context.Context, pins resetD101SpaceInventoryPins, verify resetD101SpaceBudgetVerifier, uid uint32,
+func produceResetD101HostSpaceCollectionWithSources(ctx context.Context, pins resetD101SpaceInventoryPins, verify resetD101SpaceBudgetVerifier, uid uint32,
 	observe func(string) (uint64, resetSpaceObservation, error), clock func() time.Time) ([]byte, string, error) {
 	if ctx == nil || ctx.Err() != nil || verify == nil || observe == nil || clock == nil || len(pins.SourceDirectories) != 4 || len(pins.FilesystemPaths) != 4 || !resetD101KeyID.MatchString(pins.ProducerIdentity) {
 		return nil, "", errResetExecutionEvidence
@@ -240,13 +245,13 @@ func produceResetD101SpaceInventoryWithSources(ctx context.Context, pins resetD1
 	if requiredErr != nil || completed.Before(started) || completed.Sub(started) >= resetPreflightMaxAge || time.Since(startedMonotonic) >= resetPreflightMaxAge || bounded.Err() != nil {
 		return nil, "", errResetExecutionEvidence
 	}
-	value := resetD101SpaceInventoryReceipt{1, "D101_SPACE_INVENTORY_V1", budget.OperationID, budget.TargetFingerprint, budget.AppSourceSHA, budget.DockerSourceSHA, budget.OldImageDigests, budget.NewImageDigests, "BEFORE_ADMISSION", pins.BudgetSHA, budget.SpaceBudget, pins.FilesystemPaths, filesystems, required.Bytes, required.Inodes, completed.UTC().Format(time.RFC3339Nano), pins.ProducerIdentity, "HOST_STATFS_ONLY"}
+	value := resetD101HostSpaceCollection{1, "D101_HOST_SPACE_COLLECTION_V1", budget.OperationID, budget.TargetFingerprint, budget.AppSourceSHA, budget.DockerSourceSHA, budget.OldImageDigests, budget.NewImageDigests, "BEFORE_ADMISSION", pins.BudgetSHA, budget.SpaceBudget, pins.FilesystemPaths, filesystems, required.Bytes, required.Inodes, completed.UTC().Format(time.RFC3339Nano), pins.ProducerIdentity, "HOST_STATFS_ONLY"}
 	wire, marshalErr := json.Marshal(value)
 	sha := resetD101OriginalSHA(wire)
 	if marshalErr != nil {
 		return nil, "", errResetExecutionEvidence
 	}
-	if _, err := decodeResetD101SpaceInventoryReceipt(wire, sha, pins, budget, completed); err != nil {
+	if _, err := decodeResetD101HostSpaceCollection(wire, sha, pins, budget, completed); err != nil {
 		return nil, "", errResetExecutionEvidence
 	}
 	return wire, sha, nil
