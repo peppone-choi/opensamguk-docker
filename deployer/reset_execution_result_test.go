@@ -56,6 +56,7 @@ func TestResetD101ResultBindsCurrentRecordAndRejectsChangedOutcome(t *testing.T)
 		"fingerprint": func(r *durableOperationRecord) { r.RequestFingerprint = strings.Repeat("b", 64) },
 		"accepted":    func(r *durableOperationRecord) { r.CreatedAt = r.CreatedAt.Add(time.Second) },
 		"completed":   func(r *durableOperationRecord) { r.UpdatedAt = r.UpdatedAt.Add(time.Second) },
+		"intent":      func(r *durableOperationRecord) { r.D101IntentSHA = strings.Repeat("b", 64) },
 	}
 	for name, change := range changes {
 		t.Run(name, func(t *testing.T) {

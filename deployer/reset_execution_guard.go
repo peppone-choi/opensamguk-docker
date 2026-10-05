@@ -23,17 +23,22 @@ type resetExecutionEvidence struct {
 // Every new execution phase calls this function again. A prior successful read
 // grants no later mutation. This source is not an operating approval.
 func (c config) readResetExecutionEvidence(operationID string, target resetLifecycleTarget, refs resetExecutionEvidenceRefs, now time.Time) (resetExecutionEvidence, error) {
+	return c.readResetExecutionEvidenceWithCustodyUID(operationID, target, refs, now, 0)
+}
+
+// UID injection is restricted to isolated custody fixtures.
+func (c config) readResetExecutionEvidenceWithCustodyUID(operationID string, target resetLifecycleTarget, refs resetExecutionEvidenceRefs, now time.Time, uid uint32) (resetExecutionEvidence, error) {
 	var evidence resetExecutionEvidence
 	if !resetEvidenceSHA.MatchString(refs.ApprovalPlanSHA) || !resetEvidenceSHA.MatchString(refs.ExecutionReceiptSHA) {
 		return evidence, errResetExecutionEvidence
 	}
-	if err := readResetPrivateEvidence(filepath.Join(c.serversDir, ".deployer-reset-approvals"), operationID, refs.ApprovalPlanSHA, 0, &evidence.Plan); err != nil {
+	if err := readResetPrivateEvidence(filepath.Join(c.serversDir, ".deployer-reset-approvals"), operationID, refs.ApprovalPlanSHA, uid, &evidence.Plan); err != nil {
 		return evidence, errResetExecutionEvidence
 	}
 	// A D101-linked plan may not outlive or change its immutable pre-CAS intent.
 	// Legacy empty linkage remains readable while its physical worker is gated.
 	if evidence.Plan.ApprovalIntentSHA != "" {
-		wire, err := readResetPrivateCustody(filepath.Join(c.serversDir, ".deployer-reset-intents"), operationID, 0)
+		wire, err := readResetPrivateCustody(filepath.Join(c.serversDir, ".deployer-reset-intents"), operationID, uid)
 		if err != nil {
 			return evidence, errResetExecutionEvidence
 		}
@@ -45,7 +50,7 @@ func (c config) readResetExecutionEvidence(operationID string, target resetLifec
 	if err := validateResetApprovalPlan(evidence.Plan, operationID, target, now); err != nil {
 		return evidence, errResetExecutionEvidence
 	}
-	if err := readResetPrivateEvidence(filepath.Join(c.serversDir, ".deployer-reset-preflights"), operationID, refs.ExecutionReceiptSHA, 0, &evidence.Preflight); err != nil {
+	if err := readResetPrivateEvidence(filepath.Join(c.serversDir, ".deployer-reset-preflights"), operationID, refs.ExecutionReceiptSHA, uid, &evidence.Preflight); err != nil {
 		return evidence, errResetExecutionEvidence
 	}
 	if err := validateResetPreflight(evidence.Preflight, evidence.Plan, refs.ApprovalPlanSHA, now); err != nil {

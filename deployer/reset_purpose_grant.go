@@ -1,14 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"reflect"
 	"regexp"
 	"time"
 )
@@ -138,17 +136,7 @@ func issueResetD101PurposeGrantWithKeyReader(ctx context.Context, source resetD1
 		return "", errResetExecutionEvidence
 	}
 	if request.Action == "PREPARE" {
-		var prepare struct {
-			SchemaVersion     int    `json:"schemaVersion"`
-			ApprovalIntentSHA string `json:"approvalIntentSha256"`
-			IntentBytes       string `json:"approvalIntentBytesBase64url"`
-		}
-		if requireResetIntentShape(body, reflect.TypeOf(prepare)) != nil || decodeResetPrivateJSON(body, &prepare) != nil ||
-			prepare.SchemaVersion != 1 || prepare.ApprovalIntentSHA != intent.SHA {
-			return "", errResetExecutionEvidence
-		}
-		original, err := base64.RawURLEncoding.Strict().DecodeString(prepare.IntentBytes)
-		if err != nil || base64.RawURLEncoding.EncodeToString(original) != prepare.IntentBytes || !bytes.Equal(original, intent.originalBytes()) {
+		if requireResetD101PrepareBody(body, intent, request.GatewayPayloadSHA) != nil {
 			return "", errResetExecutionEvidence
 		}
 	}

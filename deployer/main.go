@@ -1273,6 +1273,9 @@ func (c config) repairLifecycleJournal() (repairErr error) {
 		// This path only verifies the bound completed state and clears its journal.
 		// It must not replay legacy images, or rewrite a terminal operation on refusal.
 		linkedOperationSettled = true
+		if journal.ResetExecution != nil {
+			return c.settleSucceededLifecycleJournal(lease.Context(), journal.OperationID)
+		}
 		if err := c.verifySucceededLifecycleJournal(journal, target); err != nil {
 			return err
 		}
@@ -4529,7 +4532,8 @@ func (c config) startClaimedDurableLifecycleJob(lease *operationLease, jobID, na
 
 		transitionErr := c.transitionDurableLifecycleOperation(operationID, transitionStatus, httpStatus, messageID)
 		if transitionErr == nil && transitionStatus == lifecycleJobSucceeded {
-			if clearErr := c.clearLifecycleJournal(); clearErr != nil {
+			if clearErr := c.settleSucceededLifecycleJournal(lease.Context(), operationID); clearErr != nil {
+				lease.coordinator.markPreparationSettlementPending()
 				log.Printf("server lifecycle journal clear failed after durable success name=%s err=%v", name, clearErr)
 			}
 		}

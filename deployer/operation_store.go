@@ -68,6 +68,9 @@ type durableOperationRecord struct {
 	PublicMessage      string             `json:"publicMessage"`
 	CreatedAt          time.Time          `json:"createdAt"`
 	UpdatedAt          time.Time          `json:"updatedAt"`
+	// D101 physical execution IDs remain reserved after terminal retention.
+	// Empty legacy records keep the previous serialized shape and pruning.
+	D101IntentSHA string `json:"d101IntentSha256,omitempty"`
 }
 
 type durableOperationDocument struct {
@@ -185,7 +188,7 @@ func (s *durableOperationStore) Reserve(record durableOperationRecord) (durableO
 	defer s.mu.Unlock()
 
 	if existing, ok := s.operations[record.OperationID]; ok {
-		if existing.Kind != record.Kind || existing.SubjectID != record.SubjectID || existing.RequestFingerprint != record.RequestFingerprint {
+		if existing.Kind != record.Kind || existing.SubjectID != record.SubjectID || existing.RequestFingerprint != record.RequestFingerprint || existing.D101IntentSHA != record.D101IntentSHA {
 			return durableOperationRecord{}, false, errLifecycleOperationConflict
 		}
 		if deferred, pending := s.deferredTransitions[record.OperationID]; pending {
@@ -397,6 +400,9 @@ func writeDurableOperationFile(path string, data []byte, fileOps durableOperatio
 }
 
 func validateDurableOperationRecord(record durableOperationRecord) error {
+	if record.D101IntentSHA != "" && (!resetEvidenceSHA.MatchString(record.D101IntentSHA) || record.Kind != lifecycleKindReset || record.SubjectID != "pep") {
+		return errors.New("D101 operation reservation is invalid")
+	}
 	if !lifecycleJobIDRe.MatchString(record.OperationID) {
 		return errors.New("operation id must be 32 lowercase hexadecimal characters")
 	}
@@ -504,7 +510,7 @@ func isDurableOperationStatus(status lifecycleJobStatus) bool {
 func pruneExpiredDurableOperations(operations map[string]durableOperationRecord, now time.Time, retention time.Duration) bool {
 	changed := false
 	for id, record := range operations {
-		if !isTerminalLifecycleJob(record.Status) || now.Before(record.UpdatedAt.Add(retention)) {
+		if record.D101IntentSHA != "" || !isTerminalLifecycleJob(record.Status) || now.Before(record.UpdatedAt.Add(retention)) {
 			continue
 		}
 		delete(operations, id)

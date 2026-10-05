@@ -29,7 +29,23 @@ This result records physical outcome. Gateway canonical settlement and final
 PUBLIC publication require their own evidence. Missing/pruned/currently running
 or changed durable records never become success through a retained file.
 
+Successful D101 durable transitions preserve the live journal until an immutable
+result is published. The issuer binds the actual original PREPARE body, original
+intent/plan/preflight, all three phase observations and the runtime original to
+the current durable accepted/completed times. Its failure preserves physical
+success and the journal. Completed-journal recovery uses the same receipt-only
+path without Docker or registry replay. The runtime writer uses the actual
+Docker/raw ADMIN collector before the durable terminal transition; the physical
+worker call site is still pending.
+
+D101 durable records carry an immutable intent reference and are exempt from
+ordinary terminal pruning, including restart and capacity pruning. Same-ID
+legacy or changed-intent admission conflicts. The bounded store can refuse new
+admission when its retained identities fill capacity; there is no automatic
+identity removal or reuse. Empty legacy references retain prior pruning and
+serialized shape.
+
 Still unconnected: the approved authority producer and installation card,
-physical D101 worker, immutable result issuer, coordinator, and recovery path.
+physical D101 worker, coordinator, and approved physical recovery path.
 The result route remains unavailable in production configuration. Local tests
 use public synthetic keys and isolated files, not operating trust or keys.

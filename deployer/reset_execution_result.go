@@ -120,6 +120,7 @@ func requireResetD101ResultBinding(result resetD101ExecutionResult, intent reset
 	revision, revisionErr := strconv.ParseInt(result.VerifyingRevision, 10, 64)
 	initial, initialErr := strconv.ParseInt(intent.Intent.InitialPublicRevision, 10, 64)
 	if err != nil || completedErr != nil || fpErr != nil || revisionErr != nil || initialErr != nil || revision <= initial ||
+		(record.D101IntentSHA != "" && record.D101IntentSHA != intent.SHA) ||
 		completed.After(now) || !accepted.Equal(record.CreatedAt) || !completed.Equal(record.UpdatedAt) ||
 		record.OperationID != result.OperationID || record.Kind != lifecycleKindReset || record.SubjectID != "pep" ||
 		string(record.Status) != result.Status || record.RequestFingerprint != result.RootRequestFingerprint || fingerprint != record.RequestFingerprint ||
@@ -142,7 +143,7 @@ func (c config) readResetD101ExecutionResult(ctx context.Context, op, expectedSH
 		return nil, "", errResetExecutionEvidence
 	}
 	record, found := c.lifecycleOperationStore.Lookup(op)
-	if !found || record.Kind != lifecycleKindReset || record.SubjectID != "pep" {
+	if !found || record.Kind != lifecycleKindReset || record.SubjectID != "pep" || record.D101IntentSHA == "" {
 		return nil, "", errResetExecutionEvidence
 	}
 	wire, err := readResetPrivateCustody(filepath.Join(c.serversDir, ".deployer-reset-results"), op, 0)
@@ -169,6 +170,10 @@ func (c config) readResetD101ExecutionResult(ctx context.Context, op, expectedSH
 		requireResetD101ResultBinding(result, intent, plan, preflight, record, time.Now()) != nil {
 		return nil, "", errResetExecutionEvidence
 	}
+	prepare, err := readResetPrivateCustody(filepath.Join(c.serversDir, ".deployer-reset-prepare-bodies"), op, 0)
+	if err != nil || requireResetD101PrepareBody(prepare, intent, result.GatewayPayloadSHA) != nil {
+		return nil, "", errResetExecutionEvidence
+	}
 	if err := c.requireResetD101ResultProofs(result, plan, preflight, record); err != nil {
 		return nil, "", errResetExecutionEvidence
 	}
@@ -190,12 +195,23 @@ func (c config) readResetD101ExecutionResult(ctx context.Context, op, expectedSH
 
 func isResetD101ResultPath(path string) bool { return strings.Contains(path, "/execution-result/") }
 func (c config) requireResetD101ResultProofs(result resetD101ExecutionResult, plan resetApprovalPlan, preflight resetPreflightReceipt, record durableOperationRecord) error {
+	return c.requireResetD101ResultProofsWithCustodyUID(result, plan, preflight, record, 0)
+}
+
+// UID injection is restricted to isolated custody fixtures.
+func (c config) requireResetD101ResultProofsWithCustodyUID(result resetD101ExecutionResult, plan resetApprovalPlan, preflight resetPreflightReceipt, record durableOperationRecord, uid uint32) error {
 	if result.ExecutionJournalSHA != nil {
 		var journal resetExecutionJournal
-		if readResetPrivateEvidence(filepath.Join(c.serversDir, ".deployer-reset-execution-journals"), result.OperationID, *result.ExecutionJournalSHA, 0, &journal) != nil ||
+		if readResetPrivateEvidence(filepath.Join(c.serversDir, ".deployer-reset-execution-journals"), result.OperationID, *result.ExecutionJournalSHA, uid, &journal) != nil ||
 			validateResetExecutionJournal(journal, result.OperationID, plan.Target) != nil || journal.AcceptedAtUnix != record.CreatedAt.Unix() ||
 			journal.RequestFingerprint != record.RequestFingerprint || journal.Evidence != (resetExecutionEvidenceRefs{result.ApprovalPlanSHA, result.ExecutionReceiptSHA}) {
 			return errResetExecutionEvidence
+		}
+		for _, phase := range journal.Attestations {
+			if phase.Snapshot.PublicationRevision != preflight.PublicationRevision || phase.Snapshot.WriterFreezeReceiptSHA != plan.WriterFreezeReceiptSHA ||
+				preflight.FilesystemDevice == nil || phase.Space.Device != *preflight.FilesystemDevice {
+				return errResetExecutionEvidence
+			}
 		}
 		if result.Status == "succeeded" && (len(journal.Attestations) != 3 || journal.Attestations[2].Snapshot.PublicationRevision != result.VerifyingRevision ||
 			journal.Attestations[2].CompletedAt.Unix() >= plan.DestructiveCutoffUnix || journal.Attestations[2].CompletedAt.After(record.UpdatedAt)) {
@@ -204,7 +220,7 @@ func (c config) requireResetD101ResultProofs(result resetD101ExecutionResult, pl
 	}
 	if result.ActualRuntimeReceiptSHA != nil {
 		var runtime resetRuntimeObservation
-		if readResetPrivateEvidence(filepath.Join(c.serversDir, ".deployer-reset-runtime"), result.OperationID, *result.ActualRuntimeReceiptSHA, 0, &runtime) != nil ||
+		if readResetPrivateEvidence(filepath.Join(c.serversDir, ".deployer-reset-runtime"), result.OperationID, *result.ActualRuntimeReceiptSHA, uid, &runtime) != nil ||
 			runtime.Version != 1 || runtime.ServerID != "pep" || runtime.WorldID != 1 || runtime.OperationID != result.OperationID ||
 			runtime.TargetFingerprint != result.TargetFingerprint || runtime.AppSourceSHA != result.AppSourceSHA ||
 			runtime.Evidence != (resetExecutionEvidenceRefs{result.ApprovalPlanSHA, result.ExecutionReceiptSHA}) ||
