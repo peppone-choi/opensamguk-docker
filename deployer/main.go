@@ -2850,6 +2850,10 @@ func (c config) handleOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/operations/")
+	if isResetPublicationReceiptPath(path) {
+		c.handleResetPublicationReceipt(w, r, strings.Split(path, "/"))
+		return
+	}
 	if strings.Contains(path, "/") || !lifecycleJobIDRe.MatchString(path) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "operation id가 올바르지 않습니다."})
 		return

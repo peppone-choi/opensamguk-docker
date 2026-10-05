@@ -234,6 +234,7 @@ services:
       - ./servers/.deployer-reset-approvals:/workspace/servers/.deployer-reset-approvals:ro
       - ./servers/.deployer-reset-preflights:/workspace/servers/.deployer-reset-preflights:ro
       - ./servers/.deployer-reset-admin:/workspace/servers/.deployer-reset-admin:ro
+      - ./servers/.deployer-publication-receipts:/workspace/servers/.deployer-publication-receipts:ro
       - ./backups:/workspace/backups:ro
     expose:
       - "9000"
