@@ -113,21 +113,30 @@ func (c config) verifyResetStoppedContainers(ctx context.Context, evidence reset
 }
 
 func (c config) verifyResetLiveSpace(evidence resetExecutionEvidence) error {
+	_, err := c.observeAndVerifyResetLiveSpace(evidence)
+	return err
+}
+
+func (c config) observeAndVerifyResetLiveSpace(evidence resetExecutionEvidence) (resetExecutionSpaceSnapshot, error) {
 	device, observed, err := observeResetFilesystem(c.composeDir)
 	if err != nil || evidence.Preflight.FilesystemDevice == nil || device != *evidence.Preflight.FilesystemDevice {
-		return errResetExecutionEvidence
+		return resetExecutionSpaceSnapshot{}, errResetExecutionEvidence
 	}
 	backup := filepath.Join(c.composeDir, "backups", "pep", evidence.Plan.OperationID)
 	info, err := os.Lstat(backup)
 	if err != nil || !info.IsDir() || info.Mode().Perm()&0077 != 0 {
-		return errResetExecutionEvidence
+		return resetExecutionSpaceSnapshot{}, errResetExecutionEvidence
 	}
 	backupDevice, _, err := observeResetFilesystem(backup)
 	if err != nil || backupDevice != device {
-		return errResetExecutionEvidence
+		return resetExecutionSpaceSnapshot{}, errResetExecutionEvidence
 	}
-	return verifyResetRemainingSpace(evidence.Plan.SpaceBudget.RecoveryBytes, evidence.Preflight.UnfinishedTemporaryBytes,
-		evidence.Preflight.RemainingNewFileCount, evidence.Plan.SpaceBudget.InodeReserve, observed)
+	if err := verifyResetRemainingSpace(evidence.Plan.SpaceBudget.RecoveryBytes, evidence.Preflight.UnfinishedTemporaryBytes,
+		evidence.Preflight.RemainingNewFileCount, evidence.Plan.SpaceBudget.InodeReserve, observed); err != nil {
+		return resetExecutionSpaceSnapshot{}, err
+	}
+	return resetExecutionSpaceSnapshot{Device: device, AvailableBytes: *observed.AvailableBytes,
+		AvailableInodes: *observed.AvailableInodes}, nil
 }
 
 func (c config) verifyResetInitialExecutionGuard(ctx context.Context, operationID string, target resetLifecycleTarget, refs resetExecutionEvidenceRefs) error {

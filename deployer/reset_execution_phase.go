@@ -38,17 +38,23 @@ type resetExecutionPhaseSource func(context.Context, resetExecutionPhaseBinding)
 // is never renewed. The caller must persist both the initial binding and the
 // subsequent attestation chain; without that wiring this is not executable.
 func (c config) verifyResetExecutionPhase(ctx context.Context, binding resetExecutionPhaseBinding, source resetExecutionPhaseSource) error {
+	_, err := c.observeResetExecutionPhase(ctx, binding, source)
+	return err
+}
+
+func (c config) observeResetExecutionPhase(ctx context.Context, binding resetExecutionPhaseBinding, source resetExecutionPhaseSource) (resetExecutionAttestation, error) {
 	now := time.Now()
 	if source == nil || binding.AcceptedAtUnix <= 0 || time.Unix(binding.AcceptedAtUnix, 0).After(now) ||
 		(binding.Phase != "prepared" && binding.Phase != "before-journal" && binding.Phase != "before-down") ||
+		(binding.Phase == "prepared" && binding.PreviousAttestationSHA != "") ||
 		(binding.Phase != "prepared" && !resetEvidenceSHA.MatchString(binding.PreviousAttestationSHA)) {
-		return errResetExecutionEvidence
+		return resetExecutionAttestation{}, errResetExecutionEvidence
 	}
 	// Read the static plan/receipt and validate initial freshness at persisted
 	// admission time. Do not re-age the original preflight after a long pull.
 	evidence, err := c.readResetExecutionEvidence(binding.OperationID, binding.Target, binding.Evidence, time.Unix(binding.AcceptedAtUnix, 0))
 	if err != nil || validateResetApprovalPlan(evidence.Plan, binding.OperationID, binding.Target, now) != nil {
-		return errResetExecutionEvidence
+		return resetExecutionAttestation{}, errResetExecutionEvidence
 	}
 	phaseDeadline := now.Add(resetPreflightMaxAge)
 	cutoff := time.Unix(evidence.Plan.DestructiveCutoffUnix, 0)
@@ -59,17 +65,22 @@ func (c config) verifyResetExecutionPhase(ctx context.Context, binding resetExec
 	defer cancel()
 	current, err := source(phaseCtx, binding)
 	if err != nil || validateResetPhaseSnapshot(current, evidence, binding, now, time.Now()) != nil {
-		return errResetExecutionEvidence
+		return resetExecutionAttestation{}, errResetExecutionEvidence
 	}
-	if c.verifyResetStoppedContainers(phaseCtx, evidence) != nil || c.verifyResetLiveSpace(evidence) != nil {
-		return errResetExecutionEvidence
+	if c.verifyResetStoppedContainers(phaseCtx, evidence) != nil {
+		return resetExecutionAttestation{}, errResetExecutionEvidence
+	}
+	space, err := c.observeAndVerifyResetLiveSpace(evidence)
+	if err != nil {
+		return resetExecutionAttestation{}, errResetExecutionEvidence
 	}
 	if phaseCtx.Err() != nil || !time.Now().Before(phaseDeadline) ||
 		time.Since(current.ObservedAt) >= resetPreflightMaxAge ||
 		validateResetApprovalPlan(evidence.Plan, binding.OperationID, binding.Target, time.Now()) != nil {
-		return errResetExecutionEvidence
+		return resetExecutionAttestation{}, errResetExecutionEvidence
 	}
-	return nil
+	return resetExecutionAttestation{Phase: binding.Phase, PreviousSHA: binding.PreviousAttestationSHA,
+		StartedAt: now, CompletedAt: time.Now(), Snapshot: current, Space: space}, nil
 }
 
 func validateResetPhaseSnapshot(current resetExecutionPhaseSnapshot, evidence resetExecutionEvidence, binding resetExecutionPhaseBinding, phaseStart, now time.Time) error {

@@ -987,14 +987,15 @@ func writeMaintenanceMarkerDurableWithSync(path string, syncDir func(string) err
 }
 
 type lifecycleJournal struct {
-	Version       int                   `json:"version"`
-	Operation     string                `json:"operation"`
-	OperationID   string                `json:"operationId,omitempty"`
-	OperationKind lifecycleKind         `json:"operationKind,omitempty"`
-	Stage         string                `json:"stage,omitempty"`
-	ServerID      string                `json:"serverId"`
-	Project       string                `json:"project"`
-	ResetTarget   *resetLifecycleTarget `json:"resetTarget,omitempty"`
+	Version        int                    `json:"version"`
+	Operation      string                 `json:"operation"`
+	OperationID    string                 `json:"operationId,omitempty"`
+	OperationKind  lifecycleKind          `json:"operationKind,omitempty"`
+	Stage          string                 `json:"stage,omitempty"`
+	ServerID       string                 `json:"serverId"`
+	Project        string                 `json:"project"`
+	ResetTarget    *resetLifecycleTarget  `json:"resetTarget,omitempty"`
+	ResetExecution *resetExecutionJournal `json:"resetExecution,omitempty"`
 }
 
 type resetLifecycleTarget struct {
@@ -1130,6 +1131,9 @@ func validateLifecycleJournalOperationLink(operation, operationID string, kind l
 }
 
 func (c config) writeLifecycleJournalRecord(journal lifecycleJournal) error {
+	if err := validateLifecycleResetExecution(journal); err != nil {
+		return err
+	}
 	payload, err := json.Marshal(journal)
 	if err != nil {
 		return err
@@ -1183,6 +1187,9 @@ func (c config) readLifecycleJournal() (lifecycleJournal, bool, error) {
 		}
 		journal.ResetTarget = &normalized
 	}
+	if err := validateLifecycleResetExecution(journal); err != nil {
+		return lifecycleJournal{}, false, err
+	}
 	return journal, true, nil
 }
 
@@ -1235,9 +1242,17 @@ func (c config) repairLifecycleJournal() (repairErr error) {
 		if !found || linkedOperation.Kind != journal.OperationKind || linkedOperation.SubjectID != journal.ServerID {
 			return errors.New("linked lifecycle operation identity is invalid")
 		}
-		if linkedOperation.Status == lifecycleJobSucceeded && journal.ResetTarget != nil &&
-			linkedOperation.RequestFingerprint != resetRequestFingerprint(journal.ServerID, *journal.ResetTarget) {
-			return errors.New("completed reset operation target is invalid")
+		if journal.ResetExecution != nil && c.validateResetExecutionOperation(*journal.ResetExecution, journal.OperationID) != nil {
+			return errResetExecutionEvidence
+		}
+		if linkedOperation.Status == lifecycleJobSucceeded && journal.ResetTarget != nil {
+			fingerprint := resetRequestFingerprint(journal.ServerID, *journal.ResetTarget)
+			if journal.ResetExecution != nil {
+				fingerprint = journal.ResetExecution.RequestFingerprint
+			}
+			if linkedOperation.RequestFingerprint != fingerprint {
+				return errors.New("completed reset operation target is invalid")
+			}
 		}
 	}
 	linkedOperationSettled := false
