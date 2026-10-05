@@ -145,16 +145,20 @@ func TestResetPrivateEvidenceExactBytesAndCustody(t *testing.T) {
 			if err := os.Chmod(dir, 0700); err != nil {
 				t.Fatal(err)
 			}
-			wire := []byte("{\"version\":1}")
+			fixture, _, _ := resetEvidenceFixture(t)
+			wire, marshalErr := json.Marshal(fixture)
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
 			switch mode {
 			case "unknown-key":
-				wire = []byte("{\"version\":1,\"unexpected\":true}")
+				wire = append(wire[:len(wire)-1], []byte(",\"unexpected\":true}")...)
 			case "duplicate-key":
-				wire = []byte("{\"version\":1,\"version\":2}")
+				wire = append(wire[:len(wire)-1], []byte(",\"version\":2}")...)
 			case "nested-duplicate":
-				wire = []byte("{\"version\":1,\"target\":{\"generation\":0,\"generation\":1}}")
+				wire = []byte(strings.Replace(string(wire), "\"generation\":0", "\"generation\":0,\"generation\":1", 1))
 			case "trailing":
-				wire = []byte("{\"version\":1} {}")
+				wire = append(wire, []byte(" {}")...)
 			case "oversize":
 				wire = []byte(strings.Repeat(" ", resetEvidenceMaxBytes+1))
 			}
