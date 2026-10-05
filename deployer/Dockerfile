@@ -11,6 +11,7 @@ COPY go.mod ./
 # 패키지의 운영 소스 전체를 복사한다. 개별 파일 나열은 새 Go 파일 추가 시
 # 로컬 go build와 컨테이너 빌드가 달라지는 드리프트를 만든다.
 COPY *.go ./
+COPY internal ./internal
 # CGO 끈 정적 바이너리(런타임 alpine에서 그대로 동작).
 ENV CGO_ENABLED=0
 RUN go build -trimpath -ldflags="-s -w" -o /out/deployer .
