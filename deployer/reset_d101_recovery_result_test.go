@@ -19,7 +19,9 @@ func recoveryFixture(t *testing.T) (resetDecodedApprovalIntent, resetD101Recover
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := time.Unix(plan.WindowOpensAtUnix+10, 0)
+	// Recovery originals require literal UTC Z; time.Unix carries time.Local,
+	// so formatting the fixture must not depend on the test host's timezone.
+	now := time.Unix(plan.WindowOpensAtUnix+10, 0).UTC()
 	pin := strings.Repeat("c", 64)
 	result := resetD101RecoveryResult{SchemaVersion: 1, Kind: "D101_RECOVERY_RESULT_V1", Status: "RECOVERED", ServerID: "pep", WorldID: 1,
 		OperationID: intent.Intent.OperationID, ApprovalIntentSHA: intent.SHA, TargetFingerprint: intent.Intent.TargetFingerprint,
