@@ -667,7 +667,7 @@ func newOperationCoordinator(markerPath string, journalPath string, jobs *lifecy
 		writeMarker: writeMaintenanceMarkerDurable,
 	}
 	coordinator.cond = sync.NewCond(&coordinator.mu)
-	if stateFilePresent(markerPath) || stateFilePresent(journalPath) {
+	if stateFilePresent(markerPath) || stateFilePresent(journalPath) || stateFilePresent(resetD101RestoreGatePath(markerPath)) {
 		// An unreadable marker/journal is treated as present. Starting fail-closed
 		// is safer than admitting mutations while persisted lifecycle state is unknown.
 		coordinator.closed = true
@@ -949,6 +949,10 @@ func (c *operationCoordinator) leaveMaintenance() (maintenanceState, error) {
 	}
 	if c.preparationSettlementPending {
 		return maintenanceStateDrained, errors.New("lifecycle operation settlement is required before maintenance can open")
+	}
+	if stateFilePresent(resetD101RestoreGatePath(c.markerPath)) {
+		c.closed = true
+		return maintenanceStateDrained, errors.New("D101 restore closure is required before maintenance can open")
 	}
 	if c.journalPending || stateFilePresent(c.journalPath) {
 		c.closed = true
