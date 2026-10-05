@@ -4,20 +4,22 @@ import (
 	"context"
 	"reflect"
 	"regexp"
+	"strings"
 	"time"
 )
 
 // Collection is source preparation only: no receipt file is issued and no
 // caller/worker is wired. These observations do not prove seed/tick/roles.
 type resetRuntimeContainer struct {
-	ID        string   `json:"id"`
-	Name      string   `json:"name"`
-	ImageID   string   `json:"image"`
-	Running   *bool    `json:"running"`
-	Status    string   `json:"status"`
-	Project   string   `json:"project"`
-	Service   string   `json:"service"`
-	ServerIDs []string `json:"serverIds"`
+	ID           string            `json:"id"`
+	Name         string            `json:"name"`
+	ImageID      string            `json:"image"`
+	Running      *bool             `json:"running"`
+	Status       string            `json:"status"`
+	Project      string            `json:"project"`
+	Service      string            `json:"service"`
+	ServerIDs    []string          `json:"serverIds"`
+	SeedSettings map[string]string `json:"seedSettings"`
 }
 type resetRuntimeImage struct {
 	RepoDigests  []string `json:"repoDigests"`
@@ -42,9 +44,10 @@ type resetRuntimeRawSource func(context.Context, resetExecutionPhaseBinding) (re
 
 var resetRuntimeRepository = regexp.MustCompile(`^ghcr.io/[a-z0-9][a-z0-9._-]*/opensamguk$`)
 
-// Only these non-secret SERVER_ID entries are selected. Config.Env itself is
-// never returned/logged, even on a rejected observation.
-const resetRuntimeContainerFormat = `{"id":{{json .Id}},"name":{{json .Name}},"image":{{json .Image}},"running":{{json .State.Running}},"status":{{json .State.Status}},"project":{{json (index .Config.Labels "com.docker.compose.project")}},"service":{{json (index .Config.Labels "com.docker.compose.service")}},"serverIds":[{{range .Config.Env}}{{if eq (index (split . "=") 0) "SERVER_ID"}}{{json .}},{{end}}{{end}}null]}`
+// Only SERVER_ID and the explicit non-secret seed settings below are selected.
+// Config.Env itself is never returned/logged, even on rejection. These settings
+// bind the API and engine configuration; they do not prove selected file bytes.
+const resetRuntimeContainerFormat = `{"id":{{json .Id}},"name":{{json .Name}},"image":{{json .Image}},"running":{{json .State.Running}},"status":{{json .State.Status}},"project":{{json (index .Config.Labels "com.docker.compose.project")}},"service":{{json (index .Config.Labels "com.docker.compose.service")}},"serverIds":[{{range .Config.Env}}{{if eq (index (split . "=") 0) "SERVER_ID"}}{{json .}},{{end}}{{end}}null],"seedSettings":[{{range .Config.Env}}{{$key := index (split . "=") 0}}{{if or (eq $key "SERVER_NAME") (eq $key "SERVER_GENERATION") (eq $key "OPENSAMGUK_WORLD_ID") (eq $key "SCENARIO_CODE") (eq $key "SCENARIO_DIR") (eq $key "SCENARIO_SEED_ENABLED") (eq $key "RESET_TURNTERM") (eq $key "RESET_MAXGENERAL") (eq $key "RESET_FIRST_TURN") (eq $key "RESET_BLOCK_GENERAL_CREATE")}}{{json .}},{{end}}{{end}}null]}`
 
 // The source wrapper supplies the private raw credential and canonical pep
 // origin. The injectable source exists for isolated tests, never request input.
@@ -153,14 +156,15 @@ func (c config) observeResetRuntimeContainer(ctx context.Context, service string
 	// Null terminates the Go template array without exposing all environment.
 	// Decode it separately so a missing/duplicate SERVER_ID stays distinguishable.
 	var envelope struct {
-		ID        string    `json:"id"`
-		Name      string    `json:"name"`
-		ImageID   string    `json:"image"`
-		Running   *bool     `json:"running"`
-		Status    string    `json:"status"`
-		Project   string    `json:"project"`
-		Service   string    `json:"service"`
-		ServerIDs []*string `json:"serverIds"`
+		ID           string    `json:"id"`
+		Name         string    `json:"name"`
+		ImageID      string    `json:"image"`
+		Running      *bool     `json:"running"`
+		Status       string    `json:"status"`
+		Project      string    `json:"project"`
+		Service      string    `json:"service"`
+		ServerIDs    []*string `json:"serverIds"`
+		SeedSettings []*string `json:"seedSettings"`
 	}
 	if err != nil || len(out) > resetEvidenceMaxBytes || decodeResetPrivateJSON([]byte(out), &envelope) != nil ||
 		!resetEvidenceSHA.MatchString(envelope.ID) || !resetManifestDigest.MatchString(envelope.ImageID) ||
@@ -179,5 +183,47 @@ func (c config) observeResetRuntimeContainer(ctx context.Context, service string
 	if (service == "game-api" || len(values) > 0) && (len(values) != 1 || values[0] != "SERVER_ID=pep") {
 		return resetRuntimeContainer{}, errResetExecutionEvidence
 	}
-	return resetRuntimeContainer{envelope.ID, envelope.Name, envelope.ImageID, envelope.Running, envelope.Status, envelope.Project, envelope.Service, values}, nil
+	settings, err := resetRuntimeSeedSettings(service, envelope.SeedSettings)
+	if err != nil {
+		return resetRuntimeContainer{}, errResetExecutionEvidence
+	}
+	return resetRuntimeContainer{envelope.ID, envelope.Name, envelope.ImageID, envelope.Running, envelope.Status, envelope.Project, envelope.Service, values, settings}, nil
+}
+
+func resetRuntimeSeedSettings(service string, selected []*string) (map[string]string, error) {
+	wanted := map[string]string{
+		"SERVER_NAME": "빼섭", "SERVER_GENERATION": "0", "OPENSAMGUK_WORLD_ID": "1",
+		"SCENARIO_CODE": "scenario_3190", "SCENARIO_DIR": "", "SCENARIO_SEED_ENABLED": "true",
+		"RESET_TURNTERM": "60", "RESET_MAXGENERAL": "50", "RESET_FIRST_TURN": "immediate",
+		"RESET_BLOCK_GENERAL_CREATE": "1",
+	}
+	if len(selected) == 0 || selected[len(selected)-1] != nil {
+		return nil, errResetExecutionEvidence
+	}
+	settings := map[string]string{}
+	for _, value := range selected[:len(selected)-1] {
+		if value == nil {
+			return nil, errResetExecutionEvidence
+		}
+		key, actual, ok := strings.Cut(*value, "=")
+		expected, allowed := wanted[key]
+		if _, duplicate := settings[key]; !ok || !allowed || duplicate || actual != expected {
+			return nil, errResetExecutionEvidence
+		}
+		settings[key] = actual
+	}
+	required := []string{}
+	switch service {
+	case "game-api":
+		required = []string{"SERVER_NAME", "SERVER_GENERATION", "OPENSAMGUK_WORLD_ID", "SCENARIO_DIR"}
+	case "game-engine":
+		required = []string{"OPENSAMGUK_WORLD_ID", "SCENARIO_CODE", "SCENARIO_DIR", "SCENARIO_SEED_ENABLED",
+			"RESET_TURNTERM", "RESET_MAXGENERAL", "RESET_FIRST_TURN", "RESET_BLOCK_GENERAL_CREATE"}
+	}
+	for _, key := range required {
+		if _, explicit := settings[key]; !explicit {
+			return nil, errResetExecutionEvidence
+		}
+	}
+	return settings, nil
 }

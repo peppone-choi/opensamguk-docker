@@ -75,7 +75,7 @@ func resetRuntimeFixture(t *testing.T, mode string) (config, resetExecutionPhase
 		image := "sha256:" + id
 		imageServices[image] = service
 		observations[service]++
-		values := map[string]any{"id": id, "name": "/spep-" + service, "image": image, "running": true, "status": "running", "project": "opensamguk-spep", "service": service, "serverIds": []any{nil}}
+		values := map[string]any{"id": id, "name": "/spep-" + service, "image": image, "running": true, "status": "running", "project": "opensamguk-spep", "service": service, "serverIds": []any{nil}, "seedSettings": resetRuntimeFixtureSettings(service)}
 		if service == "game-api" {
 			values["serverIds"] = []any{"SERVER_ID=pep", nil}
 		}
@@ -102,6 +102,31 @@ func resetRuntimeFixture(t *testing.T, mode string) (config, resetExecutionPhase
 			if observations[service] > 1 {
 				values["image"] = "sha256:" + strings.Repeat("f", 64)
 			}
+		}
+		parts := strings.Split(mode, ":")
+		if len(parts) == 4 && parts[0] == "setting" && service == parts[1] {
+			selected := values["seedSettings"].([]any)
+			changed := []any{}
+			for _, item := range selected[:len(selected)-1] {
+				text := item.(string)
+				if strings.HasPrefix(text, parts[2]+"=") {
+					switch parts[3] {
+					case "missing":
+						continue
+					case "wrong":
+						text = parts[2] + "=wrong"
+					case "duplicate":
+						changed = append(changed, text)
+					case "null":
+						changed = append(changed, nil)
+					}
+				}
+				changed = append(changed, text)
+			}
+			values["seedSettings"] = append(changed, nil)
+		}
+		if mode == "engine-settings-drift" && service == "game-engine" && observations[service] > 1 {
+			values["seedSettings"] = []any{"OPENSAMGUK_WORLD_ID=1", "SCENARIO_DIR=/data/scenarios", nil}
 		}
 		wire, _ := json.Marshal(values)
 		return string(wire), nil
@@ -156,7 +181,7 @@ func TestResetRuntimeObservesFivePhysicalPinsAndRawWithoutMutation(t *testing.T)
 }
 
 func TestResetRuntimeUnknownMismatchOrDriftCannotIssueObservation(t *testing.T) {
-	for _, mode := range []string{"pin", "repository", "architecture", "inspect-error", "old-id", "duplicate-id", "stopped", "missing-state", "world-project", "wrong-service", "missing-server-id", "wrong-server-id", "duplicate-server-id", "runtime-drift", "raw-error", "raw-block-open", "old-raw", "future-raw", "late"} {
+	for _, mode := range []string{"pin", "repository", "architecture", "inspect-error", "old-id", "duplicate-id", "stopped", "missing-state", "world-project", "wrong-service", "missing-server-id", "wrong-server-id", "duplicate-server-id", "runtime-drift", "raw-error", "raw-block-open", "old-raw", "future-raw", "late", "engine-settings-drift"} {
 		t.Run(mode, func(t *testing.T) {
 			cfg, binding, evidence, raw, clock, _ := resetRuntimeFixture(t, mode)
 			observed, err := cfg.collectResetD101RuntimeWithSource(context.Background(), binding, evidence, "ghcr.io/peppone-choi/opensamguk", raw, clock)
@@ -177,7 +202,7 @@ func TestResetRuntimeUnknownMismatchOrDriftCannotIssueObservation(t *testing.T) 
 	}
 }
 
-func TestResetRuntimeTemplateSelectsOnlyServerIdentity(t *testing.T) {
+func TestResetRuntimeTemplateSelectsOnlyAllowedIdentityAndSeedSettings(t *testing.T) {
 	formatter := template.Must(template.New("nonsecret").Funcs(template.FuncMap{
 		"json":  func(v any) string { wire, _ := json.Marshal(v); return string(wire) },
 		"split": strings.Split,
@@ -185,12 +210,12 @@ func TestResetRuntimeTemplateSelectsOnlyServerIdentity(t *testing.T) {
 	values := map[string]any{"Id": strings.Repeat("1", 64), "Name": "/spep-game-api", "Image": "sha256:" + strings.Repeat("2", 64),
 		"State": map[string]any{"Running": true, "Status": "running"},
 		"Config": map[string]any{"Labels": map[string]string{"com.docker.compose.project": "opensamguk-spep", "com.docker.compose.service": "game-api"},
-			"Env": []string{"JWT_PRIVATE_KEY=private-must-not-return", "INTERNAL_SERVICE_TOKEN=secret-must-not-return", "SERVER_ID=pep"}}}
+			"Env": []string{"JWT_PRIVATE_KEY=private-must-not-return", "INTERNAL_SERVICE_TOKEN=secret-must-not-return", "SERVER_ID=pep", "OPENSAMGUK_WORLD_ID=1", "SCENARIO_DIR=", "SERVER_GENERATION=0", "SERVER_NAME=빼섭", "GAME_DB_PASSWORD=db-secret-must-not-return"}}}
 	var out bytes.Buffer
 	if err := formatter.Execute(&out, values); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(out.String(), "private-must-not-return") || strings.Contains(out.String(), "secret-must-not-return") {
+	if strings.Contains(out.String(), "private-must-not-return") || strings.Contains(out.String(), "secret-must-not-return") || strings.Contains(out.String(), "db-secret-must-not-return") {
 		t.Fatal("private environment projected")
 	}
 	var wire map[string]any
@@ -200,5 +225,47 @@ func TestResetRuntimeTemplateSelectsOnlyServerIdentity(t *testing.T) {
 	selected := wire["serverIds"].([]any)
 	if len(selected) != 2 || selected[0] != "SERVER_ID=pep" || selected[1] != nil {
 		t.Fatal("explicit selected identity lost")
+	}
+	settings := wire["seedSettings"].([]any)
+	if len(settings) != 5 || settings[len(settings)-1] != nil {
+		t.Fatal("non-secret explicit seed settings lost")
+	}
+	if !bytes.Contains(out.Bytes(), []byte("SCENARIO_DIR=")) || !bytes.Contains(out.Bytes(), []byte("SERVER_GENERATION=0")) {
+		t.Fatal("empty lookup or generation zero lost")
+	}
+}
+
+func resetRuntimeFixtureSettings(service string) []any {
+	switch service {
+	case "game-api":
+		return []any{"SERVER_NAME=빼섭", "SERVER_GENERATION=0", "OPENSAMGUK_WORLD_ID=1", "SCENARIO_DIR=", nil}
+	case "game-engine":
+		return []any{"OPENSAMGUK_WORLD_ID=1", "SCENARIO_CODE=scenario_3190", "SCENARIO_DIR=", "SCENARIO_SEED_ENABLED=true",
+			"RESET_TURNTERM=60", "RESET_MAXGENERAL=50", "RESET_FIRST_TURN=immediate", "RESET_BLOCK_GENERAL_CREATE=1", nil}
+	}
+	return []any{nil}
+}
+
+func TestResetRuntimeRequiresExplicitAPIAndEngineSettings(t *testing.T) {
+	for _, service := range []string{"game-api", "game-engine"} {
+		selected := resetRuntimeFixtureSettings(service)
+		for _, item := range selected[:len(selected)-1] {
+			key, _, _ := strings.Cut(item.(string), "=")
+			for _, mutation := range []string{"missing", "wrong", "duplicate", "null"} {
+				mode := "setting:" + service + ":" + key + ":" + mutation
+				t.Run(mode, func(t *testing.T) {
+					cfg, binding, evidence, raw, clock, _ := resetRuntimeFixture(t, mode)
+					observed, err := cfg.collectResetD101RuntimeWithSource(context.Background(), binding, evidence, "ghcr.io/peppone-choi/opensamguk", raw, clock)
+					if err == nil || observed.Version != 0 {
+						t.Fatal("missing, defaulted or ambiguous seed setting accepted")
+					}
+				})
+			}
+		}
+	}
+	for _, selected := range [][]*string{nil, {}, {nil, nil}} {
+		if _, err := resetRuntimeSeedSettings("game-api", selected); err == nil {
+			t.Fatal("missing or null settings accepted")
+		}
 	}
 }
