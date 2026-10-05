@@ -54,6 +54,9 @@ func (c config) runResetD101PhysicalWorker(lease *operationLease, target serverT
 	if _, err := requireResetD101Authority(authority, request, time.Now()); err != nil {
 		return "", errResetExecutionEvidence
 	}
+	if err := c.observeResetD101GatewayDispatch(ctx, binding, evidence); err != nil {
+		return "", err
+	}
 	// All original destructive work, including first new-stack startup, must
 	// finish inside the original cutoff. Admission and retries never renew it.
 	bounded, cancel := context.WithDeadline(ctx, time.Unix(evidence.Plan.DestructiveCutoffUnix, 0))
@@ -90,6 +93,9 @@ func (c config) runResetD101PhysicalWorker(lease *operationLease, target serverT
 	if err := c.requireResetD101WorkerAuthority(bounded, evidence, record.D101IntentSHA); err != nil {
 		return "", err
 	}
+	if err := c.observeResetD101GatewayDispatch(bounded, binding, evidence); err != nil {
+		return "", err
+	}
 	if _, err := c.validateServerTarget(target); err != nil {
 		return "", err
 	}
@@ -112,6 +118,9 @@ func (c config) runResetD101PhysicalWorker(lease *operationLease, target serverT
 	}
 	// The durable boundary precedes the command. An uncertain down outcome is
 	// recovery-required; this worker never automatically repeats down or up.
+	if err := c.observeResetD101GatewayDispatch(bounded, binding, evidence); err != nil {
+		return "", err
+	}
 	if err := c.advanceLifecycleJournal(lifecycleJournalStageDown); err != nil {
 		return "", err
 	}
@@ -122,6 +131,9 @@ func (c config) runResetD101PhysicalWorker(lease *operationLease, target serverT
 		return "", errResetExecutionEvidence
 	}
 	if err := c.requireResetD101WorkerAuthority(bounded, evidence, record.D101IntentSHA); err != nil {
+		return "", err
+	}
+	if err := c.observeResetD101GatewayDispatch(bounded, binding, evidence); err != nil {
 		return "", err
 	}
 	if _, err := c.upServerStack(bounded, target.Project, target.EnvFile); err != nil {

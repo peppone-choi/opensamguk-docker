@@ -44,8 +44,16 @@ checks all candidate pins, persists the phase chain, and applies the approved
 target. Down and the first up share the original cutoff; there is no automatic
 retry. A fresh authority is required again before env/down/up, and the actual
 runtime is persisted before physical success. This body is not yet connected to
-ingress or a real Gateway dispatch observation/provider. Negative lease/source
+ingress or an approved authority provider. Negative lease/source
 tests do not establish a successful physical execution.
+
+The Gateway dispatch source queries the exact internal operation route with the
+existing service credential and a freshly signed QUERY grant. It requires
+DISPATCH_INTENT, matching original prepare/intent, Root request fingerprint and
+R/V, and no terminal/publication result. Fixed private origin and credential
+custody prevent caller selection. Reads use 16 KiB, two seconds, two slots and no
+redirects/queue. The worker reobserves this real remote state before env/down/up;
+missing authority/key/credential custody cannot be replaced by local proof flags.
 
 D101 durable records carry an immutable intent reference and are exempt from
 ordinary terminal pruning, including restart and capacity pruning. Same-ID
