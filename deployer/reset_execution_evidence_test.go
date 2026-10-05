@@ -19,6 +19,15 @@ func resetEvidenceFixture(t *testing.T) (resetApprovalPlan, resetPreflightReceip
 	target.Updates["SCENARIO_CODE"] = "scenario_3190"
 	target.Generation = 0
 	target.Updates["SERVER_GENERATION"] = "0"
+	target.StorageImageDigests = map[string]string{"game-postgres": "sha256:" + strings.Repeat("d", 64), "game-redis": "sha256:" + strings.Repeat("e", 64)}
+	for key, value := range map[string]string{"SERVER_NAME": "빼섭", "RESET_MAXGENERAL": "50", "RESET_FIRST_TURN": "immediate", "SCENARIO_LOOKUP_DIR": "", "RESET_TURNTERM": "60", "RESET_EXTEND": "1", "RESET_BLOCK_GENERAL_CREATE": "1", "RESET_NPCMODE": "0", "RESET_SHOW_IMG_LEVEL": "3"} {
+		target.Updates[key] = value
+	}
+	normalized, normalizeErr := normalizeResetLifecycleTarget(target)
+	if normalizeErr != nil {
+		t.Fatal(normalizeErr)
+	}
+	target = normalized
 	pin := "sha256:" + strings.Repeat("a", 64)
 	pins := map[string]string{"game-api": pin, "game-engine": pin, "web-game": pin, "game-postgres": pin, "game-redis": pin}
 	value := uint64(100)
@@ -34,6 +43,9 @@ func resetEvidenceFixture(t *testing.T) (resetApprovalPlan, resetPreflightReceip
 		plan.NewImageDigests[key] = val
 	}
 	for key, val := range target.ImageDigests {
+		plan.NewImageDigests[key] = val
+	}
+	for key, val := range target.StorageImageDigests {
 		plan.NewImageDigests[key] = val
 	}
 	falseValue := false

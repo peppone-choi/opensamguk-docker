@@ -181,6 +181,8 @@ var v2ServerDefinitionKeys = map[string]struct{}{
 // deployer process because Compose gives its shell environment precedence over
 // --env-file.
 var serverComposeInterpolationKeys = map[string]struct{}{
+	"GAME_POSTGRES_IMAGE":            {},
+	"GAME_REDIS_IMAGE":               {},
 	"RESET_MAXGENERAL":               {},
 	"RESET_FIRST_TURN":               {},
 	"COMPOSE_HOST_DIR":               {},
@@ -227,6 +229,8 @@ var serverComposeProcessControlKeys = map[string]struct{}{
 }
 
 var resetLifecycleUpdateKeys = []string{
+	"GAME_POSTGRES_IMAGE",
+	"GAME_REDIS_IMAGE",
 	"SERVER_NAME",
 	"RESET_MAXGENERAL",
 	"RESET_FIRST_TURN",
@@ -994,6 +998,7 @@ type lifecycleJournal struct {
 }
 
 type resetLifecycleTarget struct {
+	StorageImageDigests map[string]string `json:"storageImageDigests,omitempty"`
 	ScenarioCode        string            `json:"scenarioCode"`
 	Generation          int               `json:"generation"`
 	ScenarioSeedEnabled bool              `json:"scenarioSeedEnabled"`
@@ -1258,6 +1263,11 @@ func (c config) repairLifecycleJournal() (repairErr error) {
 		return c.clearLifecycleJournal()
 	}
 	if journal.ResetTarget != nil {
+		if journal.ResetTarget.ScenarioCode == "scenario_3190" || len(journal.ResetTarget.StorageImageDigests) != 0 {
+			// Completed bound cleanup above is read-only. New destructive D101
+			// recovery cannot bypass the missing evidence/phase workflow here.
+			return errors.New("D101 reset recovery requires linked execution evidence; automatic replay is closed")
+		}
 		if _, err := normalizeResetLifecycleTarget(*journal.ResetTarget); err != nil {
 			return err
 		}
@@ -2498,6 +2508,7 @@ type createServerRequest struct {
 }
 
 type resetServerRequest struct {
+	StorageImageDigests    map[string]string `json:"storageImageDigests,omitempty"`
 	ApprovalPlanSHA256     string            `json:"approvalPlanSha256,omitempty"`
 	ExecutionReceiptSHA256 string            `json:"executionReceiptSha256,omitempty"`
 	ID                     string            `json:"id"`
@@ -4092,6 +4103,12 @@ func (c config) resetServerWithMaintenanceLease(rawID string, req resetServerReq
 	if req.Confirm != "RESET "+id {
 		return createServerResponse{OK: false, ID: id, Detail: "리셋 확인 문구가 일치하지 않습니다."}, http.StatusBadRequest
 	}
+	if len(req.StorageImageDigests) != 0 {
+		if _, err := normalizeResetStorageImageDigests(req.StorageImageDigests); err != nil {
+			return createServerResponse{OK: false, ID: id, Detail: "저장소 이미지 pin 형식이 올바르지 않습니다."}, http.StatusBadRequest
+		}
+		return createServerResponse{OK: false, ID: id, Detail: "저장소 이미지 pin은 완성된 실행 증거 경로가 필요합니다."}, http.StatusServiceUnavailable
+	}
 	if req.ApprovalPlanSHA256 != "" || req.ExecutionReceiptSHA256 != "" {
 		if _, err := normalizeResetExecutionEvidenceRefs(resetExecutionEvidenceRefs{req.ApprovalPlanSHA256, req.ExecutionReceiptSHA256}); err != nil {
 			return createServerResponse{OK: false, ID: id, Detail: "실행 증거 SHA 형식이 올바르지 않습니다."}, http.StatusBadRequest
@@ -5221,7 +5238,7 @@ func resetLifecycleTargetForEnvWithImageDigests(envFile string, requested map[st
 		}
 		// Ordinary reset fingerprints keep their old shape. Image pins are
 		// part of the target only when a leased reset requests them explicitly.
-		if key == "IMAGE_TAG" || key == "WEB_GAME_TAG" {
+		if key == "IMAGE_TAG" || key == "WEB_GAME_TAG" || key == "GAME_POSTGRES_IMAGE" || key == "GAME_REDIS_IMAGE" {
 			if _, requested := requested[key]; !requested {
 				continue
 			}
@@ -5291,6 +5308,9 @@ func normalizeResetLifecycleTarget(target resetLifecycleTarget) (resetLifecycleT
 	target.Generation = generation
 	target.Updates = updates
 	if err := normalizeResetImageTarget(&target); err != nil {
+		return resetLifecycleTarget{}, err
+	}
+	if err := normalizeResetStorageTarget(&target); err != nil {
 		return resetLifecycleTarget{}, err
 	}
 	return target, nil
@@ -5596,12 +5616,11 @@ func (c config) pullResetCandidate(ctx context.Context, target serverTarget, res
 	if err := c.verifyResetCandidateImages(ctx, stagedPath, resetTarget); err == nil {
 		return "candidate images verified locally", nil
 	}
-	detail, err := c.runServerDockerContext(ctx,
-		"compose", "-p", target.Project,
-		"--env-file", stagedPath,
-		"-f", c.composeServer,
-		"pull", "game-engine", "game-api", "web-game",
-	)
+	pullArgs := []string{"compose", "-p", target.Project, "--env-file", stagedPath, "-f", c.composeServer, "pull", "game-engine", "game-api", "web-game"}
+	if len(resetTarget.StorageImageDigests) != 0 {
+		pullArgs = append(pullArgs, "game-postgres", "game-redis")
+	}
+	detail, err := c.runServerDockerContext(ctx, pullArgs...)
 	if err != nil {
 		return detail, err
 	}

@@ -18,7 +18,7 @@ name: opensamguk-s${SERVER_ID}
 services:
   # 그 서버 월드의 영속화 DB. 서버마다 독립 볼륨.
   game-postgres:
-    image: postgres:16-alpine
+    image: ${GAME_POSTGRES_IMAGE:-postgres:16-alpine}
     container_name: s${SERVER_ID}-game-postgres
     restart: unless-stopped
     environment:
@@ -41,7 +41,7 @@ services:
           memory: 1.5G
 
   game-redis:
-    image: redis:7-alpine
+    image: ${GAME_REDIS_IMAGE:-redis:7-alpine}
     container_name: s${SERVER_ID}-game-redis
     restart: unless-stopped
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru

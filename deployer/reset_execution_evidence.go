@@ -100,6 +100,22 @@ func validateResetApprovalPlan(plan resetApprovalPlan, op string, target resetLi
 			return errResetExecutionEvidence
 		}
 	}
+	if target.ScenarioCode != "scenario_3190" || target.Generation != 0 || !target.ScenarioSeedEnabled ||
+		len(target.StorageImageDigests) != 2 {
+		return errResetExecutionEvidence
+	}
+	settings := map[string]string{"SERVER_NAME": "빼섭", "RESET_MAXGENERAL": "50", "RESET_FIRST_TURN": "immediate", "SCENARIO_LOOKUP_DIR": "", "RESET_TURNTERM": "60", "RESET_EXTEND": "1", "RESET_BLOCK_GENERAL_CREATE": "1", "RESET_NPCMODE": "0", "RESET_SHOW_IMG_LEVEL": "3"}
+	for key, want := range settings {
+		actual, explicit := target.Updates[key]
+		if !explicit || actual != want {
+			return errResetExecutionEvidence
+		}
+	}
+	for _, service := range resetStorageServices {
+		if target.StorageImageDigests[service] != plan.NewImageDigests[service] {
+			return errResetExecutionEvidence
+		}
+	}
 	for _, proof := range []string{plan.ApprovalReceiptSHA, plan.CombinedCIReceiptSHA, plan.SelectedSourceReceiptSHA,
 		plan.IsolatedSeedTickReceiptSHA, plan.WriterFreezeReceiptSHA, plan.SpaceInventoryReceiptSHA} {
 		if !resetEvidenceSHA.MatchString(proof) {

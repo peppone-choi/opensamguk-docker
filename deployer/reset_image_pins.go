@@ -123,5 +123,5 @@ func (c config) verifyResetCandidateImages(ctx context.Context, envFile string, 
 			return fmt.Errorf("candidate image digest is unverified for %s", service)
 		}
 	}
-	return nil
+	return c.verifyResetCandidateStorageImages(ctx, target)
 }
