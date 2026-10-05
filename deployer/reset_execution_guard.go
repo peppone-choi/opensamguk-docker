@@ -30,6 +30,18 @@ func (c config) readResetExecutionEvidence(operationID string, target resetLifec
 	if err := readResetPrivateEvidence(filepath.Join(c.serversDir, ".deployer-reset-approvals"), operationID, refs.ApprovalPlanSHA, 0, &evidence.Plan); err != nil {
 		return evidence, errResetExecutionEvidence
 	}
+	// A D101-linked plan may not outlive or change its immutable pre-CAS intent.
+	// Legacy empty linkage remains readable while its physical worker is gated.
+	if evidence.Plan.ApprovalIntentSHA != "" {
+		wire, err := readResetPrivateCustody(filepath.Join(c.serversDir, ".deployer-reset-intents"), operationID, 0)
+		if err != nil {
+			return evidence, errResetExecutionEvidence
+		}
+		intent, err := decodeResetApprovalIntent(wire, evidence.Plan.ApprovalIntentSHA)
+		if err != nil || requireResetIntentPlan(intent, evidence.Plan) != nil {
+			return evidence, errResetExecutionEvidence
+		}
+	}
 	if err := validateResetApprovalPlan(evidence.Plan, operationID, target, now); err != nil {
 		return evidence, errResetExecutionEvidence
 	}

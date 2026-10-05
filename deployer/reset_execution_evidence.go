@@ -25,6 +25,7 @@ var errResetExecutionEvidence = errors.New("reset execution evidence is unavaila
 // Private local custody does not attest upstream CI, human approval or drain.
 // Only the exact approved host issuing procedure can supply those proofs.
 type resetApprovalPlan struct {
+	ApprovalIntentSHA          string               `json:"approvalIntentSha256,omitempty"`
 	Version                    int                  `json:"version"`
 	ServerID                   string               `json:"serverId"`
 	WorldID                    int                  `json:"worldId"`
@@ -87,6 +88,9 @@ func validResetFiveImageDigests(pins map[string]string) bool {
 }
 
 func validateResetApprovalPlan(plan resetApprovalPlan, op string, target resetLifecycleTarget, now time.Time) error {
+	if plan.ApprovalIntentSHA != "" && !resetEvidenceSHA.MatchString(plan.ApprovalIntentSHA) {
+		return errResetExecutionEvidence
+	}
 	normalizedOp, err := normalizeLifecycleOperationID(op)
 	if err != nil || normalizedOp == "" || normalizedOp != op || plan.Version != 1 || plan.ServerID != "pep" || plan.WorldID != 1 ||
 		plan.OperationID != op || !gitSHA40.MatchString(plan.AppSourceSHA) ||

@@ -302,8 +302,9 @@ var sharedEnvAllowlist = map[string]envFieldSpec{
 
 // 환경변수 묶음.
 type config struct {
-	token                     string // Bearer 인증 토큰
-	composeDir                string // compose 파일 디렉터리(/workspace)
+	d101PurposeAuthority      resetD101PurposeAuthoritySource // Fixed approved host source; no request/env enablement.
+	token                     string                          // Bearer 인증 토큰
+	composeDir                string                          // compose 파일 디렉터리(/workspace)
 	composeHostDir            string
 	serversDir                string // 서버 env 파일 디렉터리(/workspace/servers)
 	composeServer             string // 서버 compose 파일 절대경로
@@ -2850,6 +2851,10 @@ func (c config) handleOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/operations/")
+	if isResetD101ResultPath(path) {
+		c.handleResetD101ExecutionResult(w, r, strings.Split(path, "/"))
+		return
+	}
 	if isResetPublicationReceiptPath(path) {
 		c.handleResetPublicationReceipt(w, r, strings.Split(path, "/"))
 		return
