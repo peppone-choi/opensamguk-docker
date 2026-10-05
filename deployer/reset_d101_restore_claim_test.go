@@ -11,7 +11,12 @@ import (
 
 func restoreCoordinatorFixture(t *testing.T) (*operationCoordinator, string, uint32) {
 	t.Helper()
-	dir := t.TempDir()
+	// macOS temp roots may contain /var -> /private/var. Positive custody
+	// fixtures use their canonical parent; the symlink rejection stays strict.
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Chmod(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
