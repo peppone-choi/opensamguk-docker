@@ -9,7 +9,7 @@ import (
 func candidateCapsFixture(t *testing.T) ([]byte, time.Time, time.Time) {
 	t.Helper()
 	started := time.Date(2026, 10, 6, 0, 0, 0, 0, time.UTC)
-	value := resetD101CandidateCapsObservation{SchemaVersion: 1, Kind: "D101_CANDIDATE_DB_CAPS_V1", DatabaseName: "game", DatabaseUser: "game", ServerAddress: "172.18.0.3", ServerPort: 5432, TransactionReadOnly: "on", TransactionIsolation: "repeatable read", WorldRowCount: 1, WorldID: 1, ScenarioCode: "scenario_3190", TickSeconds: 3600, ConfigMaxGeneralType: "number", ConfigMaxGeneralRaw: "50", GameEnvRowCount: 1, GameEnvMaxGeneralType: "number", GameEnvMaxGeneralRaw: "50", ObservedAtUTC: started.Add(time.Second).Format(time.RFC3339Nano)}
+	value := resetD101CandidateCapsObservation{SchemaVersion: 1, Kind: "D101_CANDIDATE_DB_CAPS_V1", DatabaseName: "game", DatabaseUser: "game", ServerAddress: "172.18.0.3", ServerPort: 5432, TransactionReadOnly: "on", TransactionIsolation: "repeatable read", WorldRowCount: 1, WorldID: 1, ScenarioCode: "scenario_3190", TickSeconds: 3600, GenerationType: "number", GenerationRaw: "0", ConfigMaxGeneralType: "number", ConfigMaxGeneralRaw: "50", GameEnvRowCount: 1, GameEnvMaxGeneralType: "number", GameEnvMaxGeneralRaw: "50", ObservedAtUTC: started.Add(time.Second).Format(time.RFC3339Nano)}
 	wire, err := json.Marshal(value)
 	if err != nil {
 		t.Fatal(err)
@@ -25,7 +25,7 @@ func TestCandidateCapsRequiresActualNumericBothCapsAndCandidateDatabaseIdentity(
 		key   string
 		value any
 	}{
-		{"configMaxGeneralType", "string"}, {"configMaxGeneralRaw", "500"}, {"gameEnvMaxGeneralType", "string"}, {"gameEnvMaxGeneralRaw", "50.0"},
+		{"generationType", "string"}, {"generationRaw", nil}, {"generationRaw", "1"}, {"configMaxGeneralType", "string"}, {"configMaxGeneralRaw", "500"}, {"gameEnvMaxGeneralType", "string"}, {"gameEnvMaxGeneralRaw", "50.0"},
 		{"gameEnvRowCount", 2}, {"worldRowCount", 2}, {"serverAddress", "172.18.0.4"}, {"serverPort", 5433}, {"databaseUser", "other"},
 		{"transactionReadOnly", "off"}, {"transactionIsolation", "read committed"}, {"tickSeconds", 60}, {"worldId", 2}, {"scenarioCode", "scenario_990002"},
 		{"observedAtUtc", started.Add(-time.Second).Format(time.RFC3339Nano)}, {"configMaxGeneralRaw", nil}, {"unexpected", true},

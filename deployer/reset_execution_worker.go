@@ -35,7 +35,7 @@ func (c config) requireResetD101WorkerLease(lease *operationLease, binding reset
 // It does not settle Gateway canonical metadata or publish PUBLIC.
 func (c config) runResetD101PhysicalWorker(lease *operationLease, target serverTarget, binding resetExecutionPhaseBinding, source resetExecutionPhaseSource) (string, error) {
 	expectedTarget, targetErr := c.serverTargetForID("pep")
-	if source == nil || c.d101PurposeAuthority == nil || target.ID != "pep" || target.Project != "opensamguk-spep" ||
+	if source == nil || c.d101PurposeAuthority == nil || c.d101CandidatePipeline == nil || target.ID != "pep" || target.Project != "opensamguk-spep" ||
 		targetErr != nil || target != expectedTarget || !resetRuntimeRepository.MatchString("ghcr.io/"+c.ghcrOwner+"/opensamguk") ||
 		binding.Phase != "prepared" || binding.PreviousAttestationSHA != "" || c.requireResetD101WorkerLease(lease, binding) != nil {
 		return "", errResetExecutionEvidence
@@ -51,7 +51,12 @@ func (c config) runResetD101PhysicalWorker(lease *operationLease, target serverT
 	if err != nil {
 		return "", errResetExecutionEvidence
 	}
-	if _, err := requireResetD101Authority(authority, request, time.Now()); err != nil {
+	intent, err := requireResetD101Authority(authority, request, time.Now())
+	if err != nil {
+		return "", errResetExecutionEvidence
+	}
+	admission, err := newResetD101CandidateAdmission(intent, evidence, binding, target)
+	if err != nil || c.d101CandidatePipeline.requireAdmission(admission, authority) != nil {
 		return "", errResetExecutionEvidence
 	}
 	if err := c.observeResetD101GatewayDispatch(ctx, binding, evidence); err != nil {
@@ -134,7 +139,10 @@ func (c config) runResetD101PhysicalWorker(lease *operationLease, target serverT
 	if err := c.observeResetD101GatewayDispatch(bounded, binding, evidence); err != nil {
 		return "", err
 	}
-	if _, err := c.upServerStack(bounded, target.Project, target.EnvFile); err != nil {
+	guard := func(commandCtx context.Context) error {
+		return c.requireResetD101CandidateGuard(commandCtx, lease, binding, evidence, admission, source)
+	}
+	if err := c.runResetD101CandidateThenPromote(bounded, admission, evidence.Preflight.StoppedContainerIDs, guard); err != nil {
 		return "", err
 	}
 	if _, err := c.persistResetD101Runtime(bounded, binding, "ghcr.io/"+c.ghcrOwner+"/opensamguk"); err != nil {
@@ -157,6 +165,36 @@ func (c config) requireResetD101WorkerAuthority(ctx context.Context, evidence re
 	}
 	intent, err := requireResetD101Authority(authority, request, time.Now())
 	if err != nil || requireResetIntentPlan(intent, evidence.Plan) != nil || ctx.Err() != nil {
+		return errResetExecutionEvidence
+	}
+	return nil
+}
+
+// After down removes old CIDs, fresh writer/publication/space checks deliberately
+// avoid the pre-down stopped-container reader. All other original gates remain.
+func (c config) requireResetD101CandidateGuard(ctx context.Context, lease *operationLease, binding resetExecutionPhaseBinding, evidence resetExecutionEvidence, a resetD101CandidateAdmission, source resetExecutionPhaseSource) error {
+	if ctx == nil || ctx.Err() != nil || source == nil || c.d101PurposeAuthority == nil || c.requireResetD101WorkerLease(lease, binding) != nil || !time.Now().Before(a.Cutoff()) {
+		return errResetExecutionEvidence
+	}
+	bounded, cancel := context.WithTimeout(ctx, resetPreflightMaxAge)
+	defer cancel()
+	authority, err := c.d101PurposeAuthority(bounded, a.OperationID(), a.ApprovalIntentSHA())
+	if err != nil {
+		return errResetExecutionEvidence
+	}
+	intent, err := requireResetD101Authority(authority, resetD101PurposeGrantRequest{OperationID: a.OperationID(), ApprovalIntentSHA: a.ApprovalIntentSHA(), Action: "DISPATCH_INTENT"}, time.Now())
+	if err != nil || requireResetIntentPlan(intent, evidence.Plan) != nil || c.d101CandidatePipeline.requireAdmission(a, authority) != nil {
+		return errResetExecutionEvidence
+	}
+	started := time.Now()
+	snapshot, err := source(bounded, binding)
+	if err != nil || validateResetPhaseSnapshot(snapshot, evidence, binding, started, time.Now()) != nil {
+		return errResetExecutionEvidence
+	}
+	if _, err = c.observeAndVerifyResetLiveSpace(evidence); err != nil {
+		return errResetExecutionEvidence
+	}
+	if c.observeResetD101GatewayDispatch(bounded, binding, evidence) != nil || bounded.Err() != nil || c.requireResetD101WorkerLease(lease, binding) != nil || !time.Now().Before(a.Cutoff()) {
 		return errResetExecutionEvidence
 	}
 	return nil

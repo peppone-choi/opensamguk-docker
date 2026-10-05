@@ -65,14 +65,18 @@ func decodeResetD101SignedHostOriginal(wire []byte, domain string, anchor ed2551
 	var envelope resetD101SignedHostOriginal
 	if len(wire) == 0 || len(wire) > resetEvidenceMaxBytes || !utf8.Valid(wire) ||
 		len(anchor) != ed25519.PublicKeySize ||
-		(domain != resetD101HostTrustDomain && domain != resetD101ClockAgreementDomain) ||
+		(domain != resetD101HostTrustDomain && domain != resetD101ClockAgreementDomain && domain != resetD101SelectedSourceDomain) ||
 		requireResetIntentShape(wire, reflect.TypeOf(envelope)) != nil ||
 		decodeResetPrivateJSON(wire, &envelope) != nil || envelope.SchemaVersion != 1 {
 		return nil, errResetExecutionEvidence
 	}
+	limit := 32 * 1024
+	if domain == resetD101SelectedSourceDomain {
+		limit = 64 * 1024
+	}
 	original, err := base64.RawURLEncoding.Strict().DecodeString(envelope.OriginalBytesBase64url)
 	signature, sigErr := base64.RawURLEncoding.Strict().DecodeString(envelope.SignatureBase64url)
-	if err != nil || sigErr != nil || len(original) == 0 || len(original) > 32*1024 || !utf8.Valid(original) ||
+	if err != nil || sigErr != nil || len(original) == 0 || len(original) > limit || !utf8.Valid(original) ||
 		len(signature) != ed25519.SignatureSize ||
 		base64.RawURLEncoding.EncodeToString(original) != envelope.OriginalBytesBase64url ||
 		base64.RawURLEncoding.EncodeToString(signature) != envelope.SignatureBase64url ||

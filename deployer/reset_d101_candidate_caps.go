@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -23,6 +24,7 @@ type resetD101CandidateCapsPins struct {
 	TargetFingerprint string            `json:"targetFingerprint"`
 	AppSourceSHA      string            `json:"appSourceSha"`
 	ImagePins         map[string]string `json:"imagePins"`
+	Network           string            `json:"network"`
 	DatabaseName      string            `json:"databaseName"`
 	DatabaseUser      string            `json:"databaseUser"`
 	LocalPassFile     string            `json:"localPassFile"`
@@ -45,7 +47,7 @@ func newResetD101CandidateCapsReader(original []byte, expectedSHA string) (*rese
 		decodeResetPrivateJSON(original, &p) != nil || p.SchemaVersion != 1 || p.Kind != "D101_CANDIDATE_DB_READER_V1" ||
 		!lifecycleJobIDRe.MatchString(p.OperationID) || !resetEvidenceSHA.MatchString(p.ApprovalIntentSHA) ||
 		!resetEvidenceSHA.MatchString(p.TargetFingerprint) || !gitSHA40.MatchString(p.AppSourceSHA) ||
-		!validResetFiveImageDigests(p.ImagePins) || !identifier.MatchString(p.DatabaseName) || !identifier.MatchString(p.DatabaseUser) ||
+		!validResetFiveImageDigests(p.ImagePins) || p.Network != resetD101CandidateResourceNames(p.OperationID).Network || !identifier.MatchString(p.DatabaseName) || !identifier.MatchString(p.DatabaseUser) ||
 		!filepath.IsAbs(p.LocalPassFile) || filepath.Clean(p.LocalPassFile) != p.LocalPassFile ||
 		!filepath.IsAbs(p.HostPassFile) || filepath.Clean(p.HostPassFile) != p.HostPassFile || strings.ContainsAny(p.HostPassFile, ",\r\n") ||
 		!resetEvidenceSHA.MatchString(p.PassFileSHA) {
@@ -66,6 +68,7 @@ SELECT json_build_object(
  'transactionIsolation',current_setting('transaction_isolation'),
  'worldRowCount',(SELECT count(*) FROM world_state),'worldId',w.id,
  'scenarioCode',w.scenario_code,'tickSeconds',w.tick_seconds,
+ 'generationType',jsonb_typeof(w.meta->'server_generation'),'generationRaw',(w.meta->'server_generation')::text,
  'configMaxGeneralType',jsonb_typeof(w.config->'maxgeneral'),
  'configMaxGeneralRaw',left((w.config->'maxgeneral')::text,128),
  'gameEnvRowCount',(SELECT count(*) FROM game_kv WHERE world_id=1 AND "table"='game_env' AND namespace='game_env' AND key='maxgeneral'),
@@ -88,6 +91,8 @@ type resetD101CandidateCapsObservation struct {
 	WorldID               int    `json:"worldId"`
 	ScenarioCode          string `json:"scenarioCode"`
 	TickSeconds           int    `json:"tickSeconds"`
+	GenerationType        string `json:"generationType"`
+	GenerationRaw         string `json:"generationRaw"`
 	ConfigMaxGeneralType  string `json:"configMaxGeneralType"`
 	ConfigMaxGeneralRaw   string `json:"configMaxGeneralRaw"`
 	GameEnvRowCount       int    `json:"gameEnvRowCount"`
@@ -102,7 +107,7 @@ func decodeResetD101CandidateCaps(wire []byte, database, user, address string, s
 		decodeResetPrivateJSON(wire, &value) != nil || value.SchemaVersion != 1 || value.Kind != "D101_CANDIDATE_DB_CAPS_V1" ||
 		value.DatabaseName != database || value.DatabaseUser != user || value.ServerAddress != address || value.ServerPort != 5432 || value.TransactionReadOnly != "on" || value.TransactionIsolation != "repeatable read" ||
 		value.WorldRowCount != 1 || value.WorldID != 1 || value.ScenarioCode != "scenario_3190" || value.TickSeconds != 3600 ||
-		value.ConfigMaxGeneralType != "number" || value.ConfigMaxGeneralRaw != "50" || value.GameEnvRowCount != 1 ||
+		value.GenerationType != "number" || value.GenerationRaw != "0" || value.ConfigMaxGeneralType != "number" || value.ConfigMaxGeneralRaw != "50" || value.GameEnvRowCount != 1 ||
 		value.GameEnvMaxGeneralType != "number" || value.GameEnvMaxGeneralRaw != "50" {
 		return resetD101CandidateCapsObservation{}, errResetExecutionEvidence
 	}
@@ -158,7 +163,7 @@ func (c config) observeResetD101CapsJob(ctx context.Context, id string) (resetD1
 	}
 	// Docker mount format below selects exact fields; unknown JSON is refused.
 	if err != nil || len(out) > 16*1024 || requireResetIntentShape([]byte(out), reflect.TypeOf(envelope)) != nil || decodeResetPrivateJSON([]byte(out), &envelope) != nil || envelope.ID != id || !resetManifestDigest.MatchString(envelope.ImageID) || envelope.ReadOnly == nil || !*envelope.ReadOnly || envelope.Privileged == nil || *envelope.Privileged ||
-		envelope.Network != "opensamguk-net" || len(envelope.CapDrop) != 1 || envelope.CapDrop[0] != "ALL" || len(envelope.SecurityOptions) != 1 ||
+		envelope.Network == "" || len(envelope.CapDrop) != 1 || envelope.CapDrop[0] != "ALL" || len(envelope.SecurityOptions) != 1 ||
 		(envelope.SecurityOptions[0] != "no-new-privileges" && envelope.SecurityOptions[0] != "no-new-privileges=true") {
 		return resetD101CapsJob{}, errResetExecutionEvidence
 	}
@@ -208,15 +213,15 @@ func (reader *resetD101CandidateCapsReader) observe(ctx context.Context, c confi
 	if guard(bounded) != nil {
 		return closed, errResetExecutionEvidence
 	}
-	before, err := c.observeResetRuntimeContainer(bounded, "game-postgres")
+	before, err := c.observeResetRuntimeContainerProject(bounded, "game-postgres", a.CandidateResources().Project)
 	if err != nil || before.ID != seed.PostgresContainerID || c.requireResetD101CapsImage(bounded, before.ImageID, p.ImagePins["game-postgres"]) != nil {
 		return closed, errResetExecutionEvidence
 	}
-	address, err := c.observeResetD101CapsAddress(bounded, before.ID)
+	address, err := c.observeResetD101CapsAddress(bounded, before.ID, p.Network)
 	if err != nil {
 		return closed, errResetExecutionEvidence
 	}
-	args := []string{"create", "--name", "d101-caps-" + a.OperationID(), "--network", "opensamguk-net",
+	args := []string{"create", "--name", "d101-caps-" + a.OperationID(), "--network", p.Network,
 		"--mount", "type=bind,src=" + p.HostPassFile + ",dst=/run/d101/pgpass,readonly",
 		"--mount", "type=tmpfs,destination=/var/lib/postgresql/data,tmpfs-size=1048576,tmpfs-mode=0700",
 		"--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
@@ -233,7 +238,7 @@ func (reader *resetD101CandidateCapsReader) observe(ctx context.Context, c confi
 	// Deterministic job name prevents an uncertain observation from silently
 	// starting another job. Retain failed/unknown jobs for exact reconciliation.
 	job, err := c.observeResetD101CapsJob(bounded, id)
-	if err != nil || job.Running || job.Status != "created" || !validResetD101CapsMount(job, p.HostPassFile) {
+	if err != nil || job.Running || job.Status != "created" || job.Network != p.Network || !validResetD101CapsMount(job, p.HostPassFile) {
 		return closed, errResetExecutionEvidence
 	}
 	if c.requireResetD101CapsImage(bounded, job.ImageID, p.ImagePins["game-postgres"]) != nil {
@@ -247,15 +252,15 @@ func (reader *resetD101CandidateCapsReader) observe(ctx context.Context, c confi
 		return closed, errResetExecutionEvidence
 	}
 	finished, err := c.observeResetD101CapsJob(bounded, id)
-	if err != nil || finished.Running || finished.Status != "exited" || finished.ExitCode != 0 || finished.ImageID != job.ImageID || !validResetD101CapsMount(finished, p.HostPassFile) {
+	if err != nil || finished.Running || finished.Status != "exited" || finished.ExitCode != 0 || finished.ImageID != job.ImageID || finished.Network != p.Network || !validResetD101CapsMount(finished, p.HostPassFile) {
 		return closed, errResetExecutionEvidence
 	}
-	after, err := c.observeResetRuntimeContainer(bounded, "game-postgres")
+	after, err := c.observeResetRuntimeContainerProject(bounded, "game-postgres", a.CandidateResources().Project)
 	passAfter, passErr := d101custody.ReadPrivate(p.LocalPassFile, 16*1024)
 	if passErr == nil {
 		defer clear(passAfter.Bytes)
 	}
-	addressAfter, addressErr := c.observeResetD101CapsAddress(bounded, before.ID)
+	addressAfter, addressErr := c.observeResetD101CapsAddress(bounded, before.ID, p.Network)
 	completed := time.Now()
 	if err != nil || !reflect.DeepEqual(before, after) || addressErr != nil || addressAfter != address || passErr != nil || passAfter.SHA256 != p.PassFileSHA || bounded.Err() != nil ||
 		!completed.Before(a.Cutoff()) {
@@ -294,8 +299,11 @@ func (c config) requireResetD101CapsImage(ctx context.Context, id, pin string) e
 
 // Bind the SQL connection to the inspected candidate CID's actual fixed-network
 // address. DNS alias membership alone is not evidence that this CID answered.
-func (c config) observeResetD101CapsAddress(ctx context.Context, id string) (string, error) {
-	const format = `{"id":{{json .Id}},"address":{{json (index .NetworkSettings.Networks "opensamguk-net").IPAddress}}}`
+func (c config) observeResetD101CapsAddress(ctx context.Context, id, network string) (string, error) {
+	if network == "" {
+		return "", errResetExecutionEvidence
+	}
+	format := `{"id":{{json .Id}},"address":{{json (index .NetworkSettings.Networks ` + strconv.Quote(network) + `).IPAddress}}}`
 	out, err := c.runServerDockerContext(ctx, "inspect", "--format", format, id)
 	var value struct {
 		ID      string `json:"id"`

@@ -104,12 +104,14 @@ func resetD101IssuerFixture(t *testing.T) (config, uint32, string) {
 				settings[pair[0]] = pair[1]
 			}
 		}
-		container := resetRuntimeContainer{ID: id, Name: "/spep-" + service, ImageID: "sha256:" + id, Running: &running, Status: "running", Project: "opensamguk-spep", Service: service, SeedSettings: settings}
+		project := resetD101RuntimeProject(service, resetD101CandidateResourceNames(plan.OperationID).Project)
+		container := resetRuntimeContainer{ID: id, Name: "/spep-" + service, ImageID: "sha256:" + id, Running: &running, Status: "running", Project: project, Service: service, SeedSettings: settings}
 		if service == "game-api" {
 			container.ServerIDs = []string{"SERVER_ID=pep"}
 		}
 		runtime.Containers[service] = container
 	}
+	installSyntheticCandidatePromotion(t, cfg, plan, accepted.Add(5*time.Second))
 	runtimeWire, _ := json.Marshal(runtime)
 	for leaf, wire := range map[string][]byte{".deployer-reset-intents": intentWire, ".deployer-reset-prepare-bodies": prepare, ".deployer-reset-approvals": planWire, ".deployer-reset-preflights": preflightWire, ".deployer-reset-runtime": runtimeWire} {
 		if writeResetImmutablePrivateBytesWithUID(filepath.Join(root, leaf), plan.OperationID, resetD101OriginalSHA(wire), wire, uid) != nil {

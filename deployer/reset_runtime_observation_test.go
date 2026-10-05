@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -27,7 +29,7 @@ func resetRuntimeFixture(t *testing.T, mode string) (config, resetExecutionPhase
 	imageServices := map[string]string{}
 	observations := map[string]int{}
 	commands := 0
-	cfg := config{dockerRunnerContext: func(ctx context.Context, args ...string) (string, error) {
+	cfg := config{serversDir: t.TempDir(), dockerRunnerContext: func(ctx context.Context, args ...string) (string, error) {
 		commands++
 		if ctx.Err() != nil {
 			return "", ctx.Err()
@@ -78,6 +80,9 @@ func resetRuntimeFixture(t *testing.T, mode string) (config, resetExecutionPhase
 		values := map[string]any{"id": id, "name": "/spep-" + service, "image": image, "running": true, "status": "running", "project": "opensamguk-spep", "service": service, "serverIds": []any{nil}, "seedSettings": resetRuntimeFixtureSettings(service)}
 		if service == "game-api" {
 			values["serverIds"] = []any{"SERVER_ID=pep", nil}
+		}
+		if service == "game-postgres" || service == "game-redis" {
+			values["project"] = resetD101CandidateResourceNames(plan.OperationID).Project
 		}
 		switch mode {
 		case "old-id":
@@ -163,13 +168,14 @@ func resetRuntimeFixture(t *testing.T, mode string) (config, resetExecutionPhase
 		}
 		return start.Add(2 * time.Second)
 	}
+	installSyntheticCandidatePromotion(t, cfg, plan, start)
 	return cfg, binding, resetExecutionEvidence{plan, preflight}, raw, clock, &commands
 }
 
 func TestResetRuntimeObservesFivePhysicalPinsAndRawWithoutMutation(t *testing.T) {
 	cfg, binding, evidence, raw, clock, commands := resetRuntimeFixture(t, "valid")
 	before, _ := json.Marshal(evidence)
-	observed, err := cfg.collectResetD101RuntimeWithSource(context.Background(), binding, evidence, "ghcr.io/peppone-choi/opensamguk", raw, clock)
+	observed, err := cfg.collectResetD101RuntimeWithSourceAndCustodyUID(context.Background(), binding, evidence, "ghcr.io/peppone-choi/opensamguk", raw, clock, uint32(os.Geteuid()))
 	if err != nil || len(observed.Containers) != 5 || len(observed.ImageDigests) != 5 || *commands != 15 ||
 		observed.TargetFingerprint != evidence.Plan.TargetFingerprint || observed.WorldID != 1 || observed.Raw.Current.Phase == nil || *observed.Raw.Current.Phase != 0 {
 		t.Fatalf("complete isolated runtime observation refused: %v commands=%d", err, *commands)
@@ -184,17 +190,17 @@ func TestResetRuntimeUnknownMismatchOrDriftCannotIssueObservation(t *testing.T) 
 	for _, mode := range []string{"pin", "repository", "architecture", "inspect-error", "old-id", "duplicate-id", "stopped", "missing-state", "world-project", "wrong-service", "missing-server-id", "wrong-server-id", "duplicate-server-id", "runtime-drift", "raw-error", "raw-block-open", "old-raw", "future-raw", "late", "engine-settings-drift"} {
 		t.Run(mode, func(t *testing.T) {
 			cfg, binding, evidence, raw, clock, _ := resetRuntimeFixture(t, mode)
-			observed, err := cfg.collectResetD101RuntimeWithSource(context.Background(), binding, evidence, "ghcr.io/peppone-choi/opensamguk", raw, clock)
+			observed, err := cfg.collectResetD101RuntimeWithSourceAndCustodyUID(context.Background(), binding, evidence, "ghcr.io/peppone-choi/opensamguk", raw, clock, uint32(os.Geteuid()))
 			if err == nil || observed.Version != 0 {
 				t.Fatal("invalid physical/runtime source accepted")
 			}
 		})
 	}
 	cfg, binding, evidence, raw, clock, commands := resetRuntimeFixture(t, "valid")
-	if _, err := cfg.collectResetD101RuntimeWithSource(context.Background(), binding, evidence, "https://caller.invalid", raw, clock); err == nil || *commands != 0 {
+	if _, err := cfg.collectResetD101RuntimeWithSourceAndCustodyUID(context.Background(), binding, evidence, "https://caller.invalid", raw, clock, uint32(os.Geteuid())); err == nil || *commands != 0 {
 		t.Fatal("caller origin reached Docker")
 	}
-	if _, err := cfg.collectResetD101RuntimeWithSource(context.Background(), binding, evidence, "ghcr.io/peppone-choi/opensamguk", nil, clock); err == nil || *commands != 0 {
+	if _, err := cfg.collectResetD101RuntimeWithSourceAndCustodyUID(context.Background(), binding, evidence, "ghcr.io/peppone-choi/opensamguk", nil, clock, uint32(os.Geteuid())); err == nil || *commands != 0 {
 		t.Fatal("missing source reached Docker")
 	}
 	if _, err := cfg.collectResetD101Runtime(context.Background(), binding, "ghcr.io/peppone-choi/opensamguk"); err == nil || *commands != 0 {
@@ -255,7 +261,7 @@ func TestResetRuntimeRequiresExplicitAPIAndEngineSettings(t *testing.T) {
 				mode := "setting:" + service + ":" + key + ":" + mutation
 				t.Run(mode, func(t *testing.T) {
 					cfg, binding, evidence, raw, clock, _ := resetRuntimeFixture(t, mode)
-					observed, err := cfg.collectResetD101RuntimeWithSource(context.Background(), binding, evidence, "ghcr.io/peppone-choi/opensamguk", raw, clock)
+					observed, err := cfg.collectResetD101RuntimeWithSourceAndCustodyUID(context.Background(), binding, evidence, "ghcr.io/peppone-choi/opensamguk", raw, clock, uint32(os.Geteuid()))
 					if err == nil || observed.Version != 0 {
 						t.Fatal("missing, defaulted or ambiguous seed setting accepted")
 					}
@@ -266,6 +272,37 @@ func TestResetRuntimeRequiresExplicitAPIAndEngineSettings(t *testing.T) {
 	for _, selected := range [][]*string{nil, {}, {nil, nil}} {
 		if _, err := resetRuntimeSeedSettings("game-api", selected); err == nil {
 			t.Fatal("missing or null settings accepted")
+		}
+	}
+}
+
+func installSyntheticCandidatePromotion(t *testing.T, c config, plan resetApprovalPlan, start time.Time) {
+	t.Helper()
+	resources := resetD101CandidateResourceNames(plan.OperationID)
+	resources.CandidateComposeFile = "/synthetic/candidate.json"
+	resources.LiveComposeFile = "/synthetic/live.json"
+	resources.CandidateComposeSHA = strings.Repeat("a", 64)
+	resources.LiveComposeSHA = strings.Repeat("b", 64)
+	generation := 0
+	seedValue := resetD101CandidateSeedReceipt{SchemaVersion: 1, Kind: "D101_SEED_ONLY_RESULT_V1", OriginalOp: plan.OperationID, TargetFingerprint: plan.TargetFingerprint, AppSourceSHA: plan.AppSourceSHA, ImagePins: plan.NewImageDigests, SelectedSourceReceiptSHA: plan.SelectedSourceReceiptSHA, EffectiveOptions: map[string]string{}, OptionProvenance: map[string]string{}, ObservedGeneration: &generation, ConfigMaxGeneral: 50, GameEnvMaxGeneral: 50, ObservedAtUTC: start.Add(-2 * time.Second).Format(time.RFC3339Nano)}
+	seed, _ := json.Marshal(seedValue)
+	capsValue := resetD101CandidateCapsObservation{SchemaVersion: 1, Kind: "D101_CANDIDATE_DB_CAPS_V1", DatabaseName: "synthetic", DatabaseUser: "synthetic", ServerAddress: "172.18.0.3", ServerPort: 5432, TransactionReadOnly: "on", TransactionIsolation: "repeatable read", WorldRowCount: 1, WorldID: 1, ScenarioCode: "scenario_3190", TickSeconds: 3600, GenerationType: "number", GenerationRaw: "0", ConfigMaxGeneralType: "number", ConfigMaxGeneralRaw: "50", GameEnvRowCount: 1, GameEnvMaxGeneralType: "number", GameEnvMaxGeneralRaw: "50", ObservedAtUTC: start.Add(-2 * time.Second).Format(time.RFC3339Nano)}
+	caps, _ := json.Marshal(capsValue)
+	proof := resetD101CandidatePromotionProof{SchemaVersion: 1, Kind: "D101_CANDIDATE_PROMOTION_V1", OperationID: plan.OperationID, ApprovalIntentSHA: plan.ApprovalIntentSHA, TargetFingerprint: plan.TargetFingerprint, CommandPlanSHA: strings.Repeat("a", 64), SelectedSourceReceiptSHA: plan.SelectedSourceReceiptSHA, SeedReceiptSHA: resetD101OriginalSHA(seed), WorkerContainerID: strings.Repeat("6", 64), PostgresContainerID: strings.Repeat("4", 64), RedisContainerID: strings.Repeat("5", 64), ActualCapsSHA: resetD101OriginalSHA(caps), CapsReaderSHA: strings.Repeat("b", 64), ObservedAtUTC: start.Add(-time.Second).Format(time.RFC3339Nano), Resources: resources, AppSourceSHA: plan.AppSourceSHA}
+	wire, err := json.Marshal(proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []struct {
+		directory string
+		wire      []byte
+	}{{".deployer-reset-candidate-seed", seed}, {".deployer-reset-candidate-caps", caps}, {".deployer-reset-candidate-promotion", wire}} {
+		dir := filepath.Join(c.serversDir, item.directory)
+		if os.Mkdir(dir, 0700) != nil {
+			t.Fatal("fixture directory")
+		}
+		if writeResetImmutablePrivateBytesWithUID(dir, plan.OperationID, resetD101OriginalSHA(item.wire), item.wire, uint32(os.Geteuid())) != nil {
+			t.Fatal("fixture custody")
 		}
 	}
 }

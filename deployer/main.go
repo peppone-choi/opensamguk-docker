@@ -302,6 +302,7 @@ var sharedEnvAllowlist = map[string]envFieldSpec{
 
 // 환경변수 묶음.
 type config struct {
+	d101CandidatePipeline     *resetD101CandidatePipeline     // Fixed native installation; nil fails before any physical command.
 	d101PurposeAuthority      resetD101PurposeAuthoritySource // Fixed approved host source; no request/env enablement.
 	d101RecoveryVerifier      resetD101RecoveryVerifier       // Fixed actual backup/metadata verifier; nil until supplied.
 	token                     string                          // Bearer 인증 토큰

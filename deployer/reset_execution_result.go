@@ -219,6 +219,10 @@ func (c config) requireResetD101ResultProofsWithCustodyUID(result resetD101Execu
 		}
 	}
 	if result.ActualRuntimeReceiptSHA != nil {
+		promotion, err := c.readResetD101CandidatePromotion(result.OperationID, uid)
+		if err != nil || promotion.AppSourceSHA != result.AppSourceSHA || promotion.ApprovalIntentSHA != record.D101IntentSHA || promotion.TargetFingerprint != result.TargetFingerprint || promotion.SelectedSourceReceiptSHA != plan.SelectedSourceReceiptSHA {
+			return errResetExecutionEvidence
+		}
 		var runtime resetRuntimeObservation
 		if readResetPrivateEvidence(filepath.Join(c.serversDir, ".deployer-reset-runtime"), result.OperationID, *result.ActualRuntimeReceiptSHA, uid, &runtime) != nil ||
 			runtime.Version != 1 || runtime.ServerID != "pep" || runtime.WorldID != 1 || runtime.OperationID != result.OperationID ||
@@ -235,8 +239,11 @@ func (c config) requireResetD101ResultProofsWithCustodyUID(result resetD101Execu
 		for _, service := range []string{"game-api", "game-engine", "web-game", "game-postgres", "game-redis"} {
 			container, ok := runtime.Containers[service]
 			if !ok || !resetEvidenceSHA.MatchString(container.ID) || ids[container.ID] || container.ID == preflight.StoppedContainerIDs[service] ||
-				container.Name != "/spep-"+service || container.Service != service || container.Project != "opensamguk-spep" ||
+				container.Name != "/spep-"+service || container.Service != service || container.Project != resetD101RuntimeProject(service, promotion.Resources.Project) ||
 				!resetManifestDigest.MatchString(container.ImageID) || container.Running == nil || !*container.Running || container.Status != "running" {
+				return errResetExecutionEvidence
+			}
+			if (service == "game-postgres" && container.ID != promotion.PostgresContainerID) || (service == "game-redis" && container.ID != promotion.RedisContainerID) {
 				return errResetExecutionEvidence
 			}
 			ids[container.ID] = true
@@ -319,4 +326,11 @@ func serveResetD101ExecutionResult(w http.ResponseWriter, r *http.Request, parts
 	w.Header().Set("X-D101-Result-Proof", observed.proof)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(observed.wire)
+}
+
+func resetD101RuntimeProject(service, candidateProject string) string {
+	if service == "game-postgres" || service == "game-redis" {
+		return candidateProject
+	}
+	return "opensamguk-spep"
 }

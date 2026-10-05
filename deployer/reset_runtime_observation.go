@@ -70,6 +70,11 @@ func (c config) collectResetD101Runtime(ctx context.Context, binding resetExecut
 }
 
 func (c config) collectResetD101RuntimeWithSource(ctx context.Context, binding resetExecutionPhaseBinding, evidence resetExecutionEvidence, appRepository string, rawSource resetRuntimeRawSource, clock func() time.Time) (resetRuntimeObservation, error) {
+	return c.collectResetD101RuntimeWithSourceAndCustodyUID(ctx, binding, evidence, appRepository, rawSource, clock, 0)
+}
+
+// Alternate custody UID is confined to synthetic local file fixtures.
+func (c config) collectResetD101RuntimeWithSourceAndCustodyUID(ctx context.Context, binding resetExecutionPhaseBinding, evidence resetExecutionEvidence, appRepository string, rawSource resetRuntimeRawSource, clock func() time.Time, uid uint32) (resetRuntimeObservation, error) {
 	plan := evidence.Plan
 	if rawSource == nil || clock == nil || ctx == nil || ctx.Err() != nil ||
 		!resetRuntimeRepository.MatchString(appRepository) ||
@@ -81,6 +86,10 @@ func (c config) collectResetD101RuntimeWithSource(ctx context.Context, binding r
 		binding.Evidence.ApprovalPlanSHA != evidence.Preflight.ApprovalPlanSHA || !resetEvidenceSHA.MatchString(binding.Evidence.ExecutionReceiptSHA) ||
 		validateResetApprovalPlan(plan, binding.OperationID, binding.Target, time.Unix(plan.WindowOpensAtUnix, 0)) != nil ||
 		validateResetPreflight(evidence.Preflight, plan, binding.Evidence.ApprovalPlanSHA, time.Unix(evidence.Preflight.ObservedAtUnix, 0)) != nil {
+		return resetRuntimeObservation{}, errResetExecutionEvidence
+	}
+	promotion, err := c.readResetD101CandidatePromotion(binding.OperationID, uid)
+	if err != nil || promotion.AppSourceSHA != plan.AppSourceSHA || promotion.ApprovalIntentSHA != plan.ApprovalIntentSHA || promotion.TargetFingerprint != plan.TargetFingerprint || promotion.SelectedSourceReceiptSHA != plan.SelectedSourceReceiptSHA {
 		return resetRuntimeObservation{}, errResetExecutionEvidence
 	}
 	started := clock()
@@ -98,8 +107,15 @@ func (c config) collectResetD101RuntimeWithSource(ctx context.Context, binding r
 		Containers: map[string]resetRuntimeContainer{}, ImageDigests: map[string]string{}}
 	ids := map[string]bool{}
 	for _, service := range []string{"game-api", "game-engine", "web-game", "game-postgres", "game-redis"} {
-		container, err := c.observeResetRuntimeContainer(bounded, service)
+		project := "opensamguk-spep"
+		if service == "game-postgres" || service == "game-redis" {
+			project = promotion.Resources.Project
+		}
+		container, err := c.observeResetRuntimeContainerProject(bounded, service, project)
 		if err != nil || container.ID == evidence.Preflight.StoppedContainerIDs[service] || ids[container.ID] {
+			return resetRuntimeObservation{}, errResetExecutionEvidence
+		}
+		if (service == "game-postgres" && container.ID != promotion.PostgresContainerID) || (service == "game-redis" && container.ID != promotion.RedisContainerID) {
 			return resetRuntimeObservation{}, errResetExecutionEvidence
 		}
 		ids[container.ID] = true
@@ -119,7 +135,11 @@ func (c config) collectResetD101RuntimeWithSource(ctx context.Context, binding r
 	result.Raw = raw
 	// Detect replacement/stop/env identity drift during the raw observation.
 	for _, service := range []string{"game-api", "game-engine", "web-game", "game-postgres", "game-redis"} {
-		current, err := c.observeResetRuntimeContainer(bounded, service)
+		project := "opensamguk-spep"
+		if service == "game-postgres" || service == "game-redis" {
+			project = promotion.Resources.Project
+		}
+		current, err := c.observeResetRuntimeContainerProject(bounded, service, project)
 		if err != nil || !reflect.DeepEqual(current, result.Containers[service]) {
 			return resetRuntimeObservation{}, errResetExecutionEvidence
 		}
@@ -152,6 +172,9 @@ func resetRuntimePinMatches(digests []string, service, appRepository, pin string
 	return false
 }
 func (c config) observeResetRuntimeContainer(ctx context.Context, service string) (resetRuntimeContainer, error) {
+	return c.observeResetRuntimeContainerProject(ctx, service, "opensamguk-spep")
+}
+func (c config) observeResetRuntimeContainerProject(ctx context.Context, service, project string) (resetRuntimeContainer, error) {
 	out, err := c.runServerDockerContext(ctx, "inspect", "--format", resetRuntimeContainerFormat, "spep-"+service)
 	// Null terminates the Go template array without exposing all environment.
 	// Decode it separately so a missing/duplicate SERVER_ID stays distinguishable.
@@ -169,7 +192,7 @@ func (c config) observeResetRuntimeContainer(ctx context.Context, service string
 	if err != nil || len(out) > resetEvidenceMaxBytes || decodeResetPrivateJSON([]byte(out), &envelope) != nil ||
 		!resetEvidenceSHA.MatchString(envelope.ID) || !resetManifestDigest.MatchString(envelope.ImageID) ||
 		envelope.Name != "/spep-"+service || envelope.Running == nil || !*envelope.Running || envelope.Status != "running" ||
-		envelope.Project != "opensamguk-spep" || envelope.Service != service || len(envelope.ServerIDs) == 0 ||
+		envelope.Project != project || envelope.Service != service || len(envelope.ServerIDs) == 0 ||
 		envelope.ServerIDs[len(envelope.ServerIDs)-1] != nil {
 		return resetRuntimeContainer{}, errResetExecutionEvidence
 	}

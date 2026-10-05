@@ -18,6 +18,7 @@ type resetD101CandidateAdmission struct {
 	target             resetLifecycleTarget
 	server             serverTarget
 	cutoff             time.Time
+	resources          resetD101CandidateResources
 }
 
 func (a resetD101CandidateAdmission) OperationID() string              { return a.operationID }
@@ -69,7 +70,7 @@ func newResetD101CandidateAdmission(intent resetDecodedApprovalIntent, evidence 
 	}
 	a := resetD101CandidateAdmission{intent.Intent.OperationID, intent.SHA, intent.Intent.TargetFingerprint,
 		intent.Intent.AppSourceSHA, intent.Intent.SelectedSourceReceiptSHA, cloneResetD101Strings(intent.Intent.NewImageDigests),
-		intent.Target, server, time.Unix(intent.Intent.DestructiveCutoffUnix, 0)}
+		intent.Target, server, time.Unix(intent.Intent.DestructiveCutoffUnix, 0), resetD101CandidateResources{}}
 	a.target = a.Target()
 	return a, nil
 }
