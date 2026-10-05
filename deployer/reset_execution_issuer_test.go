@@ -33,6 +33,9 @@ func resetD101IssuerFixture(t *testing.T) (config, uint32, string) {
 		t.Fatal(err)
 	}
 	_, preflight, accepted := resetEvidenceFixture(t)
+	// Reserve's actual first admission uses UTC. Keep the same representation
+	// across JSON restart as well as the same instant (Time == includes location).
+	accepted = accepted.UTC()
 	preflight.TargetFingerprint = plan.TargetFingerprint
 	planWire, _ := json.Marshal(plan)
 	preflight.ApprovalPlanSHA = resetD101OriginalSHA(planWire)
