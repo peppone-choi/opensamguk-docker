@@ -180,44 +180,68 @@ func validateResetPreflight(receipt resetPreflightReceipt, plan resetApprovalPla
 // The production caller fixes uid=0. Tests supply their current UID.
 // Root is the trusted issuer. This reader cannot attest a compromised root.
 func readResetPrivateEvidence(directory, operationID, expectedSHA string, uid uint32, into any) error {
-	op, opErr := normalizeLifecycleOperationID(operationID)
-	if !filepath.IsAbs(directory) || opErr != nil || op == "" || op != operationID || !resetEvidenceSHA.MatchString(expectedSHA) {
+	if !resetEvidenceSHA.MatchString(expectedSHA) {
 		return errResetExecutionEvidence
+	}
+	wire, err := readResetPrivateCustody(directory, operationID, uid)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(wire)
+	if hex.EncodeToString(sum[:]) != expectedSHA {
+		return errResetExecutionEvidence
+	}
+	return decodeResetPrivateJSON(wire, into)
+}
+
+func readResetPrivateCustody(directory, operationID string, uid uint32) ([]byte, error) {
+	op, opErr := normalizeLifecycleOperationID(operationID)
+	if !filepath.IsAbs(directory) || opErr != nil || op == "" || op != operationID {
+		return nil, errResetExecutionEvidence
 	}
 	resolved, err := filepath.EvalSymlinks(directory)
 	if err != nil || resolved != filepath.Clean(directory) {
-		return errResetExecutionEvidence
+		return nil, errResetExecutionEvidence
 	}
 	dirInfo, err := os.Lstat(directory)
 	if err != nil || !dirInfo.IsDir() || dirInfo.Mode().Perm()&0077 != 0 {
-		return errResetExecutionEvidence
+		return nil, errResetExecutionEvidence
 	}
 	dirStat, ok := dirInfo.Sys().(*syscall.Stat_t)
 	if !ok || dirStat.Uid != uid {
-		return errResetExecutionEvidence
+		return nil, errResetExecutionEvidence
 	}
 	path := filepath.Join(directory, operationID+".json")
 	// O_NOFOLLOW closes the leaf symlink race. Parent custody is root-only.
 	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return errResetExecutionEvidence
+		return nil, errResetExecutionEvidence
 	}
 	file := os.NewFile(uintptr(fd), path)
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0400 || info.Size() <= 0 || info.Size() > resetEvidenceMaxBytes {
-		return errResetExecutionEvidence
+		return nil, errResetExecutionEvidence
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || stat.Uid != uid || stat.Nlink != 1 {
-		return errResetExecutionEvidence
+		return nil, errResetExecutionEvidence
 	}
 	wire, err := io.ReadAll(io.LimitReader(file, resetEvidenceMaxBytes+1))
 	if err != nil || len(wire) > resetEvidenceMaxBytes {
-		return errResetExecutionEvidence
+		return nil, errResetExecutionEvidence
 	}
-	sum := sha256.Sum256(wire)
-	if hex.EncodeToString(sum[:]) != expectedSHA || rejectResetDuplicateJSONKeys(wire) != nil {
+	after, err := file.Stat()
+	dirAfter, dirErr := os.Lstat(directory)
+	if err != nil || dirErr != nil || !os.SameFile(info, after) || info.Size() != after.Size() ||
+		!info.ModTime().Equal(after.ModTime()) || !os.SameFile(dirInfo, dirAfter) {
+		return nil, errResetExecutionEvidence
+	}
+	return wire, nil
+}
+
+func decodeResetPrivateJSON(wire []byte, into any) error {
+	if rejectResetDuplicateJSONKeys(wire) != nil {
 		return errResetExecutionEvidence
 	}
 	decoder := json.NewDecoder(bytes.NewReader(wire))
@@ -226,12 +250,6 @@ func readResetPrivateEvidence(directory, operationID, expectedSHA string, uid ui
 		return errResetExecutionEvidence
 	}
 	if err := decoder.Decode(new(any)); err != io.EOF {
-		return errResetExecutionEvidence
-	}
-	after, err := file.Stat()
-	dirAfter, dirErr := os.Lstat(directory)
-	if err != nil || dirErr != nil || !os.SameFile(info, after) || info.Size() != after.Size() ||
-		!info.ModTime().Equal(after.ModTime()) || !os.SameFile(dirInfo, dirAfter) {
 		return errResetExecutionEvidence
 	}
 	return nil

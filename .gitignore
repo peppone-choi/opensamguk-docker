@@ -27,4 +27,5 @@ infra/nginx/certs/
 /backups/
 /servers/.deployer-reset-approvals/
 /servers/.deployer-reset-preflights/
+/servers/.deployer-reset-admin/
 /servers/.deployer-publication-receipts/
