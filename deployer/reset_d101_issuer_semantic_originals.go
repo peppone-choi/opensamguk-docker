@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"path/filepath"
 	"reflect"
 	"time"
 
@@ -65,6 +66,10 @@ func newResetD101IssuerUnsignedBatch(ctx context.Context, issuance d101operatora
 	if ctx == nil || ctx.Err() != nil || source == nil || (reflect.ValueOf(source).Kind() == reflect.Pointer && reflect.ValueOf(source).IsNil()) {
 		return empty, errResetExecutionEvidence
 	}
+	deadline, bounded := ctx.Deadline()
+	if !bounded || !deadline.After(time.Now()) {
+		return empty, errResetExecutionEvidence
+	}
 	scope, e1 := issuance.Scope()
 	event, e2 := issuance.Event()
 	approval, e3 := issuance.Issuer(d101operatorauth.ApprovalIssuerRole)
@@ -76,6 +81,9 @@ func newResetD101IssuerUnsignedBatch(ctx context.Context, issuance d101operatora
 	facts := resetD101IssuerSemanticFacts{scope, event, approval, receipt, issued}
 	snapshot, err := source.CaptureAuthenticatedUnsigned(ctx, issuance)
 	if err != nil || ctx.Err() != nil {
+		return empty, errResetExecutionEvidence
+	}
+	if deadline.Unix() > snapshot.Receipt.Scope.Window.DestructiveCutoffUnix || time.Now().Unix() >= snapshot.Receipt.Scope.Window.DestructiveCutoffUnix {
 		return empty, errResetExecutionEvidence
 	}
 	frozen, err := freezeResetD101IssuerSemanticSnapshot(snapshot)
@@ -319,6 +327,20 @@ func validateResetD101ReceiptUnsigned(f resetD101IssuerSemanticFacts, s resetD10
 		installer.SchemaVersion != 1 || installer.Kind != "D101_APPROVED_RECEIPT_INSTALLER_IDENTITY_V1" || installer.OperationID != f.scope.OperationID || installer.InstallerID != pins.InstallerID || installer.InstallerSourceSHA != pins.InstallerSourceSHA || installer.AppSourceSHA != f.scope.AppSourceSHA || installer.DockerSourceSHA != f.scope.DockerSourceSHA || installer.ReaderInstallationFile != resetD101NativeReaderInstallationPath || installer.ReaderInstallationSHA != pins.ReaderInstallationSHA || installer.RootKeyID != pins.RootKey.KeyID || installer.RootPublicKeySpkiSHA != pins.RootKey.PublicKeySpkiSHA ||
 		resetD101OriginalSHA(s.Original13["readerBindings"]) != pins.ReaderInstallationSHA {
 		return errResetExecutionEvidence
+	}
+	var installation resetD101ProvenanceReaderInstallation
+	if resetD101SemanticDecode(s.Original13["readerBindings"], &installation) != nil || installation.SchemaVersion != 1 || installation.Kind != "D101_NATIVE_READER_BINDINGS_V1" || len(installation.OriginalFiles) != 14 || len(pins.OriginalDirectories) != 14 || len(pins.AuxiliaryDirectories) != 3 {
+		return errResetExecutionEvidence
+	}
+	for _, id := range resetD101HostOriginalIDs {
+		if installation.OriginalFiles[id] != filepath.Join(pins.OriginalDirectories[id], f.scope.OperationID+".json") {
+			return errResetExecutionEvidence
+		}
+	}
+	for _, path := range []string{installation.ManifestFile, installation.ClockFile, installation.RootTokenFile, installation.SelectedEnvelopeFile} {
+		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+			return errResetExecutionEvidence
+		}
 	}
 	return nil
 }
