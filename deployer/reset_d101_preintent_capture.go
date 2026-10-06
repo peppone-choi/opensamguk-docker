@@ -147,6 +147,7 @@ func (c config) runResetD101PreIntentCapture(ctx context.Context, s *resetD101Pr
 		!resetRuntimePinMatches(image.RepoDigests, "game-engine", "ghcr.io/"+c.ghcrOwner+"/opensamguk", s.reviewed.ImagePins["game-engine"]) {
 		return nil, errResetExecutionEvidence
 	}
+	started := time.Now()
 	if _, err = call("start", id); err != nil {
 		return nil, err
 	}
@@ -161,6 +162,10 @@ func (c config) runResetD101PreIntentCapture(ctx context.Context, s *resetD101Pr
 	reception, err := readResetD101PreIntentReception(s, finished, time.Now())
 	if err != nil {
 		return nil, err
+	}
+	captured, err := resetD101RecoveryUTC(reception.manifest.CapturedAtUTC)
+	if err != nil || captured.Before(started) || captured.After(time.Now()) {
+		return nil, errResetExecutionEvidence
 	}
 	again, err := inspect()
 	if err != nil || !reflect.DeepEqual(finished, again) || reception.recheck() != nil || bounded.Err() != nil {
