@@ -305,6 +305,7 @@ type config struct {
 	d101SeedMaterialInputs    *resetD101SeedMaterialInputs    // Independent fixed native inputs; nil closes before any physical command.
 	d101CandidatePipeline     *resetD101CandidatePipeline     // Fixed native installation; nil fails before any physical command.
 	d101PurposeAuthority      resetD101PurposeAuthoritySource // Fixed approved host source; no request/env enablement.
+	d101PhaseSource           resetExecutionPhaseSource       // Actual installed current writer source; nil closes pre-stop collection.
 	d101RecoveryClosureReader resetD101RecoveryClosureReader  // Fixed retained restore1 reader; nil until actual producer installation.
 	d101RecoveryVerifier      resetD101RecoveryVerifier       // Fixed actual backup/metadata verifier; nil until supplied.
 	token                     string                          // Bearer 인증 토큰
