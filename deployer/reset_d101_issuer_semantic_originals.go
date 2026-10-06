@@ -350,7 +350,13 @@ func validateResetD101ReceiptUnsigned(f resetD101IssuerSemanticFacts, s resetD10
 // signed-envelope RawRef cannot be invented before signing. Native recheck is
 // still the supplier's responsibility. No signer, root key or receipt issue here.
 func (b resetD101IssuerUnsignedBatch) ProvenanceAfterRetainedAttestation(ctx context.Context, signed []byte) ([]byte, error) {
-	if ctx == nil || ctx.Err() != nil || time.Now().Unix() >= b.receipt.Scope.Window.DestructiveCutoffUnix || len(b.approvalPayload) == 0 || len(b.receiptAttestation) == 0 {
+	return mapResetD101RetainedAttestationProvenance(ctx, b, signed, time.Now())
+}
+
+// Pure mapping accepts an explicit observation clock for synthetic fixtures.
+// The production method above always supplies the actual local observation.
+func mapResetD101RetainedAttestationProvenance(ctx context.Context, b resetD101IssuerUnsignedBatch, signed []byte, observed time.Time) ([]byte, error) {
+	if ctx == nil || ctx.Err() != nil || observed.IsZero() || observed.Unix() < b.receipt.IssuedAtUnix || observed.Unix() >= b.receipt.Scope.Window.DestructiveCutoffUnix || len(b.approvalPayload) == 0 || len(b.receiptAttestation) == 0 {
 		return nil, errResetExecutionEvidence
 	}
 	var envelope resetD101SignedHostOriginal

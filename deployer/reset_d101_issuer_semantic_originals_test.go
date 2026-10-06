@@ -350,9 +350,20 @@ func TestIssuerSemanticRetainedSignedEnvelopePreservesExistingProvenanceOrder(t 
 	signed := resetD101SignedHostFixture(t, key, resetD101ApprovedReceiptAttestationDomain, b.ReceiptAttestation())
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	wire, err := b.ProvenanceAfterRetainedAttestation(ctx, signed)
+	wire, err := mapResetD101RetainedAttestationProvenance(ctx, b, signed, f.issued)
 	if err != nil {
 		t.Fatal("exact retained synthetic envelope refused", err)
+	}
+	// The inherited historical fixture window is already expired. The actual
+	// production observation must still refuse it; the pure mapper alone uses
+	// the fixture clock for deterministic signature/order assertions.
+	if result, err := b.ProvenanceAfterRetainedAttestation(ctx, signed); err == nil || len(result) != 0 {
+		t.Fatal("expired historical fixture became current production provenance")
+	}
+	for _, observed := range []time.Time{time.Time{}, f.issued.Add(-time.Second), time.Unix(s.Receipt.Scope.Window.DestructiveCutoffUnix, 0)} {
+		if result, err := mapResetD101RetainedAttestationProvenance(ctx, b, signed, observed); err == nil || len(result) != 0 {
+			t.Fatal("observation outside original issuance window created provenance")
+		}
 	}
 	var value resetD101ApprovedReceiptProvenance
 	var fields map[string]json.RawMessage
@@ -360,7 +371,7 @@ func TestIssuerSemanticRetainedSignedEnvelopePreservesExistingProvenanceOrder(t 
 		t.Fatal("post-sign envelope ref/profile changed")
 	}
 	for _, raw := range [][]byte{resetD101SignedHostFixture(t, key, d101operatorauth.ApprovalOriginDomain, b.ReceiptAttestation()), resetD101SignedHostFixture(t, ed25519.NewKeyFromSeed(bytes.Repeat([]byte{74}, ed25519.SeedSize)), resetD101ApprovedReceiptAttestationDomain, b.ReceiptAttestation()), resetD101SignedHostFixture(t, key, resetD101ApprovedReceiptAttestationDomain, append(b.ReceiptAttestation(), byte(' ')))} {
-		if result, err := b.ProvenanceAfterRetainedAttestation(ctx, raw); err == nil || len(result) != 0 {
+		if result, err := mapResetD101RetainedAttestationProvenance(ctx, b, raw, f.issued); err == nil || len(result) != 0 {
 			t.Fatal("wrong domain/key/unsigned original created provenance")
 		}
 	}
