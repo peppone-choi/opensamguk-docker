@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func resetD101IssuerLedgerTestDirectory(t *testing.T) (*os.File, resetD101IssuerDirectoryPin) {
@@ -270,4 +271,239 @@ func TestNativeIssuerSemanticRecheckRejectsSnapshotMutation(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Portable retained-descriptor fixture only. It never supplies installed native
+// authority, a CurrentOperator/TechnicalIssuance, a private key or a signature.
+func resetD101IssuerRetainedEmissionFixture(t *testing.T) (*resetD101NativeIssuerEmission, *resetD101IssuerRetainedEmission) {
+	t.Helper()
+	op := strings.Repeat("a", 32)
+	e := &resetD101NativeIssuerEmission{attempted: true}
+	e.inputs.policy.Scope.OperationID = op
+	r := &resetD101IssuerRetainedEmission{semantic: &resetD101IssuerEmissionSemanticSource{
+		actual: resetD101IssuerSnapshotMutationFixture{}, captured: true,
+		frozen: resetD101IssuerSemanticSnapshot{Original13: map[string][]byte{"synthetic": []byte("original")}},
+	}}
+	for i := 0; i < 3; i++ {
+		dir, pin := resetD101IssuerLedgerTestDirectory(t)
+		r.dirs = append(r.dirs, dir)
+		o, err := writeResetD101IssuerEmissionHeld(context.Background(), dir, op, []byte("synthetic output "+string(rune('a'+i))), uint32(os.Getuid()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.held = append(r.held, o)
+		output := resetD101IssuerEmissionOutput{directory: dir.Name(), pin: pin}
+		switch i {
+		case 0:
+			e.inputs.origin = output
+		case 1:
+			e.inputs.attestation = output
+		case 2:
+			e.inputs.provenance = output
+		}
+	}
+	e.retained = r
+	e.inputs.verifyRetained = func(_ context.Context, _ *os.File, _ d101operatorauth.TechnicalIssuance, _ resetD101IssuerSemanticSnapshot, a, b, c []byte) error {
+		for i, wire := range [][]byte{a, b, c} {
+			if !bytes.Equal(wire, r.held[i].wire) {
+				return errResetExecutionEvidence
+			}
+		}
+		return nil
+	}
+	t.Cleanup(func() { _ = e.CloseRetained() })
+	return e, r
+}
+
+func resetD101IssuerRetainedFixtureNative(context.Context, *os.File, string) error {
+	// Private pure seam; never wired to the production AuthenticateRetained.
+	return nil
+}
+
+func requireResetD101IssuerRetainedFixtureClosed(t *testing.T, e *resetD101NativeIssuerEmission, r *resetD101IssuerRetainedEmission) {
+	t.Helper()
+	if e.retained != nil || !e.stopped.Load() {
+		t.Fatal("failed/released custody remained available")
+	}
+	for _, o := range r.held {
+		if _, err := o.file.Stat(); err == nil {
+			t.Fatal("output descriptor remained open")
+		}
+	}
+	for _, d := range r.dirs {
+		if _, err := d.Stat(); err == nil {
+			t.Fatal("directory descriptor remained open")
+		}
+	}
+}
+
+func TestNativeIssuerRetainedOutputsPreserveDescriptorsUntilClosure(t *testing.T) {
+	e, r := resetD101IssuerRetainedEmissionFixture(t)
+	var descriptors []uintptr
+	for _, o := range r.held {
+		descriptors = append(descriptors, o.file.Fd())
+	}
+	for _, phase := range []string{"issuer-emission-retained", "issuer-release"} {
+		if e.authenticateRetainedWithNative(context.Background(), nil, e.inputs.policy.Scope.OperationID, phase, uint32(os.Getuid()), resetD101IssuerRetainedFixtureNative) != nil {
+			t.Fatal("portable same-descriptor conjunction refused")
+		}
+		for i, o := range r.held {
+			if o.file.Fd() != descriptors[i] || recheckResetD101PreparedHeldOriginal(o, uint32(os.Getuid())) != nil {
+				t.Fatal("emission/release reopened or replaced original descriptor")
+			}
+		}
+	}
+	if e.CloseRetained() != nil {
+		t.Fatal("final descriptor closure")
+	}
+	requireResetD101IssuerRetainedFixtureClosed(t, e, r)
+	for _, o := range r.held {
+		wire, err := os.ReadFile(o.file.Name())
+		if err != nil || !bytes.Equal(wire, o.wire) {
+			t.Fatal("closure changed durable original")
+		}
+	}
+	if e.authenticateRetainedWithNative(context.Background(), nil, e.inputs.policy.Scope.OperationID, "issuer-release", uint32(os.Getuid()), resetD101IssuerRetainedFixtureNative) == nil {
+		t.Fatal("release replay accepted")
+	}
+}
+
+func TestNativeIssuerRetainedOutputsRejectPostEmissionDrift(t *testing.T) {
+	for _, name := range []string{"origin-samebytes-replace", "attestation-samebytes-replace", "provenance-samebytes-replace", "directory-replace", "closed-descriptor", "content-mutation"} {
+		t.Run(name, func(t *testing.T) {
+			e, r := resetD101IssuerRetainedEmissionFixture(t)
+			op, uid := e.inputs.policy.Scope.OperationID, uint32(os.Getuid())
+			if e.authenticateRetainedWithNative(context.Background(), nil, op, "issuer-emission-retained", uid, resetD101IssuerRetainedFixtureNative) != nil {
+				t.Fatal("pre-mutation fixture")
+			}
+			i := 0
+			if name == "attestation-samebytes-replace" {
+				i = 1
+			} else if name == "provenance-samebytes-replace" {
+				i = 2
+			}
+			path := r.held[i].file.Name()
+			switch name {
+			case "directory-replace":
+				if os.Rename(r.dirs[0].Name(), r.dirs[0].Name()+".old") != nil || os.Mkdir(r.dirs[0].Name(), 0700) != nil || os.WriteFile(path, r.held[0].wire, 0400) != nil {
+					t.Fatal("fixture directory replacement")
+				}
+			case "closed-descriptor":
+				if r.held[0].file.Close() != nil {
+					t.Fatal("fixture close")
+				}
+			case "content-mutation":
+				if os.Chmod(path, 0600) != nil || os.WriteFile(path, []byte("mutated original"), 0600) != nil || os.Chmod(path, 0400) != nil {
+					t.Fatal("fixture mutation")
+				}
+			default:
+				if os.Rename(path, path+".old") != nil || os.WriteFile(path, r.held[i].wire, 0400) != nil {
+					t.Fatal("fixture same-byte replacement")
+				}
+			}
+			if e.authenticateRetainedWithNative(context.Background(), nil, op, "issuer-release", uid, resetD101IssuerRetainedFixtureNative) == nil {
+				t.Fatal("post-emission native drift released")
+			}
+			requireResetD101IssuerRetainedFixtureClosed(t, e, r)
+			if _, err := os.Lstat(path); err != nil {
+				t.Fatal("denial removed partial/original")
+			}
+		})
+	}
+}
+
+func TestNativeIssuerRetainedReleaseRequiresActualConjunction(t *testing.T) {
+	for _, name := range []string{"native-before-denied", "native-after-denied", "native-missing", "verifier-denied", "verifier-mutation", "semantic-mutation", "cancelled", "wrong-operation", "unknown-phase"} {
+		t.Run(name, func(t *testing.T) {
+			e, r := resetD101IssuerRetainedEmissionFixture(t)
+			op, phase := e.inputs.policy.Scope.OperationID, "issuer-release"
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			native := resetD101IssuerRetainedFixtureNative
+			switch name {
+			case "native-before-denied", "native-after-denied":
+				native = func(_ context.Context, _ *os.File, phase string) error {
+					if name == "native-before-denied" || strings.HasSuffix(phase, "-after") {
+						return errResetExecutionEvidence
+					}
+					return nil
+				}
+			case "native-missing":
+				native = nil
+			case "verifier-denied", "verifier-mutation":
+				e.inputs.verifyRetained = func(_ context.Context, _ *os.File, _ d101operatorauth.TechnicalIssuance, v resetD101IssuerSemanticSnapshot, _, _, _ []byte) error {
+					if name == "verifier-denied" {
+						return errResetExecutionEvidence
+					}
+					v.Original13["synthetic"][0] = 'X'
+					return nil
+				}
+			case "semantic-mutation":
+				r.semantic.actual = resetD101IssuerSnapshotMutationFixture{mutate: true}
+			case "cancelled":
+				cancel()
+			case "wrong-operation":
+				op = strings.Repeat("b", 32)
+			case "unknown-phase":
+				phase = "issuer-pre-ready"
+			}
+			if e.authenticateRetainedWithNative(ctx, nil, op, phase, uint32(os.Getuid()), native) == nil {
+				t.Fatal("missing/failed actual conjunction released")
+			}
+			requireResetD101IssuerRetainedFixtureClosed(t, e, r)
+			for _, o := range r.held {
+				wire, err := os.ReadFile(o.file.Name())
+				if err != nil || !bytes.Equal(wire, o.wire) {
+					t.Fatal("failed release removed or rewrote original")
+				}
+			}
+		})
+	}
+}
+
+func TestNativeIssuerRetainedAuthenticationRejectsAbsentNativeAuthority(t *testing.T) {
+	var absent *resetD101NativeIssuerEmission
+	if absent.AuthenticateRetained(context.Background(), nil, strings.Repeat("a", 32), "issuer-release") == nil {
+		t.Fatal("nil emitter granted native authority")
+	}
+	e, r := resetD101IssuerRetainedEmissionFixture(t)
+	if e.AuthenticateRetained(context.Background(), nil, e.inputs.policy.Scope.OperationID, "issuer-release") == nil {
+		t.Fatal("portable descriptors replaced actual Linux/source/key/FD9 authority")
+	}
+	requireResetD101IssuerRetainedFixtureClosed(t, e, r)
+}
+
+func TestNativeIssuerRetainedConcurrentClosureStopsActiveAuthentication(t *testing.T) {
+	e, r := resetD101IssuerRetainedEmissionFixture(t)
+	entered, resume := make(chan struct{}), make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- e.authenticateRetainedWithNative(context.Background(), nil, e.inputs.policy.Scope.OperationID, "issuer-release", uint32(os.Getuid()), func(context.Context, *os.File, string) error {
+			close(entered)
+			<-resume
+			return nil
+		})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		close(resume)
+		t.Fatal("fixture authentication did not enter")
+	}
+	// A second caller must not wait behind the native callback or approve a
+	// release. The active owner observes stopped and closes its own actual FDs.
+	if e.CloseRetained() == nil {
+		close(resume)
+		t.Fatal("busy closure claimed completed release")
+	}
+	close(resume)
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("active authentication ignored terminal stop")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active owner did not return its descriptors")
+	}
+	requireResetD101IssuerRetainedFixtureClosed(t, e, r)
 }

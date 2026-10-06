@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -49,7 +50,9 @@ type resetD101NativeIssuerCustody struct {
 }
 
 func newResetD101NativeIssuerCustody(v resetD101IssuerLedgerInputs) (*resetD101NativeIssuerCustody, error) {
+	_, retained := v.emitter.(resetD101IssuerRetainedOriginals)
 	if v.authenticate == nil || v.emitter == nil || (reflect.ValueOf(v.emitter).Kind() == reflect.Pointer && reflect.ValueOf(v.emitter).IsNil()) ||
+		!retained ||
 		!lifecycleJobIDRe.MatchString(v.operationID) || v.policy.Scope.OperationID != v.operationID ||
 		!resetD101IssuerIdentity.MatchString(v.jwtLogicalID) || !strings.HasPrefix(v.jwtLogicalID, "raw:") ||
 		!resetD101IssuerIdentity.MatchString(v.retentionOwner) || v.retentionSeconds < 7*24*60*60 ||
@@ -64,7 +67,18 @@ func newResetD101NativeIssuerCustody(v resetD101IssuerLedgerInputs) (*resetD101N
 	return &resetD101NativeIssuerCustody{inputs: v}, nil
 }
 
-func (c *resetD101NativeIssuerCustody) Authenticate(ctx context.Context, fd *os.File, op, phase string) error {
+func (c *resetD101NativeIssuerCustody) Authenticate(ctx context.Context, fd *os.File, op, phase string) (result error) {
+	// A failed phase cannot leave issued descriptors available for a later
+	// release attempt. Closing preserves every durable original and partial.
+	var retained resetD101IssuerRetainedOriginals
+	if c != nil {
+		retained, _ = c.inputs.emitter.(resetD101IssuerRetainedOriginals)
+	}
+	defer func() {
+		if result != nil && retained != nil {
+			_ = retained.CloseRetained()
+		}
+	}()
 	if c == nil || ctx == nil || ctx.Err() != nil || fd == nil || fd.Fd() != 9 || op != c.inputs.operationID || c.inputs.authenticate == nil {
 		return errResetExecutionEvidence
 	}
@@ -104,7 +118,19 @@ func (c *resetD101NativeIssuerCustody) Authenticate(ctx context.Context, fd *os.
 	if phase == "issuer-release" && (!c.issued || len(c.claim) == 0 || len(c.token) == 0) {
 		return errResetExecutionEvidence
 	}
+	retainedPhase := phase == "issuer-emission-retained" || phase == "issuer-release"
+	if retainedPhase && (retained == nil || retained.AuthenticateRetained(ctx, fd, op, phase) != nil) {
+		return errResetExecutionEvidence
+	}
 	if c.inputs.authenticate(ctx, fd, op, phase+"-after-native") != nil || ctx.Err() != nil {
+		return errResetExecutionEvidence
+	}
+	// The independent provider's final check cannot substitute for custody of
+	// the actual three output descriptors. Recheck them after that callback.
+	if retainedPhase && (retained.AuthenticateRetained(ctx, fd, op, phase) != nil || ctx.Err() != nil) {
+		return errResetExecutionEvidence
+	}
+	if phase == "issuer-release" && retained.CloseRetained() != nil {
 		return errResetExecutionEvidence
 	}
 	return nil
@@ -209,7 +235,14 @@ func (c *resetD101NativeIssuerCustody) ClaimAuthenticatedIssuance(ctx context.Co
 	return nil
 }
 
-func (c *resetD101NativeIssuerCustody) IssueAndRetainOriginals(ctx context.Context, fd *os.File, issuance d101operatorauth.TechnicalIssuance) error {
+func (c *resetD101NativeIssuerCustody) IssueAndRetainOriginals(ctx context.Context, fd *os.File, issuance d101operatorauth.TechnicalIssuance) (result error) {
+	defer func() {
+		if result != nil && c != nil {
+			if retained, ok := c.inputs.emitter.(resetD101IssuerRetainedOriginals); ok {
+				_ = retained.CloseRetained()
+			}
+		}
+	}()
 	if c == nil || c.inputs.emitter == nil || c.Authenticate(ctx, fd, c.inputs.operationID, "issuer-before-emission") != nil {
 		return errResetExecutionEvidence
 	}
@@ -801,6 +834,10 @@ func resetD101PreparedDirectoryBudget(dir *os.File, cap, reserve uint64) error {
 type resetD101IssuerOriginalAvailability interface {
 	AuthenticateAvailability(context.Context, *os.File, d101operatorauth.ReviewedPolicy) error
 }
+type resetD101IssuerRetainedOriginals interface {
+	AuthenticateRetained(context.Context, *os.File, string, string) error
+	CloseRetained() error
+}
 type resetD101IssuerEmissionOutput struct {
 	directory string
 	pin       resetD101IssuerDirectoryPin
@@ -823,6 +860,110 @@ type resetD101NativeIssuerEmission struct {
 	mu        sync.Mutex
 	inputs    resetD101NativeIssuerEmissionInputs
 	attempted bool
+	stopped   atomic.Bool
+	retained  *resetD101IssuerRetainedEmission
+}
+
+type resetD101IssuerRetainedEmission struct {
+	dirs     []*os.File
+	held     []resetD101PreparedHeldOriginal
+	issuance d101operatorauth.TechnicalIssuance
+	semantic *resetD101IssuerEmissionSemanticSource
+}
+
+// No path reopen, descriptor substitution, signing or unsigned recapture occurs
+// after emission. The same actual three descriptors survive both final phases.
+func (e *resetD101NativeIssuerEmission) AuthenticateRetained(ctx context.Context, fd *os.File, op, phase string) error {
+	return e.authenticateRetainedWithNative(ctx, fd, op, phase, 0, e.authenticate)
+}
+
+// The explicit UID/native seam is private to portable custody fixtures. The
+// production method always uses root and its mandatory Linux/source/key auth.
+func (e *resetD101NativeIssuerEmission) authenticateRetainedWithNative(ctx context.Context, fd *os.File, op, phase string, uid uint32, native func(context.Context, *os.File, string) error) (result error) {
+	if e == nil {
+		return errResetExecutionEvidence
+	}
+	if !e.mu.TryLock() {
+		e.stopped.Store(true)
+		return errResetExecutionEvidence
+	}
+	defer func() {
+		if result != nil {
+			e.stopped.Store(true)
+		}
+		if e.stopped.Load() {
+			_ = e.closeRetainedLocked()
+		}
+		e.mu.Unlock()
+	}()
+	if e.stopped.Load() || ctx == nil || ctx.Err() != nil || native == nil || e.inputs.verifyRetained == nil || op != e.inputs.policy.Scope.OperationID ||
+		(phase != "issuer-emission-retained" && phase != "issuer-release") || e.retained == nil || e.retained.semantic == nil || len(e.retained.dirs) != 3 || len(e.retained.held) != 3 {
+		return errResetExecutionEvidence
+	}
+	r := e.retained
+	check := func() error {
+		if e.stopped.Load() {
+			return errResetExecutionEvidence
+		}
+		for i, output := range []resetD101IssuerEmissionOutput{e.inputs.origin, e.inputs.attestation, e.inputs.provenance} {
+			if r.dirs[i] == nil || r.held[i].file == nil || r.dirs[i].Name() != output.directory || r.held[i].file.Name() != filepath.Join(output.directory, op+".json") ||
+				requireResetD101IssuerDirectory(r.dirs[i], output.pin, uid) != nil || recheckResetD101PreparedHeldOriginal(r.held[i], uid) != nil || ctx.Err() != nil {
+				return errResetExecutionEvidence
+			}
+		}
+		return r.semantic.RecheckAuthenticatedUnsigned(ctx, r.issuance, r.semantic.frozen)
+	}
+	if native(ctx, fd, phase+"-retained-before") != nil || check() != nil {
+		return errResetExecutionEvidence
+	}
+	snapshot, err := freezeResetD101IssuerSemanticSnapshot(r.semantic.frozen)
+	before, e1 := json.Marshal(snapshot)
+	if err != nil || e1 != nil || e.inputs.verifyRetained(ctx, fd, r.issuance, snapshot, bytes.Clone(r.held[0].wire), bytes.Clone(r.held[1].wire), bytes.Clone(r.held[2].wire)) != nil {
+		return errResetExecutionEvidence
+	}
+	after, err := json.Marshal(snapshot)
+	if err != nil || !bytes.Equal(before, after) || check() != nil || native(ctx, fd, phase+"-retained-after") != nil || check() != nil || ctx.Err() != nil || e.stopped.Load() {
+		return errResetExecutionEvidence
+	}
+	return nil
+}
+
+func (e *resetD101NativeIssuerEmission) CloseRetained() error {
+	if e == nil {
+		return errResetExecutionEvidence
+	}
+	e.stopped.Store(true)
+	if !e.mu.TryLock() {
+		// The active emission/authentication defer closes its own descriptors
+		// when it sees stopped. Never wait behind an external authenticator.
+		return errResetExecutionEvidence
+	}
+	defer e.mu.Unlock()
+	return e.closeRetainedLocked()
+}
+
+func (e *resetD101NativeIssuerEmission) closeRetainedLocked() error {
+	r := e.retained
+	e.retained = nil
+	if r == nil {
+		return nil
+	}
+	var result error
+	for _, o := range r.held {
+		if o.file != nil {
+			if err := o.file.Close(); err != nil && result == nil {
+				result = err
+			}
+		}
+	}
+	for _, d := range r.dirs {
+		if d != nil {
+			if err := d.Close(); err != nil && result == nil {
+				result = err
+			}
+		}
+	}
+	return result
 }
 
 func newResetD101NativeIssuerEmission(p resetD101NativeIssuerEmissionInputs) (*resetD101NativeIssuerEmission, error) {
@@ -886,7 +1027,7 @@ func (e *resetD101NativeIssuerEmission) authenticate(ctx context.Context, fd *os
 }
 
 func (e *resetD101NativeIssuerEmission) AuthenticateAvailability(ctx context.Context, fd *os.File, policy d101operatorauth.ReviewedPolicy) error {
-	if e == nil || !reflect.DeepEqual(policy, e.inputs.policy) || e.authenticate(ctx, fd, "issuer-original-availability") != nil {
+	if e == nil || e.stopped.Load() || !reflect.DeepEqual(policy, e.inputs.policy) || e.authenticate(ctx, fd, "issuer-original-availability") != nil {
 		return errResetExecutionEvidence
 	}
 	if !e.mu.TryLock() {
@@ -954,8 +1095,16 @@ func (s *resetD101IssuerEmissionSemanticSource) RecheckAuthenticatedUnsigned(ctx
 	return nil
 }
 
-func (e *resetD101NativeIssuerEmission) IssueAndRetain(ctx context.Context, fd *os.File, issuance d101operatorauth.TechnicalIssuance) error {
-	if e == nil || e.authenticate(ctx, fd, "issuer-semantic-before") != nil {
+func (e *resetD101NativeIssuerEmission) IssueAndRetain(ctx context.Context, fd *os.File, issuance d101operatorauth.TechnicalIssuance) (result error) {
+	if e == nil {
+		return errResetExecutionEvidence
+	}
+	defer func() {
+		if result != nil {
+			_ = e.CloseRetained()
+		}
+	}()
+	if e.stopped.Load() || e.authenticate(ctx, fd, "issuer-semantic-before") != nil {
 		return errResetExecutionEvidence
 	}
 	scope, e1 := issuance.Scope()
@@ -967,8 +1116,16 @@ func (e *resetD101NativeIssuerEmission) IssueAndRetain(ctx context.Context, fd *
 	if !e.mu.TryLock() {
 		return errResetExecutionEvidence
 	}
-	defer e.mu.Unlock()
-	if e.attempted {
+	defer func() {
+		if result != nil {
+			e.stopped.Store(true)
+		}
+		if e.stopped.Load() {
+			_ = e.closeRetainedLocked()
+		}
+		e.mu.Unlock()
+	}()
+	if e.attempted || e.stopped.Load() {
 		return errResetExecutionEvidence
 	}
 	var total uint64
@@ -1017,7 +1174,11 @@ func (e *resetD101NativeIssuerEmission) IssueAndRetain(ctx context.Context, fd *
 	}
 	var dirs []*os.File
 	var held []resetD101PreparedHeldOriginal
+	transferred := false
 	defer func() {
+		if transferred {
+			return
+		}
 		for _, o := range held {
 			_ = o.file.Close()
 		}
@@ -1086,9 +1247,11 @@ func (e *resetD101NativeIssuerEmission) IssueAndRetain(ctx context.Context, fd *
 		return errResetExecutionEvidence
 	}
 	after, err := json.Marshal(finalSnapshot)
-	if err != nil || !bytes.Equal(before, after) || check() != nil || e.authenticate(ctx, fd, "issuer-final-retained") != nil || check() != nil || ctx.Err() != nil {
+	if err != nil || !bytes.Equal(before, after) || check() != nil || e.authenticate(ctx, fd, "issuer-final-retained") != nil || check() != nil || ctx.Err() != nil || e.stopped.Load() {
 		return errResetExecutionEvidence
 	}
+	e.retained = &resetD101IssuerRetainedEmission{dirs: dirs, held: held, issuance: issuance, semantic: semantic}
+	transferred = true
 	return nil
 }
 
