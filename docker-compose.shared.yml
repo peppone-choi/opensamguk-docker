@@ -247,6 +247,34 @@ services:
         limits:
           memory: 128M
 
+  # Explicit temporary target only; ordinary deployer remains the default.
+  # Exact old-container stop/listener native pin/up/rollback require an approved card.
+  deployer-d101-relay:
+    profiles: [d101-host-session]
+    image: opensamguk-deployer:local
+    command: ["--d101-prepared-relay"]
+    container_name: opensamguk-deployer
+    restart: "no"
+    read_only: true
+    environment:
+      DEPLOYER_TOKEN: ${DEPLOYER_TOKEN:?DEPLOYER_TOKEN required}
+    volumes:
+      - type: bind
+        source: /etc/opensamguk/d101/host-session.sock
+        target: /etc/opensamguk/d101/host-session.sock
+        read_only: true
+        bind:
+          create_host_path: false
+    expose:
+      - "9000"
+    networks:
+      opensamguk-net:
+        aliases: [deployer]
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
   # docker.sock 프록시 — deployer에게 compose up에 필요한 최소 docker API만 노출.
   # docker.sock은 read-only로 마운트. 외부 노출 없음.
   socket-proxy:

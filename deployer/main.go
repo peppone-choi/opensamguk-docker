@@ -2632,6 +2632,9 @@ type envLine struct {
 }
 
 func main() {
+	if handled, status := earlyResetD101HostCommand(os.Args, os.Getenv, os.Stdout, os.Stderr); handled {
+		os.Exit(status)
+	}
 	if handled, status := earlyCommand(os.Args, os.Getenv, os.Stdin, os.Stdout, os.Stderr); handled {
 		os.Exit(status)
 	}
