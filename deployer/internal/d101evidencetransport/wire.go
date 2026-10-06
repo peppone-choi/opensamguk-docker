@@ -49,6 +49,16 @@ func exactShape(wire []byte, shape reflect.Type) error {
 				return d101custody.ErrUnavailable
 			}
 		}
+	case reflect.Slice, reflect.Array:
+		var values []json.RawMessage
+		if json.Unmarshal(wire, &values) != nil {
+			return d101custody.ErrUnavailable
+		}
+		for _, value := range values {
+			if exactShape(value, shape.Elem()) != nil {
+				return d101custody.ErrUnavailable
+			}
+		}
 	}
 	return nil
 }
