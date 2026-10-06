@@ -46,8 +46,11 @@ type resetD101NativeOriginOriginal struct {
 // Actual role-specific origin/custody parsers must consume these whole originals
 // before the production main installer may register any authority.
 type resetD101NativeUnverifiedOrigin struct {
-	binding   d101origin.UnverifiedOriginBinding
-	originals map[string][]byte
+	binding     d101origin.UnverifiedOriginBinding
+	originals   map[string][]byte
+	operationID string
+	entries     map[string]et.Entry
+	observed    map[string]resetD101NativeOriginOriginal
 }
 
 func (value *resetD101NativeUnverifiedOrigin) Original(id string) ([]byte, error) {
@@ -216,7 +219,7 @@ func captureResetD101NativeUnverifiedOriginWithReaders(ctx context.Context, pins
 		binding.OriginRecordReference().ByteLength > et.MetadataMaxBytes || binding.OriginRecordReference().MediaType != "application/json" {
 		return nil, errResetExecutionEvidence
 	}
-	result := &resetD101NativeUnverifiedOrigin{binding: binding, originals: map[string][]byte{}}
+	result := &resetD101NativeUnverifiedOrigin{binding: binding, originals: map[string][]byte{}, operationID: scope.OperationID, entries: entries, observed: observed}
 	for _, ref := range []et.RawReference{pins.ScopeOriginal, selected.Envelope, expectedSubject, binding.OriginRecordReference(), binding.NativeCustodyReference(), selected.PublicPin.VerifierSource, pin.CollectorSource, pin.InstallerSource} {
 		wire, err := readRegistered(ref)
 		if err != nil {
