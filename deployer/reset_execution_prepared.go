@@ -260,6 +260,21 @@ func (c config) readResetD101PreparedPhase(binding resetExecutionPhaseBinding, r
 	return wire, chain, nil
 }
 
+// Minted only after the production reader's authority, native original,
+// persisted admission and whole phase binding checks. No raw-only constructor
+// or request-selected domain exists. All parsed values belong to this read.
+type resetD101PreparedSigningInput struct {
+	original    []byte
+	originalSHA string
+	proof       resetD101PreparedProof
+	authority   resetD101VerifiedPurposeAuthority
+	request     resetD101PurposeGrantRequest
+	chain       resetExecutionJournal
+	evidence    resetExecutionEvidence
+	record      durableOperationRecord
+	validatedAt time.Time
+}
+
 func (c config) readResetD101PreparedProof(ctx context.Context, op, planSHA, preflightSHA string) ([]byte, string, error) {
 	if ctx == nil || ctx.Err() != nil || c.d101PurposeAuthority == nil || c.lifecycleOperationStore == nil {
 		return nil, "", errResetExecutionEvidence
@@ -282,10 +297,11 @@ func (c config) readResetD101PreparedProof(ctx context.Context, op, planSHA, pre
 		return nil, "", errResetExecutionEvidence
 	}
 	binding := resetExecutionPhaseBinding{OperationID: op, Target: evidence.Plan.Target, Evidence: resetExecutionEvidenceRefs{planSHA, preflightSHA}, AcceptedAtUnix: record.CreatedAt.Unix(), Phase: "prepared"}
-	wire, _, err := c.readResetD101PreparedPhase(binding, record, evidence, 0)
+	wire, chain, err := c.readResetD101PreparedPhase(binding, record, evidence, 0)
 	proof, _ := decodeResetD101PreparedProof(wire)
 	prepared, pErr := resetC4UTC(proof.PreparedAtUTC)
-	if err != nil || pErr != nil || time.Since(prepared) < 0 || time.Since(prepared) >= resetPreflightMaxAge {
+	if err != nil || pErr != nil || ctx.Err() != nil || c.requireResetD101Preparation(record) != nil ||
+		time.Since(prepared) < 0 || time.Since(prepared) >= resetPreflightMaxAge {
 		return nil, "", errResetExecutionEvidence
 	}
 	key, err := readResetD101SigningKey(authority.KeyPins)
@@ -293,14 +309,16 @@ func (c config) readResetD101PreparedProof(ctx context.Context, op, planSHA, pre
 		return nil, "", errResetExecutionEvidence
 	}
 	defer key.close()
-	signature, err := key.sign("OPENSAMGUK-D101-PREPARED-V1\n", wire)
+	input := &resetD101PreparedSigningInput{original: append([]byte(nil), wire...), originalSHA: resetD101OriginalSHA(wire), proof: proof,
+		authority: authority, request: request, chain: chain, evidence: evidence, record: record, validatedAt: time.Now()}
+	signature, err := key.signPrepared(ctx, input)
 	if err != nil || ctx.Err() != nil || c.requireResetD101Preparation(record) != nil || time.Since(prepared) >= resetPreflightMaxAge {
 		return nil, "", errResetExecutionEvidence
 	}
 	if _, err := requireResetD101Authority(authority, request, time.Now()); err != nil {
 		return nil, "", errResetExecutionEvidence
 	}
-	return wire, key.keyID + "." + base64.RawURLEncoding.EncodeToString(signature), nil
+	return input.original, key.keyID + "." + base64.RawURLEncoding.EncodeToString(signature), nil
 }
 
 func isResetD101PreparedPath(path string) bool { return strings.Contains(path, "/prepared-proof/") }

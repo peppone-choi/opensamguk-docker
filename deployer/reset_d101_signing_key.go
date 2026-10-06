@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"reflect"
+	"time"
 )
 
 // The installation card supplies these pins and a fixed root-private directory.
@@ -85,6 +87,43 @@ func readResetD101SigningKeyWithUID(pins resetD101SigningKeyPins, uid uint32) (r
 }
 
 func (key *resetD101SigningKey) close() { clear(key.private); key.private = nil }
+
+// PREPARED has a separate typed route. Generic domain/raw signing remains
+// closed to it, and this transfer type does not create purpose authority.
+func (key *resetD101SigningKey) signPrepared(ctx context.Context, input *resetD101PreparedSigningInput) ([]byte, error) {
+	now := time.Now()
+	if key == nil || ctx == nil || ctx.Err() != nil || input == nil ||
+		len(key.private) != ed25519.PrivateKeySize || !resetD101KeyID.MatchString(key.keyID) ||
+		key.keyID != input.authority.KeyPins.KeyID || key.publicKeySpkiSHA != input.authority.KeyPins.PublicKeySpkiSHA ||
+		!resetEvidenceSHA.MatchString(input.authority.KeyPins.EnvelopeSHA) || !resetEvidenceSHA.MatchString(input.originalSHA) ||
+		resetD101OriginalSHA(input.original) != input.originalSHA || input.validatedAt.IsZero() ||
+		input.validatedAt.After(now) || now.Sub(input.validatedAt) >= resetPreflightMaxAge {
+		return nil, errResetExecutionEvidence
+	}
+	spki, spkiErr := x509.MarshalPKIXPublicKey(key.private.Public())
+	if spkiErr != nil || resetD101OriginalSHA(spki) != input.authority.KeyPins.PublicKeySpkiSHA {
+		return nil, errResetExecutionEvidence
+	}
+	proof, err := decodeResetD101PreparedProof(input.original)
+	prepared, timeErr := resetC4UTC(proof.PreparedAtUTC)
+	intent, authorityErr := requireResetD101Authority(input.authority, input.request, now)
+	if err != nil || timeErr != nil || authorityErr != nil || !reflect.DeepEqual(proof, input.proof) ||
+		prepared.After(now) || now.Sub(prepared) >= resetPreflightMaxAge || now.Unix() >= proof.DestructiveCutoffUnix ||
+		input.request.Action != "DISPATCH_INTENT" ||
+		requireResetD101PreparedBinding(proof, input.chain, intent, input.evidence, input.record, now) != nil {
+		return nil, errResetExecutionEvidence
+	}
+	message := append([]byte("OPENSAMGUK-D101-PREPARED-V1\n"), input.original...)
+	signature := ed25519.Sign(key.private, message)
+	after := time.Now()
+	if ctx.Err() != nil || after.Before(now) || after.Sub(prepared) >= resetPreflightMaxAge ||
+		after.Unix() >= proof.DestructiveCutoffUnix {
+		clear(signature)
+		return nil, errResetExecutionEvidence
+	}
+	return signature, nil
+}
+
 func (key *resetD101SigningKey) sign(domain string, original []byte) ([]byte, error) {
 	if len(key.private) != ed25519.PrivateKeySize || !resetD101KeyID.MatchString(key.keyID) ||
 		(domain != "OPENSAMGUK-D101-GRANT-V1\n" && domain != "OPENSAMGUK-D101-RESULT-V1\n" && domain != resetD101RecoveryResultDomain && domain != resetD101SelectedSourceDomain) {
