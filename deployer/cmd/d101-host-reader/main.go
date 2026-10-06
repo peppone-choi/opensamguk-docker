@@ -119,7 +119,7 @@ func readFixed(action, path string, read privateReader) ([]byte, error) {
 	if action == d101preinput.Action {
 		return readPreIntentInputs(read)
 	}
-	if read == nil || action != "read-originals" && action != "read-token" && action != "read-selected" && action != "read-command-originals" && !selectedTransportAction(action) {
+	if read == nil || action != "read-originals" && action != "read-token" && action != "read-selected" && action != "read-command-originals" && !selectedTransportAction(action) && !evidenceTransportAction(action) {
 		return nil, d101custody.ErrUnavailable
 	}
 	original, err := read(path, 64<<10)
@@ -136,6 +136,9 @@ func readFixed(action, path string, read privateReader) ([]byte, error) {
 		if config.OriginalFiles[id] == "" {
 			return nil, d101custody.ErrUnavailable
 		}
+	}
+	if evidenceTransportAction(action) {
+		return readEvidenceSources(action, path, original, read, d101custody.CapturePrivateOriginal, d101custody.InspectPrivateSnapshot, d101custody.ReadPrivatePart)
 	}
 	if selectedTransportAction(action) {
 		return readSelectedSources(action, path, original, read, d101custody.InspectPrivateSnapshot, d101custody.ReadPrivatePart, time.Now())
