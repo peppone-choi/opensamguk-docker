@@ -103,5 +103,15 @@ func decodeResetD101NativeHumanEvent(event, parent, context []byte, pins resetD1
 	if decodeResetPrivateJSON(objects[2]["message"], &assistant) != nil || text(assistant, "role") != "assistant" || len(assistant["content"]) == 0 || bytes.Equal(bytes.TrimSpace(assistant["content"]), []byte("null")) {
 		return deny()
 	}
+	var blocks []json.RawMessage
+	if decodeResetPrivateJSON(assistant["content"], &blocks) != nil || len(blocks) == 0 || len(blocks) > 64 {
+		return deny()
+	}
+	for _, block := range blocks {
+		var fields map[string]json.RawMessage
+		if decodeResetPrivateJSON(block, &fields) != nil || len(fields) != 2 || text(fields, "type") != "text" || text(fields, "text") == "" {
+			return deny()
+		}
+	}
 	return resetD101NativeHumanEvent{bytes.Clone(event), bytes.Clone(parent), bytes.Clone(context), pins}, nil
 }

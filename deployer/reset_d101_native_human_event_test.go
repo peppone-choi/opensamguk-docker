@@ -47,7 +47,7 @@ func TestNativeHumanEventPreservesOriginalParentChainWithoutActorAuthority(t *te
 	}
 }
 func TestNativeHumanEventRejectsBrokenProvenanceOrNativeChain(t *testing.T) {
-	for _, mode := range []string{"pin-sha", "missing-parent", "wrong-parent", "mixed-session", "sidechain", "null-sidechain", "non-human", "tool-role", "future-time", "reversed-time", "wrong-issued", "unknown-version", "extra-key", "duplicate-key", "array", "multiple-events", "duplicate-ref", "context-cycle"} {
+	for _, mode := range []string{"pin-sha", "missing-parent", "wrong-parent", "mixed-session", "sidechain", "null-sidechain", "non-human", "tool-role", "future-time", "reversed-time", "wrong-issued", "unknown-version", "extra-key", "duplicate-key", "array", "multiple-events", "duplicate-ref", "context-cycle", "context-primitive", "context-empty", "context-block-type", "context-block-unknown"} {
 		t.Run(mode, func(t *testing.T) {
 			wires, pins, now := nativeHumanFixture(t)
 			var event, parent, context map[string]any
@@ -88,6 +88,14 @@ func TestNativeHumanEventRejectsBrokenProvenanceOrNativeChain(t *testing.T) {
 				pins.Parent.LogicalID = pins.Event.LogicalID
 			case "context-cycle":
 				context["parentUuid"] = pins.EventID
+			case "context-primitive":
+				context["message"].(map[string]any)["content"] = 1
+			case "context-empty":
+				context["message"].(map[string]any)["content"] = []any{}
+			case "context-block-type":
+				context["message"].(map[string]any)["content"] = []any{map[string]any{"type": "tool_result", "text": "synthetic"}}
+			case "context-block-unknown":
+				context["message"].(map[string]any)["content"] = []any{map[string]any{"type": "text", "text": "synthetic", "extra": true}}
 			}
 			if mode != "pin-sha" && mode != "missing-parent" && mode != "duplicate-ref" {
 				for n, obj := range []map[string]any{event, parent, context} {
