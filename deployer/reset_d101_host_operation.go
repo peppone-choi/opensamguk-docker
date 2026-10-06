@@ -62,9 +62,17 @@ func earlyResetD101HostCommand(args []string, getenv func(string) string, output
 		descriptor := os.NewFile(9, "existing-host-keeper-fd9")
 		status := 2
 		if args[1] == "--d101-issue-current-receipt" {
-			status = runResetD101HostIssuer(ctx, descriptor, args[3], os.Stdin, os.Stdout, resetD101ReviewedHostIssuerSupplier)
+			supplier := resetD101ReviewedHostIssuerSupplier
+			if supplier == nil {
+				supplier = resetD101InstalledHostIssuerSupplier
+			}
+			status = runResetD101HostIssuer(ctx, descriptor, args[3], os.Stdin, os.Stdout, supplier)
 		} else {
-			status = runResetD101HostOperation(ctx, descriptor, args[3], resetD101ReviewedHostOperationSupplier)
+			supplier := resetD101ReviewedHostOperationSupplier
+			if supplier == nil {
+				supplier = resetD101InstalledHostOperationSupplier
+			}
+			status = runResetD101HostOperation(ctx, descriptor, args[3], supplier)
 		}
 		runtime.KeepAlive(descriptor)
 		if status == 3 {
