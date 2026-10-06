@@ -94,31 +94,51 @@ func requireResetD101CandidateCompose(r resetD101CandidateResources, op string, 
 	}
 	return nil
 }
+
+// The copy intercepts helpers' single physical command without changing the
+// original runner/environment. Its closure calls the original config, avoiding
+// recursion and preventing one successful guard from covering later commands.
+func (c config) withResetD101CandidateCommandGuard(a resetD101CandidateAdmission, guard func(context.Context) error) config {
+	guarded := c
+	guarded.dockerRunner = nil
+	guarded.dockerRunnerContext = func(ctx context.Context, args ...string) (string, error) {
+		return runResetD101CandidateCommand(ctx, a, guard, func(ctx context.Context) (string, error) {
+			return c.runServerDockerContext(ctx, args...)
+		})
+	}
+	return guarded
+}
+
 func (c config) promoteResetD101CandidateApps(ctx context.Context, a resetD101CandidateAdmission, seed resetD101CandidateSeedEvidence, guard func(context.Context) error) error {
 	r := a.CandidateResources()
-	if guard == nil || requireResetD101CandidateCompose(r, a.OperationID(), a.ImagePins()) != nil || guard(ctx) != nil {
+	if ctx == nil || ctx.Err() != nil || guard == nil || requireResetD101CandidateCompose(r, a.OperationID(), a.ImagePins()) != nil {
 		return errResetExecutionEvidence
 	}
+	guarded := c.withResetD101CandidateCommandGuard(a, guard)
+	storage := []struct{ service, id string }{{"game-postgres", seed.PostgresContainerID}, {"game-redis", seed.RedisContainerID}}
 	// Verify same independently inspected storage immediately before promotion.
-	for service, id := range map[string]string{"game-postgres": seed.PostgresContainerID, "game-redis": seed.RedisContainerID} {
-		value, err := c.observeResetRuntimeContainerProject(ctx, service, r.Project)
-		if err != nil || value.ID != id {
+	for _, item := range storage {
+		value, err := guarded.observeResetRuntimeContainerProject(ctx, item.service, r.Project)
+		if err != nil || value.ID != item.id {
 			return errResetExecutionEvidence
 		}
 	}
 	if _, err := c.validateServerTarget(a.Server()); err != nil {
 		return errResetExecutionEvidence
 	}
-	if guard(ctx) != nil {
-		return errResetExecutionEvidence
-	}
-	_, err := c.runServerDockerContext(ctx, "compose", "-p", a.Server().Project, "--env-file", a.Server().EnvFile, "-f", c.composeServer, "-f", r.LiveComposeFile, "up", "-d", "--no-deps", "game-api", "game-engine", "web-game")
+	_, err := runResetD101CandidateCommand(ctx, a, guard, func(ctx context.Context) (string, error) {
+		// Consume the fixed native originals only after fresh authority.
+		if requireResetD101CandidateCompose(r, a.OperationID(), a.ImagePins()) != nil {
+			return "", errResetExecutionEvidence
+		}
+		return c.runServerDockerContext(ctx, "compose", "-p", a.Server().Project, "--env-file", a.Server().EnvFile, "-f", c.composeServer, "-f", r.LiveComposeFile, "up", "-d", "--no-deps", "game-api", "game-engine", "web-game")
+	})
 	if err != nil {
 		return errResetExecutionEvidence
 	}
-	for service, id := range map[string]string{"game-postgres": seed.PostgresContainerID, "game-redis": seed.RedisContainerID} {
-		value, err := c.observeResetRuntimeContainerProject(ctx, service, r.Project)
-		if err != nil || value.ID != id {
+	for _, item := range storage {
+		value, err := guarded.observeResetRuntimeContainerProject(ctx, item.service, r.Project)
+		if err != nil || value.ID != item.id {
 			return errResetExecutionEvidence
 		}
 	}

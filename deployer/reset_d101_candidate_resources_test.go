@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -37,5 +40,53 @@ func TestCandidateComposeContainsOnlyOperationScopedStorageAndLiveAppsJoinSameNe
 	}
 	if strings.Contains(string(candidate), "docker.sock") || strings.Contains(string(candidate), "privileged") {
 		t.Fatal("storage capability drift")
+	}
+}
+
+func TestCandidateGuardedConfigChecksAuthorityForEachHelperCommand(t *testing.T) {
+	for _, mode := range []string{"context-runner", "legacy-runner"} {
+		t.Run(mode, func(t *testing.T) {
+			a := workerAdmissionFixture(t)
+			var calls []string
+			physical := func(args ...string) (string, error) {
+				calls = append(calls, args[0])
+				return "original-output", nil
+			}
+			original := config{dockerRunner: physical}
+			if mode == "context-runner" {
+				original.dockerRunnerContext = func(ctx context.Context, args ...string) (string, error) {
+					if ctx.Err() != nil {
+						t.Fatal("cancelled physical command")
+					}
+					return physical(args...)
+				}
+				original.dockerRunner = func(...string) (string, error) { t.Fatal("runner precedence changed"); return "", nil }
+			}
+			revoked := false
+			guard := func(context.Context) error {
+				calls = append(calls, "guard")
+				if revoked {
+					return errors.New("revoked")
+				}
+				return nil
+			}
+			guarded := original.withResetD101CandidateCommandGuard(a, guard)
+			ctx := context.Background()
+			for _, command := range []string{"inspect", "image"} {
+				if out, err := guarded.runServerDockerContext(ctx, command, "unchanged-argument"); err != nil || out != "original-output" {
+					t.Fatalf("guarded runner output: %q %v", out, err)
+				}
+			}
+			revoked = true
+			if out, err := guarded.runServerDockerContext(ctx, "start"); err == nil || out != "" {
+				t.Fatal("revoked authority reached physical runner")
+			}
+			if !reflect.DeepEqual(calls, []string{"guard", "inspect", "guard", "image", "guard"}) {
+				t.Fatalf("physical order: %v", calls)
+			}
+			if out, err := original.runServerDockerContext(ctx, "original"); err != nil || out != "original-output" {
+				t.Fatal("guard copy mutated original runner")
+			}
+		})
 	}
 }

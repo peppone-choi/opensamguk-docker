@@ -196,6 +196,8 @@ func (reader *resetD101CandidateCapsReader) observe(ctx context.Context, c confi
 	if reader == nil || ctx == nil || ctx.Err() != nil || guard == nil {
 		return closed, errResetExecutionEvidence
 	}
+	// Every helper below performs one physical command through this guarded copy.
+	c = c.withResetD101CandidateCommandGuard(a, guard)
 	p := reader.pins
 	if p.OperationID != a.OperationID() || p.ApprovalIntentSHA != a.ApprovalIntentSHA() || p.TargetFingerprint != a.TargetFingerprint() ||
 		p.AppSourceSHA != a.AppSourceSHA() || !reflect.DeepEqual(p.ImagePins, a.ImagePins()) || resetD101OriginalSHA(reader.original) != reader.sha ||
@@ -212,9 +214,6 @@ func (reader *resetD101CandidateCapsReader) observe(ctx context.Context, c confi
 	started := time.Now()
 	bounded, cancel := context.WithTimeout(ctx, resetPreflightMaxAge)
 	defer cancel()
-	if guard(bounded) != nil {
-		return closed, errResetExecutionEvidence
-	}
 	before, err := c.observeResetRuntimeContainerProject(bounded, "game-postgres", a.CandidateResources().Project)
 	if err != nil || before.ID != seed.PostgresContainerID || c.requireResetD101CapsImage(bounded, before.ImageID, p.ImagePins["game-postgres"]) != nil {
 		return closed, errResetExecutionEvidence
@@ -229,9 +228,6 @@ func (reader *resetD101CandidateCapsReader) observe(ctx context.Context, c confi
 		"--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
 		"--env", "PGPASSFILE=/run/d101/pgpass", "--entrypoint", "psql", "postgres@" + p.ImagePins["game-postgres"],
 		"-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-h", address, "-p", "5432", "-U", p.DatabaseUser, "-d", p.DatabaseName, "-c", resetD101CandidateCapsSQL}
-	if guard(bounded) != nil {
-		return closed, errResetExecutionEvidence
-	}
 	out, err := c.runServerDockerContext(bounded, args...)
 	id := strings.TrimSpace(out)
 	if err != nil || !resetEvidenceSHA.MatchString(id) {
@@ -244,9 +240,6 @@ func (reader *resetD101CandidateCapsReader) observe(ctx context.Context, c confi
 		return closed, errResetExecutionEvidence
 	}
 	if c.requireResetD101CapsImage(bounded, job.ImageID, p.ImagePins["game-postgres"]) != nil {
-		return closed, errResetExecutionEvidence
-	}
-	if guard(bounded) != nil {
 		return closed, errResetExecutionEvidence
 	}
 	wire, err := c.runServerDockerContext(bounded, "start", "--attach", id)
