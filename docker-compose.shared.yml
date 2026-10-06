@@ -229,12 +229,47 @@ services:
     volumes:
       # compose 파일 + 서버 env 파일을 read-write로 마운트(IMAGE_TAG 갱신 + compose 실행).
       - ./:/workspace:rw
+      # Host issuer is the only writer of approval/preflight/backup custody.
+      # Missing/unissued private files remain a closed D101 gate.
+      - ./servers/.deployer-reset-approvals:/workspace/servers/.deployer-reset-approvals:ro
+      - ./servers/.deployer-reset-preflights:/workspace/servers/.deployer-reset-preflights:ro
+      - ./servers/.deployer-reset-admin:/workspace/servers/.deployer-reset-admin:ro
+      - ./servers/.deployer-publication-receipts:/workspace/servers/.deployer-publication-receipts:ro
+      - ./backups:/workspace/backups:ro
     expose:
       - "9000"
     depends_on:
       - socket-proxy
     networks:
       - opensamguk-net
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # Explicit temporary target only; ordinary deployer remains the default.
+  # Exact old-container stop/listener native pin/up/rollback require an approved card.
+  deployer-d101-relay:
+    profiles: [d101-host-session]
+    image: opensamguk-deployer:local
+    command: ["--d101-prepared-relay"]
+    container_name: opensamguk-deployer
+    restart: "no"
+    read_only: true
+    environment:
+      DEPLOYER_TOKEN: ${DEPLOYER_TOKEN:?DEPLOYER_TOKEN required}
+    volumes:
+      - type: bind
+        source: /etc/opensamguk/d101/host-session.sock
+        target: /etc/opensamguk/d101/host-session.sock
+        read_only: true
+        bind:
+          create_host_path: false
+    expose:
+      - "9000"
+    networks:
+      opensamguk-net:
+        aliases: [deployer]
     deploy:
       resources:
         limits:

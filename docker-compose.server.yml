@@ -18,7 +18,7 @@ name: opensamguk-s${SERVER_ID}
 services:
   # 그 서버 월드의 영속화 DB. 서버마다 독립 볼륨.
   game-postgres:
-    image: postgres:16-alpine
+    image: ${GAME_POSTGRES_IMAGE:-postgres:16-alpine}
     container_name: s${SERVER_ID}-game-postgres
     restart: unless-stopped
     environment:
@@ -41,7 +41,7 @@ services:
           memory: 1.5G
 
   game-redis:
-    image: redis:7-alpine
+    image: ${GAME_REDIS_IMAGE:-redis:7-alpine}
     container_name: s${SERVER_ID}-game-redis
     restart: unless-stopped
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
@@ -84,6 +84,9 @@ services:
       # 기본값을 비워 두는 것은 의도적이다 — 미설정의 의미(60분)는 게임 엔진
       # (SeedBootstrap.DEFAULT_TURN_TERM)이 단독으로 소유해야 두 곳이 갈라지지 않는다.
       RESET_TURNTERM: ${RESET_TURNTERM:-}
+      # Consumer-owned defaults apply only to an existing/legacy world.
+      RESET_MAXGENERAL: ${RESET_MAXGENERAL:-}
+      RESET_FIRST_TURN: ${RESET_FIRST_TURN:-}
       # 같은 리셋이 고른 나머지 시나리오 옵션. 위와 같은 이유로 기본값을 비워 둔다 —
       # 미설정의 의미(PHP install.php 기본값)는 게임 엔진(SeedBootstrap의 PHP_DEFAULT_*)이
       # 단독으로 소유해야 compose와 엔진이 갈라지지 않는다.

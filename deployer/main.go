@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"opensamguk-deployer/internal/d101native"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -154,6 +155,8 @@ var serverEnvAllowlist = map[string]envFieldSpec{
 	"JWT_PUBLIC_KEY":                 {Description: "JWT 검증 공개키(비밀 아님, gateway-api와 동일 값)"},
 	"JWT_LEGACY_SECRET":              {Description: "레거시 HS256 검증 시크릿", WriteOnly: true},
 	"JWT_LEGACY_ACCESS_ACCEPT_UNTIL": {Description: "레거시 토큰 수용 만료 시각"},
+	"RESET_MAXGENERAL":               {Description: "리셋: 사람 조작 장수 정원"},
+	"RESET_FIRST_TURN":               {Description: "리셋: 첫 턴 정책"},
 	"RESET_TURNTERM":                 {Description: "리셋: 턴 시간(분)"},
 	"RESET_SYNC":                     {Description: "리셋: 시간 동기화"},
 	"RESET_FICTION":                  {Description: "리셋: NPC 상성"},
@@ -179,6 +182,10 @@ var v2ServerDefinitionKeys = map[string]struct{}{
 // deployer process because Compose gives its shell environment precedence over
 // --env-file.
 var serverComposeInterpolationKeys = map[string]struct{}{
+	"GAME_POSTGRES_IMAGE":            {},
+	"GAME_REDIS_IMAGE":               {},
+	"RESET_MAXGENERAL":               {},
+	"RESET_FIRST_TURN":               {},
 	"COMPOSE_HOST_DIR":               {},
 	"GATEWAY_API_URL":                {},
 	"INTERNAL_SERVICE_TOKEN":         {},
@@ -223,6 +230,12 @@ var serverComposeProcessControlKeys = map[string]struct{}{
 }
 
 var resetLifecycleUpdateKeys = []string{
+	"GAME_POSTGRES_IMAGE",
+	"GAME_REDIS_IMAGE",
+	"SERVER_NAME",
+	"RESET_MAXGENERAL",
+	"RESET_FIRST_TURN",
+	"SCENARIO_LOOKUP_DIR",
 	"IMAGE_TAG",
 	"WEB_GAME_TAG",
 	"SCENARIO_CODE",
@@ -244,6 +257,8 @@ var resetLifecycleUpdateKeys = []string{
 }
 
 var registryEnvAllowlist = map[string]struct{}{
+	"RESET_MAXGENERAL":           {},
+	"RESET_FIRST_TURN":           {},
 	"IMAGE_TAG":                  {},
 	"GAME_API_PORT":              {},
 	"WEB_GAME_PORT":              {},
@@ -288,34 +303,46 @@ var sharedEnvAllowlist = map[string]envFieldSpec{
 
 // 환경변수 묶음.
 type config struct {
-	token                     string // Bearer 인증 토큰
-	composeDir                string // compose 파일 디렉터리(/workspace)
-	composeHostDir            string
-	serversDir                string // 서버 env 파일 디렉터리(/workspace/servers)
-	composeServer             string // 서버 compose 파일 절대경로
-	composeShared             string
-	ghcrOwner                 string // GHCR 패키지 소유자(태그 조회)
-	ghcrToken                 string // GHCR 조회 토큰(private면 필요, 없으면 익명)
-	ghcrAPIBaseURL            string
-	localHTTPBaseURL          string
-	authenticatedHTTPTimeout  time.Duration
-	dockerRunner              func(args ...string) (string, error)
-	dockerRunnerContext       func(context.Context, ...string) (string, error)
-	httpGet                   func(context.Context, string) (int, []byte, error)
-	gameAPIInternalPort       string
-	gameEngineInternalPort    string
-	gatewayAPIURL             string
-	resetVerifyTimeout        time.Duration
-	resetVerifyPollInterval   time.Duration
-	lifecycleJobs             *lifecycleJobManager
-	lifecycleOperationStore   *durableOperationStore
-	maintenanceFile           string
-	lifecycleJournalFile      string
-	sharedEnvMu               *sync.Mutex
-	registryRewriteHook       func()
-	lifecycleJournalWriteHook func(lifecycleJournal)
-	lifecycleJournalClearHook func()
-	operations                *operationCoordinator
+	d101RootProducer              *resetD101OldRootProducer
+	d101NativeInstaller           *resetD101NativeAuthorityInstaller
+	d101FixedInstallation         *resetD101FixedInstallation         // Independently reviewed installer pins/producers; never an env/request field.
+	d101SeedMaterialInputs        *resetD101SeedMaterialInputs        // Independent fixed native inputs; nil closes before any physical command.
+	d101CandidatePipeline         *resetD101CandidatePipeline         // Fixed native installation; nil fails before any physical command.
+	d101PurposeAuthority          resetD101PurposeAuthoritySource     // Fixed approved host source; no request/env enablement.
+	d101PhaseSource               resetExecutionPhaseSource           // Actual installed current writer source; nil closes pre-stop collection.
+	d101PreStopNativeInstallation *resetD101PreStopNativeInstallation // Independently installed producer/custody; nil denies all pre-stop commands.
+	d101RecoveryClosureReader     resetD101RecoveryClosureReader      // Fixed retained restore1 reader; nil until actual producer installation.
+	d101RecoveryVerifier          resetD101RecoveryVerifier           // Fixed actual backup/metadata verifier; nil until supplied.
+	d101RecoveryDatabaseSource    resetD101RecoveryDatabaseSource     // Fixed actual restored SQL original source; nil until installation.
+	d101InstallationError         error                               // Internal native adapter failure; never exposed as HTTP originals.
+	token                         string                              // Bearer 인증 토큰
+	composeDir                    string                              // compose 파일 디렉터리(/workspace)
+	composeHostDir                string
+	serversDir                    string // 서버 env 파일 디렉터리(/workspace/servers)
+	composeServer                 string // 서버 compose 파일 절대경로
+	composeShared                 string
+	ghcrOwner                     string // GHCR 패키지 소유자(태그 조회)
+	ghcrToken                     string // GHCR 조회 토큰(private면 필요, 없으면 익명)
+	ghcrAPIBaseURL                string
+	localHTTPBaseURL              string
+	authenticatedHTTPTimeout      time.Duration
+	dockerRunner                  func(args ...string) (string, error)
+	dockerRunnerContext           func(context.Context, ...string) (string, error)
+	httpGet                       func(context.Context, string) (int, []byte, error)
+	gameAPIInternalPort           string
+	gameEngineInternalPort        string
+	gatewayAPIURL                 string
+	resetVerifyTimeout            time.Duration
+	resetVerifyPollInterval       time.Duration
+	lifecycleJobs                 *lifecycleJobManager
+	lifecycleOperationStore       *durableOperationStore
+	maintenanceFile               string
+	lifecycleJournalFile          string
+	sharedEnvMu                   *sync.Mutex
+	registryRewriteHook           func()
+	lifecycleJournalWriteHook     func(lifecycleJournal)
+	lifecycleJournalClearHook     func()
+	operations                    *operationCoordinator
 }
 
 type lifecycleJobStatus string
@@ -381,6 +408,7 @@ type lifecycleJobResponse struct {
 }
 
 type lifecycleJobManager struct {
+	d101NativeOwner   *resetD101RootOwnerGate
 	mu                sync.Mutex
 	jobs              map[string]lifecycleJob
 	operationJobs     map[string]string
@@ -408,6 +436,7 @@ const (
 // maintenance marker, so a workflow can drain the running deployer before
 // replacing containers or shared files.
 type operationCoordinator struct {
+	d101NativeOwner              *resetD101RootOwnerGate
 	mu                           sync.Mutex
 	cond                         *sync.Cond
 	closed                       bool
@@ -491,6 +520,10 @@ func (c *operationCoordinator) prepare(kind lifecycleKind, operationID, subjectI
 	}
 	marker, journal := stateFilePresent(c.markerPath), stateFilePresent(c.journalPath)
 	c.mu.Lock()
+	if c.d101NativeOwner.blocksAdmission() {
+		c.mu.Unlock()
+		return nil, errMaintenanceClosed
+	}
 	defer c.mu.Unlock()
 	if marker {
 		c.closed = true
@@ -516,7 +549,7 @@ func (c *operationCoordinator) prepare(kind lifecycleKind, operationID, subjectI
 	p := &operationPreparation{coordinator: c, kind: kind, operationID: operationID, subjectID: subjectID, fingerprint: fingerprint, leaseAttempt: token, ctx: ctx, cancel: cancel}
 	if c.closed {
 		lease := c.maintenanceLease
-		if lease == nil || lease.consumed || !secureEqual(lease.token, token) {
+		if lease == nil || lease.consumed || !secureEqual(lease.token, token) || (lease.operationID != "" && lease.operationID != operationID) {
 			p.admissionErr = errMaintenanceClosed
 		}
 	}
@@ -528,6 +561,10 @@ func (p *operationPreparation) promote(jobID string) (*operationLease, error) {
 	c := p.coordinator
 	marker, journal := stateFilePresent(c.markerPath), stateFilePresent(c.journalPath)
 	c.mu.Lock()
+	if c.d101NativeOwner.blocksPromotion(p) {
+		c.mu.Unlock()
+		return nil, errMaintenanceClosed
+	}
 	defer c.mu.Unlock()
 	if marker {
 		c.closed = true
@@ -546,7 +583,7 @@ func (p *operationPreparation) promote(jobID string) (*operationLease, error) {
 		if c.closed {
 			lease := c.maintenanceLease
 			leasedKind := p.kind == lifecycleKindCreate || (p.kind == lifecycleKindReset && p.subjectID == "pep")
-			if !leasedKind || p.operationID == "" || p.leaseAttempt == "" || lease == nil || lease.consumed || !secureEqual(lease.token, p.leaseAttempt) {
+			if !leasedKind || p.operationID == "" || p.leaseAttempt == "" || lease == nil || lease.consumed || !secureEqual(lease.token, p.leaseAttempt) || (lease.operationID != "" && lease.operationID != p.operationID) {
 				return errMaintenanceClosed
 			}
 		}
@@ -648,7 +685,7 @@ func newOperationCoordinator(markerPath string, journalPath string, jobs *lifecy
 		writeMarker: writeMaintenanceMarkerDurable,
 	}
 	coordinator.cond = sync.NewCond(&coordinator.mu)
-	if stateFilePresent(markerPath) || stateFilePresent(journalPath) {
+	if stateFilePresent(markerPath) || stateFilePresent(journalPath) || stateFilePresent(resetD101RestoreGatePath(markerPath)) {
 		// An unreadable marker/journal is treated as present. Starting fail-closed
 		// is safer than admitting mutations while persisted lifecycle state is unknown.
 		coordinator.closed = true
@@ -670,8 +707,16 @@ func (c *operationCoordinator) begin(jobID string) (*operationLease, error) {
 		return nil, errors.New("operation coordinator unavailable")
 	}
 	c.mu.Lock()
+	if c.d101NativeOwner.blocksAdmission() {
+		c.mu.Unlock()
+		return nil, errMaintenanceClosed
+	}
 	for (c.active != nil || c.preparing != nil) && !c.closed {
 		c.cond.Wait()
+		if c.d101NativeOwner.blocksAdmission() {
+			c.mu.Unlock()
+			return nil, errMaintenanceClosed
+		}
 	}
 	if c.preparationSettlementPending || c.closed || c.journalPending || stateFilePresent(c.journalPath) {
 		c.closed = true
@@ -705,8 +750,16 @@ func (c *operationCoordinator) beginRecovery() (*operationLease, error) {
 		return nil, errors.New("operation coordinator unavailable")
 	}
 	c.mu.Lock()
+	if c.d101NativeOwner.blocksAdmission() {
+		c.mu.Unlock()
+		return nil, errMaintenanceClosed
+	}
 	for c.active != nil || c.preparing != nil {
 		c.cond.Wait()
+		if c.d101NativeOwner.blocksAdmission() {
+			c.mu.Unlock()
+			return nil, errMaintenanceClosed
+		}
 	}
 	if !c.journalPending && !stateFilePresent(c.journalPath) {
 		c.mu.Unlock()
@@ -740,7 +793,7 @@ func (c *operationCoordinator) clearLifecycleJournalPending() {
 	}
 	c.mu.Lock()
 	c.journalPending = false
-	if !c.preparationSettlementPending && !stateFilePresent(c.markerPath) {
+	if !c.d101NativeOwner.blocksAdmission() && !c.preparationSettlementPending && !stateFilePresent(c.markerPath) {
 		c.closed = false
 	}
 	c.cond.Broadcast()
@@ -884,6 +937,10 @@ func (c *operationCoordinator) enterMaintenanceIfIdle() (maintenanceState, strin
 		return maintenanceStateDrained, "", errors.New("operation coordinator unavailable")
 	}
 	c.mu.Lock()
+	if c.d101NativeOwner.blocksAdmission() {
+		c.mu.Unlock()
+		return maintenanceStateDrained, "", errMaintenanceIdleConflict
+	}
 	defer c.mu.Unlock()
 
 	state := c.maintenanceStateLocked()
@@ -921,6 +978,10 @@ func (c *operationCoordinator) leaveMaintenance() (maintenanceState, error) {
 		return maintenanceStateDrained, errors.New("operation coordinator unavailable")
 	}
 	c.mu.Lock()
+	if c.d101NativeOwner.blocksAdmission() {
+		c.mu.Unlock()
+		return maintenanceStateDrained, errMaintenanceClosed
+	}
 	defer c.mu.Unlock()
 	if !c.closed {
 		return maintenanceStateOpen, nil
@@ -930,6 +991,10 @@ func (c *operationCoordinator) leaveMaintenance() (maintenanceState, error) {
 	}
 	if c.preparationSettlementPending {
 		return maintenanceStateDrained, errors.New("lifecycle operation settlement is required before maintenance can open")
+	}
+	if stateFilePresent(resetD101RestoreGatePath(c.markerPath)) {
+		c.closed = true
+		return maintenanceStateDrained, errors.New("D101 restore closure is required before maintenance can open")
 	}
 	if c.journalPending || stateFilePresent(c.journalPath) {
 		c.closed = true
@@ -973,21 +1038,24 @@ func writeMaintenanceMarkerDurableWithSync(path string, syncDir func(string) err
 }
 
 type lifecycleJournal struct {
-	Version       int                   `json:"version"`
-	Operation     string                `json:"operation"`
-	OperationID   string                `json:"operationId,omitempty"`
-	OperationKind lifecycleKind         `json:"operationKind,omitempty"`
-	Stage         string                `json:"stage,omitempty"`
-	ServerID      string                `json:"serverId"`
-	Project       string                `json:"project"`
-	ResetTarget   *resetLifecycleTarget `json:"resetTarget,omitempty"`
+	Version        int                    `json:"version"`
+	Operation      string                 `json:"operation"`
+	OperationID    string                 `json:"operationId,omitempty"`
+	OperationKind  lifecycleKind          `json:"operationKind,omitempty"`
+	Stage          string                 `json:"stage,omitempty"`
+	ServerID       string                 `json:"serverId"`
+	Project        string                 `json:"project"`
+	ResetTarget    *resetLifecycleTarget  `json:"resetTarget,omitempty"`
+	ResetExecution *resetExecutionJournal `json:"resetExecution,omitempty"`
 }
 
 type resetLifecycleTarget struct {
+	StorageImageDigests map[string]string `json:"storageImageDigests,omitempty"`
 	ScenarioCode        string            `json:"scenarioCode"`
 	Generation          int               `json:"generation"`
 	ScenarioSeedEnabled bool              `json:"scenarioSeedEnabled"`
 	Updates             map[string]string `json:"updates,omitempty"`
+	ImageDigests        map[string]string `json:"imageDigests,omitempty"`
 }
 
 const (
@@ -1114,6 +1182,12 @@ func validateLifecycleJournalOperationLink(operation, operationID string, kind l
 }
 
 func (c config) writeLifecycleJournalRecord(journal lifecycleJournal) error {
+	if c.operations != nil && c.operations.nativeMutationBlocked() {
+		return errMaintenanceClosed
+	}
+	if err := validateLifecycleResetExecution(journal); err != nil {
+		return err
+	}
 	payload, err := json.Marshal(journal)
 	if err != nil {
 		return err
@@ -1161,16 +1235,22 @@ func (c config) readLifecycleJournal() (lifecycleJournal, bool, error) {
 		return lifecycleJournal{}, false, errors.New("lifecycle journal has an invalid reset target")
 	}
 	if journal.ResetTarget != nil {
-		normalized, err := normalizeResetLifecycleTarget(*journal.ResetTarget)
+		normalized, err := normalizeResetLifecycleJournalTarget(*journal.ResetTarget)
 		if err != nil {
 			return lifecycleJournal{}, false, err
 		}
 		journal.ResetTarget = &normalized
 	}
+	if err := validateLifecycleResetExecution(journal); err != nil {
+		return lifecycleJournal{}, false, err
+	}
 	return journal, true, nil
 }
 
 func (c config) clearLifecycleJournal() error {
+	if c.operations != nil && c.operations.nativeMutationBlocked() {
+		return errMaintenanceClosed
+	}
 	if c.lifecycleJournalFile == "" {
 		return errors.New("lifecycle journal path is unavailable")
 	}
@@ -1209,6 +1289,29 @@ func (c config) repairLifecycleJournal() (repairErr error) {
 	if !exists {
 		return errors.New("lifecycle recovery journal is unavailable")
 	}
+	var linkedOperation durableOperationRecord
+	if journal.OperationID != "" {
+		if c.lifecycleOperationStore == nil {
+			return errors.New("linked lifecycle operation store is unavailable")
+		}
+		var found bool
+		linkedOperation, found = c.lifecycleOperationStore.Lookup(journal.OperationID)
+		if !found || linkedOperation.Kind != journal.OperationKind || linkedOperation.SubjectID != journal.ServerID {
+			return errors.New("linked lifecycle operation identity is invalid")
+		}
+		if journal.ResetExecution != nil && c.validateResetExecutionOperation(*journal.ResetExecution, journal.OperationID) != nil {
+			return errResetExecutionEvidence
+		}
+		if linkedOperation.Status == lifecycleJobSucceeded && journal.ResetTarget != nil {
+			fingerprint := resetRequestFingerprint(journal.ServerID, *journal.ResetTarget)
+			if journal.ResetExecution != nil {
+				fingerprint = journal.ResetExecution.RequestFingerprint
+			}
+			if linkedOperation.RequestFingerprint != fingerprint {
+				return errors.New("completed reset operation target is invalid")
+			}
+		}
+	}
 	linkedOperationSettled := false
 	defer func() {
 		if repairErr == nil || journal.OperationID == "" || linkedOperationSettled {
@@ -1222,13 +1325,38 @@ func (c config) repairLifecycleJournal() (repairErr error) {
 	if err != nil || target.Project != journal.Project {
 		return errors.New("lifecycle recovery target is invalid")
 	}
-	if journal.OperationID != "" {
-		if operation, ok := c.lifecycleOperationStore.Lookup(journal.OperationID); ok && operation.Status == lifecycleJobSucceeded {
-			if err := c.verifySucceededLifecycleJournal(journal, target); err != nil {
-				return err
-			}
-			linkedOperationSettled = true
-			return c.clearLifecycleJournal()
+	if journal.OperationID != "" && linkedOperation.Status == lifecycleJobSucceeded {
+		// This path only verifies the bound completed state and clears its journal.
+		// It must not replay legacy images, or rewrite a terminal operation on refusal.
+		linkedOperationSettled = true
+		if journal.ResetExecution != nil {
+			return c.settleSucceededLifecycleJournal(lease.Context(), journal.OperationID)
+		}
+		if err := c.verifySucceededLifecycleJournal(journal, target); err != nil {
+			return err
+		}
+		return c.clearLifecycleJournal()
+	}
+	if journal.Operation == "reset" && journal.ResetTarget == nil {
+		if journal.Stage == "" || journal.Stage == lifecycleJournalStagePrepared {
+			return errors.New("reset recovery target is unavailable before destructive mutation")
+		}
+		effectiveTarget, err := resetLifecycleTargetForEnv(target.EnvFile, nil)
+		if err != nil {
+			return err
+		}
+		// Freeze the resolved target in this local recovery attempt. The durable
+		// legacy journal remains unchanged; preparation consumes this same target.
+		journal.ResetTarget = &effectiveTarget
+	}
+	if journal.ResetTarget != nil {
+		if resetTargetRequiresD101Execution(*journal.ResetTarget) {
+			// Completed bound cleanup above is read-only. New destructive D101
+			// recovery cannot bypass the missing evidence/phase workflow here.
+			return errors.New("D101 reset recovery requires linked execution evidence; automatic replay is closed")
+		}
+		if _, err := normalizeResetLifecycleTarget(*journal.ResetTarget); err != nil {
+			return err
 		}
 	}
 	if _, envErr := os.Stat(target.EnvFile); envErr == nil {
@@ -1278,6 +1406,11 @@ func (c config) repairLifecycleJournal() (repairErr error) {
 			return err
 		}
 	case "reset":
+		if journal.ResetTarget != nil && hasResetImagePins(*journal.ResetTarget) {
+			if _, err := c.pullResetCandidate(lease.Context(), target, *journal.ResetTarget); err != nil {
+				return err
+			}
+		}
 		if err := c.prepareResetRecovery(journal, target); err != nil {
 			return err
 		}
@@ -1384,8 +1517,16 @@ func (c config) verifySucceededLifecycleJournal(journal lifecycleJournal, target
 			return errors.New("completed close retained its registry entry")
 		}
 	case "reset":
-		if _, err := c.validateServerTarget(target); err != nil {
+		values, err := c.validateServerTarget(target)
+		if err != nil {
 			return err
+		}
+		if journal.ResetTarget != nil {
+			for key, expected := range journal.ResetTarget.Updates {
+				if actual, exists := values[key]; !exists || actual != expected {
+					return errors.New("completed reset env does not match its journal target")
+				}
+			}
 		}
 		if err := c.verifyResetRuntime(context.Background(), target); err != nil {
 			return err
@@ -1410,6 +1551,12 @@ func (c config) markResetRepairRequired(id string, cause error) error {
 		return fmt.Errorf("could not durably persist reset repair-required state: %v (original failure: %w)", markerErr, cause)
 	}
 	return cause
+}
+
+// Legacy target readability does not authorize destructive D101 execution.
+// Call only after resolving the complete target, including inherited settings.
+func resetTargetRequiresD101Execution(target resetLifecycleTarget) bool {
+	return target.ScenarioCode == "scenario_3190" || len(target.StorageImageDigests) != 0
 }
 
 func (c config) prepareResetRecovery(journal lifecycleJournal, target serverTarget) error {
@@ -1632,13 +1779,18 @@ func (m *lifecycleJobManager) reserveWithOperation(operationID string, operation
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.d101NativeOwner.blocksAdmission() && !m.d101NativeOwner.allowsPreparationDrain(operationID, operationFingerprint, kind) {
+		return "", false, errMaintenanceClosed
+	}
 	if m.jobs == nil {
 		m.jobs = make(map[string]lifecycleJob)
 	}
 	if m.operationJobs == nil {
 		m.operationJobs = make(map[string]string)
 	}
-	m.pruneExpiredTerminalLocked(m.currentTimeLocked())
+	if !m.d101NativeOwner.blocksAdmission() {
+		m.pruneExpiredTerminalLocked(m.currentTimeLocked())
+	}
 	if operationID != "" {
 		if existingID, exists := m.operationJobs[operationID]; exists {
 			if existing, exists := m.jobs[existingID]; exists {
@@ -1824,7 +1976,9 @@ func (m *lifecycleJobManager) lookupOperation(operationID string) (operationResp
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.pruneExpiredTerminalLocked(m.currentTimeLocked())
+	if !m.d101NativeOwner.blocksAdmission() {
+		m.pruneExpiredTerminalLocked(m.currentTimeLocked())
+	}
 	jobID, exists := m.operationJobs[operationID]
 	if !exists {
 		return operationResponse{}, false
@@ -1853,7 +2007,9 @@ func (m *lifecycleJobManager) lookup(id string) (lifecycleJobResponse, bool) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.pruneExpiredTerminalLocked(m.currentTimeLocked())
+	if !m.d101NativeOwner.blocksAdmission() {
+		m.pruneExpiredTerminalLocked(m.currentTimeLocked())
+	}
 	job, exists := m.jobs[id]
 	if !exists {
 		return lifecycleJobResponse{}, false
@@ -1890,11 +2046,15 @@ func loadConfig() (config, error) {
 	jobs := newLifecycleJobManager()
 	serversDir := envOr("SERVERS_DIR", "/workspace/servers")
 	operationStorePath := envOr("DEPLOYER_OPERATION_STORE_FILE", filepath.Join(serversDir, durableOperationStoreFileName))
+	if err := resetD101RootStartupOwner(serversDir, false); err != nil {
+		return config{}, err
+	}
 	operationStore, err := openDurableOperationStore(operationStorePath, durableOperationMaxEntries, durableOperationTerminalRetention)
 	if err != nil {
 		return config{}, err
 	}
 	c := config{
+		d101FixedInstallation:    resetD101ReviewedFixedInstallation,
 		token:                    os.Getenv("DEPLOYER_TOKEN"),
 		composeDir:               envOr("COMPOSE_DIR", "/workspace"),
 		composeHostDir:           envOr("COMPOSE_HOST_DIR", envOr("PWD", ".")),
@@ -2454,28 +2614,36 @@ type createServerRequest struct {
 }
 
 type resetServerRequest struct {
-	ID                  string   `json:"id"`
-	OperationID         string   `json:"operationId"`
-	MaintenanceLease    string   `json:"maintenanceLease,omitempty"`
-	Confirm             string   `json:"confirm"`
-	ImageTag            string   `json:"imageTag,omitempty"`
-	WebGameTag          string   `json:"webGameTag,omitempty"`
-	Generation          string   `json:"generation"`
-	ScenarioCode        string   `json:"scenarioCode"`
-	ScenarioSeedEnabled *bool    `json:"scenarioSeedEnabled"`
-	TurnTerm            string   `json:"turnTerm"`
-	Sync                string   `json:"sync"`
-	Fiction             string   `json:"fiction"`
-	Extend              string   `json:"extend"`
-	BlockGeneralCreate  string   `json:"blockGeneralCreate"`
-	NPCMode             string   `json:"npcMode"`
-	ShowImgLevel        string   `json:"showImgLevel"`
-	AutorunUserOptions  []string `json:"autorunUserOptions"`
-	AutorunUserMinutes  string   `json:"autorunUserMinutes"`
-	JoinMode            string   `json:"joinMode"`
-	TournamentTrig      string   `json:"tournamentTrig"`
-	ReserveOpen         string   `json:"reserveOpen"`
-	PreReserveOpen      string   `json:"preReserveOpen"`
+	StorageImageDigests    map[string]string `json:"storageImageDigests,omitempty"`
+	ApprovalPlanSHA256     string            `json:"approvalPlanSha256,omitempty"`
+	ExecutionReceiptSHA256 string            `json:"executionReceiptSha256,omitempty"`
+	ID                     string            `json:"id"`
+	OperationID            string            `json:"operationId"`
+	MaintenanceLease       string            `json:"maintenanceLease,omitempty"`
+	Confirm                string            `json:"confirm"`
+	ImageTag               string            `json:"imageTag,omitempty"`
+	WebGameTag             string            `json:"webGameTag,omitempty"`
+	ImageDigests           map[string]string `json:"imageDigests,omitempty"`
+	Generation             string            `json:"generation"`
+	ServerName             *string           `json:"serverName,omitempty"`
+	MaxGeneral             *int              `json:"maxGeneral,omitempty"`
+	FirstTurn              *string           `json:"firstTurn,omitempty"`
+	ScenarioLookupDir      *string           `json:"scenarioLookupDir,omitempty"`
+	ScenarioCode           string            `json:"scenarioCode"`
+	ScenarioSeedEnabled    *bool             `json:"scenarioSeedEnabled"`
+	TurnTerm               string            `json:"turnTerm"`
+	Sync                   string            `json:"sync"`
+	Fiction                string            `json:"fiction"`
+	Extend                 string            `json:"extend"`
+	BlockGeneralCreate     string            `json:"blockGeneralCreate"`
+	NPCMode                string            `json:"npcMode"`
+	ShowImgLevel           string            `json:"showImgLevel"`
+	AutorunUserOptions     []string          `json:"autorunUserOptions"`
+	AutorunUserMinutes     string            `json:"autorunUserMinutes"`
+	JoinMode               string            `json:"joinMode"`
+	TournamentTrig         string            `json:"tournamentTrig"`
+	ReserveOpen            string            `json:"reserveOpen"`
+	PreReserveOpen         string            `json:"preReserveOpen"`
 }
 
 type createServerResponse struct {
@@ -2537,12 +2705,29 @@ type envLine struct {
 }
 
 func main() {
+	if handled, status := earlyResetD101HostCommand(os.Args, os.Getenv, os.Stdout, os.Stderr); handled {
+		os.Exit(status)
+	}
 	if handled, status := earlyCommand(os.Args, os.Getenv, os.Stdin, os.Stdout, os.Stderr); handled {
 		os.Exit(status)
 	}
 	cfg, err := loadConfig()
 	if err != nil {
 		log.Fatalf("durable operation store initialization failed: %v", err)
+	}
+	// Register the fixed installation atomically; missing actual inputs keep
+	// all D101 sources closed while ordinary service/registry checks remain.
+	if !d101native.Missing(resetD101ReviewedNativeEntryFactory) {
+		if actual, nativeErr := actualResetD101NativeEntry(context.Background(), "main", ""); nativeErr == nil {
+			resetD101ReviewedNativeAuthorityInstaller = actual
+		}
+	}
+	if resetD101ReviewedNativeAuthorityInstaller != nil {
+		cfg.d101NativeInstaller = resetD101ReviewedNativeAuthorityInstaller
+	}
+	cfg, err = assembleResetD101InstalledSources(context.Background(), cfg)
+	if err != nil {
+		log.Print("D101 fixed installation sources unavailable")
 	}
 	if len(os.Args) == 2 && os.Args[1] == "--check-running-registry-targets" {
 		os.Exit(checkRunningRegistryTargetsCommand(cfg, os.Stderr))
@@ -2557,11 +2742,22 @@ func main() {
 		log.Fatal("DEPLOYER_TOKEN 미설정 — 인증 토큰 필수")
 	}
 
+	var rootSource resetD101RootSource
+	if cfg.d101NativeInstaller != nil {
+		rootSource = cfg.d101NativeInstaller.rootSource
+	}
+	cfg.d101RootProducer = registerResetD101OldRoot(&cfg, rootSource)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "up"})
 	})
 	mux.HandleFunc("/readyz", cfg.handleReady)
+	if cfg.d101RootProducer != nil {
+		mux.HandleFunc("/d101/native/root", cfg.withAuth(cfg.withLoopback(cfg.d101RootProducer.handler())))
+	}
+	if cfg.d101NativeInstaller != nil {
+		mux.HandleFunc("/d101/native/completion", cfg.withAuth(cfg.withLoopback(cfg.d101NativeInstaller.completionHandler())))
+	}
 	mux.HandleFunc("/status", cfg.withAuth(cfg.handleStatus))
 	mux.HandleFunc("/deploy", cfg.withAuth(cfg.handleDeploy))
 	mux.HandleFunc("/servers", cfg.withAuth(cfg.handleServers))
@@ -2668,7 +2864,17 @@ func authenticatedHTTPCommand(c config, method, requestPath string, input io.Rea
 		return 1
 	}
 	defer response.Body.Close()
-	if _, err := io.Copy(output, response.Body); err != nil {
+	if isResetD101ResultPath(strings.TrimPrefix(requestPath, "/operations/")) {
+		original, err := io.ReadAll(io.LimitReader(response.Body, resetD101ResultMaxBytes+1))
+		if err != nil || len(original) > resetD101ResultMaxBytes {
+			fmt.Fprintln(errOutput, "authenticated HTTP response read failed")
+			return 1
+		}
+		if _, err := output.Write(original); err != nil {
+			fmt.Fprintln(errOutput, "authenticated HTTP response read failed")
+			return 1
+		}
+	} else if _, err := io.Copy(output, response.Body); err != nil {
 		fmt.Fprintln(errOutput, "authenticated HTTP response read failed")
 		return 1
 	}
@@ -2683,6 +2889,11 @@ func isAuthenticatedHTTPRouteAllowed(method, requestPath string) bool {
 	switch method {
 	case http.MethodGet:
 		if requestPath == "/maintenance" {
+			return true
+		}
+		parts := strings.Split(strings.TrimPrefix(requestPath, "/operations/"), "/")
+		if strings.HasPrefix(requestPath, "/operations/") && len(parts) == 3 && lifecycleJobIDRe.MatchString(parts[0]) &&
+			parts[1] == "execution-result" && resetEvidenceSHA.MatchString(parts[2]) {
 			return true
 		}
 		return strings.HasPrefix(requestPath, "/jobs/") && lifecycleJobIDRe.MatchString(strings.TrimPrefix(requestPath, "/jobs/"))
@@ -2773,6 +2984,26 @@ func (c config) handleOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/operations/")
+	if strings.Contains(path, "/seed-approval") {
+		c.handleResetD101SeedApproval(w, r, strings.Split(path, "/"))
+		return
+	}
+	if strings.Contains(path, "/recovery-result") {
+		c.handleResetD101RecoveryResult(w, r, strings.Split(path, "/"))
+		return
+	}
+	if isResetD101PreparedPath(path) {
+		c.handleResetD101PreparedProof(w, r, strings.Split(path, "/"))
+		return
+	}
+	if isResetD101ResultPath(path) {
+		c.handleResetD101ExecutionResult(w, r, strings.Split(path, "/"))
+		return
+	}
+	if isResetPublicationReceiptPath(path) {
+		c.handleResetPublicationReceipt(w, r, strings.Split(path, "/"))
+		return
+	}
 	if strings.Contains(path, "/") || !lifecycleJobIDRe.MatchString(path) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "operation id가 올바르지 않습니다."})
 		return
@@ -4041,13 +4272,35 @@ func (c config) resetServerWithMaintenanceLease(rawID string, req resetServerReq
 	if req.Confirm != "RESET "+id {
 		return createServerResponse{OK: false, ID: id, Detail: "리셋 확인 문구가 일치하지 않습니다."}, http.StatusBadRequest
 	}
+	if len(req.StorageImageDigests) != 0 {
+		if _, err := normalizeResetStorageImageDigests(req.StorageImageDigests); err != nil {
+			return createServerResponse{OK: false, ID: id, Detail: "저장소 이미지 pin 형식이 올바르지 않습니다."}, http.StatusBadRequest
+		}
+		return createServerResponse{OK: false, ID: id, Detail: "저장소 이미지 pin은 완성된 실행 증거 경로가 필요합니다."}, http.StatusServiceUnavailable
+	}
+	if req.ApprovalPlanSHA256 != "" || req.ExecutionReceiptSHA256 != "" {
+		if _, err := normalizeResetExecutionEvidenceRefs(resetExecutionEvidenceRefs{req.ApprovalPlanSHA256, req.ExecutionReceiptSHA256}); err != nil {
+			return createServerResponse{OK: false, ID: id, Detail: "실행 증거 SHA 형식이 올바르지 않습니다."}, http.StatusBadRequest
+		}
+		// Do not silently ignore supplied proofs while their mandatory worker,
+		// journal and phase source are not connected. This is a closed gate.
+		return createServerResponse{OK: false, ID: id, Detail: "실행 증거와 단계별 검증 경로가 아직 연결되지 않았습니다."}, http.StatusServiceUnavailable
+	}
+	if req.ScenarioCode == "scenario_3190" && maintenanceLease == "" {
+		return createServerResponse{OK: false, ID: id, Detail: "3190 리셋은 검증된 유지보수 실행 경로가 필요합니다."}, http.StatusBadRequest
+	}
 	if maintenanceLease == "" {
-		if req.ImageTag != "" || req.WebGameTag != "" {
+		if req.ImageTag != "" || req.WebGameTag != "" || len(req.ImageDigests) != 0 {
 			return createServerResponse{OK: false, ID: id, Detail: "이미지 pin은 유지보수 리셋에서만 변경할 수 있습니다."}, http.StatusBadRequest
 		}
 	} else if id != "pep" || req.OperationID == "" || req.ScenarioCode != "scenario_990002" ||
-		!gitSHA40.MatchString(req.ImageTag) || !gitSHA40.MatchString(req.WebGameTag) {
+		!gitSHA40.MatchString(req.ImageTag) || req.ImageTag != req.WebGameTag {
 		return createServerResponse{OK: false, ID: id, Detail: "PEP 유지보수 리셋에 정확한 후보 pin과 작업 ID가 필요합니다."}, http.StatusBadRequest
+	}
+	if maintenanceLease != "" {
+		if _, err := normalizeResetImageDigests(req.ImageDigests); err != nil {
+			return createServerResponse{OK: false, ID: id, Detail: err.Error()}, http.StatusBadRequest
+		}
 	}
 	requestedOperationID, err := normalizeLifecycleOperationID(req.OperationID)
 	if err != nil {
@@ -4081,9 +4334,12 @@ func (c config) resetServerWithMaintenanceLease(rawID string, req resetServerReq
 	if _, err := os.Stat(envFile); err != nil {
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: fmt.Sprintf("서버 env 확인 실패: %v", err)}, http.StatusInternalServerError
 	}
-	resetTarget, err := resetLifecycleTargetForEnv(envFile, updates)
+	resetTarget, err := resetLifecycleTargetForEnvWithImageDigests(envFile, updates, req.ImageDigests)
 	if err != nil {
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: err.Error()}, http.StatusBadRequest
+	}
+	if resetTargetRequiresD101Execution(resetTarget) {
+		return createServerResponse{OK: false, ID: id, Detail: "3190 리셋은 검증된 유지보수 실행 경로가 필요합니다."}, http.StatusBadRequest
 	}
 	fingerprint := resetRequestFingerprint(id, resetTarget)
 	operationID := requestedOperationID
@@ -4406,7 +4662,8 @@ func (c config) startClaimedDurableLifecycleJob(lease *operationLease, jobID, na
 
 		transitionErr := c.transitionDurableLifecycleOperation(operationID, transitionStatus, httpStatus, messageID)
 		if transitionErr == nil && transitionStatus == lifecycleJobSucceeded {
-			if clearErr := c.clearLifecycleJournal(); clearErr != nil {
+			if clearErr := c.settleSucceededLifecycleJournal(lease.Context(), operationID); clearErr != nil {
+				lease.coordinator.markPreparationSettlementPending()
 				log.Printf("server lifecycle journal clear failed after durable success name=%s err=%v", name, clearErr)
 			}
 		}
@@ -5037,7 +5294,10 @@ func envValuesFromLines(lines []envLine) map[string]string {
 }
 
 func resetEnvUpdates(req resetServerRequest) (map[string]string, error) {
-	values := map[string]string{}
+	values, err := explicitResetSettings(req)
+	if err != nil {
+		return nil, err
+	}
 	putSafe := func(key, value string) error {
 		value = strings.TrimSpace(value)
 		if value == "" {
@@ -5111,6 +5371,10 @@ func isResetLifecycleUpdateKey(key string) bool {
 }
 
 func resetLifecycleTargetForEnv(envFile string, requested map[string]string) (resetLifecycleTarget, error) {
+	return resetLifecycleTargetForEnvWithImageDigests(envFile, requested, nil)
+}
+
+func resetLifecycleTargetForEnvWithImageDigests(envFile string, requested map[string]string, digests map[string]string) (resetLifecycleTarget, error) {
 	current, err := readEnvValues(envFile)
 	if err != nil {
 		return resetLifecycleTarget{}, err
@@ -5140,9 +5404,14 @@ func resetLifecycleTargetForEnv(envFile string, requested map[string]string) (re
 	}
 	updates := make(map[string]string, len(resetLifecycleUpdateKeys))
 	for _, key := range resetLifecycleUpdateKeys {
+		if key == "SERVER_NAME" || key == "RESET_MAXGENERAL" || key == "RESET_FIRST_TURN" || key == "SCENARIO_LOOKUP_DIR" {
+			if _, explicit := requested[key]; !explicit {
+				continue
+			}
+		}
 		// Ordinary reset fingerprints keep their old shape. Image pins are
 		// part of the target only when a leased reset requests them explicitly.
-		if key == "IMAGE_TAG" || key == "WEB_GAME_TAG" {
+		if key == "IMAGE_TAG" || key == "WEB_GAME_TAG" || key == "GAME_POSTGRES_IMAGE" || key == "GAME_REDIS_IMAGE" {
 			if _, requested := requested[key]; !requested {
 				continue
 			}
@@ -5164,11 +5433,15 @@ func resetLifecycleTargetForEnv(envFile string, requested map[string]string) (re
 		Generation:          expected.generation,
 		ScenarioSeedEnabled: true,
 		Updates:             updates,
+		ImageDigests:        digests,
 	}
 	return normalizeResetLifecycleTarget(target)
 }
 
 func normalizeResetLifecycleTarget(target resetLifecycleTarget) (resetLifecycleTarget, error) {
+	if err := validateExplicitResetTargetSettings(target.Updates); err != nil {
+		return resetLifecycleTarget{}, err
+	}
 	target.ScenarioCode = strings.TrimSpace(target.ScenarioCode)
 	if !isSafeToken(target.ScenarioCode) {
 		return resetLifecycleTarget{}, errors.New("reset scenario code is invalid")
@@ -5207,6 +5480,12 @@ func normalizeResetLifecycleTarget(target resetLifecycleTarget) (resetLifecycleT
 	}
 	target.Generation = generation
 	target.Updates = updates
+	if err := normalizeResetImageTarget(&target); err != nil {
+		return resetLifecycleTarget{}, err
+	}
+	if err := normalizeResetStorageTarget(&target); err != nil {
+		return resetLifecycleTarget{}, err
+	}
 	return target, nil
 }
 
@@ -5473,6 +5752,14 @@ func (c config) upServerStack(ctx context.Context, project, envFile string) (str
 }
 
 func (c config) pullResetCandidate(ctx context.Context, target serverTarget, resetTarget resetLifecycleTarget) (string, error) {
+	var err error
+	resetTarget, err = normalizeResetLifecycleTarget(resetTarget)
+	if err != nil {
+		return "", err
+	}
+	if !hasResetImagePins(resetTarget) {
+		return "", errors.New("candidate pull requires approved image pins")
+	}
 	if _, err := c.validateServerTarget(target); err != nil {
 		return "", err
 	}
@@ -5499,12 +5786,21 @@ func (c config) pullResetCandidate(ctx context.Context, target serverTarget, res
 	if _, err := c.validateDockerServerTarget(target.Project, stagedPath, true); err != nil {
 		return "", err
 	}
-	return c.runServerDockerContext(ctx,
-		"compose", "-p", target.Project,
-		"--env-file", stagedPath,
-		"-f", c.composeServer,
-		"pull", "game-engine", "game-api", "web-game",
-	)
+	if err := c.verifyResetCandidateImages(ctx, stagedPath, resetTarget); err == nil {
+		return "candidate images verified locally", nil
+	}
+	pullArgs := []string{"compose", "-p", target.Project, "--env-file", stagedPath, "-f", c.composeServer, "pull", "game-engine", "game-api", "web-game"}
+	if len(resetTarget.StorageImageDigests) != 0 {
+		pullArgs = append(pullArgs, "game-postgres", "game-redis")
+	}
+	detail, err := c.runServerDockerContext(ctx, pullArgs...)
+	if err != nil {
+		return detail, err
+	}
+	if err := c.verifyResetCandidateImages(ctx, stagedPath, resetTarget); err != nil {
+		return "", err
+	}
+	return detail, nil
 }
 
 func (c config) reconcileServerRegistry(target serverTarget) error {
@@ -5775,13 +6071,22 @@ func (c config) runDockerContext(parent context.Context, args ...string) (string
 	return c.runDockerContextWithEnvironment(parent, nil, args...)
 }
 
-func (c config) runDockerContextWithEnvironment(parent context.Context, environment []string, args ...string) (string, error) {
+func (c config) runDockerContextWithEnvironment(parent context.Context, environment []string, args ...string) (out string, resultErr error) {
 	if parent == nil {
 		parent = context.Background()
 	}
 	if err := parent.Err(); err != nil {
 		return "", err
 	}
+	completeNativeTrace, traceErr := resetD101TraceActualDocker(parent, args)
+	if traceErr != nil {
+		return "", traceErr
+	}
+	defer func() {
+		if completeNativeTrace() != nil {
+			resultErr = errResetExecutionEvidence
+		}
+	}()
 	if c.dockerRunnerContext != nil {
 		out, err := c.dockerRunnerContext(parent, args...)
 		if parentErr := parent.Err(); parentErr != nil {
@@ -5803,8 +6108,8 @@ func (c config) runDockerContextWithEnvironment(parent context.Context, environm
 	if environment != nil {
 		cmd.Env = environment
 	}
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	output, err := cmd.CombinedOutput()
+	return string(output), err
 }
 
 func (c config) fetchAvailableTags() []string {

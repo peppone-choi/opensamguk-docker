@@ -3,6 +3,10 @@ name: Start Existing Game Server
 on:
   workflow_dispatch:
     inputs:
+      d101_operation_id:
+        description: "Approved native D101 operation selector (32 lowercase hex); separate execution card required"
+        required: false
+        default: ""
       server_id:
         description: "Public server id (mixed case accepted, stored lowercase), e.g. pep"
         required: true
@@ -25,6 +29,7 @@ jobs:
     steps:
       - name: Synchronize, start, and verify server lifecycle
         env:
+          D101_OPERATION_ID: ${{ inputs.d101_operation_id }}
           SERVER_ID: ${{ inputs.server_id }}
           IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
@@ -73,6 +78,17 @@ jobs:
             shift 2
             run_bounded "$deadline" "$requested" sudo docker exec "$@"
           }
+          # This optional selector chooses the separately approved native entry.
+          # Issuer-only workflow never uses this physical operation branch.
+          if [[ -n "${D101_OPERATION_ID:-}" ]]; then
+            if [[ "${GITHUB_EVENT_NAME:-}" != "workflow_dispatch" || ! "$D101_OPERATION_ID" =~ ^[a-f0-9]{32}$ ]]; then
+              echo "::error::invalid D101 operation selector"
+              exit 2
+            fi
+            # Privilege first; installed launcher acquires FD9 once itself.
+            # No old exec9/flock branch is entered and no token/card goes in argv.
+            exec sudo -n -- /etc/opensamguk/d101/native-helper/host-session-launcher --operation-id "$D101_OPERATION_ID"
+          fi
           exec 9>/tmp/opensamguk-production.lock
           if ! run_bounded "$WORKFLOW_DEADLINE" 1800 flock -w 1800 9; then
             echo "::error::Timed out acquiring /tmp/opensamguk-production.lock after 1800 seconds"

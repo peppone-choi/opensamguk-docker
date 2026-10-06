@@ -1,0 +1,176 @@
+name: Build D101 controlled candidate images
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_issuer_sha:
+        description: Reviewed workflow and candidate driver issuer (lowercase full40)
+        required: true
+        type: string
+      expected_issuer_ref:
+        description: Reviewed full refs/heads or refs/tags dispatch reference
+        required: true
+        type: string
+      expected_root_source_sha:
+        description: Approved final execution-time Root main (lowercase full40)
+        required: true
+        type: string
+      expected_app_source_sha:
+        description: Approved final execution-time App main (lowercase full40)
+        required: true
+        type: string
+      expected_source_inputs_sha256:
+        description: Reviewed SHA256 of raw tracked NUL tree at Root source
+        required: true
+        type: string
+      approved_build_contract_json:
+        description: Reviewed nonsecret Go pins, original architecture observation, existing driver pins and immutable runtime base
+        required: true
+        type: string
+      expected_build_contract_sha256:
+        description: Reviewed SHA256 of original contract JSON UTF8 bytes
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: d101-candidate-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  admit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      go_release: ${{ steps.admit.outputs.go_release }}
+    env:
+      ISSUER_SHA: ${{ inputs.expected_issuer_sha }}
+      ISSUER_REF: ${{ inputs.expected_issuer_ref }}
+      ROOT_SOURCE_SHA: ${{ inputs.expected_root_source_sha }}
+      APP_SOURCE_SHA: ${{ inputs.expected_app_source_sha }}
+      SOURCE_FINGERPRINT: ${{ inputs.expected_source_inputs_sha256 }}
+      CONTRACT_SHA256: ${{ inputs.expected_build_contract_sha256 }}
+      APPROVED_BUILD_CONTRACT_JSON: ${{ inputs.approved_build_contract_json }}
+      ACTUAL_WORKFLOW_SHA: ${{ github.workflow_sha }}
+      GH_TOKEN: ${{ github.token }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Reject unpinned sources and retries before checkout
+        run: |
+          python3 - <<'PY'
+          import os, re
+          for key in ('ISSUER_SHA', 'ROOT_SOURCE_SHA', 'APP_SOURCE_SHA'):
+              if not re.fullmatch('[0-9a-f]{40}', os.environ[key]):
+                  raise SystemExit('reviewed source and issuer full40 required')
+          for key in ('SOURCE_FINGERPRINT', 'CONTRACT_SHA256'):
+              if not re.fullmatch('[0-9a-f]{64}', os.environ[key]):
+                  raise SystemExit('reviewed original SHA256 input required')
+          if os.environ['ACTUAL_WORKFLOW_SHA'] != os.environ['ISSUER_SHA'] or os.environ['GITHUB_REF'] != os.environ['ISSUER_REF']:
+              raise SystemExit('workflow issuer or ref differs from reviewed input')
+          if os.environ['GITHUB_REPOSITORY'] != 'peppone-choi/opensamguk-docker' or os.environ['GITHUB_EVENT_NAME'] != 'workflow_dispatch' or os.environ['GITHUB_RUN_ATTEMPT'] != '1':
+              raise SystemExit('manual Root repository and first-attempt contract required')
+          PY
+      - name: Checkout exact issuer
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.expected_issuer_sha }}
+          path: issuer
+          persist-credentials: false
+      - name: Checkout exact controlled source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.expected_root_source_sha }}
+          path: source
+          persist-credentials: false
+      - name: Admit source, original build contract and current Root/App main
+        id: admit
+        run: |
+          python3 issuer/scripts/build-d101-candidate-images.py admit \
+            --issuer "$GITHUB_WORKSPACE/issuer" --source "$GITHUB_WORKSPACE/source" \
+            --issuer-sha "$ISSUER_SHA" --issuer-ref "$ISSUER_REF" --source-sha "$ROOT_SOURCE_SHA" \
+            --app-source-sha "$APP_SOURCE_SHA" --fingerprint "$SOURCE_FINGERPRINT" \
+            --contract-sha256 "$CONTRACT_SHA256" --output "$GITHUB_WORKSPACE/admission.json"
+      - name: Preserve admission evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: d101-candidate-admission-${{ github.run_id }}-${{ github.run_attempt }}
+          path: admission.json
+          if-no-files-found: error
+          retention-days: 30
+
+  images:
+    needs: admit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    env:
+      ISSUER_SHA: ${{ inputs.expected_issuer_sha }}
+      ISSUER_REF: ${{ inputs.expected_issuer_ref }}
+      ROOT_SOURCE_SHA: ${{ inputs.expected_root_source_sha }}
+      APP_SOURCE_SHA: ${{ inputs.expected_app_source_sha }}
+      SOURCE_FINGERPRINT: ${{ inputs.expected_source_inputs_sha256 }}
+      CONTRACT_SHA256: ${{ inputs.expected_build_contract_sha256 }}
+      APPROVED_BUILD_CONTRACT_JSON: ${{ inputs.approved_build_contract_json }}
+      ACTUAL_WORKFLOW_SHA: ${{ github.workflow_sha }}
+      GH_TOKEN: ${{ github.token }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout exact issuer
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.expected_issuer_sha }}
+          path: issuer
+          persist-credentials: false
+      - name: Checkout exact controlled source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.expected_root_source_sha }}
+          path: source
+          persist-credentials: false
+      - name: Set up reviewed Go1.23 patch
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ needs.admit.outputs.go_release }}
+          cache: false
+      - name: Set up candidate Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          version: v0.37.2
+      - name: Authenticate candidate registry using existing workflow token
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build controlled artifacts and package candidates
+        run: |
+          python3 issuer/scripts/build-d101-candidate-images.py issue \
+            --issuer "$GITHUB_WORKSPACE/issuer" --source "$GITHUB_WORKSPACE/source" \
+            --issuer-sha "$ISSUER_SHA" --issuer-ref "$ISSUER_REF" --source-sha "$ROOT_SOURCE_SHA" \
+            --app-source-sha "$APP_SOURCE_SHA" --fingerprint "$SOURCE_FINGERPRINT" \
+            --contract-sha256 "$CONTRACT_SHA256" --output "$GITHUB_WORKSPACE/evidence"
+      - name: Preserve publication or partial evidence without build cache
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: d101-candidate-images-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            evidence/*.json
+            evidence/tracked-tree.nul
+            evidence/host-architecture.raw
+            evidence/*-context/Dockerfile
+            evidence/*-extracted/*
+            evidence/controlled-artifacts/intent.json
+            evidence/controlled-artifacts/receipt.json
+            evidence/controlled-artifacts/failure.json
+            evidence/controlled-artifacts/deployer
+            evidence/controlled-artifacts/d101-host-reader
+            evidence/controlled-artifacts/host-session-launcher
+          if-no-files-found: error
+          retention-days: 30

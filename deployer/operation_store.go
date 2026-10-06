@@ -68,6 +68,9 @@ type durableOperationRecord struct {
 	PublicMessage      string             `json:"publicMessage"`
 	CreatedAt          time.Time          `json:"createdAt"`
 	UpdatedAt          time.Time          `json:"updatedAt"`
+	// D101 physical execution IDs remain reserved after terminal retention.
+	// Empty legacy records keep the previous serialized shape and pruning.
+	D101IntentSHA string `json:"d101IntentSha256,omitempty"`
 }
 
 type durableOperationDocument struct {
@@ -76,6 +79,7 @@ type durableOperationDocument struct {
 }
 
 type durableOperationStore struct {
+	d101NativeOwner     *resetD101RootOwnerGate
 	mu                  sync.Mutex
 	path                string
 	maxEntries          int
@@ -183,9 +187,12 @@ func (s *durableOperationStore) Reserve(record durableOperationRecord) (durableO
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.d101NativeOwner.blocksMutation() {
+		return durableOperationRecord{}, false, errMaintenanceClosed
+	}
 
 	if existing, ok := s.operations[record.OperationID]; ok {
-		if existing.Kind != record.Kind || existing.SubjectID != record.SubjectID || existing.RequestFingerprint != record.RequestFingerprint {
+		if existing.Kind != record.Kind || existing.SubjectID != record.SubjectID || existing.RequestFingerprint != record.RequestFingerprint || existing.D101IntentSHA != record.D101IntentSHA {
 			return durableOperationRecord{}, false, errLifecycleOperationConflict
 		}
 		if deferred, pending := s.deferredTransitions[record.OperationID]; pending {
@@ -202,6 +209,10 @@ func (s *durableOperationStore) Reserve(record durableOperationRecord) (durableO
 			return deferred, true, nil
 		}
 		return existing, true, nil
+	}
+
+	if s.d101NativeOwner.blocksAdmission() && (!s.d101NativeOwner.allowsPreparationDrain(record.OperationID, record.RequestFingerprint, record.Kind) || s.d101NativeOwner.preparation.subjectID != record.SubjectID) {
+		return durableOperationRecord{}, false, errMaintenanceClosed
 	}
 
 	now := s.currentTimeLocked().UTC()
@@ -238,6 +249,9 @@ func (s *durableOperationStore) Transition(operationID string, status lifecycleJ
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.d101NativeOwner.blocksMutation() {
+		return durableOperationRecord{}, errMaintenanceClosed
+	}
 	record, ok := s.operations[operationID]
 	if !ok {
 		return durableOperationRecord{}, os.ErrNotExist
@@ -289,6 +303,9 @@ func (s *durableOperationStore) Recover(journalOperationID string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.d101NativeOwner.blocksAdmission() {
+		return errMaintenanceClosed
+	}
 	now := s.currentTimeLocked().UTC()
 	next := cloneDurableOperations(s.operations)
 	changed := pruneExpiredDurableOperations(next, now, s.retention)
@@ -329,6 +346,9 @@ func (s *durableOperationStore) currentTimeLocked() time.Time {
 }
 
 func (s *durableOperationStore) persistAndInstallLocked(operations map[string]durableOperationRecord) error {
+	if s.d101NativeOwner.blocksMutation() {
+		return errMaintenanceClosed
+	}
 	committed, err := s.persistLocked(operations)
 	if committed {
 		s.operations = operations
@@ -397,6 +417,9 @@ func writeDurableOperationFile(path string, data []byte, fileOps durableOperatio
 }
 
 func validateDurableOperationRecord(record durableOperationRecord) error {
+	if record.D101IntentSHA != "" && (!resetEvidenceSHA.MatchString(record.D101IntentSHA) || record.Kind != lifecycleKindReset || record.SubjectID != "pep") {
+		return errors.New("D101 operation reservation is invalid")
+	}
 	if !lifecycleJobIDRe.MatchString(record.OperationID) {
 		return errors.New("operation id must be 32 lowercase hexadecimal characters")
 	}
@@ -504,7 +527,7 @@ func isDurableOperationStatus(status lifecycleJobStatus) bool {
 func pruneExpiredDurableOperations(operations map[string]durableOperationRecord, now time.Time, retention time.Duration) bool {
 	changed := false
 	for id, record := range operations {
-		if !isTerminalLifecycleJob(record.Status) || now.Before(record.UpdatedAt.Add(retention)) {
+		if record.D101IntentSHA != "" || !isTerminalLifecycleJob(record.Status) || now.Before(record.UpdatedAt.Add(retention)) {
 			continue
 		}
 		delete(operations, id)

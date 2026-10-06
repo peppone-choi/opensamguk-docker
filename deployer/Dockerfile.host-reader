@@ -1,0 +1,11 @@
+# Candidate artifact only. Build/digest/card review and root-only host install
+# are separate gates; this file installs no originals, key, token or authority.
+FROM golang:1.23-alpine AS build
+WORKDIR /src
+COPY go.mod ./
+COPY internal ./internal
+COPY cmd/d101-host-reader ./cmd/d101-host-reader
+ENV CGO_ENABLED=0
+RUN go build -trimpath -ldflags="-s -w" -o /out/d101-host-reader ./cmd/d101-host-reader
+FROM scratch AS host-reader-artifact
+COPY --from=build /out/d101-host-reader /d101-host-reader

@@ -359,3 +359,33 @@ func assertOperationStatus(t *testing.T, store *durableOperationStore, operation
 		t.Fatalf("operation lookup = %#v, %v; want status %q", record, ok, want)
 	}
 }
+
+func TestNative9StoreOwnerPreservesDrainAndBlocksNewAdmission(t *testing.T) {
+	store := mustOpenOperationStore(t, filepath.Join(t.TempDir(), "operations.json"))
+	op := strings.Repeat("a", 32)
+	mustReserveOperation(t, store, pendingDurableOperation(op))
+	g := &resetD101RootOwnerGate{}
+	g.state.Store(int32(resetD101RootOwnerPresent))
+	store.d101NativeOwner = g
+	if _, _, err := store.Reserve(pendingDurableOperation(strings.Repeat("b", 32))); err == nil {
+		t.Fatal("owner admits new durable operation")
+	}
+	if _, err := store.Transition(op, lifecycleJobSucceeded, http.StatusOK, durableOperationMessageResetSucceeded); err != nil {
+		t.Fatal("existing admitted operation cannot settle", err)
+	}
+	g.frozen.Store(true)
+	before, err := os.ReadFile(store.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Reserve(pendingDurableOperation(op)); err == nil {
+		t.Fatal("frozen store Reserve mutates")
+	}
+	if err := store.Recover(""); err == nil {
+		t.Fatal("owner permits Recover")
+	}
+	after, err := os.ReadFile(store.path)
+	if err != nil || string(before) != string(after) {
+		t.Fatal("denial changed complete store original")
+	}
+}

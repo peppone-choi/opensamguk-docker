@@ -5702,7 +5702,7 @@ JWT_PUBLIC_KEY=shared-public-key
 SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApiUrl":"http://spep-game-api:8081","gameEngineUrl":"http://spep-game-engine:8082","deployProject":"opensamguk-spep"}]
 `)
 	envFile := filepath.Join(cfg.serversDir, "spep.env")
-	writeEnv(t, envFile, "SERVER_ID=pep\nIMAGE_TAG="+strings.Repeat("a", 40)+"\nWEB_GAME_TAG="+strings.Repeat("a", 40)+"\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1020\nSCENARIO_SEED_ENABLED=true\n")
+	writeEnv(t, envFile, "SERVER_ID=pep\nGHCR_OWNER=owner\nIMAGE_TAG="+strings.Repeat("a", 40)+"\nWEB_GAME_TAG="+strings.Repeat("a", 40)+"\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1020\nSCENARIO_SEED_ENABLED=true\n")
 	ordinary, err := resetLifecycleTargetForEnv(envFile, map[string]string{"SCENARIO_CODE": "scenario_990002"})
 	if err != nil {
 		t.Fatal(err)
@@ -5719,6 +5719,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 			return "29.0.0\n", nil
 		}
 		calls.record(args...)
+		if out, ok := resetDigestInspectFixture(t, args); ok {
+			return out, nil
+		}
 		return "ok\n", nil
 	}
 	maintenance := cfg.withAuth(cfg.withLoopback(cfg.handleMaintenance))
@@ -5728,7 +5731,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 	}
 	operationID := "0123456789abcdef0123456789abcdef"
 	newTag := strings.Repeat("b", 40)
-	body := `{"id":"pep","confirm":"RESET pep","operationId":"` + operationID + `","generation":"2","scenarioCode":"scenario_990002","imageTag":"` + newTag + `","webGameTag":"` + newTag + `"}`
+	body := withResetDigestPins(t, `{"id":"pep","confirm":"RESET pep","operationId":"`+operationID+`","generation":"2","scenarioCode":"scenario_990002","imageTag":"`+newTag+`","webGameTag":"`+newTag+`"}`)
 	reset := cfg.withAuth(cfg.handleServerReset)
 	request := func(remote, lease, payload string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/servers/reset", bytes.NewBufferString(payload))
@@ -5775,9 +5778,9 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 		t.Fatalf("leased reset completion=%#v", completed)
 	}
 	recorded := calls.snapshot()
-	if len(recorded) < 2 || !strings.Contains(recorded[0], "pull game-engine game-api web-game") ||
-		!strings.Contains(recorded[1], "down --volumes --remove-orphans") {
-		t.Fatalf("candidate images were not pulled before volume removal: %#v", recorded)
+	if len(recorded) < 4 || !strings.HasPrefix(recorded[0], "image inspect ") ||
+		!strings.Contains(recorded[3], "down --volumes --remove-orphans") {
+		t.Fatalf("candidate images were not verified before volume removal: %#v", recorded)
 	}
 	serverEnv := readFile(t, envFile)
 	for _, field := range []string{"IMAGE_TAG=" + newTag, "WEB_GAME_TAG=" + newTag,
@@ -5804,7 +5807,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 `
 	writeEnv(t, filepath.Join(cfg.composeDir, ".env"), oldShared)
 	envFile := filepath.Join(cfg.serversDir, "spep.env")
-	oldEnv := "SERVER_ID=pep\nIMAGE_TAG=" + strings.Repeat("a", 40) + "\nWEB_GAME_TAG=" + strings.Repeat("a", 40) + "\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1020\nSCENARIO_SEED_ENABLED=true\n"
+	oldEnv := "SERVER_ID=pep\nGHCR_OWNER=owner\nIMAGE_TAG=" + strings.Repeat("a", 40) + "\nWEB_GAME_TAG=" + strings.Repeat("a", 40) + "\nSERVER_GENERATION=1\nSCENARIO_CODE=scenario_1020\nSCENARIO_SEED_ENABLED=true\n"
 	writeEnv(t, envFile, oldEnv)
 	calls := &dockerCallRecorder{}
 	cfg.dockerRunner = func(args ...string) (string, error) {
@@ -5823,7 +5826,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 		t.Fatal("maintenance did not drain")
 	}
 	tag := strings.Repeat("b", 40)
-	body := `{"id":"pep","confirm":"RESET pep","operationId":"0123456789abcdef0123456789abcdef","generation":"2","scenarioCode":"scenario_990002","imageTag":"` + tag + `","webGameTag":"` + tag + `"}`
+	body := withResetDigestPins(t, `{"id":"pep","confirm":"RESET pep","operationId":"0123456789abcdef0123456789abcdef","generation":"2","scenarioCode":"scenario_990002","imageTag":"`+tag+`","webGameTag":"`+tag+`"}`)
 	req := httptest.NewRequest(http.MethodPost, "/servers/reset", bytes.NewBufferString(body))
 	req.Header.Set("Authorization", "Bearer test-token")
 	req.Header.Set("Content-Type", "application/json")
@@ -5842,7 +5845,7 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"통일 서버","generation":1,"gameApi
 		t.Fatalf("pull failure status=%#v", completed)
 	}
 	recorded := calls.snapshot()
-	if len(recorded) != 1 || !strings.Contains(recorded[0], "pull game-engine game-api web-game") {
+	if len(recorded) != 2 || !strings.HasPrefix(recorded[0], "image inspect ") || !strings.Contains(recorded[1], "pull game-engine game-api web-game") {
 		t.Fatalf("pull failure reached a destructive Docker call: %#v", recorded)
 	}
 	if current := readFile(t, envFile); current != oldEnv {
@@ -5878,7 +5881,7 @@ func TestResetJournalRejectsMutableImagePins(t *testing.T) {
 func TestPepLeasedResetRefusesOpenMaintenance(t *testing.T) {
 	cfg := configuredResetOperationTest(t)
 	newTag := strings.Repeat("b", 40)
-	body := `{"id":"pep","confirm":"RESET pep","operationId":"0123456789abcdef0123456789abcdef","generation":"2","scenarioCode":"scenario_990002","imageTag":"` + newTag + `","webGameTag":"` + newTag + `"}`
+	body := withResetDigestPins(t, `{"id":"pep","confirm":"RESET pep","operationId":"0123456789abcdef0123456789abcdef","generation":"2","scenarioCode":"scenario_990002","imageTag":"`+newTag+`","webGameTag":"`+newTag+`"}`)
 	req := httptest.NewRequest(http.MethodPost, "/servers/reset", bytes.NewBufferString(body))
 	req.Header.Set("Authorization", "Bearer test-token")
 	req.Header.Set("Content-Type", "application/json")
@@ -8038,5 +8041,58 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"\ud1b5\uc77c \uc11c\ubc84","gameApiUrl
 	}
 	if after := calls.count(); after != before {
 		t.Fatalf("replay re-ran docker work: before=%d after=%d", before, after)
+	}
+}
+
+func TestNative9AbsentOwnerPreservesOrdinaryStartup(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SERVERS_DIR", dir)
+	t.Setenv("DEPLOYER_OPERATION_STORE_FILE", filepath.Join(dir, "operations.json"))
+	t.Setenv("DEPLOYER_MAINTENANCE_FILE", filepath.Join(dir, "marker"))
+	t.Setenv("DEPLOYER_LIFECYCLE_JOURNAL_FILE", filepath.Join(dir, "journal"))
+	c, err := loadConfig()
+	if err != nil || c.operations == nil || c.lifecycleJobs == nil || c.lifecycleOperationStore == nil {
+		t.Fatal("actual absence broke ordinary startup", err)
+	}
+	if c.operations.d101NativeOwner.blocksAdmission() {
+		t.Fatal("missing D101 supplier closed ordinary admission")
+	}
+}
+func TestNative9PresentUnknownOwnerHoldsBeforeRecovery(t *testing.T) {
+	for _, name := range []string{"present", "unknown"} {
+		t.Run(name, func(t *testing.T) {
+			if name == "present" && os.Geteuid() != 0 {
+				t.Skip("NOT_RUN: actual PRESENT native owner requires isolated Linux UID0")
+			}
+			dir := t.TempDir()
+			storePath := filepath.Join(dir, "operations.json")
+			before := []byte(`{"version":1,"operations":[]}`)
+			if err := os.WriteFile(storePath, before, 0644); err != nil {
+				t.Fatal(err)
+			}
+			owner := resetD101RootOwnerPath(dir)
+			if name == "present" {
+				if err := os.WriteFile(owner, []byte("unresolved owner"), 0400); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.Mkdir(owner, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("SERVERS_DIR", dir)
+			t.Setenv("DEPLOYER_OPERATION_STORE_FILE", storePath)
+			if _, err := loadConfig(); err == nil {
+				t.Fatal("owner allowed startup Recover")
+			}
+			after, err := os.ReadFile(storePath)
+			info, statErr := os.Stat(storePath)
+			if err != nil || statErr != nil || !bytes.Equal(before, after) || info.Mode().Perm() != 0644 {
+				t.Fatal("startup HOLD opened/chmodded/pruned store")
+			}
+		})
 	}
 }

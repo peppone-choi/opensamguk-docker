@@ -11,9 +11,11 @@ COPY go.mod ./
 # 패키지의 운영 소스 전체를 복사한다. 개별 파일 나열은 새 Go 파일 추가 시
 # 로컬 go build와 컨테이너 빌드가 달라지는 드리프트를 만든다.
 COPY *.go ./
+COPY internal ./internal
 # CGO 끈 정적 바이너리(런타임 alpine에서 그대로 동작).
+ARG D101_ROOT_SOURCE_SHA=""
 ENV CGO_ENABLED=0
-RUN go build -trimpath -ldflags="-s -w" -o /out/deployer .
+RUN go build -trimpath -ldflags="-s -w -X main.rootBuiltSourceSHA=${D101_ROOT_SOURCE_SHA}" -o /out/deployer .
 
 # --- 런타임 스테이지 ---
 # docker:27-cli 이미지에는 docker CLI + compose v2 플러그인이 포함된다.
@@ -23,6 +25,9 @@ RUN apk add --no-cache bash curl python3
 COPY --from=build /out/deployer /usr/local/bin/deployer
 # compose 파일/서버 env는 호스트에서 /workspace로 마운트(compose.shared.yml 참조).
 WORKDIR /workspace
+# The host issuer owns the private proof files as root:0400.
+# Explicit candidate UID; no claim about the currently deployed container.
+USER 0:0
 EXPOSE 9000
 # docker 접근은 DOCKER_HOST(tcp://socket-proxy:2375)로 — sock 직접 마운트 없음.
 ENTRYPOINT ["/usr/local/bin/deployer"]
