@@ -611,14 +611,9 @@ func TestHostRelayCASRechecksOriginalCutoffAfterWaiting(t *testing.T) {
 	}
 	originalNow := time.Now()
 	beforeCAS := make(chan struct{})
-	var calls atomic.Int32
+	var bindingCalls atomic.Int32
 	var elapsed atomic.Bool
-	r.policy.authenticate = func(context.Context, string, string, string, resetD101RelayPeerObservation) error {
-		if calls.Add(1) == 2 {
-			close(beforeCAS)
-		}
-		return nil
-	}
+	r.policy.authenticate = func(context.Context, string, string, string, resetD101RelayPeerObservation) error { return nil }
 	r.admissionMu.Lock()
 	locked := true
 	defer func() {
@@ -638,6 +633,14 @@ func TestHostRelayCASRechecksOriginalCutoffAfterWaiting(t *testing.T) {
 				return resetD101RelayFixtureResponse(wire, header), nil
 			})
 		}, func() time.Time {
+			// Freeze the second outer binding's valid timestamp BEFORE notifying
+			// the thread holding admissionMu. Only the following in-mutex
+			// binding can observe the deliberately advanced cutoff clock.
+			n := bindingCalls.Add(1)
+			if n == 2 {
+				close(beforeCAS)
+				return originalNow
+			}
 			if elapsed.Load() {
 				return time.Unix(proof.DestructiveCutoffUnix, 0)
 			}
