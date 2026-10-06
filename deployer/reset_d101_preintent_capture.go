@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -63,16 +64,29 @@ type resetD101PreIntentChild struct {
 	ReadOnly        *bool                 `json:"readOnly"`
 	Privileged      *bool                 `json:"privileged"`
 	CapDrop         []string              `json:"capDrop"`
+	CapAdd          []string              `json:"capAdd"`
 	SecurityOptions []string              `json:"securityOptions"`
 	Mounts          []*resetD101CapsMount `json:"mounts"`
 }
 
+var resetD101PreIntentChildInspectFormat = strings.Replace(resetD101SeedChildInspectFormat, `"capDrop":`, `"capAdd":{{json .HostConfig.CapAdd}},"capDrop":`, 1)
+
 func decodeResetD101PreIntentChild(wire, id, imageRef string, s *resetD101PreIntentCaptureSource) (resetD101PreIntentChild, error) {
 	var child resetD101PreIntentChild
+	var fields map[string]json.RawMessage
+	if json.Unmarshal([]byte(wire), &fields) != nil || len(fields) != reflect.TypeOf(child).NumField() {
+		return child, errResetExecutionEvidence
+	}
+	shape := reflect.TypeOf(child)
+	for i := 0; i < shape.NumField(); i++ {
+		if _, ok := fields[shape.Field(i).Tag.Get("json")]; !ok {
+			return child, errResetExecutionEvidence
+		}
+	}
 	if s == nil || len(wire) == 0 || len(wire) > 16<<10 || !utf8.ValidString(wire) || decodeResetPrivateJSON([]byte(wire), &child) != nil ||
 		child.ID != id || !resetEvidenceSHA.MatchString(id) || child.Name != "/d101-pre-intent-"+s.reviewed.OperationID || !resetManifestDigest.MatchString(child.ImageID) || child.ImageRef != imageRef ||
 		child.Running == nil || child.ExitCode == nil || child.Network != "none" || child.User != "0:0" || child.ReadOnly == nil || !*child.ReadOnly || child.Privileged == nil || *child.Privileged ||
-		!reflect.DeepEqual(child.Entrypoint, []string{resetD101PreIntentCaptureEntrypoint}) || len(child.Cmd) != 0 || !reflect.DeepEqual(child.CapDrop, []string{"ALL"}) ||
+		!reflect.DeepEqual(child.Entrypoint, []string{resetD101PreIntentCaptureEntrypoint}) || len(child.Cmd) != 0 || len(child.CapAdd) != 0 || !reflect.DeepEqual(child.CapDrop, []string{"ALL"}) ||
 		len(child.SecurityOptions) != 1 || child.SecurityOptions[0] != "no-new-privileges" && child.SecurityOptions[0] != "no-new-privileges=true" || len(child.Mounts) != 3 || child.Mounts[2] != nil {
 		return resetD101PreIntentChild{}, errResetExecutionEvidence
 	}
@@ -131,7 +145,7 @@ func (c config) runResetD101PreIntentCapture(ctx context.Context, s *resetD101Pr
 	}
 	imageRef := args[len(args)-1]
 	inspect := func() (resetD101PreIntentChild, error) {
-		out, err := call("inspect", "--format", resetD101SeedChildInspectFormat, id)
+		out, err := call("inspect", "--format", resetD101PreIntentChildInspectFormat, id)
 		if err != nil {
 			return resetD101PreIntentChild{}, err
 		}
@@ -181,7 +195,7 @@ func (c config) requireResetD101PreIntentRetainedChild(ctx context.Context, r *r
 	if ctx == nil || ctx.Err() != nil || r == nil || r.beforeCommand == nil || r.beforeCommand(ctx) != nil || r.recheck() != nil {
 		return errResetExecutionEvidence
 	}
-	out, err := c.runServerDockerContext(ctx, "inspect", "--format", resetD101SeedChildInspectFormat, r.child.ID)
+	out, err := c.runServerDockerContext(ctx, "inspect", "--format", resetD101PreIntentChildInspectFormat, r.child.ID)
 	if err != nil {
 		return errResetExecutionEvidence
 	}

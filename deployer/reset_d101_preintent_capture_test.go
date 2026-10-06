@@ -75,6 +75,7 @@ func TestPreIntentChildRequiresExactIsolationAndArguments(t *testing.T) {
 			v.Mounts = append(v.Mounts[:2], &resetD101CapsMount{Source: "/var/run/docker.sock"}, nil)
 		}, false},
 		{"network", func(v *resetD101PreIntentChild) { v.Network = "bridge" }, false},
+		{"added-capability", func(v *resetD101PreIntentChild) { v.CapAdd = []string{"SYS_ADMIN"} }, false},
 		{"old-wrapper", func(v *resetD101PreIntentChild) { v.Entrypoint = []string{"/app/d101-selected-capture"} }, false},
 		{"caller-args", func(v *resetD101PreIntentChild) { v.Cmd = []string{"--capture"} }, false},
 		{"privileged", func(v *resetD101PreIntentChild) { yes := true; v.Privileged = &yes }, false},
