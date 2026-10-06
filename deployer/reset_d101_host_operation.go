@@ -44,6 +44,12 @@ func earlyResetD101HostCommand(args []string, getenv func(string) string, output
 		return false, 0
 	}
 	switch args[1] {
+	case "--d101-initialize-key3":
+		if len(args) != 4 || args[2] != "--ceremony-card-sha256" || !resetEvidenceSHA.MatchString(args[3]) ||
+			runtime.GOOS != "linux" || runtime.GOARCH != "amd64" || os.Geteuid() != 0 {
+			return true, 2
+		}
+		return true, runResetD101Key3Initialization(context.Background(), args[3])
 	case "--d101-prepared-relay":
 		if len(args) != 2 || getenv == nil || !validResetD101ServiceToken(getenv("DEPLOYER_TOKEN")) {
 			return true, 2
