@@ -87,7 +87,8 @@ func (c config) requireResetD101PreStopLeaseAndPlan(ctx context.Context, s *rese
 	}
 	intentWire, err := readResetPrivateCustody(filepath.Join(c.serversDir, ".deployer-reset-intents"), s.intent.Intent.OperationID, 0)
 	planWire, planErr := readResetPrivateCustody(filepath.Join(c.serversDir, ".deployer-reset-approvals"), s.intent.Intent.OperationID, 0)
-	if err != nil || planErr != nil || !bytes.Equal(intentWire, s.intent.originalBytes()) || !bytes.Equal(planWire, s.planOriginal) || ctx.Err() != nil || s.caller.Err() != nil || validateResetApprovalPlan(s.plan, s.intent.Intent.OperationID, s.intent.Target, time.Now()) != nil || c.requireResetD101PreStopLease(s) != nil {
+	var nativePlan resetApprovalPlan
+	if err != nil || planErr != nil || !bytes.Equal(intentWire, s.intent.originalBytes()) || !bytes.Equal(planWire, s.planOriginal) || decodeResetPrivateJSON(planWire, &nativePlan) != nil || !reflect.DeepEqual(nativePlan, s.plan) || ctx.Err() != nil || s.caller.Err() != nil || validateResetApprovalPlan(s.plan, s.intent.Intent.OperationID, s.intent.Target, time.Now()) != nil || c.requireResetD101PreStopLease(s) != nil {
 		return errResetExecutionEvidence
 	}
 	return nil
