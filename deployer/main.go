@@ -1337,8 +1337,20 @@ func (c config) repairLifecycleJournal() (repairErr error) {
 		}
 		return c.clearLifecycleJournal()
 	}
+	if journal.Operation == "reset" && journal.ResetTarget == nil {
+		if journal.Stage == "" || journal.Stage == lifecycleJournalStagePrepared {
+			return errors.New("reset recovery target is unavailable before destructive mutation")
+		}
+		effectiveTarget, err := resetLifecycleTargetForEnv(target.EnvFile, nil)
+		if err != nil {
+			return err
+		}
+		// Freeze the resolved target in this local recovery attempt. The durable
+		// legacy journal remains unchanged; preparation consumes this same target.
+		journal.ResetTarget = &effectiveTarget
+	}
 	if journal.ResetTarget != nil {
-		if journal.ResetTarget.ScenarioCode == "scenario_3190" || len(journal.ResetTarget.StorageImageDigests) != 0 {
+		if resetTargetRequiresD101Execution(*journal.ResetTarget) {
 			// Completed bound cleanup above is read-only. New destructive D101
 			// recovery cannot bypass the missing evidence/phase workflow here.
 			return errors.New("D101 reset recovery requires linked execution evidence; automatic replay is closed")
@@ -1539,6 +1551,12 @@ func (c config) markResetRepairRequired(id string, cause error) error {
 		return fmt.Errorf("could not durably persist reset repair-required state: %v (original failure: %w)", markerErr, cause)
 	}
 	return cause
+}
+
+// Legacy target readability does not authorize destructive D101 execution.
+// Call only after resolving the complete target, including inherited settings.
+func resetTargetRequiresD101Execution(target resetLifecycleTarget) bool {
+	return target.ScenarioCode == "scenario_3190" || len(target.StorageImageDigests) != 0
 }
 
 func (c config) prepareResetRecovery(journal lifecycleJournal, target serverTarget) error {
@@ -4319,6 +4337,9 @@ func (c config) resetServerWithMaintenanceLease(rawID string, req resetServerReq
 	resetTarget, err := resetLifecycleTargetForEnvWithImageDigests(envFile, updates, req.ImageDigests)
 	if err != nil {
 		return createServerResponse{OK: false, ID: id, Name: entry.Name, Project: entry.DeployProject, Detail: err.Error()}, http.StatusBadRequest
+	}
+	if resetTargetRequiresD101Execution(resetTarget) {
+		return createServerResponse{OK: false, ID: id, Detail: "3190 리셋은 검증된 유지보수 실행 경로가 필요합니다."}, http.StatusBadRequest
 	}
 	fingerprint := resetRequestFingerprint(id, resetTarget)
 	operationID := requestedOperationID
