@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -74,11 +77,53 @@ type currentFreezeHostInstallation struct {
 	supplier            currentFreezeHostSupplier
 }
 
-// Fixed runtime adapter input is deliberately not obtained from argv, env or the
-// seven-key reader JSON. The original installer/issuer/launcher mapping is not
-// supplied yet: no installed current authority is fabricated from that JSON.
-func fixedCurrentFreezeHostInstallation(_ d101custody.Original) (currentFreezeHostInstallation, error) {
-	return currentFreezeHostInstallation{}, d101custody.ErrUnavailable
+// Actual reviewed private Go input. Its expected pins and mandatory writer
+// authenticator are never adopted from reader JSON, argv or environment.
+var reviewedCurrentFreezeHostInputs *currentFreezeHostInstallation
+
+// Retain the wrapper for the helper process's whole lifetime. It wraps only the
+// already inherited descriptor: no pathname open/reacquire/duplicate/unlock or
+// Close is performed. The external launcher owns continuity/release policy.
+var inheritedCurrentFreezeDescriptor struct {
+	sync.Mutex
+	file *os.File
+}
+
+func fixedCurrentFreezeHostInstallation(original d101custody.Original) (currentFreezeHostInstallation, error) {
+	return fixedCurrentFreezeHostInstallationWithInput(original, reviewedCurrentFreezeHostInputs, runtime.GOOS)
+}
+
+// Explicit data/platform inputs are private portable fixture seams; the
+// production entry above always uses its reviewed compiled input and GOOS.
+func fixedCurrentFreezeHostInstallationWithInput(original d101custody.Original, input *currentFreezeHostInstallation, platform string) (currentFreezeHostInstallation, error) {
+	if platform != "linux" || input == nil {
+		return currentFreezeHostInstallation{}, d101custody.ErrUnavailable
+	}
+	pins := *input
+	if original.SHA256 != pins.installationSHA || !currentFreezeSHA.MatchString(pins.installationSHA) ||
+		pins.supplier == nil || (reflect.ValueOf(pins.supplier).Kind() == reflect.Pointer && reflect.ValueOf(pins.supplier).IsNil()) ||
+		!currentFreezeOp.MatchString(pins.operationID) || !currentFreezeSHA.MatchString(pins.targetFingerprint) ||
+		!currentFreezeSHA.MatchString(pins.freezeSHA) || pins.parentDevice == 0 || pins.parentInode == 0 ||
+		pins.lockPins.Inode == 0 || pins.destructiveCutoff.IsZero() || !filepath.IsAbs(pins.directory) || filepath.Clean(pins.directory) != pins.directory {
+		return currentFreezeHostInstallation{}, d101custody.ErrUnavailable
+	}
+	inheritedCurrentFreezeDescriptor.Lock()
+	defer inheritedCurrentFreezeDescriptor.Unlock()
+	if inheritedCurrentFreezeDescriptor.file == nil {
+		inheritedCurrentFreezeDescriptor.file = os.NewFile(9, "inherited-production-lock")
+	}
+	pins.descriptor = inheritedCurrentFreezeDescriptor.file
+	if pins.descriptor == nil || pins.descriptor.Fd() != 9 {
+		return currentFreezeHostInstallation{}, d101custody.ErrUnavailable
+	}
+	// This is only a private capture lifetime, never a human approval/operation
+	// UUID. Every capture retains a new O_EXCL original without overwriting old.
+	var capture [16]byte
+	if _, err := rand.Read(capture[:]); err != nil {
+		return currentFreezeHostInstallation{}, d101custody.ErrUnavailable
+	}
+	pins.captureNonce = hex.EncodeToString(capture[:])
+	return pins, nil
 }
 func readCurrentFreeze(read privateReader) ([]byte, error) {
 	if read == nil {

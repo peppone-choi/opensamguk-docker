@@ -25,18 +25,18 @@ type resetD101InstalledSources struct {
 }
 type resetD101InstallationInputReader func(context.Context, config) (resetD101InstalledSources, error)
 
-// Production has no mapped approved installer/issuer/launcher input yet. Read
-// the EXISTING fixed native installation only, then deny; its UID/mode/SHA and
-// seven-key shape do not authenticate the human issuer or create current sources.
-// No fabricated key/UUID/path or always-success verifier fills that gap.
-func readFixedResetD101InstalledSources(ctx context.Context, _ config) (resetD101InstalledSources, error) {
+// The existing record is consumed by the concrete mapper below. Independent
+// reviewed pins/actual producers are private installer input, never learned
+// from that record or exposed through HTTP/env. Missing input stays closed.
+func readFixedResetD101InstalledSources(ctx context.Context, c config) (resetD101InstalledSources, error) {
 	if ctx == nil || ctx.Err() != nil {
 		return resetD101InstalledSources{}, errResetExecutionEvidence
 	}
-	if _, _, err := d101custody.CapturePrivateOriginalPin(resetD101NativeReaderInstallationPath, 64<<10); err != nil {
+	original, pin, err := d101custody.CapturePrivateOriginalPin(resetD101NativeReaderInstallationPath, 64<<10)
+	if err != nil {
 		return resetD101InstalledSources{}, err
 	}
-	return resetD101InstalledSources{}, errResetD101InstallationNotSupplied
+	return mapResetD101FixedInstallation(ctx, c, original, pin, c.d101FixedInstallation)
 }
 func closeResetD101InstalledSources(c config) config {
 	c.d101PurposeAuthority = nil

@@ -302,6 +302,7 @@ var sharedEnvAllowlist = map[string]envFieldSpec{
 
 // 환경변수 묶음.
 type config struct {
+	d101FixedInstallation         *resetD101FixedInstallation         // Independently reviewed installer pins/producers; never an env/request field.
 	d101SeedMaterialInputs        *resetD101SeedMaterialInputs        // Independent fixed native inputs; nil closes before any physical command.
 	d101CandidatePipeline         *resetD101CandidatePipeline         // Fixed native installation; nil fails before any physical command.
 	d101PurposeAuthority          resetD101PurposeAuthoritySource     // Fixed approved host source; no request/env enablement.
@@ -1980,6 +1981,7 @@ func loadConfig() (config, error) {
 		return config{}, err
 	}
 	c := config{
+		d101FixedInstallation:    resetD101ReviewedFixedInstallation,
 		token:                    os.Getenv("DEPLOYER_TOKEN"),
 		composeDir:               envOr("COMPOSE_DIR", "/workspace"),
 		composeHostDir:           envOr("COMPOSE_HOST_DIR", envOr("PWD", ".")),
