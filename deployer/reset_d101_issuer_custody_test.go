@@ -2,8 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/x509"
+	"encoding/json"
+	"opensamguk-deployer/internal/d101operatorauth"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -126,6 +132,141 @@ func TestIssuerLedgerDirectoryAndBudgetRejectUnknownOrOverflow(t *testing.T) {
 			}
 			if resetD101IssuerLedgerBudget(root, once, cap, reserve, uid) == nil {
 				t.Fatal("unknown/budget unsafe namespace accepted")
+			}
+		})
+	}
+}
+
+func TestNativeIssuerEmitterMissingOpaqueInputsNeverCapturesOrSigns(t *testing.T) {
+	if emitter, err := newResetD101NativeIssuerEmission(resetD101NativeIssuerEmissionInputs{}); err == nil || emitter != nil {
+		t.Fatal("missing native semantic/key/output inputs registered")
+	}
+	var emitter *resetD101NativeIssuerEmission
+	if emitter.IssueAndRetain(context.Background(), nil, d101operatorauth.TechnicalIssuance{}) == nil || emitter.AuthenticateAvailability(context.Background(), nil, d101operatorauth.ReviewedPolicy{}) == nil {
+		t.Fatal("missing opaque/native inputs accepted")
+	}
+}
+func TestNativeIssuerRoleEnvelopeUsesExistingRoleDomainAndRejectsRootKey(t *testing.T) {
+	for _, name := range []string{"approval", "receipt", "unknown-role", "root-key", "wrong-public-key", "changed-unsigned", "cross-role-domain", "corrupt-envelope"} {
+		t.Run(name, func(t *testing.T) {
+			// Public deterministic synthetic crypto fixture, never native signing.
+			private := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{21}, ed25519.SeedSize))
+			spki, err := x509.MarshalPKIXPublicKey(private.Public())
+			if err != nil {
+				t.Fatal(err)
+			}
+			issuer := d101operatorauth.IssuerPins{Role: d101operatorauth.ApprovalIssuerRole, PublicKeySPKI: spki, PublicKeySPKISHA256: resetD101OriginalSHA(spki)}
+			key := resetD101SigningKey{keyID: "synthetic-issuer", publicKeySpkiSHA: issuer.PublicKeySPKISHA256, private: private}
+			defer key.close()
+			root := strings.Repeat("f", 64)
+			unsigned := []byte(`{"synthetic":"frozen unsigned"}`)
+			if name == "receipt" {
+				issuer.Role = d101operatorauth.ApprovedReceiptIssuerRole
+			}
+			if name == "unknown-role" {
+				issuer.Role = "QUERY"
+			}
+			if name == "root-key" {
+				root = issuer.PublicKeySPKISHA256
+			}
+			if name == "wrong-public-key" {
+				issuer.PublicKeySPKISHA256 = strings.Repeat("e", 64)
+			}
+			wire, err := signResetD101IssuerRoleEnvelope(&key, issuer, root, unsigned)
+			if name == "unknown-role" || name == "root-key" || name == "wrong-public-key" {
+				if err == nil || wire != nil {
+					t.Fatal("unapproved role/root/mismatched key signed")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if name == "changed-unsigned" {
+				unsigned = append(unsigned, ' ')
+			}
+			if name == "cross-role-domain" {
+				issuer.Role = d101operatorauth.ApprovedReceiptIssuerRole
+			}
+			if name == "corrupt-envelope" {
+				var env resetD101SignedHostOriginal
+				if json.Unmarshal(wire, &env) != nil {
+					t.Fatal("fixture")
+				}
+				env.SignatureBase64url = "invalid"
+				wire, _ = json.Marshal(env)
+			}
+			err = verifyResetD101IssuerRoleEnvelope(wire, unsigned, issuer, root)
+			if (err == nil) != (name == "approval" || name == "receipt") {
+				t.Fatal("exact existing role/domain/frozen bytes verification")
+			}
+		})
+	}
+}
+func TestNativeIssuerEmissionRetentionPreservesAndRejectsNativeReplacement(t *testing.T) {
+	for _, name := range []string{"retained", "existing", "same-byte-replaced"} {
+		t.Run(name, func(t *testing.T) {
+			dir, _ := resetD101IssuerLedgerTestDirectory(t)
+			uid := uint32(os.Getuid())
+			op := strings.Repeat("a", 32)
+			wire := []byte("synthetic retained envelope")
+			if name == "existing" {
+				if err := os.WriteFile(filepath.Join(dir.Name(), op+".json"), []byte("preserved"), 0400); err != nil {
+					t.Fatal(err)
+				}
+			}
+			o, err := writeResetD101IssuerEmissionHeld(context.Background(), dir, op, wire, uid)
+			if name == "existing" {
+				if err == nil || o.file != nil {
+					t.Fatal("overwrite accepted")
+				}
+				b, _ := os.ReadFile(filepath.Join(dir.Name(), op+".json"))
+				if string(b) != "preserved" {
+					t.Fatal("old envelope changed")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer o.file.Close()
+			if name == "same-byte-replaced" {
+				path := filepath.Join(dir.Name(), op+".json")
+				if os.Rename(path, path+".old") != nil || os.WriteFile(path, wire, 0400) != nil {
+					t.Fatal("fixture replacement")
+				}
+			}
+			if (recheckResetD101PreparedHeldOriginal(o, uid) == nil) != (name == "retained") {
+				t.Fatal("native descriptor replacement result")
+			}
+		})
+	}
+}
+
+type resetD101IssuerSnapshotMutationFixture struct{ mutate bool }
+
+func (s resetD101IssuerSnapshotMutationFixture) CaptureAuthenticatedUnsigned(context.Context, d101operatorauth.TechnicalIssuance) (resetD101IssuerSemanticSnapshot, error) {
+	return resetD101IssuerSemanticSnapshot{}, errResetExecutionEvidence
+}
+func (s resetD101IssuerSnapshotMutationFixture) RecheckAuthenticatedUnsigned(_ context.Context, _ d101operatorauth.TechnicalIssuance, v resetD101IssuerSemanticSnapshot) error {
+	if s.mutate {
+		v.Original13["synthetic"][0] = 'X'
+	}
+	return nil
+}
+func TestNativeIssuerSemanticRecheckRejectsSnapshotMutation(t *testing.T) {
+	for _, mutate := range []bool{false, true} {
+		name := "unchanged"
+		if mutate {
+			name = "mutated"
+		}
+		t.Run(name, func(t *testing.T) {
+			// Private snapshot-copy seam only, zero issuance stays unavailable in
+			// the production factory/emitter; this fixture grants no authority.
+			s := &resetD101IssuerEmissionSemanticSource{actual: resetD101IssuerSnapshotMutationFixture{mutate: mutate}, frozen: resetD101IssuerSemanticSnapshot{Original13: map[string][]byte{"synthetic": []byte("original")}}, captured: true}
+			err := s.RecheckAuthenticatedUnsigned(context.Background(), d101operatorauth.TechnicalIssuance{}, s.frozen)
+			if (err == nil) == mutate || string(s.frozen.Original13["synthetic"]) != "original" {
+				t.Fatal("callback mutation accepted or frozen input changed")
 			}
 		})
 	}

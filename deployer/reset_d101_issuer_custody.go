@@ -3,12 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -16,6 +19,7 @@ import (
 
 	"opensamguk-deployer/internal/d101custody"
 	"opensamguk-deployer/internal/d101operatorauth"
+	"opensamguk-deployer/internal/d101origin"
 )
 
 const resetD101IssuerLedgerDirectory = "/etc/opensamguk/d101/current-operator"
@@ -66,6 +70,12 @@ func (c *resetD101NativeIssuerCustody) Authenticate(ctx context.Context, fd *os.
 	}
 	if c.inputs.authenticate(ctx, fd, op, phase) != nil || ctx.Err() != nil {
 		return errResetExecutionEvidence
+	}
+	if phase == "issuer-pre-ready" || phase == "issuer-reserved" {
+		availability, ok := c.inputs.emitter.(resetD101IssuerOriginalAvailability)
+		if !ok || availability.AuthenticateAvailability(ctx, fd, cloneResetD101TechnicalPolicy(c.inputs.policy)) != nil || ctx.Err() != nil {
+			return errResetExecutionEvidence
+		}
 	}
 	root, err := openResetD101IssuerDirectory(resetD101IssuerLedgerDirectory, c.inputs.directoryPin, 0)
 	if err != nil {
@@ -780,6 +790,432 @@ func resetD101PreparedDirectoryBudget(dir *os.File, cap, reserve uint64) error {
 	}
 	var free syscall.Statfs_t
 	if syscall.Fstatfs(int(dir.Fd()), &free) != nil || uint64(free.Bsize) == 0 || uint64(free.Bavail) > ^uint64(0)/uint64(free.Bsize) || uint64(free.Bavail)*uint64(free.Bsize) < reserve+4*(64<<10) {
+		return errResetExecutionEvidence
+	}
+	return nil
+}
+
+// Mandatory pre-READY native availability, without inventing a current event.
+// The existing issuer entry reserves before R and claims the actual authenticated
+// JTI before this concrete emitter is ever called.
+type resetD101IssuerOriginalAvailability interface {
+	AuthenticateAvailability(context.Context, *os.File, d101operatorauth.ReviewedPolicy) error
+}
+type resetD101IssuerEmissionOutput struct {
+	directory string
+	pin       resetD101IssuerDirectoryPin
+}
+type resetD101NativeIssuerEmissionInputs struct {
+	policy                              d101operatorauth.ReviewedPolicy
+	semantic                            resetD101IssuerSemanticSource
+	approvalKey, receiptKey             resetD101SigningKeyPins
+	approvalKeyNative, receiptKeyNative d101custody.NativeFilePin
+	origin, attestation, provenance     resetD101IssuerEmissionOutput
+	retentionOwner                      string
+	retentionSeconds                    int64
+	byteBudget, reserveBytes            uint64
+	// Actual source/policy/history/upstream/native availability and final native
+	// semantics, independent of this adapter's shape/codec/signature checks.
+	authenticate   func(context.Context, *os.File, string, string) error
+	verifyRetained func(context.Context, *os.File, d101operatorauth.TechnicalIssuance, resetD101IssuerSemanticSnapshot, []byte, []byte, []byte) error
+}
+type resetD101NativeIssuerEmission struct {
+	mu        sync.Mutex
+	inputs    resetD101NativeIssuerEmissionInputs
+	attempted bool
+}
+
+func newResetD101NativeIssuerEmission(p resetD101NativeIssuerEmissionInputs) (*resetD101NativeIssuerEmission, error) {
+	if p.semantic == nil || reflect.ValueOf(p.semantic).Kind() == reflect.Pointer && reflect.ValueOf(p.semantic).IsNil() || p.authenticate == nil || p.verifyRetained == nil ||
+		!resetD101IssuerIdentity.MatchString(p.retentionOwner) || p.retentionSeconds < 7*24*60*60 || p.byteBudget == 0 || p.byteBudget > 1<<30 || p.reserveBytes < 10<<30 || p.reserveBytes > ^uint64(0)-3*(64<<10) {
+		return nil, errResetD101InstallationNotSupplied
+	}
+	if _, err := d101operatorauth.NewVerifier(p.policy); err != nil {
+		return nil, errResetExecutionEvidence
+	}
+	p.policy = cloneResetD101TechnicalPolicy(p.policy)
+	seen := map[string]bool{}
+	seenPin := map[resetD101IssuerDirectoryPin]bool{}
+	for _, output := range []resetD101IssuerEmissionOutput{p.origin, p.attestation, p.provenance} {
+		if !filepath.IsAbs(output.directory) || filepath.Clean(output.directory) != output.directory || output.pin.device == 0 || output.pin.inode == 0 || seen[output.directory] || seenPin[output.pin] {
+			return nil, errResetExecutionEvidence
+		}
+		seen[output.directory] = true
+		seenPin[output.pin] = true
+	}
+	if p.origin.pin.device != p.attestation.pin.device || p.origin.pin.device != p.provenance.pin.device {
+		return nil, errResetExecutionEvidence
+	}
+	for _, item := range []struct {
+		key    resetD101SigningKeyPins
+		native d101custody.NativeFilePin
+		issuer d101operatorauth.IssuerPins
+	}{
+		{p.approvalKey, p.approvalKeyNative, p.policy.ApprovalIssuer}, {p.receiptKey, p.receiptKeyNative, p.policy.ReceiptIssuer},
+	} {
+		if !filepath.IsAbs(item.key.Directory) || filepath.Clean(item.key.Directory) != item.key.Directory || !lifecycleJobIDRe.MatchString(item.key.CustodyID) || !resetD101KeyID.MatchString(item.key.KeyID) ||
+			item.key.PublicKeySpkiSHA != item.issuer.PublicKeySPKISHA256 || item.key.PublicKeySpkiSHA == p.policy.RootPurposeSPKISHA256 || !resetEvidenceSHA.MatchString(item.key.EnvelopeSHA) || item.native.SHA256 != item.key.EnvelopeSHA ||
+			item.native.OwnerUID != 0 || item.native.FileMode != 0400 || item.native.LinkCount != 1 || item.native.ParentOwnerUID != 0 || item.native.ParentMode != 0700 {
+			return nil, errResetExecutionEvidence
+		}
+	}
+	if p.approvalKey.KeyID == p.receiptKey.KeyID || p.approvalKey.PublicKeySpkiSHA == p.receiptKey.PublicKeySpkiSHA || p.approvalKey.Directory == p.receiptKey.Directory && p.approvalKey.CustodyID == p.receiptKey.CustodyID {
+		return nil, errResetExecutionEvidence
+	}
+	return &resetD101NativeIssuerEmission{inputs: p}, nil
+}
+
+func (e *resetD101NativeIssuerEmission) authenticate(ctx context.Context, fd *os.File, phase string) error {
+	if e == nil || ctx == nil || ctx.Err() != nil || runtime.GOOS != "linux" || os.Geteuid() != 0 || fd == nil || fd.Fd() != 9 || e.inputs.authenticate == nil ||
+		rootBuiltSourceSHA != e.inputs.policy.Scope.DockerSourceSHA || time.Now().Unix() >= e.inputs.policy.CutoffUnix || e.inputs.authenticate(ctx, fd, e.inputs.policy.Scope.OperationID, phase+"-before") != nil {
+		return errResetExecutionEvidence
+	}
+	for _, item := range []struct {
+		key    resetD101SigningKeyPins
+		native d101custody.NativeFilePin
+	}{{e.inputs.approvalKey, e.inputs.approvalKeyNative}, {e.inputs.receiptKey, e.inputs.receiptKeyNative}} {
+		wire, native, err := d101custody.CapturePrivateOriginalPin(filepath.Join(item.key.Directory, item.key.CustodyID+".json"), 64<<10)
+		if err != nil || native != item.native || wire.SHA256 != item.key.EnvelopeSHA || ctx.Err() != nil {
+			return errResetExecutionEvidence
+		}
+	}
+	if e.inputs.authenticate(ctx, fd, e.inputs.policy.Scope.OperationID, phase+"-after") != nil || ctx.Err() != nil {
+		return errResetExecutionEvidence
+	}
+	return nil
+}
+
+func (e *resetD101NativeIssuerEmission) AuthenticateAvailability(ctx context.Context, fd *os.File, policy d101operatorauth.ReviewedPolicy) error {
+	if e == nil || !reflect.DeepEqual(policy, e.inputs.policy) || e.authenticate(ctx, fd, "issuer-original-availability") != nil {
+		return errResetExecutionEvidence
+	}
+	if !e.mu.TryLock() {
+		return errResetExecutionEvidence
+	}
+	defer e.mu.Unlock()
+	if e.attempted {
+		return errResetExecutionEvidence
+	}
+	var total uint64
+	for _, output := range []resetD101IssuerEmissionOutput{e.inputs.origin, e.inputs.attestation, e.inputs.provenance} {
+		dir, err := openResetD101IssuerDirectory(output.directory, output.pin, 0)
+		if err != nil {
+			return errResetExecutionEvidence
+		}
+		err = resetD101IssuerEmissionDirectoryBudget(ctx, dir, e.inputs.policy.Scope.OperationID, e.inputs.byteBudget, e.inputs.reserveBytes, &total)
+		_ = dir.Close()
+		if err != nil {
+			return errResetExecutionEvidence
+		}
+	}
+	return e.authenticate(ctx, fd, "issuer-original-availability-final")
+}
+
+// Retain the exact frozen snapshot that the C1 factory authenticated; never
+// recapture another unsigned subject after signing or mutate its references.
+type resetD101IssuerEmissionSemanticSource struct {
+	actual   resetD101IssuerSemanticSource
+	frozen   resetD101IssuerSemanticSnapshot
+	captured bool
+}
+
+func (s *resetD101IssuerEmissionSemanticSource) CaptureAuthenticatedUnsigned(ctx context.Context, issuance d101operatorauth.TechnicalIssuance) (resetD101IssuerSemanticSnapshot, error) {
+	if s == nil || s.actual == nil || s.captured {
+		return resetD101IssuerSemanticSnapshot{}, errResetExecutionEvidence
+	}
+	snapshot, err := s.actual.CaptureAuthenticatedUnsigned(ctx, issuance)
+	if err != nil {
+		return resetD101IssuerSemanticSnapshot{}, err
+	}
+	s.frozen, err = freezeResetD101IssuerSemanticSnapshot(snapshot)
+	if err != nil {
+		return resetD101IssuerSemanticSnapshot{}, err
+	}
+	s.captured = true
+	return freezeResetD101IssuerSemanticSnapshot(s.frozen)
+}
+func (s *resetD101IssuerEmissionSemanticSource) RecheckAuthenticatedUnsigned(ctx context.Context, issuance d101operatorauth.TechnicalIssuance, snapshot resetD101IssuerSemanticSnapshot) error {
+	if s == nil || !s.captured || ctx == nil || ctx.Err() != nil {
+		return errResetExecutionEvidence
+	}
+	a, err := json.Marshal(s.frozen)
+	b, e2 := json.Marshal(snapshot)
+	if err != nil || e2 != nil || !bytes.Equal(a, b) {
+		return errResetExecutionEvidence
+	}
+	copy, err := freezeResetD101IssuerSemanticSnapshot(s.frozen)
+	if err != nil || s.actual.RecheckAuthenticatedUnsigned(ctx, issuance, copy) != nil || ctx.Err() != nil {
+		return errResetExecutionEvidence
+	}
+	after, err := json.Marshal(copy)
+	if err != nil || !bytes.Equal(a, after) {
+		return errResetExecutionEvidence
+	}
+	return nil
+}
+
+func (e *resetD101NativeIssuerEmission) IssueAndRetain(ctx context.Context, fd *os.File, issuance d101operatorauth.TechnicalIssuance) error {
+	if e == nil || e.authenticate(ctx, fd, "issuer-semantic-before") != nil {
+		return errResetExecutionEvidence
+	}
+	scope, e1 := issuance.Scope()
+	approval, e2 := issuance.Issuer(d101operatorauth.ApprovalIssuerRole)
+	receipt, e3 := issuance.Issuer(d101operatorauth.ApprovedReceiptIssuerRole)
+	if e1 != nil || e2 != nil || e3 != nil || scope != e.inputs.policy.Scope || !reflect.DeepEqual(approval, e.inputs.policy.ApprovalIssuer) || !reflect.DeepEqual(receipt, e.inputs.policy.ReceiptIssuer) {
+		return errResetExecutionEvidence
+	}
+	if !e.mu.TryLock() {
+		return errResetExecutionEvidence
+	}
+	defer e.mu.Unlock()
+	if e.attempted {
+		return errResetExecutionEvidence
+	}
+	var total uint64
+	for _, output := range []resetD101IssuerEmissionOutput{e.inputs.origin, e.inputs.attestation, e.inputs.provenance} {
+		dir, err := openResetD101IssuerDirectory(output.directory, output.pin, 0)
+		if err != nil {
+			return errResetExecutionEvidence
+		}
+		err = resetD101IssuerEmissionDirectoryBudget(ctx, dir, scope.OperationID, e.inputs.byteBudget, e.inputs.reserveBytes, &total)
+		_ = dir.Close()
+		if err != nil {
+			return errResetExecutionEvidence
+		}
+	}
+	e.attempted = true
+	semantic := &resetD101IssuerEmissionSemanticSource{actual: e.inputs.semantic}
+	batch, err := newResetD101IssuerUnsignedBatch(ctx, issuance, semantic)
+	if err != nil || !semantic.captured || e.authenticate(ctx, fd, "issuer-semantic-both-valid") != nil {
+		return errResetExecutionEvidence
+	}
+	approvalUnsigned, receiptUnsigned := batch.ApprovalPayload(), batch.ReceiptAttestation()
+	if len(approvalUnsigned) == 0 || len(receiptUnsigned) == 0 {
+		return errResetExecutionEvidence
+	}
+	// BOTH semantic batches are valid before either private key is used.
+	approvalKey, err := readResetD101SigningKey(e.inputs.approvalKey)
+	if err != nil {
+		return errResetExecutionEvidence
+	}
+	defer approvalKey.close()
+	receiptKey, err := readResetD101SigningKey(e.inputs.receiptKey)
+	if err != nil {
+		return errResetExecutionEvidence
+	}
+	defer receiptKey.close()
+	if e.authenticate(ctx, fd, "issuer-key-custody-before-sign") != nil {
+		return errResetExecutionEvidence
+	}
+	origin, err := signResetD101IssuerRoleEnvelope(&approvalKey, approval, e.inputs.policy.RootPurposeSPKISHA256, approvalUnsigned)
+	if err != nil {
+		return errResetExecutionEvidence
+	}
+	attestation, err := signResetD101IssuerRoleEnvelope(&receiptKey, receipt, e.inputs.policy.RootPurposeSPKISHA256, receiptUnsigned)
+	if err != nil || e.authenticate(ctx, fd, "issuer-role2-signed") != nil || semantic.RecheckAuthenticatedUnsigned(ctx, issuance, semantic.frozen) != nil {
+		return errResetExecutionEvidence
+	}
+	var dirs []*os.File
+	var held []resetD101PreparedHeldOriginal
+	defer func() {
+		for _, o := range held {
+			_ = o.file.Close()
+		}
+		for _, d := range dirs {
+			_ = d.Close()
+		}
+	}()
+	for _, output := range []resetD101IssuerEmissionOutput{e.inputs.origin, e.inputs.attestation, e.inputs.provenance} {
+		dir, err := openResetD101IssuerDirectory(output.directory, output.pin, 0)
+		if err != nil {
+			return errResetExecutionEvidence
+		}
+		dirs = append(dirs, dir)
+	}
+	for i, wire := range [][]byte{origin, attestation} {
+		o, err := writeResetD101IssuerEmissionHeld(ctx, dirs[i], scope.OperationID, wire, 0)
+		if err != nil {
+			return errResetExecutionEvidence
+		}
+		held = append(held, o)
+	}
+	// Only ACTUAL retained signed envelope bytes can supply the provenance RawRef.
+	if recheckResetD101PreparedHeldOriginal(held[0], 0) != nil || recheckResetD101PreparedHeldOriginal(held[1], 0) != nil ||
+		verifyResetD101IssuerRoleEnvelope(origin, approvalUnsigned, approval, e.inputs.policy.RootPurposeSPKISHA256) != nil {
+		return errResetExecutionEvidence
+	}
+	provenance, err := batch.ProvenanceAfterRetainedAttestation(ctx, held[1].wire)
+	if err != nil {
+		return errResetExecutionEvidence
+	}
+	var value resetD101ApprovedReceiptProvenance
+	if resetD101SemanticDecode(provenance, &value) != nil || value.Scope.OperationID != scope.OperationID || value.Issuer.ScopeAttestationRef.SHA != resetD101OriginalSHA(held[1].wire) {
+		return errResetExecutionEvidence
+	}
+	profile := semantic.frozen.OriginInstallation.Profile
+	binding, err := d101origin.VerifyCryptographicBinding(held[0].wire, semantic.frozen.OriginDependencies[profile.LogicalID], d101origin.ExpectedBinding{Role: d101origin.ApprovalIssuer, OperationID: scope.OperationID, ProfileSHA256: profile.SHA256, ScopeOriginal: semantic.frozen.OriginInstallation.ScopeOriginal}, time.Now())
+	if err != nil || !bytes.Equal(binding.PayloadOriginal(), approvalUnsigned) {
+		return errResetExecutionEvidence
+	}
+	// This existing envelope reference is filled only from the actual retained
+	// signed origin. Its logical ID was independently approved in the snapshot.
+	installedOrigin := semantic.frozen.OriginInstallation
+	installedOrigin.Envelope.SHA256 = resetD101OriginalSHA(held[0].wire)
+	installedOrigin.Envelope.ByteLength = uint64(len(held[0].wire))
+	installedOrigin.Envelope.MediaType = "application/json"
+	if _, err := d101origin.ParseUnverifiedRecords(binding, semantic.frozen.OriginOriginal, semantic.frozen.OriginCustodyOriginal, installedOrigin, time.Now()); err != nil ||
+		verifyResetD101IssuerRoleEnvelope(held[1].wire, receiptUnsigned, receipt, e.inputs.policy.RootPurposeSPKISHA256) != nil {
+		return errResetExecutionEvidence
+	}
+	o, err := writeResetD101IssuerEmissionHeld(ctx, dirs[2], scope.OperationID, provenance, 0)
+	if err != nil {
+		return errResetExecutionEvidence
+	}
+	held = append(held, o)
+	check := func() error {
+		for i, o := range held {
+			if requireResetD101IssuerDirectory(dirs[i], []resetD101IssuerEmissionOutput{e.inputs.origin, e.inputs.attestation, e.inputs.provenance}[i].pin, 0) != nil || recheckResetD101PreparedHeldOriginal(o, 0) != nil || ctx.Err() != nil {
+				return errResetExecutionEvidence
+			}
+		}
+		return semantic.RecheckAuthenticatedUnsigned(ctx, issuance, semantic.frozen)
+	}
+	finalSnapshot, err := freezeResetD101IssuerSemanticSnapshot(semantic.frozen)
+	before, e4 := json.Marshal(finalSnapshot)
+	if err != nil || e4 != nil || check() != nil || e.inputs.verifyRetained(ctx, fd, issuance, finalSnapshot, bytes.Clone(held[0].wire), bytes.Clone(held[1].wire), bytes.Clone(held[2].wire)) != nil {
+		return errResetExecutionEvidence
+	}
+	after, err := json.Marshal(finalSnapshot)
+	if err != nil || !bytes.Equal(before, after) || check() != nil || e.authenticate(ctx, fd, "issuer-final-retained") != nil || check() != nil || ctx.Err() != nil {
+		return errResetExecutionEvidence
+	}
+	return nil
+}
+
+func signResetD101IssuerRoleEnvelope(key *resetD101SigningKey, issuer d101operatorauth.IssuerPins, rootSPKI string, unsigned []byte) ([]byte, error) {
+	if key == nil || len(key.private) != ed25519.PrivateKeySize || key.publicKeySpkiSHA != issuer.PublicKeySPKISHA256 || issuer.PublicKeySPKISHA256 == rootSPKI || !resetEvidenceSHA.MatchString(rootSPKI) || len(unsigned) == 0 || len(unsigned) > 32<<10 {
+		return nil, errResetExecutionEvidence
+	}
+	domain := ""
+	switch issuer.Role {
+	case d101operatorauth.ApprovalIssuerRole:
+		domain = d101operatorauth.ApprovalOriginDomain
+	case d101operatorauth.ApprovedReceiptIssuerRole:
+		domain = resetD101ApprovedReceiptAttestationDomain
+	default:
+		return nil, errResetExecutionEvidence
+	}
+	pub, err := resetD101PinnedPublicKey(issuer.PublicKeySPKI, issuer.PublicKeySPKISHA256)
+	if err != nil || !bytes.Equal(key.private.Public().(ed25519.PublicKey), pub) {
+		return nil, errResetExecutionEvidence
+	}
+	sig := ed25519.Sign(key.private, append([]byte(domain), unsigned...))
+	wire, err := json.Marshal(resetD101SignedHostOriginal{SchemaVersion: 1, OriginalBytesBase64url: base64.RawURLEncoding.EncodeToString(unsigned), SignatureBase64url: base64.RawURLEncoding.EncodeToString(sig)})
+	if err != nil || verifyResetD101IssuerRoleEnvelope(wire, unsigned, issuer, rootSPKI) != nil {
+		return nil, errResetExecutionEvidence
+	}
+	return wire, nil
+}
+func verifyResetD101IssuerRoleEnvelope(wire, unsigned []byte, issuer d101operatorauth.IssuerPins, rootSPKI string) error {
+	if issuer.PublicKeySPKISHA256 == rootSPKI || !resetEvidenceSHA.MatchString(rootSPKI) {
+		return errResetExecutionEvidence
+	}
+	domain := ""
+	switch issuer.Role {
+	case d101operatorauth.ApprovalIssuerRole:
+		domain = d101operatorauth.ApprovalOriginDomain
+	case d101operatorauth.ApprovedReceiptIssuerRole:
+		domain = resetD101ApprovedReceiptAttestationDomain
+	default:
+		return errResetExecutionEvidence
+	}
+	var envelope resetD101SignedHostOriginal
+	if resetD101SemanticDecode(wire, &envelope) != nil || envelope.SchemaVersion != 1 {
+		return errResetExecutionEvidence
+	}
+	body, e1 := base64.RawURLEncoding.Strict().DecodeString(envelope.OriginalBytesBase64url)
+	sig, e2 := base64.RawURLEncoding.Strict().DecodeString(envelope.SignatureBase64url)
+	key, e3 := resetD101PinnedPublicKey(issuer.PublicKeySPKI, issuer.PublicKeySPKISHA256)
+	if e1 != nil || e2 != nil || e3 != nil || !bytes.Equal(body, unsigned) || len(sig) != ed25519.SignatureSize || base64.RawURLEncoding.EncodeToString(body) != envelope.OriginalBytesBase64url || base64.RawURLEncoding.EncodeToString(sig) != envelope.SignatureBase64url || !ed25519.Verify(key, append([]byte(domain), body...), sig) {
+		return errResetExecutionEvidence
+	}
+	return nil
+}
+
+func writeResetD101IssuerEmissionHeld(ctx context.Context, dir *os.File, op string, wire []byte, uid uint32) (resetD101PreparedHeldOriginal, error) {
+	if ctx == nil || ctx.Err() != nil || dir == nil || !lifecycleJobIDRe.MatchString(op) || len(wire) == 0 || len(wire) > 64<<10 {
+		return resetD101PreparedHeldOriginal{}, errResetExecutionEvidence
+	}
+	info, err := dir.Stat()
+	if err != nil {
+		return resetD101PreparedHeldOriginal{}, errResetExecutionEvidence
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return resetD101PreparedHeldOriginal{}, errResetExecutionEvidence
+	}
+	pin := resetD101IssuerDirectoryPin{uint64(st.Dev), uint64(st.Ino)}
+	if requireResetD101IssuerDirectory(dir, pin, uid) != nil {
+		return resetD101PreparedHeldOriginal{}, errResetExecutionEvidence
+	}
+	file, err := os.OpenFile(filepath.Join(dir.Name(), op+".json"), os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0400)
+	if err != nil {
+		return resetD101PreparedHeldOriginal{}, errResetExecutionEvidence
+	}
+	owned := false
+	defer func() {
+		if !owned {
+			_ = file.Close()
+		}
+	}()
+	before, err := file.Stat()
+	if err != nil || !resetD101IssuerFileMetadata(before, uid) {
+		return resetD101PreparedHeldOriginal{}, errResetExecutionEvidence
+	}
+	if n, err := file.Write(wire); err != nil || n != len(wire) || file.Sync() != nil || dir.Sync() != nil || ctx.Err() != nil {
+		return resetD101PreparedHeldOriginal{}, errResetExecutionEvidence
+	}
+	after, err := file.Stat()
+	if err != nil || !os.SameFile(before, after) || requireResetD101IssuerDirectory(dir, pin, uid) != nil {
+		return resetD101PreparedHeldOriginal{}, errResetExecutionEvidence
+	}
+	o := resetD101PreparedHeldOriginal{file: file, info: after, wire: bytes.Clone(wire)}
+	if recheckResetD101PreparedHeldOriginal(o, uid) != nil || ctx.Err() != nil {
+		return resetD101PreparedHeldOriginal{}, errResetExecutionEvidence
+	}
+	owned = true
+	return o, nil
+}
+func resetD101IssuerEmissionDirectoryBudget(ctx context.Context, dir *os.File, op string, cap, reserve uint64, total *uint64) error {
+	if ctx == nil || ctx.Err() != nil || dir == nil || total == nil || cap == 0 || cap > 1<<30 || *total > cap || reserve < 10<<30 || reserve > ^uint64(0)-3*(64<<10) {
+		return errResetExecutionEvidence
+	}
+	if _, err := os.Lstat(filepath.Join(dir.Name(), op+".json")); !os.IsNotExist(err) {
+		return errResetExecutionEvidence
+	}
+	stream, err := os.OpenFile(dir.Name(), os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return errResetExecutionEvidence
+	}
+	defer stream.Close()
+	a, e1 := dir.Stat()
+	b, e2 := stream.Stat()
+	if e1 != nil || e2 != nil || !os.SameFile(a, b) {
+		return errResetExecutionEvidence
+	}
+	names, err := stream.Readdirnames(1025)
+	if len(names) > 1024 || err != nil && err != io.EOF {
+		return errResetExecutionEvidence
+	}
+	for _, name := range names {
+		info, err := os.Lstat(filepath.Join(dir.Name(), name))
+		if err != nil || !strings.HasSuffix(name, ".json") || !lifecycleJobIDRe.MatchString(strings.TrimSuffix(name, ".json")) || !resetD101IssuerFileMetadata(info, 0) || info.Size() <= 0 || uint64(info.Size()) > cap-*total {
+			return errResetExecutionEvidence
+		}
+		*total += uint64(info.Size())
+	}
+	var free syscall.Statfs_t
+	if cap-*total < 3*(64<<10) || syscall.Fstatfs(int(dir.Fd()), &free) != nil || uint64(free.Bsize) == 0 || uint64(free.Bavail) > ^uint64(0)/uint64(free.Bsize) || uint64(free.Bavail)*uint64(free.Bsize) < reserve+3*(64<<10) || ctx.Err() != nil {
 		return errResetExecutionEvidence
 	}
 	return nil
