@@ -43,6 +43,8 @@ type resetD101SelectedProducerPins struct {
 }
 type resetD101SelectedProducer struct{ pins resetD101SelectedProducerPins }
 
+const resetD101PreIntentCaptureEntrypoint = "/app/d101-pre-intent-entrypoint"
+
 func newResetD101SelectedProducer(p resetD101SelectedProducerPins) (*resetD101SelectedProducer, error) {
 	if !lifecycleJobIDRe.MatchString(p.OperationID) || !resetEvidenceSHA.MatchString(p.TargetFingerprint) || !gitSHA40.MatchString(p.AppSourceSHA) || !validResetFiveImageDigests(p.ImagePins) ||
 		!resetEvidenceSHA.MatchString(p.ProducerContainerID) || !resetManifestDigest.MatchString(p.ProducerImageID) || !resetRuntimeRepository.MatchString(p.AppRepository) || !resetEvidenceSHA.MatchString(p.FactsSHA) || !resetEvidenceSHA.MatchString(p.ParserBytecodeSHA) || !resetEvidenceSHA.MatchString(p.TopologyAlgorithmSHA) || len(p.TopologyInputs) == 0 || len(p.TopologyInputs) > 32 {
@@ -245,7 +247,7 @@ type resetD101SelectedCaptureObservation struct {
 func (c config) observeResetD101SelectedCapture(ctx context.Context, p resetD101SelectedProducerPins) (resetD101SelectedCaptureObservation, error) {
 	var value resetD101SelectedCaptureObservation
 	out, err := c.runServerDockerContext(ctx, "inspect", "--format", `{"id":{{json .Id}},"imageId":{{json .Image}},"status":{{json .State.Status}},"running":{{json .State.Running}},"exitCode":{{json .State.ExitCode}},"entrypoint":{{json .Config.Entrypoint}},"command":{{json .Config.Cmd}}}`, p.ProducerContainerID)
-	if err != nil || len(out) > 16*1024 || requireResetIntentShape([]byte(out), reflect.TypeOf(value)) != nil || decodeResetPrivateJSON([]byte(out), &value) != nil || value.ID != p.ProducerContainerID || value.ImageID != p.ProducerImageID || value.Status != "exited" || value.Running == nil || *value.Running || value.ExitCode == nil || *value.ExitCode != 0 || !reflect.DeepEqual(value.Entrypoint, []string{"/app/d101-selected-capture"}) || len(value.Command) != 0 {
+	if err != nil || len(out) > 16*1024 || requireResetIntentShape([]byte(out), reflect.TypeOf(value)) != nil || decodeResetPrivateJSON([]byte(out), &value) != nil || value.ID != p.ProducerContainerID || value.ImageID != p.ProducerImageID || value.Status != "exited" || value.Running == nil || *value.Running || value.ExitCode == nil || *value.ExitCode != 0 || !reflect.DeepEqual(value.Entrypoint, []string{resetD101PreIntentCaptureEntrypoint}) || len(value.Command) != 0 {
 		return value, errResetExecutionEvidence
 	}
 	imageOut, err := c.runServerDockerContext(ctx, "image", "inspect", "--format", `{"repoDigests":{{json .RepoDigests}},"os":{{json .Os}},"architecture":{{json .Architecture}}}`, value.ImageID)
