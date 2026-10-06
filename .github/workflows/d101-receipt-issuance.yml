@@ -1,0 +1,35 @@
+name: D101 발급 전용 원문 보존
+
+on:
+  workflow_dispatch:
+    inputs:
+      operationId:
+        description: 독립 설치 범위와 대조할 lowercase32hex 후보
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: d101-issuer-only-${{ inputs.operationId }}
+  cancel-in-progress: false
+
+jobs:
+  issuer-only:
+    runs-on: [self-hosted, gcp-prod]
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: 현재 workflow 소스 읽기
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: 독립 공급자와 발급 전용 host 경로 검증
+        env:
+          OPERATION_SELECTOR: ${{ inputs.operationId }}
+        run: |
+          set -euo pipefail
+          python3 scripts/d101-current-operator-producer.py --operation-id "$OPERATION_SELECTOR"
