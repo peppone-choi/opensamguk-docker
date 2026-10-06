@@ -76,7 +76,7 @@ func resetD101SelectedTopologyPaths(values map[string]string) []string {
 	return result
 }
 func (c config) issueResetD101SelectedSource(ctx context.Context, producer *resetD101SelectedProducer) (string, error) {
-	if producer == nil || ctx == nil || ctx.Err() != nil {
+	if producer == nil || ctx == nil || ctx.Err() != nil || producer.pins.capture == nil {
 		return "", errResetExecutionEvidence
 	}
 	p := producer.pins

@@ -73,6 +73,9 @@ var resetD101PreIntentChildInspectFormat = strings.Replace(resetD101SeedChildIns
 
 func decodeResetD101PreIntentChild(wire, id, imageRef string, s *resetD101PreIntentCaptureSource) (resetD101PreIntentChild, error) {
 	var child resetD101PreIntentChild
+	if s == nil || len(wire) == 0 || len(wire) > 16<<10 || !utf8.ValidString(wire) {
+		return child, errResetExecutionEvidence
+	}
 	var fields map[string]json.RawMessage
 	if json.Unmarshal([]byte(wire), &fields) != nil || len(fields) != reflect.TypeOf(child).NumField() {
 		return child, errResetExecutionEvidence
