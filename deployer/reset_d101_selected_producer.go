@@ -40,12 +40,16 @@ type resetD101SelectedProducerPins struct {
 	SigningKey            resetD101SigningKeyPins
 	ReceiptDirectory      string
 	EnvelopeDirectory     string
+	capture               *resetD101PreIntentCaptureReception
 }
 type resetD101SelectedProducer struct{ pins resetD101SelectedProducerPins }
 
 const resetD101PreIntentCaptureEntrypoint = "/app/d101-pre-intent-entrypoint"
 
 func newResetD101SelectedProducer(p resetD101SelectedProducerPins) (*resetD101SelectedProducer, error) {
+	if p.capture == nil || p.capture.requireProducerPins(p) != nil {
+		return nil, errResetExecutionEvidence
+	}
 	if !lifecycleJobIDRe.MatchString(p.OperationID) || !resetEvidenceSHA.MatchString(p.TargetFingerprint) || !gitSHA40.MatchString(p.AppSourceSHA) || !validResetFiveImageDigests(p.ImagePins) ||
 		!resetEvidenceSHA.MatchString(p.ProducerContainerID) || !resetManifestDigest.MatchString(p.ProducerImageID) || !resetRuntimeRepository.MatchString(p.AppRepository) || !resetEvidenceSHA.MatchString(p.FactsSHA) || !resetEvidenceSHA.MatchString(p.ParserBytecodeSHA) || !resetEvidenceSHA.MatchString(p.TopologyAlgorithmSHA) || len(p.TopologyInputs) == 0 || len(p.TopologyInputs) > 32 {
 		return nil, errResetExecutionEvidence
@@ -84,7 +88,7 @@ func (c config) issueResetD101SelectedSource(ctx context.Context, producer *rese
 	if err != nil {
 		return "", err
 	}
-	raw, err := readResetD101SelectedBytes(p.RawOriginals)
+	raw, err := p.capture.readRawFive()
 	if err != nil {
 		return "", errResetExecutionEvidence
 	}
@@ -206,7 +210,7 @@ func (c config) issueResetD101SelectedSource(ctx context.Context, producer *rese
 			return "", errResetExecutionEvidence
 		}
 	}
-	rawAfter, err := readResetD101SelectedBytes(p.RawOriginals)
+	rawAfter, err := p.capture.readRawFive()
 	if err != nil || !reflect.DeepEqual(rawAfter.ObservedPins(), raw.ObservedPins()) {
 		return "", errResetExecutionEvidence
 	}
@@ -245,12 +249,21 @@ type resetD101SelectedCaptureObservation struct {
 }
 
 func (c config) observeResetD101SelectedCapture(ctx context.Context, p resetD101SelectedProducerPins) (resetD101SelectedCaptureObservation, error) {
+	if p.capture != nil && c.requireResetD101PreIntentRetainedChild(ctx, p.capture) != nil {
+		return resetD101SelectedCaptureObservation{}, errResetExecutionEvidence
+	}
 	var value resetD101SelectedCaptureObservation
-	out, err := c.runServerDockerContext(ctx, "inspect", "--format", `{"id":{{json .Id}},"imageId":{{json .Image}},"status":{{json .State.Status}},"running":{{json .State.Running}},"exitCode":{{json .State.ExitCode}},"entrypoint":{{json .Config.Entrypoint}},"command":{{json .Config.Cmd}}}`, p.ProducerContainerID)
+	call := func(args ...string) (string, error) {
+		if p.capture != nil && (p.capture.beforeCommand == nil || p.capture.beforeCommand(ctx) != nil || p.capture.recheck() != nil) {
+			return "", errResetExecutionEvidence
+		}
+		return c.runServerDockerContext(ctx, args...)
+	}
+	out, err := call("inspect", "--format", `{"id":{{json .Id}},"imageId":{{json .Image}},"status":{{json .State.Status}},"running":{{json .State.Running}},"exitCode":{{json .State.ExitCode}},"entrypoint":{{json .Config.Entrypoint}},"command":{{json .Config.Cmd}}}`, p.ProducerContainerID)
 	if err != nil || len(out) > 16*1024 || requireResetIntentShape([]byte(out), reflect.TypeOf(value)) != nil || decodeResetPrivateJSON([]byte(out), &value) != nil || value.ID != p.ProducerContainerID || value.ImageID != p.ProducerImageID || value.Status != "exited" || value.Running == nil || *value.Running || value.ExitCode == nil || *value.ExitCode != 0 || !reflect.DeepEqual(value.Entrypoint, []string{resetD101PreIntentCaptureEntrypoint}) || len(value.Command) != 0 {
 		return value, errResetExecutionEvidence
 	}
-	imageOut, err := c.runServerDockerContext(ctx, "image", "inspect", "--format", `{"repoDigests":{{json .RepoDigests}},"os":{{json .Os}},"architecture":{{json .Architecture}}}`, value.ImageID)
+	imageOut, err := call("image", "inspect", "--format", `{"repoDigests":{{json .RepoDigests}},"os":{{json .Os}},"architecture":{{json .Architecture}}}`, value.ImageID)
 	var image resetRuntimeImage
 	if err != nil || len(imageOut) > 16*1024 || requireResetIntentShape([]byte(imageOut), reflect.TypeOf(image)) != nil || decodeResetPrivateJSON([]byte(imageOut), &image) != nil || image.OS != "linux" || image.Architecture != "amd64" || !resetRuntimePinMatches(image.RepoDigests, "game-engine", p.AppRepository, p.ImagePins["game-engine"]) {
 		return value, errResetExecutionEvidence
