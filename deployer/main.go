@@ -302,40 +302,42 @@ var sharedEnvAllowlist = map[string]envFieldSpec{
 
 // 환경변수 묶음.
 type config struct {
-	d101SeedMaterialInputs    *resetD101SeedMaterialInputs    // Independent fixed native inputs; nil closes before any physical command.
-	d101CandidatePipeline     *resetD101CandidatePipeline     // Fixed native installation; nil fails before any physical command.
-	d101PurposeAuthority      resetD101PurposeAuthoritySource // Fixed approved host source; no request/env enablement.
-	d101PhaseSource           resetExecutionPhaseSource       // Actual installed current writer source; nil closes pre-stop collection.
-	d101RecoveryClosureReader resetD101RecoveryClosureReader  // Fixed retained restore1 reader; nil until actual producer installation.
-	d101RecoveryVerifier      resetD101RecoveryVerifier       // Fixed actual backup/metadata verifier; nil until supplied.
-	token                     string                          // Bearer 인증 토큰
-	composeDir                string                          // compose 파일 디렉터리(/workspace)
-	composeHostDir            string
-	serversDir                string // 서버 env 파일 디렉터리(/workspace/servers)
-	composeServer             string // 서버 compose 파일 절대경로
-	composeShared             string
-	ghcrOwner                 string // GHCR 패키지 소유자(태그 조회)
-	ghcrToken                 string // GHCR 조회 토큰(private면 필요, 없으면 익명)
-	ghcrAPIBaseURL            string
-	localHTTPBaseURL          string
-	authenticatedHTTPTimeout  time.Duration
-	dockerRunner              func(args ...string) (string, error)
-	dockerRunnerContext       func(context.Context, ...string) (string, error)
-	httpGet                   func(context.Context, string) (int, []byte, error)
-	gameAPIInternalPort       string
-	gameEngineInternalPort    string
-	gatewayAPIURL             string
-	resetVerifyTimeout        time.Duration
-	resetVerifyPollInterval   time.Duration
-	lifecycleJobs             *lifecycleJobManager
-	lifecycleOperationStore   *durableOperationStore
-	maintenanceFile           string
-	lifecycleJournalFile      string
-	sharedEnvMu               *sync.Mutex
-	registryRewriteHook       func()
-	lifecycleJournalWriteHook func(lifecycleJournal)
-	lifecycleJournalClearHook func()
-	operations                *operationCoordinator
+	d101SeedMaterialInputs        *resetD101SeedMaterialInputs        // Independent fixed native inputs; nil closes before any physical command.
+	d101CandidatePipeline         *resetD101CandidatePipeline         // Fixed native installation; nil fails before any physical command.
+	d101PurposeAuthority          resetD101PurposeAuthoritySource     // Fixed approved host source; no request/env enablement.
+	d101PhaseSource               resetExecutionPhaseSource           // Actual installed current writer source; nil closes pre-stop collection.
+	d101PreStopNativeInstallation *resetD101PreStopNativeInstallation // Independently installed producer/custody; nil denies all pre-stop commands.
+	d101RecoveryClosureReader     resetD101RecoveryClosureReader      // Fixed retained restore1 reader; nil until actual producer installation.
+	d101RecoveryVerifier          resetD101RecoveryVerifier           // Fixed actual backup/metadata verifier; nil until supplied.
+	d101RecoveryDatabaseSource    resetD101RecoveryDatabaseSource     // Fixed actual restored SQL original source; nil until installation.
+	token                         string                              // Bearer 인증 토큰
+	composeDir                    string                              // compose 파일 디렉터리(/workspace)
+	composeHostDir                string
+	serversDir                    string // 서버 env 파일 디렉터리(/workspace/servers)
+	composeServer                 string // 서버 compose 파일 절대경로
+	composeShared                 string
+	ghcrOwner                     string // GHCR 패키지 소유자(태그 조회)
+	ghcrToken                     string // GHCR 조회 토큰(private면 필요, 없으면 익명)
+	ghcrAPIBaseURL                string
+	localHTTPBaseURL              string
+	authenticatedHTTPTimeout      time.Duration
+	dockerRunner                  func(args ...string) (string, error)
+	dockerRunnerContext           func(context.Context, ...string) (string, error)
+	httpGet                       func(context.Context, string) (int, []byte, error)
+	gameAPIInternalPort           string
+	gameEngineInternalPort        string
+	gatewayAPIURL                 string
+	resetVerifyTimeout            time.Duration
+	resetVerifyPollInterval       time.Duration
+	lifecycleJobs                 *lifecycleJobManager
+	lifecycleOperationStore       *durableOperationStore
+	maintenanceFile               string
+	lifecycleJournalFile          string
+	sharedEnvMu                   *sync.Mutex
+	registryRewriteHook           func()
+	lifecycleJournalWriteHook     func(lifecycleJournal)
+	lifecycleJournalClearHook     func()
+	operations                    *operationCoordinator
 }
 
 type lifecycleJobStatus string
@@ -5962,13 +5964,22 @@ func (c config) runDockerContext(parent context.Context, args ...string) (string
 	return c.runDockerContextWithEnvironment(parent, nil, args...)
 }
 
-func (c config) runDockerContextWithEnvironment(parent context.Context, environment []string, args ...string) (string, error) {
+func (c config) runDockerContextWithEnvironment(parent context.Context, environment []string, args ...string) (out string, resultErr error) {
 	if parent == nil {
 		parent = context.Background()
 	}
 	if err := parent.Err(); err != nil {
 		return "", err
 	}
+	completeNativeTrace, traceErr := resetD101TraceActualDocker(parent, args)
+	if traceErr != nil {
+		return "", traceErr
+	}
+	defer func() {
+		if completeNativeTrace() != nil {
+			resultErr = errResetExecutionEvidence
+		}
+	}()
 	if c.dockerRunnerContext != nil {
 		out, err := c.dockerRunnerContext(parent, args...)
 		if parentErr := parent.Err(); parentErr != nil {
@@ -5990,8 +6001,8 @@ func (c config) runDockerContextWithEnvironment(parent context.Context, environm
 	if environment != nil {
 		cmd.Env = environment
 	}
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	output, err := cmd.CombinedOutput()
+	return string(output), err
 }
 
 func (c config) fetchAvailableTags() []string {

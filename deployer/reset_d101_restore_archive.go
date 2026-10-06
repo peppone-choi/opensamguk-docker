@@ -41,7 +41,7 @@ func (c config) observeResetD101RestoreArchiveWithCustodyUID(ctx context.Context
 	defer cancel()
 	started := time.Now()
 	command := func(run func(context.Context) (string, error)) (string, error) {
-		if bounded.Err() != nil || !time.Now().Before(time.Unix(intent.Intent.RecoveryDeadlineUnix, 0)) || guard(bounded) != nil {
+		if bounded.Err() != nil || !time.Now().Before(time.Unix(intent.Intent.RecoveryDeadlineUnix, 0)) || guard(bounded) != nil || c.requireResetD101PreStopBackup(bounded, binding.evidence, uid) != nil {
 			return "", errResetExecutionEvidence
 		}
 		result, err := run(bounded)
@@ -51,7 +51,7 @@ func (c config) observeResetD101RestoreArchiveWithCustodyUID(ctx context.Context
 		return result, nil
 	}
 	before, err := verifyResetRecoveryBackup(bounded, local, binding.backup.manifestSHA, binding.evidence.Plan.SpaceBudget, intent.Intent.OldImageDigests, uid)
-	if err != nil {
+	if err != nil || c.requireResetD101PreStopBackup(bounded, binding.evidence, uid) != nil {
 		return closed, errResetExecutionEvidence
 	}
 	expected, err := readResetRecoverySmallFile(bounded, local, "postgres-list.txt", resetEvidenceMaxBytes, uid)
@@ -102,6 +102,9 @@ func (c config) observeResetD101RestoreArchiveWithCustodyUID(ctx context.Context
 		return closed, errResetExecutionEvidence
 	}
 	verified, err := verifyResetRecoveryBackup(bounded, local, before.manifestSHA, binding.evidence.Plan.SpaceBudget, intent.Intent.OldImageDigests, uid)
+	if c.requireResetD101PreStopBackup(bounded, binding.evidence, uid) != nil {
+		return closed, errResetExecutionEvidence
+	}
 	completed := time.Now()
 	if err != nil || verified.manifestSHA != before.manifestSHA || bounded.Err() != nil || completed.Sub(started) >= resetPreflightMaxAge || !completed.Before(time.Unix(intent.Intent.RecoveryDeadlineUnix, 0)) || guard(bounded) != nil {
 		return closed, errResetExecutionEvidence

@@ -30,7 +30,8 @@ func recoveryFixture(t *testing.T) (resetDecodedApprovalIntent, resetD101Recover
 		OldImageDigests: intent.Intent.OldImageDigests, RestoreAttempt: 1, StartedAtUTC: now.Add(-time.Second).Format(time.RFC3339Nano),
 		CompletedAtUTC: now.Format(time.RFC3339Nano), RecoveryDeadlineUnix: intent.Intent.RecoveryDeadlineUnix, OldGeneration: 9,
 		OldScenarioCode: "scenario_990002", OldPublicationReceiptSHA: pin}
-	registry, _ := json.Marshal(resetD101OldCanonicalRegistry{"pep", "synthetic old name", "http://spep-game-api:8081", "http://spep-game-engine:8082", "opensamguk-spep", 9, "scenario_990002"})
+	registryGeneration, registryScenario := 9, "scenario_990002"
+	registry, _ := json.Marshal(resetD101NullableOldCanonicalRegistry{"pep", "synthetic old name", "http://spep-game-api:8081", "http://spep-game-engine:8082", "opensamguk-spep", &registryGeneration, &registryScenario})
 	world, _ := json.Marshal(resetD101RestoredOldWorld{1, "D101_RESTORED_OLD_WORLD_V1", result.OperationID, result.ApprovalIntentSHA,
 		result.TargetFingerprint, "2", pin, 1, 9, "scenario_990002", 300, result.OldImageDigests, pin, pin, result.CompletedAtUTC})
 	result.OldRegistryReceiptSHA = resetD101OriginalSHA(registry)

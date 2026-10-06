@@ -64,6 +64,7 @@ type resetPreflightReceipt struct {
 	WriterFreezeReceiptSHA   string            `json:"writerFreezeReceiptSha256"`
 	DrainReceiptSHA          string            `json:"drainReceiptSha256"`
 	BackupManifestSHA        string            `json:"backupManifestSha256"`
+	PreStopNativeProofSHA    string            `json:"preStopNativeProofSha256,omitempty"`
 	BackupRetainUntilUnix    int64             `json:"backupRetainUntilUnix"`
 	RestoreVerified          *bool             `json:"restoreVerified"`
 	FilesystemDevice         *uint64           `json:"filesystemDevice"`
@@ -138,6 +139,9 @@ func validateResetApprovalPlan(plan resetApprovalPlan, op string, target resetLi
 }
 
 func validateResetPreflight(receipt resetPreflightReceipt, plan resetApprovalPlan, planSHA string, now time.Time) error {
+	if plan.ApprovalIntentSHA != "" && !resetEvidenceSHA.MatchString(receipt.PreStopNativeProofSHA) || plan.ApprovalIntentSHA == "" && receipt.PreStopNativeProofSHA != "" {
+		return errResetExecutionEvidence
+	}
 	revision, revisionErr := strconv.ParseInt(receipt.PublicationRevision, 10, 64)
 	if receipt.Version != 1 || receipt.ServerID != plan.ServerID || receipt.WorldID != plan.WorldID ||
 		receipt.OperationID != plan.OperationID || receipt.TargetFingerprint != plan.TargetFingerprint ||
@@ -255,6 +259,9 @@ func decodeResetPrivateJSON(wire []byte, into any) error {
 		return errResetExecutionEvidence
 	}
 	if _, plan := into.(*resetApprovalPlan); plan && requireResetApprovalTargetJSON(wire) != nil {
+		return errResetExecutionEvidence
+	}
+	if _, preflight := into.(*resetPreflightReceipt); preflight && requireResetD101PreflightProofShape(wire) != nil {
 		return errResetExecutionEvidence
 	}
 	decoder := json.NewDecoder(bytes.NewReader(wire))

@@ -21,6 +21,7 @@ type resetD101RecoveryBinding struct {
 	intent            resetDecodedApprovalIntent
 	backup            resetRecoveryBackup
 	deploymentCardSHA string
+	restoredDatabase  *resetD101RestoredDatabaseObservation // Actual source/native provenance, supplied before fixed closure signing.
 }
 
 type resetD101RecoveryClaim struct {
@@ -111,7 +112,7 @@ func (c config) claimResetD101RecoveryAttemptWithCustodyUID(lease *operationLeas
 		return closed, errResetExecutionEvidence
 	}
 	backup, err := verifyResetRecoveryBackup(ctx, filepath.Join(c.composeDir, "backups", "pep", journal.OperationID), evidence.Preflight.BackupManifestSHA, evidence.Plan.SpaceBudget, evidence.Plan.OldImageDigests, uid)
-	if err != nil {
+	if err != nil || c.requireResetD101PreStopBackup(ctx, evidence, uid) != nil {
 		return closed, errResetExecutionEvidence
 	}
 	binding := resetD101RecoveryBinding{operation: record, journal: journal, evidence: evidence, intent: intent, backup: backup, deploymentCardSHA: authority.DeploymentCardSHA}

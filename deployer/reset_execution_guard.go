@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 	"time"
@@ -55,6 +56,20 @@ func (c config) readResetExecutionEvidenceWithCustodyUID(operationID string, tar
 	}
 	if err := validateResetPreflight(evidence.Preflight, evidence.Plan, refs.ApprovalPlanSHA, now); err != nil {
 		return evidence, errResetExecutionEvidence
+	}
+	if evidence.Plan.ApprovalIntentSHA != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), resetPreflightMaxAge)
+		defer cancel()
+		if _, err := c.readResetD101PreStopProofForEvidence(ctx, evidence, uid); err != nil {
+			return resetExecutionEvidence{}, errResetExecutionEvidence
+		}
+		var planAfter resetApprovalPlan
+		var preflightAfter resetPreflightReceipt
+		if readResetPrivateEvidence(filepath.Join(c.serversDir, ".deployer-reset-approvals"), operationID, refs.ApprovalPlanSHA, uid, &planAfter) != nil ||
+			readResetPrivateEvidence(filepath.Join(c.serversDir, ".deployer-reset-preflights"), operationID, refs.ExecutionReceiptSHA, uid, &preflightAfter) != nil ||
+			!reflect.DeepEqual(planAfter, evidence.Plan) || !reflect.DeepEqual(preflightAfter, evidence.Preflight) {
+			return resetExecutionEvidence{}, errResetExecutionEvidence
+		}
 	}
 	return evidence, nil
 }

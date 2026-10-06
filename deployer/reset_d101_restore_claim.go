@@ -177,7 +177,7 @@ func (c config) claimResetD101SucceededRestore(ctx context.Context, op, intentSH
 	bounded, cancel := context.WithDeadline(ctx, time.Unix(intent.Intent.RecoveryDeadlineUnix, 0))
 	defer cancel()
 	backup, err := verifyResetRecoveryBackup(bounded, filepath.Join(c.composeDir, "backups", "pep", op), evidence.Preflight.BackupManifestSHA, evidence.Plan.SpaceBudget, intent.Intent.OldImageDigests, 0)
-	if err != nil {
+	if err != nil || c.requireResetD101PreStopBackup(bounded, evidence, 0) != nil {
 		return closed, errResetExecutionEvidence
 	}
 	attempt := resetD101SucceededRestore{lease: lease, binding: resetD101RecoveryBinding{operation: record, evidence: evidence,

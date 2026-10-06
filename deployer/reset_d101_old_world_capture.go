@@ -265,7 +265,18 @@ func runResetD101OldWorldCommand(ctx context.Context, intent resetDecodedApprova
 	if beforeCommand(ctx) != nil || ctx.Err() != nil || !validResetD101OldWorldIntent(intent, time.Now()) {
 		return "", errResetExecutionEvidence
 	}
-	out, err := command(ctx)
+	// The marker is absent during the guard's QUERY/current/native reads.
+	// Only this command's actual Docker transport consumes its fresh frame.
+	physical := context.WithValue(ctx, resetD101OldWorldPhysicalContextKey{}, true)
+	stream := resetD101PreStopStreamFromContext(ctx)
+	beforeFrames := 0
+	if stream != nil {
+		beforeFrames = stream.frames
+	}
+	out, err := command(physical)
+	if stream != nil && (stream.openCommand || stream.pending != nil || stream.frames != beforeFrames+1) {
+		return "", errResetExecutionEvidence
+	}
 	if err != nil || ctx.Err() != nil || !validResetD101OldWorldIntent(intent, time.Now()) {
 		return "", errResetExecutionEvidence
 	}

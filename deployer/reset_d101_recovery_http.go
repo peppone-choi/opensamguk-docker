@@ -54,16 +54,28 @@ func (c config) readResetD101RecoveryResult(ctx context.Context, op, expectedSHA
 	if readResetPrivateEvidence(filepath.Join(c.serversDir, ".deployer-reset-approvals"), op, rootResult.ApprovalPlanSHA, 0, &plan) != nil || readResetPrivateEvidence(filepath.Join(c.serversDir, ".deployer-reset-preflights"), op, rootResult.ExecutionReceiptSHA, 0, &preflight) != nil || requireResetD101ResultBinding(rootResult, intent, plan, preflight, record, time.Now()) != nil || closure.BackupManifestSHA != preflight.BackupManifestSHA {
 		return nil, "", errResetExecutionEvidence
 	}
+	evidence := resetExecutionEvidence{plan, preflight}
+	if c.requireResetD101RecoveryPreSQL(ctx, record, evidence, intent, closure, 0) != nil {
+		return nil, "", errResetExecutionEvidence
+	}
 	prepare, err := readResetPrivateCustody(filepath.Join(c.serversDir, ".deployer-reset-prepare-bodies"), op, 0)
 	if err != nil || requireResetD101PrepareBody(prepare, intent, closure.GatewayPayloadSHA) != nil {
 		return nil, "", errResetExecutionEvidence
 	}
-	frozen := func(context.Context, string, string) ([]byte, error) { return append([]byte(nil), wire...), nil }
+	frozen := func(ctx context.Context, requestedOp, requestedBegin string) ([]byte, error) {
+		if requestedOp != op || requestedBegin != closure.RecoveryBeginReceiptSHA || c.requireResetD101RecoveryPreSQL(ctx, record, evidence, intent, closure, 0) != nil {
+			return nil, errResetExecutionEvidence
+		}
+		return append([]byte(nil), wire...), nil
+	}
 	signed, proof, err := issueResetD101RecoveryResultOriginalWithKeyReader(ctx, c.d101PurposeAuthority, frozen, op, record.D101IntentSHA, closure.RecoveryBeginReceiptSHA, time.Now, readResetD101SigningKey)
 	after, afterErr := c.d101RecoveryClosureReader(ctx, op, expectedSHA)
 	rootAfter, rootErr := readResetPrivateCustody(filepath.Join(c.serversDir, ".deployer-reset-results"), op, 0)
 	current, exists := c.lifecycleOperationStore.Lookup(op)
 	if err != nil || afterErr != nil || rootErr != nil || ctx.Err() != nil || !exists || current != record || !bytes.Equal(after, wire) || !bytes.Equal(rootAfter, rootWire) {
+		return nil, "", errResetExecutionEvidence
+	}
+	if c.requireResetD101RecoveryPreSQL(ctx, record, evidence, intent, closure, 0) != nil {
 		return nil, "", errResetExecutionEvidence
 	}
 	return signed, proof, nil

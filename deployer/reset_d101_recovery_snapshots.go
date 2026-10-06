@@ -19,6 +19,18 @@ type resetD101OldCanonicalRegistry struct {
 	Generation    int    `json:"generation"`
 	ScenarioCode  string `json:"scenarioCode"`
 }
+
+// Nullable wire custody for recovery closure. Keep the existing strict C10
+// comparison input above intact; actual preSQL/restored SQL remain mandatory.
+type resetD101NullableOldCanonicalRegistry struct {
+	ID            string  `json:"id"`
+	Name          string  `json:"name"`
+	GameAPIURL    string  `json:"gameApiUrl"`
+	GameEngineURL string  `json:"gameEngineUrl"`
+	DeployProject string  `json:"deployProject"`
+	Generation    *int    `json:"generation"`
+	ScenarioCode  *string `json:"scenarioCode"`
+}
 type resetD101RestoredOldWorld struct {
 	SchemaVersion           int               `json:"schemaVersion"`
 	Kind                    string            `json:"kind"`
@@ -42,26 +54,30 @@ func decodeResetD101RecoverySnapshot(encoded, sha string, target any) error {
 		return errResetExecutionEvidence
 	}
 	wire, err := base64.RawURLEncoding.Strict().DecodeString(encoded)
+	shapeErr := requireResetIntentShape(wire, reflect.TypeOf(target).Elem())
+	if _, canonical := target.(*resetD101NullableOldCanonicalRegistry); canonical {
+		shapeErr = requireResetD101NullableShape(wire, reflect.TypeOf(resetD101NullableOldCanonicalRegistry{}), map[string]bool{"generation": true, "scenarioCode": true}, nil)
+	}
 	if err != nil || len(wire) == 0 || len(wire) > 16*1024 || !utf8.Valid(wire) ||
 		base64.RawURLEncoding.EncodeToString(wire) != encoded || resetD101OriginalSHA(wire) != sha ||
-		requireResetIntentShape(wire, reflect.TypeOf(target).Elem()) != nil || decodeResetPrivateJSON(wire, target) != nil {
+		shapeErr != nil || decodeResetPrivateJSON(wire, target) != nil {
 		return errResetExecutionEvidence
 	}
 	return nil
 }
 func validateResetD101RecoverySnapshots(result resetD101RecoveryResult, started, completed time.Time) error {
-	var registry resetD101OldCanonicalRegistry
+	var registry resetD101NullableOldCanonicalRegistry
 	var world resetD101RestoredOldWorld
 	if decodeResetD101RecoverySnapshot(result.OldCanonicalRegistryBytesBase64url, result.OldRegistryReceiptSHA, &registry) != nil ||
 		decodeResetD101RecoverySnapshot(result.RestoredOldWorldBytesBase64url, result.OldWorldReceiptSHA, &world) != nil ||
 		registry.ID != "pep" || strings.TrimSpace(registry.Name) == "" ||
 		registry.GameAPIURL != "http://spep-game-api:8081" || registry.GameEngineURL != "http://spep-game-engine:8082" ||
-		registry.DeployProject != "opensamguk-spep" || registry.Generation != result.OldGeneration ||
-		registry.ScenarioCode != result.OldScenarioCode || world.SchemaVersion != 1 || world.Kind != "D101_RESTORED_OLD_WORLD_V1" ||
+		registry.DeployProject != "opensamguk-spep" || registry.Generation != nil && (*registry.Generation < 0 || *registry.Generation > 2147483647 || *registry.Generation != result.OldGeneration) ||
+		registry.ScenarioCode != nil && *registry.ScenarioCode != result.OldScenarioCode || world.SchemaVersion != 1 || world.Kind != "D101_RESTORED_OLD_WORLD_V1" ||
 		world.OperationID != result.OperationID || world.ApprovalIntentSHA != result.ApprovalIntentSHA ||
 		world.TargetFingerprint != result.TargetFingerprint || world.VerifyingRevision != result.VerifyingRevision ||
 		world.RecoveryBeginReceiptSHA != result.RecoveryBeginReceiptSHA || world.WorldID != 1 ||
-		world.Generation != result.OldGeneration || world.ScenarioCode != result.OldScenarioCode || world.TickSeconds <= 0 ||
+		world.Generation < 0 || world.Generation > 2147483647 || world.Generation != result.OldGeneration || world.ScenarioCode != result.OldScenarioCode || world.TickSeconds <= 0 ||
 		world.TickSeconds > 2147483647 || !reflect.DeepEqual(world.OldImageDigests, result.OldImageDigests) ||
 		world.DatabaseReceiptSHA != result.RestoredDatabaseReceiptSHA || world.RuntimeReceiptSHA != result.RestoredRuntimeReceiptSHA {
 		return errResetExecutionEvidence
