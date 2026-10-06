@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -21,9 +23,12 @@ func resetD101RecoveryFixture(t *testing.T) (config, *operationLease, lifecycleJ
 		t.Fatal(err)
 	}
 	record, _ := cfg.lifecycleOperationStore.Lookup(op)
-	evidence, err := cfg.readResetExecutionEvidenceWithCustodyUID(op, *journal.ResetTarget, journal.ResetExecution.Evidence, record.CreatedAt, uid)
-	if err != nil {
-		t.Fatal(err)
+	// Bootstrap synthetic originals without claiming admission through the new
+	// native gate. Install the complete r2 data before calling the real consumer.
+	var evidence resetExecutionEvidence
+	if readResetPrivateEvidence(filepath.Join(cfg.serversDir, ".deployer-reset-approvals"), op, journal.ResetExecution.Evidence.ApprovalPlanSHA, uid, &evidence.Plan) != nil ||
+		readResetPrivateEvidence(filepath.Join(cfg.serversDir, ".deployer-reset-preflights"), op, journal.ResetExecution.Evidence.ExecutionReceiptSHA, uid, &evidence.Preflight) != nil {
+		t.Fatal("synthetic original bootstrap")
 	}
 	authority, err := cfg.d101PurposeAuthority(context.Background(), op, record.D101IntentSHA)
 	if err != nil {
@@ -77,6 +82,12 @@ func resetD101RecoveryFixture(t *testing.T) (config, *operationLease, lifecycleJ
 	evidence.Preflight.OldImageDigests = pins
 	space := resetDiskReserveBytes + 2*1024*1024
 	evidence.Preflight.AvailableBytes = &space
+	prepare, _ := json.Marshal(struct {
+		SchemaVersion     int    `json:"schemaVersion"`
+		ApprovalIntentSHA string `json:"approvalIntentSha256"`
+		IntentBytes       string `json:"approvalIntentBytesBase64url"`
+	}{1, intentSHA, base64.RawURLEncoding.EncodeToString(intentWire)})
+	installResetD101LinkedFixtureProof(t, &cfg, uid, decoded, evidence.Plan, prepare, &evidence.Preflight)
 	preflightWire, _ := json.Marshal(evidence.Preflight)
 	refs := resetExecutionEvidenceRefs{resetD101OriginalSHA(planWire), resetD101OriginalSHA(preflightWire)}
 	journal.ResetExecution.Evidence = refs
@@ -96,11 +107,6 @@ func resetD101RecoveryFixture(t *testing.T) (config, *operationLease, lifecycleJ
 	record.RequestFingerprint = fingerprint
 	record.D101IntentSHA = intentSHA
 	cfg.lifecycleOperationStore.operations[op] = record
-	prepare, _ := json.Marshal(struct {
-		SchemaVersion     int    `json:"schemaVersion"`
-		ApprovalIntentSHA string `json:"approvalIntentSha256"`
-		IntentBytes       string `json:"approvalIntentBytesBase64url"`
-	}{1, intentSHA, base64.RawURLEncoding.EncodeToString(intentWire)})
 	for leaf, wire := range map[string][]byte{".deployer-reset-intents": intentWire, ".deployer-reset-approvals": planWire, ".deployer-reset-preflights": preflightWire, ".deployer-reset-prepare-bodies": prepare} {
 		if os.Remove(filepath.Join(cfg.serversDir, leaf, op+".json")) != nil || writeResetImmutablePrivateBytesWithUID(filepath.Join(cfg.serversDir, leaf), op, resetD101OriginalSHA(wire), wire, uid) != nil {
 			t.Fatal("fixture original custody")
@@ -130,6 +136,18 @@ func TestResetD101RecoveryClaimPinsOriginalOperationAndNeverReplays(t *testing.T
 	before, _ := cfg.lifecycleOperationStore.Lookup(journal.OperationID)
 	journalBefore, _ := os.ReadFile(cfg.lifecycleJournalFile)
 	binding, err := cfg.claimResetD101RecoveryAttemptWithCustodyUID(lease, journal, uid)
+	if runtime.GOOS != "linux" {
+		if err == nil || binding.operation.OperationID != "" || stateFilePresent(filepath.Join(cfg.serversDir, ".deployer-reset-recovery-claims", journal.OperationID+".json")) {
+			t.Fatal("unsupported production native reader claimed recovery")
+		}
+		after, _ := cfg.lifecycleOperationStore.Lookup(journal.OperationID)
+		journalAfter, _ := os.ReadFile(cfg.lifecycleJournalFile)
+		proof, proofErr := os.ReadFile(filepath.Join(cfg.serversDir, ".deployer-reset-old-world", journal.OperationID+".json"))
+		if before != after || !bytes.Equal(journalBefore, journalAfter) || proofErr != nil || len(proof) == 0 || !cfg.operations.closed || !cfg.operations.journalPending {
+			t.Fatal("unsupported consumer discarded original identity/barrier")
+		}
+		return
+	}
 	if err != nil {
 		t.Fatal("synthetic owned claim refused", err)
 	}
@@ -256,5 +274,52 @@ func TestResetD101RecoveryAuthorityUsesOriginalRecoveryDeadlineWithoutNewGrant(t
 	}
 	if _, _, err := resetD101PurposeRoute("RECOVERY", record.OperationID); err == nil {
 		t.Fatal("Root recovery invented Gateway grant route")
+	}
+}
+
+func TestLinkedRecoveryFixtureProofRefusalPrecedesVerifierAndClaim(t *testing.T) {
+	for _, mode := range []string{"producer-missing", "proof-file-missing", "proof-sha-wrong", "proof-partial", "canonical-changed"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg, lease, journal, uid := resetD101RecoveryFixture(t)
+			record, _ := cfg.lifecycleOperationStore.Lookup(journal.OperationID)
+			journalBefore, _ := os.ReadFile(cfg.lifecycleJournalFile)
+			proofPath := filepath.Join(cfg.serversDir, ".deployer-reset-old-world", record.OperationID+".json")
+			switch mode {
+			case "producer-missing":
+				cfg.d101PreStopNativeInstallation = nil
+			case "proof-file-missing":
+				if os.Rename(proofPath, proofPath+".retained") != nil {
+					t.Fatal("fixture retain")
+				}
+			case "proof-sha-wrong", "proof-partial":
+				wire, err := os.ReadFile(proofPath)
+				if err != nil || os.Rename(proofPath, proofPath+".retained") != nil {
+					t.Fatal("fixture retain")
+				}
+				if mode == "proof-partial" {
+					wire = wire[:len(wire)-1]
+				} else {
+					wire = append(wire, '\n')
+				}
+				if os.WriteFile(proofPath, wire, 0400) != nil {
+					t.Fatal("fixture replacement")
+				}
+			case "canonical-changed":
+				path := filepath.Join(cfg.serversDir, ".deployer-reset-pre-reset-originals", record.OperationID+".json")
+				if os.Rename(path, path+".retained") != nil || os.WriteFile(path, []byte("{}"), 0400) != nil {
+					t.Fatal("fixture canonical")
+				}
+			}
+			verifications := 0
+			cfg.d101RecoveryVerifier = func(context.Context, resetD101RecoveryBinding) error { verifications++; return nil }
+			if _, err := cfg.claimResetD101RecoveryAttemptWithCustodyUID(lease, journal, uid); err == nil || verifications != 0 {
+				t.Fatal("missing native proof reached verifier/claim")
+			}
+			current, found := cfg.lifecycleOperationStore.Lookup(record.OperationID)
+			journalAfter, _ := os.ReadFile(cfg.lifecycleJournalFile)
+			if !found || current != record || !bytes.Equal(journalBefore, journalAfter) || !cfg.operations.closed || !cfg.operations.journalPending || stateFilePresent(filepath.Join(cfg.serversDir, ".deployer-reset-recovery-claims", record.OperationID+".json")) {
+				t.Fatal("refusal consumed recovery or cleared barrier")
+			}
+		})
 	}
 }

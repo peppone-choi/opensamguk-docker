@@ -9,10 +9,108 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
+
+// Synthetic retained protocol originals only, never an actual host issuer.
+// Production Linux readers remain unchanged. Portable tests can construct the
+// same data, but cannot turn the unsupported production reader into authority.
+func installResetD101LinkedFixtureProof(t *testing.T, cfg *config, uid uint32, intent resetDecodedApprovalIntent, plan resetApprovalPlan, prepare []byte, preflight *resetPreflightReceipt) {
+	t.Helper()
+	base := time.Unix(preflight.ObservedAtUnix, 0).UTC().Add(-10 * time.Second)
+	body, _, _, _, _, sourceSHA := r2PreStopNativeFixture(t, base)
+	body.OperationID, body.ApprovalIntentSHA = intent.Intent.OperationID, intent.SHA
+	body.ApprovalPlanSHA, body.GatewayPayloadSHA = preflight.ApprovalPlanSHA, resetD101OriginalSHA(prepare)
+	body.VerifyingRevision, body.PostgresContainerID = preflight.PublicationRevision, preflight.StoppedContainerIDs["game-postgres"]
+	if body.PostgresContainerID == body.JobContainerID {
+		body.JobContainerID = strings.Repeat("f", 64)
+	}
+	canonicalWire, _ := base64.RawURLEncoding.DecodeString(body.PreResetOriginalsBase64url)
+	var canonical resetD101PreResetOriginal
+	if json.Unmarshal(canonicalWire, &canonical) != nil {
+		t.Fatal("synthetic canonical")
+	}
+	canonical.OperationID, canonical.ApprovalIntentSHA, canonical.TargetFingerprint = body.OperationID, intent.SHA, plan.TargetFingerprint
+	canonical.GatewayPayloadSHA = body.GatewayPayloadSHA
+	canonical.InitialPublicRevision = intent.Intent.InitialPublicRevision
+	canonicalWire, _ = json.Marshal(canonical)
+	body.PreResetOriginalsBase64url, body.PreResetOriginalsSHA = base64.RawURLEncoding.EncodeToString(canonicalWire), resetD101OriginalSHA(canonicalWire)
+	for i := range body.Observations {
+		frame := &body.Observations[i]
+		query, _ := base64.RawURLEncoding.DecodeString(frame.GatewayQueryBase64)
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(query, &fields) != nil {
+			t.Fatal("synthetic QUERY")
+		}
+		for key, value := range map[string]string{"operationId": body.OperationID, "approvalIntentSha256": intent.SHA, "targetFingerprint": plan.TargetFingerprint,
+			"gatewayPayloadSha256": body.GatewayPayloadSHA, "initialPublicRevision": intent.Intent.InitialPublicRevision, "verifyingRevision": body.VerifyingRevision,
+			"preResetOriginalsBytesBase64url": body.PreResetOriginalsBase64url, "preResetOriginalsSha256": body.PreResetOriginalsSHA} {
+			fields[key], _ = json.Marshal(value)
+		}
+		query, _ = json.Marshal(fields)
+		frame.GatewayQueryBase64 = base64.RawURLEncoding.EncodeToString(query)
+		frame.Publication.Current.OperationID, frame.Publication.Current.TargetFingerprint, frame.Publication.Current.Revision = body.OperationID, plan.TargetFingerprint, body.VerifyingRevision
+		publicationWire, _ := json.Marshal(frame.Publication.Current)
+		frame.Publication.BodyBase64, frame.Publication.BodySHA = base64.RawURLEncoding.EncodeToString(publicationWire), resetD101OriginalSHA(publicationWire)
+		frame.Snapshot.OperationID, frame.Snapshot.TargetFingerprint, frame.Snapshot.PublicationRevision, frame.Snapshot.WriterFreezeReceiptSHA = body.OperationID, plan.TargetFingerprint, body.VerifyingRevision, plan.WriterFreezeReceiptSHA
+	}
+	wire, err := json.Marshal(body)
+	proofSHA := resetD101OriginalSHA(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeResetD101PreStopNative(wire, proofSHA, intent, plan, preflight.ApprovalPlanSHA, body.GatewayPayloadSHA, sourceSHA); err != nil {
+		t.Fatal("synthetic retained proof data", err)
+	}
+	for _, leaf := range []string{".deployer-reset-pre-reset-originals", ".deployer-reset-old-world"} {
+		if err := os.Mkdir(filepath.Join(cfg.serversDir, leaf), 0700); err != nil {
+			t.Fatal("isolated fixture directory", err)
+		}
+	}
+	if writeResetImmutablePrivateBytesWithUID(filepath.Join(cfg.serversDir, ".deployer-reset-pre-reset-originals"), body.OperationID, body.PreResetOriginalsSHA, canonicalWire, uid) != nil {
+		t.Fatal("isolated canonical custody")
+	}
+	directory := filepath.Join(cfg.serversDir, ".deployer-reset-old-world")
+	file, err := os.OpenFile(filepath.Join(directory, body.OperationID+".json"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0400)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, writeErr := file.Write(wire)
+	syncErr, closeErr := file.Sync(), file.Close()
+	if writeErr != nil || n != len(wire) || syncErr != nil || closeErr != nil {
+		t.Fatal("isolated retained data write")
+	}
+	parentFile, err := os.Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentSyncErr, parentCloseErr := parentFile.Sync(), parentFile.Close()
+	if parentSyncErr != nil || parentCloseErr != nil {
+		t.Fatal("isolated directory sync")
+	}
+	parentInfo, err := os.Stat(directory)
+	parent, statErr := resetD101NativeSnapshot(parentInfo)
+	if err != nil || statErr != nil {
+		t.Fatal("isolated parent pin")
+	}
+	planSHA, gatewaySHA := preflight.ApprovalPlanSHA, body.GatewayPayloadSHA
+	cfg.d101PreStopNativeInstallation = &resetD101PreStopNativeInstallation{sourceSHA: sourceSHA, parentDevice: parent.Device, parentInode: parent.Inode,
+		oldInputs: resetD101OldWorldCaptureInputs{PostgresContainerID: body.PostgresContainerID, Database: "game", User: "game"},
+		verify: func(ctx context.Context, binding resetD101PreStopNativeBinding) error {
+			// This is an isolated fixed-data expectation, not operating authority.
+			if ctx == nil || ctx.Err() != nil || binding.intent.SHA != intent.SHA || binding.planSHA != planSHA || binding.gatewaySHA != gatewaySHA ||
+				!reflect.DeepEqual(binding.plan, plan) || !bytes.Equal(binding.original.Original(), wire) || binding.nativePin.SHA256 != proofSHA ||
+				binding.nativePin.OwnerUID != uid || binding.nativePin.ParentOwnerUID != uid || binding.parent.Device != parent.Device || binding.parent.Inode != parent.Inode {
+				return errResetExecutionEvidence
+			}
+			return nil
+		}}
+	preflight.PreStopNativeProofSHA = proofSHA
+}
 
 // Synthetic fixture: real private files/store/coordinator, no operating authority
 // or Docker. The UID seam cannot be selected by configuration or HTTP input.
@@ -50,12 +148,13 @@ func resetD101PreparedFixture(t *testing.T) (config, uint32, *operationPreparati
 	planWire, _ := json.Marshal(plan)
 	preflight.ApprovalPlanSHA = resetD101OriginalSHA(planWire)
 	preflight.ObservedAtUnix, preflight.ExpiresAtUnix, preflight.BackupRetainUntilUnix = accepted.Unix()-1, accepted.Unix()+20, accepted.Unix()+7*24*3600
-	preflightWire, _ := json.Marshal(preflight)
 	prepare, _ := json.Marshal(struct {
 		SchemaVersion int    `json:"schemaVersion"`
 		IntentSHA     string `json:"approvalIntentSha256"`
 		IntentBytes   string `json:"approvalIntentBytesBase64url"`
 	}{1, intentSHA, base64.RawURLEncoding.EncodeToString(intentWire)})
+	installResetD101LinkedFixtureProof(t, &cfg, uid, intent, plan, prepare, &preflight)
+	preflightWire, _ := json.Marshal(preflight)
 	for leaf, wire := range map[string][]byte{".deployer-reset-intents": intentWire, ".deployer-reset-approvals": planWire, ".deployer-reset-preflights": preflightWire, ".deployer-reset-prepare-bodies": prepare} {
 		if os.Remove(filepath.Join(cfg.serversDir, leaf, op+".json")) != nil ||
 			writeResetImmutablePrivateBytesWithUID(filepath.Join(cfg.serversDir, leaf), op, resetD101OriginalSHA(wire), wire, uid) != nil {
@@ -271,5 +370,82 @@ func TestResetD101PreparedHttpExactIdentityAndSharedCapacity(t *testing.T) {
 	<-resetD101ResultReadSlots
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatal("busy prepared route queued")
+	}
+}
+
+func TestLinkedPreparedFixtureRetainsProofAndUsesProductionPlatformBoundary(t *testing.T) {
+	cfg, uid, _, evidence, chain, record := resetD101PreparedFixture(t)
+	if validateResetPreflight(evidence.Preflight, evidence.Plan, chain.Evidence.ApprovalPlanSHA, record.CreatedAt) != nil {
+		t.Fatal("linked fixture has invalid preflight data")
+	}
+	path := filepath.Join(cfg.serversDir, ".deployer-reset-old-world", record.OperationID+".json")
+	wire, err := os.ReadFile(path)
+	if err != nil || resetD101OriginalSHA(wire) != evidence.Preflight.PreStopNativeProofSHA {
+		t.Fatal("linked proof original/SHA missing")
+	}
+	verified := 0
+	source := cfg.d101PreStopNativeInstallation.verify
+	cfg.d101PreStopNativeInstallation.verify = func(ctx context.Context, binding resetD101PreStopNativeBinding) error {
+		verified++
+		return source(ctx, binding)
+	}
+	got, err := cfg.readResetExecutionEvidenceWithCustodyUID(record.OperationID, evidence.Plan.Target, chain.Evidence, record.CreatedAt, uid)
+	if runtime.GOOS == "linux" {
+		if err != nil || !reflect.DeepEqual(got, evidence) || verified != 1 {
+			t.Fatal("Linux native data reader refused linked fixture", err)
+		}
+	} else if err == nil || got.Plan.OperationID != "" || verified != 0 {
+		t.Fatal("portable fixture bypassed unsupported production reader")
+	}
+	after, afterErr := os.ReadFile(path)
+	current, found := cfg.lifecycleOperationStore.Lookup(record.OperationID)
+	if afterErr != nil || !bytes.Equal(wire, after) || !found || current != record || !cfg.operations.closed || cfg.operations.maintenanceLease.consumed || stateFilePresent(cfg.lifecycleJournalFile) {
+		t.Fatal("native data read advanced/discarded preparation")
+	}
+}
+
+func TestLinkedPreparedFixtureMissingOrChangedProofCannotAdmit(t *testing.T) {
+	for _, mode := range []string{"proof-sha-absent", "proof-sha-wrong", "proof-file-missing", "proof-partial", "canonical-changed", "producer-missing"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg, uid, _, evidence, chain, record := resetD101PreparedFixture(t)
+			proofPath := filepath.Join(cfg.serversDir, ".deployer-reset-old-world", record.OperationID+".json")
+			switch mode {
+			case "proof-sha-absent":
+				evidence.Preflight.PreStopNativeProofSHA = ""
+			case "proof-sha-wrong":
+				evidence.Preflight.PreStopNativeProofSHA = strings.Repeat("a", 64)
+			case "proof-file-missing":
+				if os.Rename(proofPath, proofPath+".retained") != nil {
+					t.Fatal("fixture retain")
+				}
+			case "proof-partial":
+				wire, err := os.ReadFile(proofPath)
+				if err != nil || os.Rename(proofPath, proofPath+".retained") != nil || os.WriteFile(proofPath, wire[:len(wire)-1], 0400) != nil {
+					t.Fatal("fixture partial")
+				}
+				evidence.Preflight.PreStopNativeProofSHA = resetD101OriginalSHA(wire[:len(wire)-1])
+			case "canonical-changed":
+				path := filepath.Join(cfg.serversDir, ".deployer-reset-pre-reset-originals", record.OperationID+".json")
+				if os.Rename(path, path+".retained") != nil || os.WriteFile(path, []byte("{}"), 0400) != nil {
+					t.Fatal("fixture canonical")
+				}
+			case "producer-missing":
+				cfg.d101PreStopNativeInstallation = nil
+			}
+			preflightWire, _ := json.Marshal(evidence.Preflight)
+			path := filepath.Join(cfg.serversDir, ".deployer-reset-preflights", record.OperationID+".json")
+			if os.Rename(path, path+".retained") != nil || writeResetImmutablePrivateBytesWithUID(filepath.Dir(path), record.OperationID, resetD101OriginalSHA(preflightWire), preflightWire, uid) != nil {
+				t.Fatal("fixture preflight")
+			}
+			refs := chain.Evidence
+			refs.ExecutionReceiptSHA = resetD101OriginalSHA(preflightWire)
+			if _, err := cfg.readResetExecutionEvidenceWithCustodyUID(record.OperationID, evidence.Plan.Target, refs, record.CreatedAt, uid); err == nil {
+				t.Fatal("changed proof admitted")
+			}
+			current, found := cfg.lifecycleOperationStore.Lookup(record.OperationID)
+			if !found || current != record || !cfg.operations.closed || cfg.operations.maintenanceLease.consumed || stateFilePresent(cfg.lifecycleJournalFile) {
+				t.Fatal("refusal changed original preparation")
+			}
+		})
 	}
 }
