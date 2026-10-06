@@ -30,7 +30,8 @@ func newResetD101TechnicalBootstrapScopeFixture(t *testing.T) (resetD101Bootstra
 	op := strings.Repeat("a", 32)
 	manifest := resetD101HostTrustManifest{SchemaVersion: 1, Kind: "D101_HOST_TRUST_V1", OperationID: op,
 		AppSourceSHA: strings.Repeat("b", 40), DockerSourceSHA: strings.Repeat("c", 40),
-		DeploymentCardSHA: strings.Repeat("d", 64), PublicKeySpkiSHA: strings.Repeat("e", 64)}
+		DeploymentCardSHA: strings.Repeat("d", 64), PublicKeySpkiSHA: strings.Repeat("e", 64),
+		OldImageDigests: map[string]string{}, NewImageDigests: map[string]string{}}
 	wire, err := json.Marshal(manifest)
 	if err != nil {
 		t.Fatal(err)
