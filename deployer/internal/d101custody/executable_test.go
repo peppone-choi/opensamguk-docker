@@ -7,7 +7,10 @@ import (
 )
 
 func TestPrivateExecutableKeepsNativeSnapshotAndExactMode(t *testing.T) {
-	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if os.Chmod(dir, 0700) != nil {
 		t.Fatal("directory")
 	}
