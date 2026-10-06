@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - "deployer/**"
+      - "scripts/build-d101-candidate-images.py"
+      - ".github/workflows/build-d101-candidate-images.yml"
       - "scripts/deploy-orchestration-admission-test.sh"
       - ".github/workflows/deploy-orchestration.yml"
       - ".gitignore"
@@ -12,6 +14,8 @@ on:
     branches: [main]
     paths:
       - "deployer/**"
+      - "scripts/build-d101-candidate-images.py"
+      - ".github/workflows/build-d101-candidate-images.yml"
       - "scripts/deploy-orchestration-admission-test.sh"
       - ".github/workflows/deploy-orchestration.yml"
       - ".gitignore"
