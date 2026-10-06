@@ -197,8 +197,8 @@ func TestHostPreparedRelayPreservesOriginalAndChecksLiveTwice(t *testing.T) {
 		return resetD101RelayFixtureResponse(wire, header), nil
 	})
 	got, signature, err := readResetD101RelayFixture(relay, context.Background(), relay.policy.expected.OperationID, relay.policy.expected.ApprovalPlanSHA, relay.policy.expected.ExecutionReceiptSHA)
-	if err != nil || !bytes.Equal(got, wire) || signature != header || requests != 1 || authCalls != 2 {
-		t.Fatal("relay did not preserve original or verify current live authority twice")
+	if err != nil || !bytes.Equal(got, wire) || signature != header || requests != 1 || authCalls != 4 {
+		t.Fatal("relay did not preserve original or verify live authority before wire and under CAS")
 	}
 }
 
@@ -354,7 +354,7 @@ func TestHostRelayCallRetainsOwnHandlesThroughEOFAndFinalAuthentication(t *testi
 			return response, nil
 		})
 	})
-	if err != nil || !bytes.Equal(got, wire) || signature != header || !eof || !closedBody || auth != 2 || checks < 6 {
+	if err != nil || !bytes.Equal(got, wire) || signature != header || !eof || !closedBody || auth != 4 || checks < 6 {
 		t.Fatal("call did not retain EOF/final witness", err, checks, auth)
 	}
 	if _, err := file.Stat(); err == nil {
@@ -393,7 +393,7 @@ func TestHostRelayNativeLossCannotCommitAdmissionCAS(t *testing.T) {
 				call.witness = &resetD101RelayPeerWitness{}
 				call.checkNative = func(ctx context.Context) error {
 					checks++
-					if phase == "before-cas" && checks == 6 || phase == "after-cas" && checks == 7 {
+					if phase == "before-cas" && checks == 6 || phase == "after-cas" && checks == 8 {
 						return errResetExecutionEvidence
 					}
 					return ctx.Err()
@@ -541,5 +541,124 @@ func TestHostRelayTransportRejectsRedialAndAlternateDestination(t *testing.T) {
 				t.Fatal("alternate dial acquired witness")
 			}
 		})
+	}
+}
+
+func TestHostRelayCASRechecksIndependentAuthorityAfterWaiting(t *testing.T) {
+	for _, phase := range []string{"before-write", "after-write"} {
+		t.Run(phase, func(t *testing.T) {
+			r, wire, header, _ := newResetD101RelayFixture(t)
+			r.policy.expected.AcceptedAtUTC = ""
+			beforeCAS := make(chan struct{})
+			var calls atomic.Int32
+			var denied atomic.Bool
+			r.policy.authenticate = func(context.Context, string, string, string, resetD101RelayPeerObservation) error {
+				n := calls.Add(1)
+				if n == 2 {
+					close(beforeCAS)
+				}
+				if denied.Load() && (phase == "before-write" && n == 3 || phase == "after-write" && n == 4) {
+					return errResetExecutionEvidence
+				}
+				return nil
+			}
+			r.admissionMu.Lock()
+			locked := true
+			defer func() {
+				if locked {
+					r.admissionMu.Unlock()
+				}
+			}()
+			result := make(chan bool, 1)
+			go func() {
+				body, signature, err := r.readWithCallTransport(context.Background(), r.policy.expected.OperationID, r.policy.expected.ApprovalPlanSHA, r.policy.expected.ExecutionReceiptSHA, func(call *resetD101RelayCall) http.RoundTripper {
+					call.witness = &resetD101RelayPeerWitness{}
+					call.checkNative = func(ctx context.Context) error { return ctx.Err() }
+					return resetD101RelayFixtureTransport(func(*http.Request) (*http.Response, error) {
+						if call.authenticate(r.policy, call.op, call.plan, call.receipt) != nil {
+							return nil, errResetExecutionEvidence
+						}
+						return resetD101RelayFixtureResponse(wire, header), nil
+					})
+				})
+				result <- err != nil && body == nil && signature == ""
+			}()
+			select {
+			case <-beforeCAS:
+			case <-time.After(time.Second):
+				t.Fatal("reader did not reach held CAS mutex")
+			}
+			denied.Store(true)
+			r.admissionMu.Unlock()
+			locked = false
+			select {
+			case rejected := <-result:
+				if !rejected || r.acceptedAtUTC != "" {
+					t.Fatal("native-stable denied authority committed admission")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("CAS reader stuck")
+			}
+		})
+	}
+}
+func TestHostRelayCASRechecksOriginalCutoffAfterWaiting(t *testing.T) {
+	r, wire, header, _ := newResetD101RelayFixture(t)
+	r.policy.expected.AcceptedAtUTC = ""
+	proof, err := decodeResetD101PreparedProof(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalNow := time.Now()
+	beforeCAS := make(chan struct{})
+	var calls atomic.Int32
+	var elapsed atomic.Bool
+	r.policy.authenticate = func(context.Context, string, string, string, resetD101RelayPeerObservation) error {
+		if calls.Add(1) == 2 {
+			close(beforeCAS)
+		}
+		return nil
+	}
+	r.admissionMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			r.admissionMu.Unlock()
+		}
+	}()
+	result := make(chan bool, 1)
+	go func() {
+		body, signature, err := r.readWithCallTransportClock(context.Background(), r.policy.expected.OperationID, r.policy.expected.ApprovalPlanSHA, r.policy.expected.ExecutionReceiptSHA, func(call *resetD101RelayCall) http.RoundTripper {
+			call.witness = &resetD101RelayPeerWitness{}
+			call.checkNative = func(ctx context.Context) error { return ctx.Err() }
+			return resetD101RelayFixtureTransport(func(*http.Request) (*http.Response, error) {
+				if call.authenticate(r.policy, call.op, call.plan, call.receipt) != nil {
+					return nil, errResetExecutionEvidence
+				}
+				return resetD101RelayFixtureResponse(wire, header), nil
+			})
+		}, func() time.Time {
+			if elapsed.Load() {
+				return time.Unix(proof.DestructiveCutoffUnix, 0)
+			}
+			return originalNow
+		})
+		result <- err != nil && body == nil && signature == ""
+	}()
+	select {
+	case <-beforeCAS:
+	case <-time.After(time.Second):
+		t.Fatal("reader did not reach CAS boundary")
+	}
+	elapsed.Store(true)
+	r.admissionMu.Unlock()
+	locked = false
+	select {
+	case rejected := <-result:
+		if !rejected || r.acceptedAtUTC != "" {
+			t.Fatal("expired proof committed admission")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("CAS reader stuck")
 	}
 }

@@ -71,7 +71,13 @@ func (r *resetD101HostPreparedRelay) Read(ctx context.Context, op, planSHA, rece
 // Explicit transport seam is private to isolated fixtures; production above
 // always captures the actual connected UNIX descriptor and retained native FDs.
 func (r *resetD101HostPreparedRelay) readWithCallTransport(ctx context.Context, op, planSHA, receiptSHA string, transport func(*resetD101RelayCall) http.RoundTripper) ([]byte, string, error) {
-	if r == nil || ctx == nil || ctx.Err() != nil || r.policy.authenticate == nil || transport == nil ||
+	return r.readWithCallTransportClock(ctx, op, planSHA, receiptSHA, transport, time.Now)
+}
+
+// The clock seam belongs only to deterministic boundary fixtures. Production
+// Read and transport entry above always use the actual wall clock.
+func (r *resetD101HostPreparedRelay) readWithCallTransportClock(ctx context.Context, op, planSHA, receiptSHA string, transport func(*resetD101RelayCall) http.RoundTripper, clock func() time.Time) ([]byte, string, error) {
+	if r == nil || ctx == nil || ctx.Err() != nil || r.policy.authenticate == nil || transport == nil || clock == nil ||
 		op != r.policy.expected.OperationID || planSHA != r.policy.expected.ApprovalPlanSHA || receiptSHA != r.policy.expected.ExecutionReceiptSHA {
 		return nil, "", errResetExecutionEvidence
 	}
@@ -120,14 +126,14 @@ func (r *resetD101HostPreparedRelay) readWithCallTransport(ctx context.Context, 
 	proof, err := decodeResetD101PreparedProof(wire)
 	header := response.Header.Get("X-D101-Prepared-Proof")
 	parts := strings.Split(header, ".")
-	if err != nil || len(parts) != 2 || parts[0] != r.policy.keyID || requireResetD101RelayPreparedBinding(proof, r.policy.expected, time.Now()) != nil {
+	if err != nil || len(parts) != 2 || parts[0] != r.policy.keyID || requireResetD101RelayPreparedBinding(proof, r.policy.expected, clock()) != nil {
 		return nil, "", errResetExecutionEvidence
 	}
 	signature, err := base64.RawURLEncoding.Strict().DecodeString(parts[1])
 	if err != nil || len(signature) != ed25519.SignatureSize || base64.RawURLEncoding.EncodeToString(signature) != parts[1] ||
 		!ed25519.Verify(r.publicKey, append([]byte(resetD101PreparedDomain), wire...), signature) ||
 		call.authenticate(r.policy, op, planSHA, receiptSHA) != nil || bounded.Err() != nil ||
-		requireResetD101RelayPreparedBinding(proof, r.policy.expected, time.Now()) != nil {
+		requireResetD101RelayPreparedBinding(proof, r.policy.expected, clock()) != nil {
 		return nil, "", errResetExecutionEvidence
 	}
 	// Only authenticated, signed, canonical admission values reach this CAS.
@@ -135,7 +141,7 @@ func (r *resetD101HostPreparedRelay) readWithCallTransport(ctx context.Context, 
 	// mandatory actual host admission authentication must succeed again.
 	r.admissionMu.Lock()
 	defer r.admissionMu.Unlock()
-	if call.checkNative == nil || call.checkNative(bounded) != nil || bounded.Err() != nil {
+	if call.authenticate(r.policy, op, planSHA, receiptSHA) != nil || requireResetD101RelayPreparedBinding(proof, r.policy.expected, clock()) != nil || bounded.Err() != nil {
 		return nil, "", errResetExecutionEvidence
 	}
 	previous := r.acceptedAtUTC
@@ -147,7 +153,7 @@ func (r *resetD101HostPreparedRelay) readWithCallTransport(ctx context.Context, 
 	}
 	// Only this call's pending CAS can be rolled back while holding the mutex.
 	// No rejected/canceled/native-lost witness publishes a new admission value.
-	if call.checkNative(bounded) != nil || bounded.Err() != nil {
+	if call.authenticate(r.policy, op, planSHA, receiptSHA) != nil || requireResetD101RelayPreparedBinding(proof, r.policy.expected, clock()) != nil || bounded.Err() != nil {
 		r.acceptedAtUTC = previous
 		return nil, "", errResetExecutionEvidence
 	}
