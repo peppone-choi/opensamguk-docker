@@ -19,6 +19,31 @@ type Original struct {
 	SHA256 string
 }
 
+// Actual descriptor observations for the r1 custody record. These values are
+// data, not origin authentication or an installed signing authority.
+type NativeFilePin struct {
+	SHA256         string          `json:"sha256"`
+	Snapshot       PrivateSnapshot `json:"nativeSnapshot"`
+	OwnerUID       uint32          `json:"ownerUid"`
+	FileMode       uint32          `json:"fileMode"`
+	LinkCount      uint64          `json:"linkCount"`
+	ParentSnapshot PrivateSnapshot `json:"parentSnapshot"`
+	ParentOwnerUID uint32          `json:"parentOwnerUid"`
+	ParentMode     uint32          `json:"parentMode"`
+}
+
+func CapturePrivateOriginalPin(path string, limit int64) (Original, NativeFilePin, error) {
+	return capturePrivateFilePin(path, limit, 0, 0400)
+}
+func CapturePrivateExecutablePin(path string, limit int64) (Original, NativeFilePin, error) {
+	return capturePrivateFilePin(path, limit, 0, 0500)
+}
+func capturePrivateFilePin(path string, limit int64, uid uint32, mode os.FileMode) (Original, NativeFilePin, error) {
+	var pin NativeFilePin
+	original, err := readPrivateModeNativeCapture(path, limit, uid, mode, nil, &pin)
+	return original, pin, err
+}
+
 // Production ownership is root. UID injection is private to this package tests.
 func ReadPrivate(path string, limit int64) (Original, error) { return readPrivate(path, limit, 0) }
 
@@ -42,6 +67,9 @@ func readPrivateMode(path string, limit int64, uid uint32, mode os.FileMode) (Or
 	return readPrivateModeCapture(path, limit, uid, mode, nil)
 }
 func readPrivateModeCapture(path string, limit int64, uid uint32, mode os.FileMode, snapshot *PrivateSnapshot) (Original, error) {
+	return readPrivateModeNativeCapture(path, limit, uid, mode, snapshot, nil)
+}
+func readPrivateModeNativeCapture(path string, limit int64, uid uint32, mode os.FileMode, snapshot *PrivateSnapshot, nativePin *NativeFilePin) (Original, error) {
 	closed := Original{}
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path || limit <= 0 || limit > 64<<20 || mode != 0400 && mode != 0500 {
 		return closed, ErrUnavailable
@@ -54,6 +82,21 @@ func readPrivateModeCapture(path string, limit int64, uid uint32, mode os.FileMo
 	beforeDir, err := os.Lstat(parent)
 	if err != nil || !privateDirectory(beforeDir, uid) {
 		return closed, ErrUnavailable
+	}
+	var parentFile *os.File
+	if nativePin != nil {
+		dirFD, err := syscall.Open(parent, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+		if err != nil {
+			return closed, ErrUnavailable
+		}
+		parentFile = os.NewFile(uintptr(dirFD), parent)
+		defer parentFile.Close()
+		actualDir, err := parentFile.Stat()
+		if err != nil || !privateDirectory(actualDir, uid) || !os.SameFile(beforeDir, actualDir) ||
+			beforeDir.Size() != actualDir.Size() || !beforeDir.ModTime().Equal(actualDir.ModTime()) {
+			return closed, ErrUnavailable
+		}
+		beforeDir = actualDir // Parent snapshot comes from the actual open FD.
 	}
 	beforePath, err := os.Lstat(path)
 	if err != nil || !privateFileMode(beforePath, limit, uid, mode) {
@@ -86,6 +129,14 @@ func readPrivateModeCapture(path string, limit int64, uid uint32, mode os.FileMo
 		!beforeDir.ModTime().Equal(afterDir.ModTime()) {
 		return closed, ErrUnavailable
 	}
+	if parentFile != nil {
+		actualAfterDir, err := parentFile.Stat()
+		if err != nil || !privateDirectory(actualAfterDir, uid) || !os.SameFile(beforeDir, actualAfterDir) ||
+			!os.SameFile(actualAfterDir, afterDir) || beforeDir.Size() != actualAfterDir.Size() || beforeDir.Size() != afterDir.Size() ||
+			!beforeDir.ModTime().Equal(actualAfterDir.ModTime()) || !beforeDir.ModTime().Equal(afterDir.ModTime()) {
+			return closed, ErrUnavailable
+		}
+	}
 	sum := sha256.Sum256(wire)
 	if snapshot != nil {
 		value, err := privateSnapshot(before)
@@ -93,6 +144,17 @@ func readPrivateModeCapture(path string, limit int64, uid uint32, mode os.FileMo
 			return closed, ErrUnavailable
 		}
 		*snapshot = value
+	}
+	if nativePin != nil {
+		fileSnapshot, fileErr := privateSnapshot(before)
+		parentSnapshot, parentErr := privateSnapshot(beforeDir)
+		fileStat, fileOK := before.Sys().(*syscall.Stat_t)
+		parentStat, parentOK := beforeDir.Sys().(*syscall.Stat_t)
+		if fileErr != nil || parentErr != nil || !fileOK || !parentOK {
+			return closed, ErrUnavailable
+		}
+		*nativePin = NativeFilePin{hex.EncodeToString(sum[:]), fileSnapshot, fileStat.Uid, uint32(before.Mode().Perm()), uint64(fileStat.Nlink),
+			parentSnapshot, parentStat.Uid, uint32(beforeDir.Mode().Perm())}
 	}
 	return Original{wire, hex.EncodeToString(sum[:])}, nil
 }
