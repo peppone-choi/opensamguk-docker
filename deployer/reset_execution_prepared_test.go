@@ -67,9 +67,16 @@ func installResetD101LinkedFixtureProof(t *testing.T, cfg *config, uid uint32, i
 		t.Fatal("synthetic retained proof data", err)
 	}
 	for _, leaf := range []string{".deployer-reset-pre-reset-originals", ".deployer-reset-old-world"} {
-		if err := os.Mkdir(filepath.Join(cfg.serversDir, leaf), 0700); err != nil {
+		directory := filepath.Join(cfg.serversDir, leaf)
+		if err := os.Mkdir(directory, 0700); err != nil && !os.IsExist(err) {
 			t.Fatal("isolated fixture directory", err)
 		}
+		dir, _, err := openResetD101NativeDirectory(directory, uid)
+		if err != nil {
+			t.Fatal("isolated fixture directory custody")
+		}
+		dir.Close()
+		retainResetD101FixtureOriginalHistory(t, filepath.Join(directory, body.OperationID+".json"), uid)
 	}
 	if writeResetImmutablePrivateBytesWithUID(filepath.Join(cfg.serversDir, ".deployer-reset-pre-reset-originals"), body.OperationID, body.PreResetOriginalsSHA, canonicalWire, uid) != nil {
 		t.Fatal("isolated canonical custody")
@@ -112,6 +119,31 @@ func installResetD101LinkedFixtureProof(t *testing.T, cfg *config, uid uint32, i
 	preflight.PreStopNativeProofSHA = proofSHA
 }
 
+// Only fixture construction may rebase its synthetic history. Keep previous
+// bytes in a separate one-time test leaf; product originals/cleanup are intact.
+func retainResetD101FixtureOriginalHistory(t *testing.T, path string, uid uint32) {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return
+	}
+	if err != nil || !resetD101NativeFileInfo(info, uid, false) {
+		t.Fatal("unsafe synthetic history source")
+	}
+	history := path + ".fixture-history"
+	if _, err := os.Lstat(history); !os.IsNotExist(err) {
+		t.Fatal("synthetic history would overwrite previous bytes")
+	}
+	before, err := os.ReadFile(path)
+	if err != nil || os.Rename(path, history) != nil {
+		t.Fatal("synthetic history retention")
+	}
+	after, err := os.ReadFile(history)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatal("synthetic history bytes changed")
+	}
+}
+
 // Synthetic fixture: real private files/store/coordinator, no operating authority
 // or Docker. The UID seam cannot be selected by configuration or HTTP input.
 func resetD101PreparedFixture(t *testing.T) (config, uint32, *operationPreparation, resetExecutionEvidence, resetExecutionJournal, durableOperationRecord) {
@@ -136,7 +168,9 @@ func resetD101PreparedFixture(t *testing.T) (config, uint32, *operationPreparati
 	authority, _ := cfg.d101PurposeAuthority(context.Background(), op, plan.ApprovalIntentSHA)
 	intentValue := authority.Intent.Intent
 	accepted := time.Now().UTC().Truncate(time.Second).Add(-time.Second)
-	plan.WindowOpensAtUnix, plan.DestructiveCutoffUnix, plan.RecoveryDeadlineUnix = accepted.Unix()-60, accepted.Unix()+300, accepted.Unix()+3600
+	// A distinct (slightly narrower) synthetic window keeps the new history
+	// separate even when the wall clock equals the fixed issuer fixture instant.
+	plan.WindowOpensAtUnix, plan.DestructiveCutoffUnix, plan.RecoveryDeadlineUnix = accepted.Unix()-59, accepted.Unix()+300, accepted.Unix()+3600
 	intentValue.WindowOpensAtUnix, intentValue.DestructiveCutoffUnix, intentValue.RecoveryDeadlineUnix = plan.WindowOpensAtUnix, plan.DestructiveCutoffUnix, plan.RecoveryDeadlineUnix
 	intentWire, _ := json.Marshal(intentValue)
 	intentSHA := resetD101OriginalSHA(intentWire)
@@ -156,8 +190,8 @@ func resetD101PreparedFixture(t *testing.T) (config, uint32, *operationPreparati
 	installResetD101LinkedFixtureProof(t, &cfg, uid, intent, plan, prepare, &preflight)
 	preflightWire, _ := json.Marshal(preflight)
 	for leaf, wire := range map[string][]byte{".deployer-reset-intents": intentWire, ".deployer-reset-approvals": planWire, ".deployer-reset-preflights": preflightWire, ".deployer-reset-prepare-bodies": prepare} {
-		if os.Remove(filepath.Join(cfg.serversDir, leaf, op+".json")) != nil ||
-			writeResetImmutablePrivateBytesWithUID(filepath.Join(cfg.serversDir, leaf), op, resetD101OriginalSHA(wire), wire, uid) != nil {
+		retainResetD101FixtureOriginalHistory(t, filepath.Join(cfg.serversDir, leaf, op+".json"), uid)
+		if writeResetImmutablePrivateBytesWithUID(filepath.Join(cfg.serversDir, leaf), op, resetD101OriginalSHA(wire), wire, uid) != nil {
 			t.Fatal("fixture replace source")
 		}
 	}
@@ -383,6 +417,14 @@ func TestLinkedPreparedFixtureRetainsProofAndUsesProductionPlatformBoundary(t *t
 	if err != nil || resetD101OriginalSHA(wire) != evidence.Preflight.PreStopNativeProofSHA {
 		t.Fatal("linked proof original/SHA missing")
 	}
+	for _, leaf := range []string{".deployer-reset-intents", ".deployer-reset-approvals", ".deployer-reset-preflights", ".deployer-reset-prepare-bodies", ".deployer-reset-pre-reset-originals", ".deployer-reset-old-world"} {
+		originalPath := filepath.Join(cfg.serversDir, leaf, record.OperationID+".json")
+		prior, priorErr := os.ReadFile(originalPath + ".fixture-history")
+		current, currentErr := os.ReadFile(originalPath)
+		if priorErr != nil || currentErr != nil || len(prior) == 0 || len(current) == 0 || bytes.Equal(prior, current) {
+			t.Fatal("fixture history discarded or re-used as current", leaf)
+		}
+	}
 	verified := 0
 	source := cfg.d101PreStopNativeInstallation.verify
 	cfg.d101PreStopNativeInstallation.verify = func(ctx context.Context, binding resetD101PreStopNativeBinding) error {
@@ -405,7 +447,7 @@ func TestLinkedPreparedFixtureRetainsProofAndUsesProductionPlatformBoundary(t *t
 }
 
 func TestLinkedPreparedFixtureMissingOrChangedProofCannotAdmit(t *testing.T) {
-	for _, mode := range []string{"proof-sha-absent", "proof-sha-wrong", "proof-file-missing", "proof-partial", "canonical-changed", "producer-missing"} {
+	for _, mode := range []string{"proof-sha-absent", "proof-sha-wrong", "proof-file-missing", "proof-partial", "proof-previous-history", "canonical-changed", "producer-missing"} {
 		t.Run(mode, func(t *testing.T) {
 			cfg, uid, _, evidence, chain, record := resetD101PreparedFixture(t)
 			proofPath := filepath.Join(cfg.serversDir, ".deployer-reset-old-world", record.OperationID+".json")
@@ -424,6 +466,12 @@ func TestLinkedPreparedFixtureMissingOrChangedProofCannotAdmit(t *testing.T) {
 					t.Fatal("fixture partial")
 				}
 				evidence.Preflight.PreStopNativeProofSHA = resetD101OriginalSHA(wire[:len(wire)-1])
+			case "proof-previous-history":
+				prior, err := os.ReadFile(proofPath + ".fixture-history")
+				if err != nil || os.Rename(proofPath, proofPath+".retained") != nil || os.WriteFile(proofPath, prior, 0400) != nil {
+					t.Fatal("fixture previous-history substitution")
+				}
+				evidence.Preflight.PreStopNativeProofSHA = resetD101OriginalSHA(prior)
 			case "canonical-changed":
 				path := filepath.Join(cfg.serversDir, ".deployer-reset-pre-reset-originals", record.OperationID+".json")
 				if os.Rename(path, path+".retained") != nil || os.WriteFile(path, []byte("{}"), 0400) != nil {

@@ -108,7 +108,8 @@ func resetD101RecoveryFixture(t *testing.T) (config, *operationLease, lifecycleJ
 	record.D101IntentSHA = intentSHA
 	cfg.lifecycleOperationStore.operations[op] = record
 	for leaf, wire := range map[string][]byte{".deployer-reset-intents": intentWire, ".deployer-reset-approvals": planWire, ".deployer-reset-preflights": preflightWire, ".deployer-reset-prepare-bodies": prepare} {
-		if os.Remove(filepath.Join(cfg.serversDir, leaf, op+".json")) != nil || writeResetImmutablePrivateBytesWithUID(filepath.Join(cfg.serversDir, leaf), op, resetD101OriginalSHA(wire), wire, uid) != nil {
+		retainResetD101FixtureOriginalHistory(t, filepath.Join(cfg.serversDir, leaf, op+".json"), uid)
+		if writeResetImmutablePrivateBytesWithUID(filepath.Join(cfg.serversDir, leaf), op, resetD101OriginalSHA(wire), wire, uid) != nil {
 			t.Fatal("fixture original custody")
 		}
 	}

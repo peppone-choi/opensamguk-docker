@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -39,6 +40,13 @@ func resetD101IssuerFixture(t *testing.T) (config, uint32, string) {
 	preflight.TargetFingerprint = plan.TargetFingerprint
 	planWire, _ := json.Marshal(plan)
 	preflight.ApprovalPlanSHA = resetD101OriginalSHA(planWire)
+	prepare, _ := json.Marshal(struct {
+		SchemaVersion     int    `json:"schemaVersion"`
+		ApprovalIntentSHA string `json:"approvalIntentSha256"`
+		IntentBytes       string `json:"approvalIntentBytesBase64url"`
+	}{1, intentSHA, base64.RawURLEncoding.EncodeToString(intentWire)})
+	nativeCfg := config{serversDir: root}
+	installResetD101LinkedFixtureProof(t, &nativeCfg, uid, intent, plan, prepare, &preflight)
 	preflightWire, _ := json.Marshal(preflight)
 	refs := resetExecutionEvidenceRefs{preflight.ApprovalPlanSHA, resetD101OriginalSHA(preflightWire)}
 	fingerprint, err := resetExecutionRequestFingerprint("pep", plan.Target, refs)
@@ -70,6 +78,7 @@ func resetD101IssuerFixture(t *testing.T) (config, uint32, string) {
 	mustReserveOperation(t, store, durableOperationRecord{OperationID: plan.OperationID, Kind: lifecycleKindReset, SubjectID: "pep", RequestFingerprint: fingerprint,
 		Status: lifecycleJobSucceeded, HTTPStatus: 200, PublicMessage: durableOperationResetSucceededMessage, CreatedAt: accepted, UpdatedAt: accepted.Add(12 * time.Second), D101IntentSHA: intentSHA})
 	cfg := config{serversDir: root, lifecycleOperationStore: store, lifecycleJournalFile: filepath.Join(root, ".deployer-lifecycle.json"),
+		d101PreStopNativeInstallation: nativeCfg.d101PreStopNativeInstallation,
 		dockerRunnerContext: func(context.Context, ...string) (string, error) {
 			t.Fatal("receipt settlement invoked Docker")
 			return "", errResetExecutionEvidence
@@ -83,11 +92,6 @@ func resetD101IssuerFixture(t *testing.T) (config, uint32, string) {
 	if cfg.writeLifecycleJournalRecord(journal) != nil {
 		t.Fatal("synthetic live journal")
 	}
-	prepare, _ := json.Marshal(struct {
-		SchemaVersion     int    `json:"schemaVersion"`
-		ApprovalIntentSHA string `json:"approvalIntentSha256"`
-		IntentBytes       string `json:"approvalIntentBytesBase64url"`
-	}{1, intentSHA, base64.RawURLEncoding.EncodeToString(intentWire)})
 	number := func(n int) *int { return &n }
 	text := func(s string) *string { return &s }
 	running := true
@@ -124,7 +128,25 @@ func resetD101IssuerFixture(t *testing.T) (config, uint32, string) {
 func TestResetD101IssuerPersistsActualBoundSuccessExactlyOnceWithoutPhysicalReplay(t *testing.T) {
 	cfg, uid, op := resetD101IssuerFixture(t)
 	before, _ := cfg.lifecycleOperationStore.Lookup(op)
+	journalBefore, _ := os.ReadFile(cfg.lifecycleJournalFile)
+	proofPath := filepath.Join(cfg.serversDir, ".deployer-reset-old-world", op+".json")
+	proofBefore, proofReadErr := os.ReadFile(proofPath)
+	if proofReadErr != nil {
+		t.Fatal("retained synthetic proof missing")
+	}
 	sha, err := cfg.publishResetD101SucceededResultWithCustodyUID(context.Background(), op, uid)
+	if runtime.GOOS != "linux" {
+		if err == nil || sha != "" || stateFilePresent(filepath.Join(cfg.serversDir, ".deployer-reset-results", op+".json")) {
+			t.Fatal("unsupported native reader published RESULT")
+		}
+		current, found := cfg.lifecycleOperationStore.Lookup(op)
+		journalAfter, journalErr := os.ReadFile(cfg.lifecycleJournalFile)
+		proofAfter, proofErr := os.ReadFile(proofPath)
+		if !found || current != before || current.Status != lifecycleJobSucceeded || journalErr != nil || proofErr != nil || !bytes.Equal(journalBefore, journalAfter) || !bytes.Equal(proofBefore, proofAfter) {
+			t.Fatal("unsupported issuer rewrote SUCCEEDED or retained originals")
+		}
+		return
+	}
 	if err != nil {
 		t.Fatal("bound synthetic success refused", err)
 	}
