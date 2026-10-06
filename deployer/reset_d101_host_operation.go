@@ -43,7 +43,41 @@ func earlyResetD101HostCommand(args []string, getenv func(string) string, output
 	if len(args) < 2 {
 		return false, 0
 	}
+	// Optional independently authenticated native registration. Missing input
+	// leaves legacy entries unchanged; no target reads or keeper are forced.
+	if resetD101ReviewedNativeEntryFactory != nil && (args[1] == "--d101-host-operation" || args[1] == "--d101-issue-current-receipt" || args[1] == "--d101-prepared-relay" || args[1] == "--d101-initialize-key3") {
+		op := ""
+		if len(args) == 4 && args[2] == "--operation-id" {
+			op = args[3]
+		}
+		if installer, err := actualResetD101NativeEntry(context.Background(), args[1], op); err == nil {
+			resetD101ReviewedNativeAuthorityInstaller = installer
+			if args[1] == "--d101-initialize-key3" {
+				if installer.registerKey3(context.Background()) != nil {
+					return true, 2
+				}
+			}
+		} else {
+			return true, 2
+		}
+	}
 	switch args[1] {
+	case "--d101-native-keeper":
+		if (len(args) != 4 && len(args) != 5) || args[2] != "--operation-id" || !lifecycleJobIDRe.MatchString(args[3]) || (len(args) == 5 && args[4] != "--issuer-only") {
+			return true, 2
+		}
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		status := runResetD101NativeKeeper(ctx, args[3], len(args) == 5, os.Stdin, output)
+		if status == 3 {
+			resetD101NativeHoldMessage(errOutput)
+			for {
+				time.Sleep(time.Second)
+				runtime.KeepAlive(resetD101HeldNativeKeeper)
+			}
+		}
+		return true, status
+
 	case "--d101-initialize-key3":
 		if len(args) != 4 || args[2] != "--ceremony-card-sha256" || !resetEvidenceSHA.MatchString(args[3]) ||
 			runtime.GOOS != "linux" || runtime.GOARCH != "amd64" || os.Geteuid() != 0 {
@@ -65,6 +99,11 @@ func earlyResetD101HostCommand(args []string, getenv func(string) string, output
 		}
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer cancel()
+		if resetD101ReviewedNativeAuthorityInstaller != nil {
+			if awaitResetD101NativeBirth(ctx, resetD101ReviewedNativeAuthorityInstaller, args[3]) != nil {
+				return true, 2
+			}
+		}
 		// FD9 is borrowed; it is never closed/reopened/unlocked by this process.
 		descriptor := os.NewFile(9, "existing-host-keeper-fd9")
 		status := 2
@@ -295,6 +334,8 @@ func runResetD101HostOperation(ctx context.Context, descriptor *os.File, selecto
 			if p.authenticate(ctx, descriptor, selector, "release") != nil {
 				return 3
 			}
+			// Physical RESULT/job/child success is preserved. Native overall
+			// completion belongs to the parent keeper after this child exits.
 			failed = false
 			return 0
 		}

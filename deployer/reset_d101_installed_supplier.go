@@ -173,6 +173,9 @@ func requireResetD101TechnicalInstalledBinding(issuance d101operatorauth.Technic
 }
 
 func loadResetD101ReviewedInstallation(ctx context.Context, c config, bootstrap *resetD101InstalledBootstrap) (config, error) {
+	if c.d101NativeInstaller != nil && (bootstrap == nil || bootstrap.producer == nil) {
+		return closeResetD101InstalledSources(c), errResetD101InstallationNotSupplied
+	}
 	closed := closeResetD101InstalledSources(c)
 	closed.d101FixedInstallation = nil
 	if ctx == nil || ctx.Err() != nil || bootstrap == nil || bootstrap.producer == nil ||

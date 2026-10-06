@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"opensamguk-deployer/internal/d101native"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -302,6 +303,8 @@ var sharedEnvAllowlist = map[string]envFieldSpec{
 
 // 환경변수 묶음.
 type config struct {
+	d101RootProducer              *resetD101OldRootProducer
+	d101NativeInstaller           *resetD101NativeAuthorityInstaller
 	d101FixedInstallation         *resetD101FixedInstallation         // Independently reviewed installer pins/producers; never an env/request field.
 	d101SeedMaterialInputs        *resetD101SeedMaterialInputs        // Independent fixed native inputs; nil closes before any physical command.
 	d101CandidatePipeline         *resetD101CandidatePipeline         // Fixed native installation; nil fails before any physical command.
@@ -405,6 +408,7 @@ type lifecycleJobResponse struct {
 }
 
 type lifecycleJobManager struct {
+	d101NativeOwner   *resetD101RootOwnerGate
 	mu                sync.Mutex
 	jobs              map[string]lifecycleJob
 	operationJobs     map[string]string
@@ -432,6 +436,7 @@ const (
 // maintenance marker, so a workflow can drain the running deployer before
 // replacing containers or shared files.
 type operationCoordinator struct {
+	d101NativeOwner              *resetD101RootOwnerGate
 	mu                           sync.Mutex
 	cond                         *sync.Cond
 	closed                       bool
@@ -515,6 +520,10 @@ func (c *operationCoordinator) prepare(kind lifecycleKind, operationID, subjectI
 	}
 	marker, journal := stateFilePresent(c.markerPath), stateFilePresent(c.journalPath)
 	c.mu.Lock()
+	if c.d101NativeOwner.blocksAdmission() {
+		c.mu.Unlock()
+		return nil, errMaintenanceClosed
+	}
 	defer c.mu.Unlock()
 	if marker {
 		c.closed = true
@@ -552,6 +561,10 @@ func (p *operationPreparation) promote(jobID string) (*operationLease, error) {
 	c := p.coordinator
 	marker, journal := stateFilePresent(c.markerPath), stateFilePresent(c.journalPath)
 	c.mu.Lock()
+	if c.d101NativeOwner.blocksPromotion(p) {
+		c.mu.Unlock()
+		return nil, errMaintenanceClosed
+	}
 	defer c.mu.Unlock()
 	if marker {
 		c.closed = true
@@ -694,8 +707,16 @@ func (c *operationCoordinator) begin(jobID string) (*operationLease, error) {
 		return nil, errors.New("operation coordinator unavailable")
 	}
 	c.mu.Lock()
+	if c.d101NativeOwner.blocksAdmission() {
+		c.mu.Unlock()
+		return nil, errMaintenanceClosed
+	}
 	for (c.active != nil || c.preparing != nil) && !c.closed {
 		c.cond.Wait()
+		if c.d101NativeOwner.blocksAdmission() {
+			c.mu.Unlock()
+			return nil, errMaintenanceClosed
+		}
 	}
 	if c.preparationSettlementPending || c.closed || c.journalPending || stateFilePresent(c.journalPath) {
 		c.closed = true
@@ -729,8 +750,16 @@ func (c *operationCoordinator) beginRecovery() (*operationLease, error) {
 		return nil, errors.New("operation coordinator unavailable")
 	}
 	c.mu.Lock()
+	if c.d101NativeOwner.blocksAdmission() {
+		c.mu.Unlock()
+		return nil, errMaintenanceClosed
+	}
 	for c.active != nil || c.preparing != nil {
 		c.cond.Wait()
+		if c.d101NativeOwner.blocksAdmission() {
+			c.mu.Unlock()
+			return nil, errMaintenanceClosed
+		}
 	}
 	if !c.journalPending && !stateFilePresent(c.journalPath) {
 		c.mu.Unlock()
@@ -764,7 +793,7 @@ func (c *operationCoordinator) clearLifecycleJournalPending() {
 	}
 	c.mu.Lock()
 	c.journalPending = false
-	if !c.preparationSettlementPending && !stateFilePresent(c.markerPath) {
+	if !c.d101NativeOwner.blocksAdmission() && !c.preparationSettlementPending && !stateFilePresent(c.markerPath) {
 		c.closed = false
 	}
 	c.cond.Broadcast()
@@ -908,6 +937,10 @@ func (c *operationCoordinator) enterMaintenanceIfIdle() (maintenanceState, strin
 		return maintenanceStateDrained, "", errors.New("operation coordinator unavailable")
 	}
 	c.mu.Lock()
+	if c.d101NativeOwner.blocksAdmission() {
+		c.mu.Unlock()
+		return maintenanceStateDrained, "", errMaintenanceIdleConflict
+	}
 	defer c.mu.Unlock()
 
 	state := c.maintenanceStateLocked()
@@ -945,6 +978,10 @@ func (c *operationCoordinator) leaveMaintenance() (maintenanceState, error) {
 		return maintenanceStateDrained, errors.New("operation coordinator unavailable")
 	}
 	c.mu.Lock()
+	if c.d101NativeOwner.blocksAdmission() {
+		c.mu.Unlock()
+		return maintenanceStateDrained, errMaintenanceClosed
+	}
 	defer c.mu.Unlock()
 	if !c.closed {
 		return maintenanceStateOpen, nil
@@ -1145,6 +1182,9 @@ func validateLifecycleJournalOperationLink(operation, operationID string, kind l
 }
 
 func (c config) writeLifecycleJournalRecord(journal lifecycleJournal) error {
+	if c.operations != nil && c.operations.nativeMutationBlocked() {
+		return errMaintenanceClosed
+	}
 	if err := validateLifecycleResetExecution(journal); err != nil {
 		return err
 	}
@@ -1208,6 +1248,9 @@ func (c config) readLifecycleJournal() (lifecycleJournal, bool, error) {
 }
 
 func (c config) clearLifecycleJournal() error {
+	if c.operations != nil && c.operations.nativeMutationBlocked() {
+		return errMaintenanceClosed
+	}
 	if c.lifecycleJournalFile == "" {
 		return errors.New("lifecycle journal path is unavailable")
 	}
@@ -1718,13 +1761,18 @@ func (m *lifecycleJobManager) reserveWithOperation(operationID string, operation
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.d101NativeOwner.blocksAdmission() && !m.d101NativeOwner.allowsPreparationDrain(operationID, operationFingerprint, kind) {
+		return "", false, errMaintenanceClosed
+	}
 	if m.jobs == nil {
 		m.jobs = make(map[string]lifecycleJob)
 	}
 	if m.operationJobs == nil {
 		m.operationJobs = make(map[string]string)
 	}
-	m.pruneExpiredTerminalLocked(m.currentTimeLocked())
+	if !m.d101NativeOwner.blocksAdmission() {
+		m.pruneExpiredTerminalLocked(m.currentTimeLocked())
+	}
 	if operationID != "" {
 		if existingID, exists := m.operationJobs[operationID]; exists {
 			if existing, exists := m.jobs[existingID]; exists {
@@ -1910,7 +1958,9 @@ func (m *lifecycleJobManager) lookupOperation(operationID string) (operationResp
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.pruneExpiredTerminalLocked(m.currentTimeLocked())
+	if !m.d101NativeOwner.blocksAdmission() {
+		m.pruneExpiredTerminalLocked(m.currentTimeLocked())
+	}
 	jobID, exists := m.operationJobs[operationID]
 	if !exists {
 		return operationResponse{}, false
@@ -1939,7 +1989,9 @@ func (m *lifecycleJobManager) lookup(id string) (lifecycleJobResponse, bool) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.pruneExpiredTerminalLocked(m.currentTimeLocked())
+	if !m.d101NativeOwner.blocksAdmission() {
+		m.pruneExpiredTerminalLocked(m.currentTimeLocked())
+	}
 	job, exists := m.jobs[id]
 	if !exists {
 		return lifecycleJobResponse{}, false
@@ -1976,6 +2028,9 @@ func loadConfig() (config, error) {
 	jobs := newLifecycleJobManager()
 	serversDir := envOr("SERVERS_DIR", "/workspace/servers")
 	operationStorePath := envOr("DEPLOYER_OPERATION_STORE_FILE", filepath.Join(serversDir, durableOperationStoreFileName))
+	if err := resetD101RootStartupOwner(serversDir, false); err != nil {
+		return config{}, err
+	}
 	operationStore, err := openDurableOperationStore(operationStorePath, durableOperationMaxEntries, durableOperationTerminalRetention)
 	if err != nil {
 		return config{}, err
@@ -2644,6 +2699,14 @@ func main() {
 	}
 	// Register the fixed installation atomically; missing actual inputs keep
 	// all D101 sources closed while ordinary service/registry checks remain.
+	if !d101native.Missing(resetD101ReviewedNativeEntryFactory) {
+		if actual, nativeErr := actualResetD101NativeEntry(context.Background(), "main", ""); nativeErr == nil {
+			resetD101ReviewedNativeAuthorityInstaller = actual
+		}
+	}
+	if resetD101ReviewedNativeAuthorityInstaller != nil {
+		cfg.d101NativeInstaller = resetD101ReviewedNativeAuthorityInstaller
+	}
 	cfg, err = assembleResetD101InstalledSources(context.Background(), cfg)
 	if err != nil {
 		log.Print("D101 fixed installation sources unavailable")
@@ -2661,11 +2724,22 @@ func main() {
 		log.Fatal("DEPLOYER_TOKEN 미설정 — 인증 토큰 필수")
 	}
 
+	var rootSource resetD101RootSource
+	if cfg.d101NativeInstaller != nil {
+		rootSource = cfg.d101NativeInstaller.rootSource
+	}
+	cfg.d101RootProducer = registerResetD101OldRoot(&cfg, rootSource)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "up"})
 	})
 	mux.HandleFunc("/readyz", cfg.handleReady)
+	if cfg.d101RootProducer != nil {
+		mux.HandleFunc("/d101/native/root", cfg.withAuth(cfg.withLoopback(cfg.d101RootProducer.handler())))
+	}
+	if cfg.d101NativeInstaller != nil {
+		mux.HandleFunc("/d101/native/completion", cfg.withAuth(cfg.withLoopback(cfg.d101NativeInstaller.completionHandler())))
+	}
 	mux.HandleFunc("/status", cfg.withAuth(cfg.handleStatus))
 	mux.HandleFunc("/deploy", cfg.withAuth(cfg.handleDeploy))
 	mux.HandleFunc("/servers", cfg.withAuth(cfg.handleServers))

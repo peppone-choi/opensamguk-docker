@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"opensamguk-deployer/internal/d101custody"
+	"opensamguk-deployer/internal/d101native"
 )
 
 // Private Go installation input from the independently reviewed fixed installer.
@@ -19,17 +20,18 @@ import (
 var resetD101ReviewedFixedInstallation *resetD101FixedInstallation
 
 type resetD101FixedInstallation struct {
-	readerSHA  string
-	readerPin  d101custody.NativeFilePin
-	authority  resetD101HostAuthorityPins
-	provenance resetD101ApprovedReceiptPins
-	current    resetD101CurrentFreezePins
-	preStop    resetD101PreStopNativeInstallation
-	seed       resetD101SeedMaterialInputs
-	candidate  resetD101CandidateInstallation
-	upstream   resetD101ProvenanceUpstreamVerifier
-	evidence   resetD101HostEvidenceVerifier
-	recovery   resetD101FixedRecoveryProducer
+	nativeInstaller *resetD101NativeAuthorityInstaller
+	readerSHA       string
+	readerPin       d101custody.NativeFilePin
+	authority       resetD101HostAuthorityPins
+	provenance      resetD101ApprovedReceiptPins
+	current         resetD101CurrentFreezePins
+	preStop         resetD101PreStopNativeInstallation
+	seed            resetD101SeedMaterialInputs
+	candidate       resetD101CandidateInstallation
+	upstream        resetD101ProvenanceUpstreamVerifier
+	evidence        resetD101HostEvidenceVerifier
+	recovery        resetD101FixedRecoveryProducer
 }
 
 // Actual restore1/native producer, not a record claiming RECOVERED. The
@@ -74,6 +76,11 @@ func mapResetD101FixedInstallationWithSources(ctx context.Context, c config, ori
 	checkRecord := func(ctx context.Context) error {
 		if ctx == nil || ctx.Err() != nil {
 			return errResetExecutionEvidence
+		}
+		if p.nativeInstaller != nil {
+			if err := p.nativeInstaller.consumePhase(ctx, nil, p.authority.OperationID, 13, func(_ *d101native.VerifiedCurrent) error { return nil }); err != nil {
+				return err
+			}
 		}
 		after, afterPin, err := read(resetD101NativeReaderInstallationPath, 64<<10)
 		if err != nil || afterPin != pin || after.SHA256 != original.SHA256 || !bytes.Equal(after.Bytes, original.Bytes) || ctx.Err() != nil {

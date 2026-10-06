@@ -8043,3 +8043,56 @@ SERVER_REGISTRY_JSON=[{"id":"pep","name":"\ud1b5\uc77c \uc11c\ubc84","gameApiUrl
 		t.Fatalf("replay re-ran docker work: before=%d after=%d", before, after)
 	}
 }
+
+func TestNative9AbsentOwnerPreservesOrdinaryStartup(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SERVERS_DIR", dir)
+	t.Setenv("DEPLOYER_OPERATION_STORE_FILE", filepath.Join(dir, "operations.json"))
+	t.Setenv("DEPLOYER_MAINTENANCE_FILE", filepath.Join(dir, "marker"))
+	t.Setenv("DEPLOYER_LIFECYCLE_JOURNAL_FILE", filepath.Join(dir, "journal"))
+	c, err := loadConfig()
+	if err != nil || c.operations == nil || c.lifecycleJobs == nil || c.lifecycleOperationStore == nil {
+		t.Fatal("actual absence broke ordinary startup", err)
+	}
+	if c.operations.d101NativeOwner.blocksAdmission() {
+		t.Fatal("missing D101 supplier closed ordinary admission")
+	}
+}
+func TestNative9PresentUnknownOwnerHoldsBeforeRecovery(t *testing.T) {
+	for _, name := range []string{"present", "unknown"} {
+		t.Run(name, func(t *testing.T) {
+			if name == "present" && os.Geteuid() != 0 {
+				t.Skip("NOT_RUN: actual PRESENT native owner requires isolated Linux UID0")
+			}
+			dir := t.TempDir()
+			storePath := filepath.Join(dir, "operations.json")
+			before := []byte(`{"version":1,"operations":[]}`)
+			if err := os.WriteFile(storePath, before, 0644); err != nil {
+				t.Fatal(err)
+			}
+			owner := resetD101RootOwnerPath(dir)
+			if name == "present" {
+				if err := os.WriteFile(owner, []byte("unresolved owner"), 0400); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.Mkdir(owner, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("SERVERS_DIR", dir)
+			t.Setenv("DEPLOYER_OPERATION_STORE_FILE", storePath)
+			if _, err := loadConfig(); err == nil {
+				t.Fatal("owner allowed startup Recover")
+			}
+			after, err := os.ReadFile(storePath)
+			info, statErr := os.Stat(storePath)
+			if err != nil || statErr != nil || !bytes.Equal(before, after) || info.Mode().Perm() != 0644 {
+				t.Fatal("startup HOLD opened/chmodded/pruned store")
+			}
+		})
+	}
+}

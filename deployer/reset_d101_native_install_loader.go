@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"opensamguk-deployer/internal/d101custody"
+	"opensamguk-deployer/internal/d101native"
 )
 
 const resetD101InstallationAnchorPath = "/etc/opensamguk/d101/installation-anchor.spki"
@@ -218,4 +219,12 @@ func readResetD101NativeInstallNegative(ctx context.Context, op string) error {
 		return errResetExecutionEvidence
 	}
 	return errResetD101InstallationNotSupplied
+}
+
+// Positive native construction is separate from the preserved negative reader.
+func readResetD101NativeCurrent(ctx context.Context, descriptor *os.File, op string, sequence uint64, use func(*d101native.VerifiedCurrent) error) error {
+	if resetD101ReviewedNativeAuthorityInstaller == nil {
+		return errResetD101InstallationNotSupplied
+	}
+	return resetD101ReviewedNativeAuthorityInstaller.consumePhase(ctx, descriptor, op, sequence, use)
 }

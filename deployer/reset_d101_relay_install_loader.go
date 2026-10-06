@@ -32,6 +32,13 @@ func readResetD101RelayInstallNegative(ctx context.Context) (*resetD101HostRelay
 	return nil, errResetD101InstallationNotSupplied
 }
 func fixedResetD101HostRelayInstallation(ctx context.Context) *resetD101HostRelayInstallation {
+	if resetD101ReviewedNativeAuthorityInstaller != nil {
+		p, err := resetD101ReviewedNativeAuthorityInstaller.relayInstallation(ctx)
+		if err != nil {
+			return nil
+		}
+		return p
+	}
 	if resetD101ReviewedHostRelay != nil {
 		return resetD101ReviewedHostRelay
 	}

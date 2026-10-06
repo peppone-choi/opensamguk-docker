@@ -325,3 +325,23 @@ func TestPreparedNativeTwoStepRetentionBindsOriginalDescriptors(t *testing.T) {
 		})
 	}
 }
+
+func TestNative9PhysicalStageFactDoesNotDependOnReleaseCompletion(t *testing.T) {
+	c := native9RootDataFixture(t)
+	op := strings.Repeat("a", 32)
+	job := strings.Repeat("b", 32)
+	body := json.RawMessage(`{"stage":"physical-result","success":true}`)
+	c.lifecycleJobs.jobs[job] = lifecycleJob{id: job, operationID: op, status: lifecycleJobSucceeded, httpStatus: 200, result: body}
+	c.lifecycleJobs.operationJobs[op] = job
+	response, ok := c.lifecycleJobs.lookupOperation(op)
+	if !ok || response.Status != lifecycleJobSucceeded || response.HTTPStatus != 200 {
+		t.Fatal("physical stage success became release dependent")
+	}
+	v := &resetD101NativeAuthorityInstaller{operationID: op}
+	if _, err := v.overallCompletion(context.Background()); err == nil {
+		t.Fatal("physical stage result forged overall completion")
+	}
+	if c.lifecycleJobs.jobs[job].status != lifecycleJobSucceeded || !bytes.Equal(c.lifecycleJobs.jobs[job].result, body) {
+		t.Fatal("completion HOLD overwrote physical fact")
+	}
+}

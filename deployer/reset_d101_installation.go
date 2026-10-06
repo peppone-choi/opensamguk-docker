@@ -36,7 +36,14 @@ func readFixedResetD101InstalledSources(ctx context.Context, c config) (resetD10
 	if err != nil {
 		return resetD101InstalledSources{}, err
 	}
-	return mapResetD101FixedInstallation(ctx, c, original, pin, c.d101FixedInstallation)
+	input := c.d101FixedInstallation
+	if c.d101NativeInstaller != nil && input == nil {
+		input, err = c.d101NativeInstaller.fixedForMain(ctx, c, original, pin)
+		if err != nil {
+			return resetD101InstalledSources{}, err
+		}
+	}
+	return mapResetD101FixedInstallation(ctx, c, original, pin, input)
 }
 func closeResetD101InstalledSources(c config) config {
 	c.d101PurposeAuthority = nil

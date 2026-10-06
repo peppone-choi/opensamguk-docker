@@ -13,8 +13,9 @@ COPY go.mod ./
 COPY *.go ./
 COPY internal ./internal
 # CGO 끈 정적 바이너리(런타임 alpine에서 그대로 동작).
+ARG D101_ROOT_SOURCE_SHA=""
 ENV CGO_ENABLED=0
-RUN go build -trimpath -ldflags="-s -w" -o /out/deployer .
+RUN go build -trimpath -ldflags="-s -w -X main.rootBuiltSourceSHA=${D101_ROOT_SOURCE_SHA}" -o /out/deployer .
 
 # --- 런타임 스테이지 ---
 # docker:27-cli 이미지에는 docker CLI + compose v2 플러그인이 포함된다.

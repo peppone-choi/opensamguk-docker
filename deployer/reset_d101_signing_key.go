@@ -10,6 +10,8 @@ import (
 	"encoding/hex"
 	"reflect"
 	"time"
+
+	"opensamguk-deployer/internal/d101native"
 )
 
 // The installation card supplies these pins and a fixed root-private directory.
@@ -131,4 +133,30 @@ func (key *resetD101SigningKey) sign(domain string, original []byte) ([]byte, er
 	}
 	message := append([]byte(domain), original...)
 	return ed25519.Sign(key.private, message), nil
+}
+
+// Private typed native route. This does not add to sign(domain,raw)'s whitelist.
+func (key *resetD101SigningKey) signNativeAuthority(ctx context.Context, input *resetD101NativeSigningInput) ([]byte, error) {
+	if key == nil || ctx == nil || ctx.Err() != nil || input == nil || input.auth == nil || d101native.Missing(input.source) || input.descriptor == nil || input.descriptor.Fd() != 9 || len(key.private) != ed25519.PrivateKeySize {
+		return nil, errResetExecutionEvidence
+	}
+	a := input.auth
+	record := nativeResetD101RecordForSigning(a.original)
+	h, ok := d101native.HeaderOf(record)
+	if pub, isPublic := record.(*d101native.RelaySessionBinding); isPublic {
+		ok = pub.OperationID == a.binding.OperationID && pub.TargetFingerprint == a.binding.TargetFingerprint && pub.PublicationRevision == a.binding.PublicationRevision && pub.OriginalCutoffUnix == a.binding.OriginalCutoffUnix && pub.KeeperProcess == a.binding.Keeper.Process && pub.KeeperBirthNonce == a.binding.Keeper.BirthNonce
+		h.Binding = a.binding
+	}
+	if !ok || h.Binding != a.binding || a.binding.IssuerSPKISHA256 != key.publicKeySpkiSHA || key.keyID != a.keyPins.KeyID || key.publicKeySpkiSHA != a.keyPins.PublicKeySpkiSHA || !d101native.ValidRef(a.purposeOriginal) || time.Now().Unix() >= a.binding.OriginalCutoffUnix || input.source.RecheckNativeSigning(ctx, input.descriptor, a) != nil {
+		return nil, errResetExecutionEvidence
+	}
+	preimage := append([]byte(d101native.NativeAuthorityDomain), a.original...)
+	defer clear(preimage)
+	signature := ed25519.Sign(key.private, preimage)
+	defer clear(signature)
+	wire, err := d101native.EncodeEnvelope(a.original, key.keyID, signature)
+	if err != nil || input.source.RecheckNativeSigning(ctx, input.descriptor, a) != nil || ctx.Err() != nil || time.Now().Unix() >= a.binding.OriginalCutoffUnix {
+		return nil, errResetExecutionEvidence
+	}
+	return wire, nil
 }
