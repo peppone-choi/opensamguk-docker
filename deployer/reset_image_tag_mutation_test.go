@@ -24,12 +24,19 @@ func TestResetImageTagMutationIsRejectedByCandidateRegression(t *testing.T) {
 		t.Fatal("image tag mutation point changed; update the behavioral probe")
 	}
 	scratch := t.TempDir()
-	sources, err := filepath.Glob("*.go")
+	// Include the tracked module dependency closure, not just root Go files.
+	// Untracked files from other work are never inputs to the mutation child.
+	tracked, err := exec.Command("git", "ls-files", "-z", "--", "*.go", "go.mod", "go.sum").Output()
 	if err != nil {
 		t.Fatal(err)
 	}
-	sources = append(sources, "go.mod")
-	for _, file := range sources {
+	for _, file := range strings.Split(string(tracked), "\x00") {
+		if file == "" {
+			continue
+		}
+		if filepath.IsAbs(file) || filepath.Clean(file) != file || file == ".." || strings.HasPrefix(file, ".."+string(filepath.Separator)) {
+			t.Fatal("tracked mutation source escaped the module")
+		}
 		contents, err := os.ReadFile(file)
 		if err != nil {
 			t.Fatal(err)
@@ -37,7 +44,11 @@ func TestResetImageTagMutationIsRejectedByCandidateRegression(t *testing.T) {
 		if file == "reset_image_pins.go" {
 			contents = bytes.Replace(contents, []byte(approved), []byte(mutated), 1)
 		}
-		if err := os.WriteFile(filepath.Join(scratch, file), contents, 0o600); err != nil {
+		destination := filepath.Join(scratch, file)
+		if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(destination, contents, 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -55,6 +66,7 @@ func TestResetImageTagMutationIsRejectedByCandidateRegression(t *testing.T) {
 	if !strings.Contains(string(output), "inspection did not use exact approved tag: ghcr.io/owner/opensamguk:game-api-latest") {
 		t.Fatalf("mutation failed without the required behavior assertion: %s", output)
 	}
+	t.Logf("mutation child reached the required behavior assertion:\n%s", output)
 	after, err := os.ReadFile("reset_image_pins.go")
 	if err != nil || !bytes.Equal(original, after) {
 		t.Fatal("mutation probe changed the original source")

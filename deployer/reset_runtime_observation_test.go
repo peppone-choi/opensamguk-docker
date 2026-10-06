@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"os"
@@ -16,7 +17,8 @@ import (
 
 func resetRuntimeFixture(t *testing.T, mode string) (config, resetExecutionPhaseBinding, resetExecutionEvidence, resetRuntimeRawSource, func() time.Time, *int) {
 	t.Helper()
-	plan, preflight, _ := resetEvidenceFixture(t)
+	intentWire, _, plan := resetIntentFixture(t)
+	_, preflight, _ := resetEvidenceFixture(t)
 	start := time.Now().UTC().Add(-time.Second)
 	plan.WindowOpensAtUnix = start.Unix() - 60
 	plan.DestructiveCutoffUnix = start.Unix() + 300
@@ -24,12 +26,34 @@ func resetRuntimeFixture(t *testing.T, mode string) (config, resetExecutionPhase
 	preflight.ObservedAtUnix = start.Unix() - 1
 	preflight.ExpiresAtUnix = start.Unix() + 20
 	preflight.BackupRetainUntilUnix = start.Unix() + 7*24*60*60
-	binding := resetExecutionPhaseBinding{OperationID: plan.OperationID, Target: plan.Target, AcceptedAtUnix: start.Unix(), Evidence: resetExecutionEvidenceRefs{preflight.ApprovalPlanSHA, strings.Repeat("d", 64)}}
+	var intentValue resetApprovalIntent
+	if json.Unmarshal(intentWire, &intentValue) != nil {
+		t.Fatal("synthetic runtime intent")
+	}
+	intentValue.WindowOpensAtUnix, intentValue.DestructiveCutoffUnix, intentValue.RecoveryDeadlineUnix = plan.WindowOpensAtUnix, plan.DestructiveCutoffUnix, plan.RecoveryDeadlineUnix
+	intentWire, err := json.Marshal(intentValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := decodeResetApprovalIntent(intentWire, resetD101OriginalSHA(intentWire))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.ApprovalIntentSHA = intent.SHA
+	planWire, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preflight.ApprovalPlanSHA, preflight.TargetFingerprint = resetD101OriginalSHA(planWire), plan.TargetFingerprint
 	services := []string{"game-api", "game-engine", "web-game", "game-postgres", "game-redis"}
 	imageServices := map[string]string{}
 	observations := map[string]int{}
 	commands := 0
-	cfg := config{serversDir: t.TempDir(), dockerRunnerContext: func(ctx context.Context, args ...string) (string, error) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config{serversDir: root, dockerRunnerContext: func(ctx context.Context, args ...string) (string, error) {
 		commands++
 		if ctx.Err() != nil {
 			return "", ctx.Err()
@@ -168,6 +192,29 @@ func resetRuntimeFixture(t *testing.T, mode string) (config, resetExecutionPhase
 		}
 		return start.Add(2 * time.Second)
 	}
+	// Retain actual synthetic bytes before hashing the preflight. Reuse the
+	// fixed-data test verifier; this never installs an operating authority.
+	prepare, err := json.Marshal(struct {
+		SchemaVersion int    `json:"schemaVersion"`
+		IntentSHA     string `json:"approvalIntentSha256"`
+		IntentBytes   string `json:"approvalIntentBytesBase64url"`
+	}{1, intent.SHA, base64.RawURLEncoding.EncodeToString(intentWire)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid := uint32(os.Geteuid())
+	installResetD101LinkedFixtureProof(t, &cfg, uid, intent, plan, prepare, &preflight)
+	preflightWire, err := json.Marshal(preflight)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for leaf, wire := range map[string][]byte{".deployer-reset-intents": intentWire, ".deployer-reset-prepare-bodies": prepare, ".deployer-reset-approvals": planWire, ".deployer-reset-preflights": preflightWire} {
+		dir := filepath.Join(root, leaf)
+		if os.Mkdir(dir, 0700) != nil || writeResetImmutablePrivateBytesWithUID(dir, plan.OperationID, resetD101OriginalSHA(wire), wire, uid) != nil {
+			t.Fatal("synthetic runtime original custody")
+		}
+	}
+	binding := resetExecutionPhaseBinding{OperationID: plan.OperationID, Target: plan.Target, AcceptedAtUnix: start.Unix(), Evidence: resetExecutionEvidenceRefs{preflight.ApprovalPlanSHA, resetD101OriginalSHA(preflightWire)}}
 	installSyntheticCandidatePromotion(t, cfg, plan, start)
 	return cfg, binding, resetExecutionEvidence{plan, preflight}, raw, clock, &commands
 }
