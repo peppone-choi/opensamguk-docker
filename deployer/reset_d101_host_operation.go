@@ -33,6 +33,7 @@ type resetD101HostOperationInstallation struct {
 	target                                       resetLifecycleTarget
 	evidence                                     resetExecutionEvidenceRefs
 	authenticate                                 func(context.Context, *os.File, string, string) error
+	preparedCustody                              *resetD101HostPreparedCustody
 }
 type resetD101HostOperationSupplier func(context.Context, *os.File, string) (*resetD101HostOperationInstallation, error)
 
@@ -116,7 +117,12 @@ func runResetD101HostOperation(ctx context.Context, descriptor *os.File, selecto
 	if err != nil || p.authenticate(ctx, descriptor, selector, "installed") != nil || ctx.Err() != nil {
 		return 2
 	}
-	if c.d101FixedInstallation == nil || c.d101PurposeAuthority == nil {
+	if c.d101FixedInstallation == nil || c.d101PurposeAuthority == nil || p.preparedCustody == nil {
+		return 2
+	}
+	currentSupplier, ok := c.d101FixedInstallation.current.supplier.(*resetD101CurrentHostSupplier)
+	if !ok || currentSupplier == nil || p.preparedCustody.pins.operationID != selector ||
+		p.preparedCustody.pins.purposeKeyID != c.d101FixedInstallation.authority.SigningKey.KeyID || p.preparedCustody.pins.purposeSPKISHA != c.d101FixedInstallation.authority.SigningKey.PublicKeySpkiSHA {
 		return 2
 	}
 	intentSHA := c.d101FixedInstallation.authority.ApprovalIntentSHA
@@ -167,14 +173,51 @@ func runResetD101HostOperation(ctx context.Context, descriptor *os.File, selecto
 		return 3
 	}
 	getter := func(readCtx context.Context, op, plan, receipt string) ([]byte, string, error) {
+		if readCtx == nil {
+			return nil, "", errResetExecutionEvidence
+		}
+		bounded, cancel := context.WithTimeout(readCtx, 2*time.Second)
+		defer cancel()
+		requestStarted := time.Now()
 		if op != selector || plan != binding.Evidence.ApprovalPlanSHA || receipt != binding.Evidence.ExecutionReceiptSHA ||
-			p.authenticate(readCtx, descriptor, selector, "prepared-get-before") != nil {
+			p.authenticate(bounded, descriptor, selector, "prepared-get-before") != nil || bounded.Err() != nil {
 			return nil, "", errResetExecutionEvidence
 		}
-		wire, header, err := c.readResetD101PreparedProof(readCtx, op, plan, receipt)
-		if err != nil || p.authenticate(readCtx, descriptor, selector, "prepared-get-after") != nil || readCtx.Err() != nil {
+		returned := false
+		defer func() {
+			if !returned {
+				p.preparedCustody.hold()
+			}
+		}()
+		record, found := c.lifecycleOperationStore.Lookup(op)
+		if !found || record.CreatedAt.Unix() != binding.AcceptedAtUnix || c.requireResetD101Preparation(record) != nil {
 			return nil, "", errResetExecutionEvidence
 		}
+		_, witness, err := currentSupplier.captureAuthenticatedWitness(bounded, binding, requestStarted)
+		if err != nil || witness == nil || bounded.Err() != nil {
+			if witness != nil && witness.release != nil {
+				witness.release()
+			}
+			return nil, "", errResetExecutionEvidence
+		}
+		defer witness.release()
+		wire, header, err := c.readResetD101PreparedProof(bounded, op, plan, receipt)
+		if err != nil {
+			return nil, "", errResetExecutionEvidence
+		}
+		retained, err := p.preparedCustody.retain(bounded, descriptor, binding, record.CreatedAt, requestStarted, witness, wire, header)
+		if err != nil || retained == nil {
+			return nil, "", errResetExecutionEvidence
+		}
+		defer retained.close()
+		if c.requireResetD101Preparation(record) != nil || retained.recheck(bounded) != nil || witness.recheckNative() != nil ||
+			p.authenticate(bounded, descriptor, selector, "prepared-get-after") != nil || retained.recheck(bounded) != nil || witness.recheckNative() != nil || bounded.Err() != nil {
+			return nil, "", errResetExecutionEvidence
+		}
+		if retained.complete == nil || retained.complete() != nil || bounded.Err() != nil {
+			return nil, "", errResetExecutionEvidence
+		}
+		returned = true
 		return wire, header, nil
 	}
 	if p.authenticate(ctx, descriptor, selector, "socket-parent-before") != nil || ctx.Err() != nil {

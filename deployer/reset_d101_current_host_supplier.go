@@ -53,25 +53,62 @@ func newResetD101CurrentHostSupplier(descriptor *os.File, launcher d101hostlaunc
 	return &resetD101CurrentHostSupplier{descriptor: descriptor, launcher: launcher, pins: pins, verify: verify}, nil
 }
 
+// Private same-call witness; raw8/native labels are not independent authority.
+// Only the actual supplier's mandatory verifier followed by native rereads
+// creates this witness for the host prepared GET audit adapter.
+type resetD101AuthenticatedCaptureWitness struct {
+	binding        resetExecutionPhaseBinding
+	observation    resetD101CurrentHostObservation
+	capture        resetD101CurrentFreezeCapture
+	requestStarted time.Time
+	release        func()
+}
+
+func (w *resetD101AuthenticatedCaptureWitness) recheckNative() error {
+	if w == nil || w.release == nil || !lifecycleJobIDRe.MatchString(w.capture.captureNonce) || w.observation.captureNonce != w.capture.captureNonce {
+		return errResetExecutionEvidence
+	}
+	retained, pin, e1 := d101custody.CapturePrivateOriginalPin(w.observation.retainedPath, resetD101CurrentFreezeLimit)
+	visible, visiblePin, e2 := d101custody.CapturePrivateOriginalPin(filepath.Join(filepath.Dir(w.observation.retainedPath), "current-freeze-"+w.binding.OperationID), resetD101CurrentFreezeLimit)
+	if e1 != nil || e2 != nil || pin != w.observation.retainedPin || visiblePin != w.observation.visiblePin || retained.SHA256 != w.capture.wholeSHA ||
+		!bytes.Equal(retained.Bytes, w.observation.original) || !bytes.Equal(visible.Bytes, w.observation.original) {
+		return errResetExecutionEvidence
+	}
+	return nil
+}
+
 func (s *resetD101CurrentHostSupplier) CaptureAfter(ctx context.Context, binding resetExecutionPhaseBinding, started time.Time) (resetD101CurrentFreezeCapture, error) {
+	capture, witness, err := s.captureAuthenticatedWitness(ctx, binding, started)
+	if witness != nil && witness.release != nil {
+		defer witness.release()
+	}
+	return capture, err
+}
+
+func (s *resetD101CurrentHostSupplier) captureAuthenticatedWitness(ctx context.Context, binding resetExecutionPhaseBinding, started time.Time) (resetD101CurrentFreezeCapture, *resetD101AuthenticatedCaptureWitness, error) {
 	empty := resetD101CurrentFreezeCapture{}
 	if s == nil || ctx == nil || ctx.Err() != nil || s.verify == nil || started.IsZero() ||
 		binding.OperationID != s.pins.operationID || resetRequestFingerprint("pep", binding.Target) != s.pins.targetFingerprint ||
 		binding.Evidence.ApprovalPlanSHA != s.pins.approvalPlanSHA || !time.Now().Before(s.pins.destructiveCutoff) {
-		return empty, errResetExecutionEvidence
+		return empty, nil, errResetExecutionEvidence
 	}
 	// One child per installed host session. Queue time remains inside the
 	// caller's guard deadline; no capture can receive a renewed cutoff.
 	if !s.mu.TryLock() {
-		return empty, errResetExecutionEvidence
+		return empty, nil, errResetExecutionEvidence
 	}
-	defer s.mu.Unlock()
+	witnessReturned := false
+	defer func() {
+		if !witnessReturned {
+			s.mu.Unlock()
+		}
+	}()
 	if ctx.Err() != nil {
-		return empty, errResetExecutionEvidence
+		return empty, nil, errResetExecutionEvidence
 	}
 	dir, err := os.OpenFile(s.pins.directory, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
-		return empty, errResetExecutionEvidence
+		return empty, nil, errResetExecutionEvidence
 	}
 	defer dir.Close() // auxiliary directory only, never keeper FD9
 	checkDirectory := func() bool {
@@ -84,35 +121,35 @@ func (s *resetD101CurrentHostSupplier) CaptureAfter(ctx context.Context, binding
 		return ok && native.Uid == 0 && uint64(native.Dev) == s.pins.parentDevice && uint64(native.Ino) == s.pins.parentInode
 	}
 	if !checkDirectory() {
-		return empty, errResetExecutionEvidence
+		return empty, nil, errResetExecutionEvidence
 	}
 	before, err := dir.Readdirnames(1025)
 	if len(before) > 1024 || err != nil && err != io.EOF {
-		return empty, errResetExecutionEvidence
+		return empty, nil, errResetExecutionEvidence
 	}
 	result, err := d101hostlaunch.RunCurrent(ctx, s.descriptor, s.launcher)
 	if err != nil || ctx.Err() != nil || result.StartedAt().Before(started) || !checkDirectory() {
-		return empty, errResetExecutionEvidence
+		return empty, nil, errResetExecutionEvidence
 	}
 	// Fresh auxiliary directory stream; do not rely on directory Seek semantics.
 	// This never reopens the production lock descriptor.
 	afterDir, err := os.OpenFile(s.pins.directory, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
-		return empty, errResetExecutionEvidence
+		return empty, nil, errResetExecutionEvidence
 	}
 	defer afterDir.Close()
 	afterInfo, e1 := afterDir.Stat()
 	beforeInfo, e2 := dir.Stat()
 	if e1 != nil || e2 != nil || !os.SameFile(afterInfo, beforeInfo) || !checkDirectory() {
-		return empty, errResetExecutionEvidence
+		return empty, nil, errResetExecutionEvidence
 	}
 	after, err := afterDir.Readdirnames(1025)
 	if len(after) > 1024 || err != nil && err != io.EOF {
-		return empty, errResetExecutionEvidence
+		return empty, nil, errResetExecutionEvidence
 	}
 	names, err := resetD101NewRetainedCaptureNames(s.pins.operationID, before, after)
 	if err != nil || len(names) != 1 || !checkDirectory() {
-		return empty, errResetExecutionEvidence
+		return empty, nil, errResetExecutionEvidence
 	}
 	name := names[0]
 	stem := "current-freeze-" + s.pins.operationID + "-"
@@ -130,21 +167,24 @@ func (s *resetD101CurrentHostSupplier) CaptureAfter(ctx context.Context, binding
 		current.OperationID != s.pins.operationID || current.TargetFingerprint != s.pins.targetFingerprint ||
 		current.PublicationRevision != s.pins.publicationRevision || current.WriterFreezeReceiptSHA != s.pins.freezeSHA ||
 		ctx.Err() != nil || !checkDirectory() {
-		return empty, errResetExecutionEvidence
+		return empty, nil, errResetExecutionEvidence
 	}
 	observation := resetD101CurrentHostObservation{bytes.Clone(wire), path, retainedPin, visiblePin, result.StartedAt(), result.CompletedAt(), nonce}
 	if s.verify(ctx, binding, observation) != nil || ctx.Err() != nil || !checkDirectory() {
-		return empty, errResetExecutionEvidence
+		return empty, nil, errResetExecutionEvidence
 	}
 	// Authenticator success cannot hide mutation of either native original.
 	retainedAfter, retainedAfterPin, e1 := d101custody.CapturePrivateOriginalPin(path, resetD101CurrentFreezeLimit)
 	visibleAfter, visibleAfterPin, e2 := d101custody.CapturePrivateOriginalPin(visiblePath, resetD101CurrentFreezeLimit)
 	if e1 != nil || e2 != nil || retainedAfterPin != retainedPin || visibleAfterPin != visiblePin ||
 		!bytes.Equal(retainedAfter.Bytes, wire) || !bytes.Equal(visibleAfter.Bytes, wire) || ctx.Err() != nil || !checkDirectory() {
-		return empty, errResetExecutionEvidence
+		return empty, nil, errResetExecutionEvidence
 	}
 	runtime.KeepAlive(s.descriptor)
-	return resetD101CurrentFreezeCapture{nonce, sha, result.StartedAt(), result.CompletedAt()}, nil
+	capture := resetD101CurrentFreezeCapture{nonce, sha, result.StartedAt(), result.CompletedAt()}
+	witnessReturned = true
+	var releaseOnce sync.Once
+	return capture, &resetD101AuthenticatedCaptureWitness{binding: binding, observation: observation, capture: capture, requestStarted: started, release: func() { releaseOnce.Do(s.mu.Unlock) }}, nil
 }
 
 // Only a newly issued filename can carry this invocation's private nonce.

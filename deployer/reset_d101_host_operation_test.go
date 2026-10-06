@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -193,5 +195,133 @@ func TestHostIssuerTransportRequiresAnonymousPipe(t *testing.T) {
 	wantPipe := runtime.GOOS == "linux"
 	if resetD101AnonymousPipe(read) != wantPipe || resetD101AnonymousPipe(write) != wantPipe || resetD101AnonymousPipe(regular) || resetD101AnonymousPipe(nil) {
 		t.Fatal("private pipe transport accepted ordinary file or rejected pipe")
+	}
+}
+
+func TestHostCaptureWitnessUnavailableDoesNotInventNativeAuthority(t *testing.T) {
+	var supplier *resetD101CurrentHostSupplier
+	if _, witness, err := supplier.captureAuthenticatedWitness(context.Background(), resetExecutionPhaseBinding{}, time.Now()); err == nil || witness != nil {
+		t.Fatal("missing native supplier returned witness")
+	}
+	if err := (*resetD101AuthenticatedCaptureWitness)(nil).recheckNative(); err == nil {
+		t.Fatal("missing capture witness accepted")
+	}
+}
+
+func TestPreparedNativeCustodyTupleDigestFramesBodyAndHeader(t *testing.T) {
+	if resetD101SignedResponseTupleSHA([]byte("ab"), []byte("c")) == resetD101SignedResponseTupleSHA([]byte("a"), []byte("bc")) {
+		t.Fatal("tuple boundaries were lost")
+	}
+	if resetD101SignedResponseTupleSHA([]byte("body"), []byte("proof")) != resetD101SignedResponseTupleSHA([]byte("body"), []byte("proof")) {
+		t.Fatal("same immutable response cannot have different tuple digests")
+	}
+}
+
+func TestPreparedNativeCustodyMissingInputsNeverRegistersOrRetains(t *testing.T) {
+	if custody, err := newResetD101HostPreparedCustody(resetD101HostPreparedCustodyPins{}); err == nil || custody != nil {
+		t.Fatal("unsupplied audit custody registered")
+	}
+	var custody *resetD101HostPreparedCustody
+	if _, err := custody.retain(context.Background(), nil, resetExecutionPhaseBinding{}, time.Time{}, time.Time{}, nil, nil, ""); err == nil {
+		t.Fatal("missing authority retained a successful response")
+	}
+}
+
+func TestPreparedNativeTwoStepRetentionBindsOriginalDescriptors(t *testing.T) {
+	for _, name := range []string{"success", "body-existing", "record-existing", "commit-existing", "cancelled", "record-replaced", "commit-replaced", "directory-replaced", "expired-original"} {
+		t.Run(name, func(t *testing.T) {
+			// Isolated temporary UID fixture only, never native host authority.
+			root := t.TempDir()
+			path := filepath.Join(root, "private")
+			if err := os.Mkdir(path, 0700); err != nil {
+				t.Fatal(err)
+			}
+			dir, err := os.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer dir.Close()
+			op, nonce := strings.Repeat("a", 32), strings.Repeat("b", 32)
+			stem := "get-" + op + "-" + nonce
+			body, header := []byte("synthetic exact response"), []byte("synthetic-key.synthetic-proof")
+			record := resetD101PreparedPrivateRecord{Version: 1, OperationID: op, CaptureNonce: nonce, RequestSequence: 1,
+				ResponseBodyWholeSHA: resetD101OriginalSHA(body), ResponseProofHeaderWholeSHA: resetD101OriginalSHA(header), SignedResponseWholeSHA: resetD101SignedResponseTupleSHA(body, header)}
+			if strings.HasSuffix(name, "-existing") {
+				suffix := strings.TrimSuffix(name, "-existing")
+				if err := os.WriteFile(filepath.Join(path, stem+"."+suffix), []byte("preserved original"), 0400); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if name == "cancelled" {
+				cancel()
+			}
+			started := time.Now()
+			receipt, err := retainResetD101PreparedNativeRecord(ctx, dir, stem, record, body, header, uint32(os.Geteuid()))
+			if name == "cancelled" || strings.HasSuffix(name, "-existing") {
+				if err == nil || receipt != nil {
+					t.Fatal("uncertain or existing originals accepted")
+				}
+				if name != "cancelled" {
+					wire, err := os.ReadFile(filepath.Join(path, stem+"."+strings.TrimSuffix(name, "-existing")))
+					if err != nil || string(wire) != "preserved original" {
+						t.Fatal("existing original changed")
+					}
+				}
+				return
+			}
+			if err != nil || receipt == nil {
+				t.Fatal("two step retention", err)
+			}
+			defer receipt.close()
+			var commit resetD101PreparedPrivateCommit
+			if json.Unmarshal(receipt.commitWire, &commit) != nil || commit.CommittedRecordWholeSHA != resetD101OriginalSHA(receipt.recordWire) {
+				t.Fatal("record link")
+			}
+			observed, err := resetC4UTC(commit.RecordCommittedAtUTC)
+			if err != nil || observed.Before(started) || time.Now().Before(observed) {
+				t.Fatal("actual post-record observation")
+			}
+			var recordKeys map[string]json.RawMessage
+			if json.Unmarshal(receipt.recordWire, &recordKeys) != nil || recordKeys["recordCommittedAtUTC"] != nil {
+				t.Fatal("record claimed its own future completion")
+			}
+			if name == "expired-original" {
+				receipt.validUntil = started.Add(-time.Nanosecond)
+				if receipt.recheck(ctx) == nil {
+					t.Fatal("original cutoff extended")
+				}
+				return
+			}
+			if strings.HasSuffix(name, "-replaced") {
+				if name == "directory-replaced" {
+					if err := os.Rename(path, path+"-old"); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Mkdir(path, 0700); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					suffix := strings.TrimSuffix(name, "-replaced")
+					file := filepath.Join(path, stem+"."+suffix)
+					wire, err := os.ReadFile(file)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Rename(file, file+"-old"); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(file, wire, 0400); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if receipt.recheck(ctx) == nil {
+					t.Fatal("same-byte native replacement accepted")
+				}
+			} else if receipt.recheck(ctx) != nil {
+				t.Fatal("unchanged original descriptors rejected")
+			}
+		})
 	}
 }

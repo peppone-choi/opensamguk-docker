@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -20,6 +21,120 @@ type resetD101RelayFixtureTransport func(*http.Request) (*http.Response, error)
 
 func (f resetD101RelayFixtureTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	return f(request)
+}
+
+func TestHostRelayAdmissionLatchDoesNotLearnRejectedCandidate(t *testing.T) {
+	for _, name := range []string{"bad-signature", "auth-after-denied", "future", "noncanonical", "static-pin-mismatch"} {
+		t.Run(name, func(t *testing.T) {
+			relay, wire, header, private := newResetD101RelayFixture(t)
+			relay.policy.expected.AcceptedAtUTC = ""
+			proof, err := decodeResetD101PreparedProof(wire)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch name {
+			case "bad-signature":
+				header = "synthetic-root." + base64.RawURLEncoding.EncodeToString(make([]byte, ed25519.SignatureSize))
+			case "auth-after-denied":
+				calls := 0
+				relay.policy.authenticate = func(context.Context, string, string, string) error {
+					calls++
+					if calls == 2 {
+						return errResetExecutionEvidence
+					}
+					return nil
+				}
+			case "future":
+				proof.AcceptedAtUTC = time.Now().Add(time.Second).UTC().Format(time.RFC3339Nano)
+			case "noncanonical":
+				proof.AcceptedAtUTC = time.Now().Add(-time.Second).UTC().Truncate(time.Second).Format("2006-01-02T15:04:05.000Z")
+			case "static-pin-mismatch":
+				proof.TargetFingerprint = strings.Repeat("f", 64)
+			}
+			if name != "bad-signature" {
+				wire, err = json.Marshal(proof)
+				if err != nil {
+					t.Fatal(err)
+				}
+				header = "synthetic-root." + base64.RawURLEncoding.EncodeToString(ed25519.Sign(private, append([]byte(resetD101PreparedDomain), wire...)))
+			}
+			relay.client.Transport = resetD101RelayFixtureTransport(func(*http.Request) (*http.Response, error) { return resetD101RelayFixtureResponse(wire, header), nil })
+			if body, _, err := relay.Read(context.Background(), relay.policy.expected.OperationID, relay.policy.expected.ApprovalPlanSHA, relay.policy.expected.ExecutionReceiptSHA); err == nil || body != nil || relay.acceptedAtUTC != "" {
+				t.Fatal("rejected candidate changed first admission latch")
+			}
+		})
+	}
+}
+
+func TestHostRelayAdmissionLatchUsesSingleCASUnderConcurrentSlots(t *testing.T) {
+	for _, name := range []string{"same-admission", "changed-admission", "concurrent-change"} {
+		t.Run(name, func(t *testing.T) {
+			relay, first, firstHeader, private := newResetD101RelayFixture(t)
+			relay.policy.expected.AcceptedAtUTC = ""
+			proof, err := decodeResetD101PreparedProof(first)
+			if err != nil {
+				t.Fatal(err)
+			}
+			accepted, _ := resetC4UTC(proof.AcceptedAtUTC)
+			proof.AcceptedAtUTC = accepted.Add(-time.Nanosecond).Format(time.RFC3339Nano)
+			second, err := json.Marshal(proof)
+			if err != nil {
+				t.Fatal(err)
+			}
+			secondHeader := "synthetic-root." + base64.RawURLEncoding.EncodeToString(ed25519.Sign(private, append([]byte(resetD101PreparedDomain), second...)))
+			if name == "same-admission" {
+				second, secondHeader = first, firstHeader
+			}
+			var requests atomic.Int32
+			barrier := make(chan struct{})
+			ready := make(chan struct{}, 2)
+			relay.client.Transport = resetD101RelayFixtureTransport(func(request *http.Request) (*http.Response, error) {
+				n := requests.Add(1)
+				if name == "concurrent-change" {
+					ready <- struct{}{}
+					select {
+					case <-barrier:
+					case <-request.Context().Done():
+						return nil, request.Context().Err()
+					}
+				}
+				if n == 1 {
+					return resetD101RelayFixtureResponse(first, firstHeader), nil
+				}
+				return resetD101RelayFixtureResponse(second, secondHeader), nil
+			})
+			read := func() error {
+				_, _, err := relay.Read(context.Background(), relay.policy.expected.OperationID, relay.policy.expected.ApprovalPlanSHA, relay.policy.expected.ExecutionReceiptSHA)
+				return err
+			}
+			if name == "concurrent-change" {
+				results := make(chan error, 2)
+				go func() { results <- read() }()
+				go func() { results <- read() }()
+				for i := 0; i < 2; i++ {
+					select {
+					case <-ready:
+					case <-time.After(2 * time.Second):
+						close(barrier)
+						t.Fatal("concurrent readers did not reach transport")
+					}
+				}
+				close(barrier)
+				one, two := <-results, <-results
+				if (one == nil) == (two == nil) || relay.acceptedAtUTC == "" {
+					t.Fatal("concurrent admissions both accepted or neither latched")
+				}
+			} else {
+				if read() != nil {
+					t.Fatal("first authenticated admission")
+				}
+				secondErr := read()
+				if (secondErr == nil) != (name == "same-admission") {
+					t.Fatal("changed admission was adopted or same admission rejected")
+				}
+			}
+		})
+	}
 }
 
 func newResetD101RelayFixture(t *testing.T) (*resetD101HostPreparedRelay, []byte, string, ed25519.PrivateKey) {

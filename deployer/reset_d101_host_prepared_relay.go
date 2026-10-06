@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -31,11 +32,13 @@ type resetD101HostRelayInstallation struct {
 var resetD101ReviewedHostRelay *resetD101HostRelayInstallation
 
 type resetD101HostPreparedRelay struct {
-	policy     resetD101HostRelayInstallation
-	publicKey  ed25519.PublicKey
-	credential string
-	client     *http.Client
-	slots      chan struct{}
+	policy        resetD101HostRelayInstallation
+	publicKey     ed25519.PublicKey
+	credential    string
+	client        *http.Client
+	slots         chan struct{}
+	admissionMu   sync.Mutex
+	acceptedAtUTC string
 }
 
 func newResetD101HostPreparedRelay(p *resetD101HostRelayInstallation, credential string) (*resetD101HostPreparedRelay, error) {
@@ -59,7 +62,7 @@ func newResetD101HostPreparedRelay(p *resetD101HostRelayInstallation, credential
 		}}
 	client := &http.Client{Transport: transport, Timeout: 2 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	return &resetD101HostPreparedRelay{policy, key, credential, client, make(chan struct{}, 2)}, nil
+	return &resetD101HostPreparedRelay{policy: policy, publicKey: key, credential: credential, client: client, slots: make(chan struct{}, 2)}, nil
 }
 
 // Existing getter ABI, original body/signature bytes, and original deadline.
@@ -121,13 +124,25 @@ func (r *resetD101HostPreparedRelay) Read(ctx context.Context, op, planSHA, rece
 		requireResetD101RelayPreparedBinding(proof, r.policy.expected, time.Now()) != nil {
 		return nil, "", errResetExecutionEvidence
 	}
+	// Only authenticated, signed, canonical admission values reach this CAS.
+	// Restart loses memory but never renews the immutable proof's time/cutoff;
+	// mandatory actual host admission authentication must succeed again.
+	r.admissionMu.Lock()
+	if r.acceptedAtUTC == "" {
+		r.acceptedAtUTC = proof.AcceptedAtUTC
+	}
+	matched := r.acceptedAtUTC == proof.AcceptedAtUTC
+	r.admissionMu.Unlock()
+	if !matched || bounded.Err() != nil {
+		return nil, "", errResetExecutionEvidence
+	}
 	return wire, header, nil
 }
 
 func requireResetD101RelayPreparedBinding(proof, expected resetD101PreparedProof, now time.Time) error {
 	prepared, e1 := resetC4UTC(proof.PreparedAtUTC)
 	accepted, e2 := resetC4UTC(proof.AcceptedAtUTC)
-	if e1 != nil || e2 != nil || now.Before(prepared) || now.Sub(prepared) >= resetPreflightMaxAge || accepted.After(prepared) ||
+	if e1 != nil || e2 != nil || accepted.UTC().Format(time.RFC3339Nano) != proof.AcceptedAtUTC || prepared.UTC().Format(time.RFC3339Nano) != proof.PreparedAtUTC || now.Before(prepared) || now.Sub(prepared) >= resetPreflightMaxAge || accepted.After(prepared) ||
 		now.Unix() >= proof.DestructiveCutoffUnix {
 		return errResetExecutionEvidence
 	}
@@ -136,6 +151,9 @@ func requireResetD101RelayPreparedBinding(proof, expected resetD101PreparedProof
 	// fields, including first admission and original cutoff, match installed pins.
 	proof.PreparedAtUTC, expected.PreparedAtUTC = "", ""
 	proof.PreparedJournalSHA, expected.PreparedJournalSHA = "", ""
+	if expected.AcceptedAtUTC == "" {
+		proof.AcceptedAtUTC = ""
+	}
 	if !reflect.DeepEqual(proof, expected) {
 		return errResetExecutionEvidence
 	}
