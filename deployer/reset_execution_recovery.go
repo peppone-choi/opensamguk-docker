@@ -90,7 +90,7 @@ func (c config) claimResetD101RecoveryAttempt(lease *operationLease, journal lif
 func (c config) claimResetD101RecoveryAttemptWithCustodyUID(lease *operationLease, journal lifecycleJournal, uid uint32) (resetD101RecoveryBinding, error) {
 	closed := resetD101RecoveryBinding{}
 	record, err := c.requireResetD101RecoveryLease(lease, journal)
-	if err != nil || c.d101PurposeAuthority == nil || c.d101RecoveryVerifier == nil || !filepath.IsAbs(c.composeDir) {
+	if err != nil || c.d101RetainedRecovery == nil || c.d101RecoveryVerifier == nil || !filepath.IsAbs(c.composeDir) {
 		return closed, errResetExecutionEvidence
 	}
 	// Original plan/preflight are validated at the immutable first admission.
@@ -101,7 +101,7 @@ func (c config) claimResetD101RecoveryAttemptWithCustodyUID(lease *operationLeas
 	}
 	ctx, cancel := context.WithDeadline(lease.Context(), time.Unix(evidence.Plan.RecoveryDeadlineUnix, 0))
 	defer cancel()
-	authority, err := c.d101PurposeAuthority(ctx, journal.OperationID, record.D101IntentSHA)
+	authority, err := c.resetD101RecoveryAuthority(ctx, journal.OperationID, record.D101IntentSHA, "QUERY")
 	if err != nil || ctx.Err() != nil {
 		return closed, errResetExecutionEvidence
 	}
@@ -125,7 +125,7 @@ func (c config) claimResetD101RecoveryAttemptWithCustodyUID(lease *operationLeas
 	if err != nil || current != record {
 		return closed, errResetExecutionEvidence
 	}
-	authority, err = c.d101PurposeAuthority(ctx, journal.OperationID, record.D101IntentSHA)
+	authority, err = c.resetD101RecoveryAuthority(ctx, journal.OperationID, record.D101IntentSHA, "QUERY")
 	if err != nil || authority.DeploymentCardSHA != binding.deploymentCardSHA {
 		return closed, errResetExecutionEvidence
 	}

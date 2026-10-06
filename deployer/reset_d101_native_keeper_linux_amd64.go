@@ -12,10 +12,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
 	"opensamguk-deployer/internal/d101native"
+	"opensamguk-deployer/internal/d101custody"
 )
 
 // Actual preAcquisition and handoff sources are absent until independently
@@ -26,6 +28,9 @@ type resetD101NativePreAcquisition struct {
 	directoryDevice, directoryInode uint64
 	approvalOriginal                []byte
 	existing                        *resetD101NativeExistingKeeper
+	// Routing data must be covered by the actual preAcquisition source's
+	// independent original approval/recheck; this string never grants authority.
+	physicalMode                    string
 }
 type resetD101NativeExistingKeeper struct {
 	binding         d101native.PreBinding
@@ -53,6 +58,15 @@ type resetD101NativeKeeper struct {
 	childStart                  uint64
 	childExited                 bool
 	attempted, acquired, closed bool
+	physicalMode                string
+	clientInput                 *d101native.ManagementClientInput
+	clientContext               context.Context
+	clientCancel                context.CancelFunc
+	clientSession               *d101native.ManagementSession
+	clientBinding               *d101native.ManagementConnectionBinding
+	clientExpected              []byte
+	clientCloseOnce             sync.Once
+	clientCloseErr              error
 }
 
 func resetD101NativeSequenceLeaf(sequence uint64) string {
@@ -353,6 +367,71 @@ func (k *resetD101NativeKeeper) stage(ctx context.Context, sequence uint64) (any
 	k.refs = append(k.refs, ref)
 	return record, wire, nil
 }
+func (k *resetD101NativeKeeper) prepareManagedPhysicalClient(ctx context.Context) error {
+	if k.check(ctx) != nil || k.physicalMode != "" || k.clientInput != nil { return errResetExecutionEvidence }
+	switch k.pre.physicalMode {
+	case "--d101-host-operation":
+		k.physicalMode = k.pre.physicalMode // Explicit actual-source approval only.
+		return nil
+	case "--d101-managed-host-operation":
+	default:
+		return errResetExecutionEvidence
+	}
+	clientCtx, cancel := context.WithDeadline(ctx, time.Unix(k.pre.binding.OriginalCutoffUnix, 0))
+	held, session, expected, err := d101native.OpenInstalledManagementClient(clientCtx, k.pre.binding, nil, d101custody.Original{})
+	if err != nil || held == nil || session != nil || len(expected) != 0 || k.check(ctx) != nil {
+		if held != nil { held.Close() }
+		cancel()
+		return errResetExecutionEvidence
+	}
+	k.physicalMode = k.pre.physicalMode
+	k.clientInput, k.clientContext, k.clientCancel = held, clientCtx, cancel
+	return nil
+}
+
+func (k *resetD101NativeKeeper) approvedChildMode(ctx context.Context, issuer bool) (string, error) {
+	if k.check(ctx) != nil || k.physicalMode == "" || k.physicalMode != k.pre.physicalMode { return "", errResetExecutionEvidence }
+	if k.physicalMode != "--d101-host-operation" && k.physicalMode != "--d101-managed-host-operation" { return "", errResetExecutionEvidence }
+	if k.physicalMode == "--d101-managed-host-operation" && (k.clientInput == nil || k.clientContext == nil || k.clientContext.Err() != nil) { return "", errResetExecutionEvidence }
+	if issuer { return "--d101-issue-current-receipt", nil }
+	return k.physicalMode, nil
+}
+
+func (k *resetD101NativeKeeper) openManagedPhysicalClient(ctx context.Context, wire []byte) error {
+	if k.check(ctx) != nil || k.physicalMode != "--d101-managed-host-operation" || k.clientInput == nil ||
+		k.clientContext == nil || k.clientContext.Err() != nil || k.clientSession != nil || len(k.refs) != 14 ||
+		!bytes.Equal(wire, k.refsWire(13)) { return errResetExecutionEvidence }
+	paused := d101custody.Original{Bytes: bytes.Clone(wire), SHA256: resetD101OriginalSHA(wire)}
+	defer clear(paused.Bytes)
+	held, session, expected, err := d101native.OpenInstalledManagementClient(k.clientContext, k.pre.binding, k.clientInput, paused)
+	if err != nil || held != k.clientInput || session == nil || len(expected) == 0 { return errResetExecutionEvidence }
+	k.clientSession, k.clientExpected = session, bytes.Clone(expected)
+	binding, err := session.Consume(k.clientContext)
+	if err != nil || binding == nil { return errResetExecutionEvidence }
+	k.clientBinding = binding
+	return k.recheckManagedPhysicalClient(ctx)
+}
+
+func (k *resetD101NativeKeeper) recheckManagedPhysicalClient(ctx context.Context) error {
+	if k.check(ctx) != nil || k.physicalMode != "--d101-managed-host-operation" || k.physicalMode != k.pre.physicalMode ||
+		k.clientContext == nil || k.clientContext.Err() != nil || k.clientInput == nil || k.clientSession == nil ||
+		k.clientBinding == nil || len(k.clientExpected) == 0 || k.clientBinding.RecheckExpected(k.clientContext, k.clientExpected) != nil || k.check(ctx) != nil {
+		return errResetExecutionEvidence
+	}
+	return nil
+}
+
+func (k *resetD101NativeKeeper) closeManagedPhysicalClient() error {
+	if k == nil { return nil }
+	k.clientCloseOnce.Do(func() {
+		if k.clientInput != nil { k.clientCloseErr = k.clientInput.Close() }
+		if k.clientCancel != nil { k.clientCancel() }
+		// Keep the selected route and closed binding; absence cannot become a
+		// legacy fallback. Native stages never consult this closed binding.
+	})
+	return k.clientCloseErr
+}
+
 func (k *resetD101NativeKeeper) startChild(ctx context.Context, issuer bool, input io.Reader, output io.Writer) (*os.File, error) {
 	if k.check(ctx) != nil || k.child != nil && !k.childExited {
 		return nil, errResetExecutionEvidence
@@ -361,6 +440,8 @@ func (k *resetD101NativeKeeper) startChild(ctx context.Context, issuer bool, inp
 	if k.pre.binding.Keeper.Process.ExePath != binary {
 		return nil, errResetExecutionEvidence
 	}
+	mode, err := k.approvedChildMode(ctx, issuer)
+	if err != nil { return nil, err }
 	gateRead, gateWrite, err := os.Pipe()
 	if err != nil {
 		return nil, err
@@ -370,10 +451,6 @@ func (k *resetD101NativeKeeper) startChild(ctx context.Context, issuer bool, inp
 		gateRead.Close()
 		gateWrite.Close()
 		return nil, err
-	}
-	mode := "--d101-host-operation"
-	if issuer {
-		mode = "--d101-issue-current-receipt"
 	}
 	cmd := exec.Command(binary, mode, "--operation-id", k.pre.binding.OperationID)
 	cmd.ExtraFiles = []*os.File{null, null, null, null, null, gateRead, k.descriptor}
@@ -496,6 +573,8 @@ func runResetD101NativeKeeper(ctx context.Context, op string, issuerOnly bool, i
 		return 2
 	}
 	k := &resetD101NativeKeeper{installer: v, pre: p}
+	if k.prepareManagedPhysicalClient(ctx) != nil { return 2 }
+	defer k.closeManagedPhysicalClient()
 	resetD101HeldNativeKeeper = k
 	if k.acquire(ctx) != nil {
 		if k.acquired {
@@ -547,21 +626,20 @@ func runResetD101NativeKeeper(ctx context.Context, op string, issuerOnly bool, i
 	// Physical permission is reauthenticated for this exact operation/target,
 	// original cutoff and same keeper. It is never inferred from issuer exit0.
 	birth, err = k.startChild(ctx, false, nil, io.Discard)
-	if err != nil {
-		return 3
+	if err != nil { return 3 }
+	record, physicalWire, err := k.stage(ctx, 13)
+	if err != nil { birth.Close(); return 3 }
+	if k.physicalMode == "--d101-managed-host-operation" {
+		if k.openManagedPhysicalClient(ctx, physicalWire) != nil ||
+			v.stages.RecheckAuthenticatedStage(ctx, k, 13, record) != nil || k.recheckManagedPhysicalClient(ctx) != nil {
+			birth.Close(); return 3
+		}
 	}
-	if _, _, err = k.stage(ctx, 13); err != nil {
-		birth.Close()
-		return 3
-	}
-	if _, err = birth.Write([]byte{'B'}); err != nil {
-		birth.Close()
-		return 3
-	}
+	if _, err = birth.Write([]byte{'B'}); err != nil { birth.Close(); return 3 }
 	birth.Close()
-	if k.waitChild(ctx) != nil {
-		return 3
-	}
+	// EOF/client cancellation never substitutes for actual native child Wait.
+	if k.waitChild(ctx) != nil { return 3 }
+	if k.closeManagedPhysicalClient() != nil { return 3 }
 	_, terminal, err := k.stage(ctx, 14)
 	if err != nil {
 		return 3

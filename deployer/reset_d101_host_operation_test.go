@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"opensamguk-deployer/internal/d101native"
 )
 
 func TestHostOperationMissingNativeInputsNeverStartsSupplier(t *testing.T) {
@@ -343,5 +345,173 @@ func TestNative9PhysicalStageFactDoesNotDependOnReleaseCompletion(t *testing.T) 
 	}
 	if c.lifecycleJobs.jobs[job].status != lifecycleJobSucceeded || !bytes.Equal(c.lifecycleJobs.jobs[job].result, body) {
 		t.Fatal("completion HOLD overwrote physical fact")
+	}
+}
+
+type resetD101ManagedRefusingFactoryMR struct { calls int }
+func (f *resetD101ManagedRefusingFactoryMR) OpenApprovedEntry(context.Context, string, string) (*resetD101NativeAuthorityInstaller, error) {
+	f.calls++
+	return nil, errResetD101InstallationNotSupplied
+}
+type resetD101ManagedRefusingInstallationMR struct { calls int }
+func (s *resetD101ManagedRefusingInstallationMR) AuthenticateInstallation(context.Context, string, string) error {
+	s.calls++
+	return errResetD101InstallationNotSupplied
+}
+func (s *resetD101ManagedRefusingInstallationMR) RecheckInstallation(context.Context, string, string) error {
+	s.calls++
+	return errResetD101InstallationNotSupplied
+}
+type resetD101ManagedRefusingCurrentMR struct{}
+func (*resetD101ManagedRefusingCurrentMR) Current(context.Context, *os.File, string, uint64) (*d101native.CurrentVerifier, error) {
+	return nil, errResetD101InstallationNotSupplied
+}
+
+func TestManagedHostSelectorStrictBeforeFactoryMR(t *testing.T) {
+	op := strings.Repeat("a", 32)
+	previousFactory := resetD101ReviewedNativeEntryFactory
+	previousInstaller := resetD101ReviewedNativeAuthorityInstaller
+	t.Cleanup(func() { resetD101ReviewedNativeEntryFactory = previousFactory })
+	for _, item := range []struct { name string; args []string }{
+		{"missing-op-flag", []string{"root", "--d101-managed-host-operation", op}},
+		{"wrong-flag", []string{"root", "--d101-managed-host-operation", "--other", op}},
+		{"missing-op", []string{"root", "--d101-managed-host-operation", "--operation-id"}},
+		{"extra-arg", []string{"root", "--d101-managed-host-operation", "--operation-id", op, "extra"}},
+		{"invalid-op", []string{"root", "--d101-managed-host-operation", "--operation-id", "invalid"}},
+		{"empty-op", []string{"root", "--d101-managed-host-operation", "--operation-id", ""}},
+		{"valid-missing-factory", []string{"root", "--d101-managed-host-operation", "--operation-id", op}},
+	} {
+		t.Run(item.name, func(t *testing.T) {
+			factory := &resetD101ManagedRefusingFactoryMR{}
+			resetD101ReviewedNativeEntryFactory = factory
+			if item.name == "valid-missing-factory" { resetD101ReviewedNativeEntryFactory = nil }
+			var output, diagnostic bytes.Buffer
+			handled, status := earlyResetD101HostCommand(item.args, nil, &output, &diagnostic)
+			if !handled || status != 2 || factory.calls != 0 || output.Len() != 0 || diagnostic.Len() != 0 || resetD101ReviewedNativeAuthorityInstaller != previousInstaller {
+				t.Fatal("managed selector read a supplier, published native state or wrote carrier data")
+			}
+		})
+	}
+}
+
+func TestManagedHostOperationMissingFactoryBeforeIOMR(t *testing.T) {
+	previousFactory := resetD101ReviewedNativeEntryFactory
+	previousSupplier := resetD101ReviewedHostOperationSupplier
+	t.Cleanup(func() { resetD101ReviewedNativeEntryFactory = previousFactory; resetD101ReviewedHostOperationSupplier = previousSupplier })
+	resetD101ReviewedNativeEntryFactory = nil
+	calls := 0
+	resetD101ReviewedHostOperationSupplier = func(context.Context, *os.File, string) (*resetD101HostOperationInstallation, error) {
+		calls++
+		return nil, errResetD101InstallationNotSupplied
+	}
+	op := strings.Repeat("a", 32)
+	for _, name := range []string{"nil-caller", "cancelled-caller", "expired-caller", "invalid-selector", "missing-factory"} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			selector := op
+			switch name {
+			case "nil-caller": ctx = nil
+			case "cancelled-caller":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx); cancel()
+			case "expired-caller":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithDeadline(ctx, time.Now().Add(-time.Second)); defer cancel()
+			case "invalid-selector": selector = "invalid"
+			}
+			if runResetD101ManagedHostOperation(ctx, selector) != 2 || calls != 0 {
+				t.Fatal("missing actual factory adopted an ordinary supplier or admitted work")
+			}
+			if name == "missing-factory" {
+				resetD101ReviewedNativeEntryFactory = (*resetD101ManagedRefusingFactoryMR)(nil)
+				if runResetD101ManagedHostOperation(ctx, selector) != 2 || calls != 0 { t.Fatal("typed nil factory entered acquisition or fallback") }
+				resetD101ReviewedNativeEntryFactory = nil
+			}
+		})
+	}
+}
+
+func TestManagedEntryPreflightRejectsMissingOwnerOrExpectationMR(t *testing.T) {
+	op := strings.Repeat("a", 32)
+	for _, name := range []string{"nil-installer", "wrong-op", "missing-installation", "missing-owner", "unbounded-owner", "cancelled-owner", "expired-owner", "empty-expectation", "oversize-expectation"} {
+		t.Run(name, func(t *testing.T) {
+			owner, ownerCancel := context.WithTimeout(context.Background(), time.Minute); defer ownerCancel()
+			source := &resetD101ManagedRefusingInstallationMR{}
+			v := &resetD101NativeAuthorityInstaller{operationID:op, installation:source, nativeOwnerContext:owner, expectedManagementBinding:[]byte("unverified-data")}
+			switch name {
+			case "nil-installer": v = nil
+			case "wrong-op": v.operationID = strings.Repeat("b", 32)
+			case "missing-installation": v.installation = nil
+			case "missing-owner": v.nativeOwnerContext = nil
+			case "unbounded-owner": v.nativeOwnerContext = context.Background()
+			case "cancelled-owner": ownerCancel()
+			case "expired-owner":
+				expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second)); defer cancel(); v.nativeOwnerContext = expired
+			case "empty-expectation": v.expectedManagementBinding = nil
+			case "oversize-expectation": v.expectedManagementBinding = make([]byte, d101native.PayloadMaxBytes+1)
+			}
+			ctx, cancel, err := resetD101ManagedEntryContext(context.Background(), v, op)
+			if cancel != nil { cancel() }
+			if err == nil || ctx != nil || cancel != nil || source.calls != 0 {
+				t.Fatal("missing owner/expectation entered authentication or returned a fallback bound")
+			}
+		})
+	}
+}
+
+func TestManagedEntryLifetimeDoesNotAuthenticateOrReleaseNativeCustodyMR(t *testing.T) {
+	op := strings.Repeat("a", 32)
+	for _, name := range []string{"owner-minimum", "caller-earlier", "owner-cancel", "caller-cancel", "bound-is-not-auth"} {
+		t.Run(name, func(t *testing.T) {
+			owner, ownerCancel := context.WithDeadline(context.Background(), time.Now().Add(time.Minute)); defer ownerCancel()
+			caller, callerCancel := context.WithCancel(context.Background()); defer callerCancel()
+			want, _ := owner.Deadline()
+			if name == "caller-earlier" {
+				var cancel context.CancelFunc
+				caller, cancel = context.WithDeadline(caller, time.Now().Add(30*time.Second)); defer cancel()
+				want, _ = caller.Deadline()
+			}
+			source := &resetD101ManagedRefusingInstallationMR{}
+			v := &resetD101NativeAuthorityInstaller{operationID:op, installation:source, nativeOwnerContext:owner, expectedManagementBinding:[]byte("unverified-data")}
+			child, cleanup, err := resetD101ManagedEntryContext(caller, v, op)
+			if err != nil || child == nil || cleanup == nil { t.Fatal("ordinary bounded child unavailable") }
+			defer cleanup()
+			deadline, bounded := child.Deadline()
+			if !bounded || !deadline.Equal(want) { t.Fatal("child extended an owner/caller deadline") }
+			if v.recheckManagedEntry(child, "--d101-host-operation", op) == nil || source.calls != 0 { t.Fatal("context data authenticated a native or management source") }
+			if name == "owner-cancel" { ownerCancel() }
+			if name == "caller-cancel" { callerCancel() }
+			if name == "owner-cancel" || name == "caller-cancel" {
+				select { case <-child.Done(): case <-time.After(time.Second): t.Fatal("owner/caller cancellation failed to reach child") }
+			}
+			cleanup(); cleanup()
+			if name != "owner-cancel" && owner.Err() != nil { t.Fatal("child cleanup cancelled the original native owner") }
+		})
+	}
+}
+
+func TestManagedEntryGuardsCannotAdoptRawSessionMR(t *testing.T) {
+	op := strings.Repeat("a", 32)
+	for _, name := range []string{"zero-fields-explicit-recheck", "owner-only", "expectation-only", "binding-only", "closed-no-legacy-fallback", "native-pointers-preserved"} {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute); defer cancel()
+			source := &resetD101ManagedRefusingInstallationMR{}
+			physical := &resetD101HostInstallerInputs{}
+			current := &resetD101ManagedRefusingCurrentMR{}
+			v := &resetD101NativeAuthorityInstaller{operationID:op, installation:source, physical:physical, current:current}
+			switch name {
+			case "owner-only": v.nativeOwnerContext = ctx
+			case "expectation-only": v.expectedManagementBinding = []byte("unverified-data")
+			case "binding-only": v.managementBinding = &d101native.ManagementConnectionBinding{}
+			case "closed-no-legacy-fallback", "native-pointers-preserved":
+				v.nativeOwnerContext = ctx; v.expectedManagementBinding = []byte("unverified-data")
+				v.managementSession = &d101native.ManagementSession{}; v.managementBinding = &d101native.ManagementConnectionBinding{}
+				if v.closeManagementEntry() != nil || v.closeManagementEntry() != nil { t.Fatal("zero owned management close failed") }
+			}
+			if required := resetD101ManagedEntryRequired(v); required != (name != "zero-fields-explicit-recheck") { t.Fatal("partial or closed managed state lost its guard") }
+			if v.recheckManagedEntry(ctx, "--d101-host-operation", op) == nil || source.calls != 0 { t.Fatal("raw state minted source authority") }
+			if v.physical != physical || v.current != current || v.installation != source || ctx.Err() != nil { t.Fatal("management cleanup changed native custody pointers or owner") }
+			if name == "closed-no-legacy-fallback" && (v.managementSession == nil || v.managementBinding == nil || len(v.expectedManagementBinding) == 0) { t.Fatal("closed management fields were cleared for a legacy fallback") }
+		})
 	}
 }

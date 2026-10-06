@@ -17,7 +17,7 @@ import (
 type resetD101RecoveryClosureReader func(context.Context, string, string) ([]byte, error)
 
 func (c config) readResetD101RecoveryResult(ctx context.Context, op, expectedSHA string) ([]byte, string, error) {
-	if ctx == nil || ctx.Err() != nil || c.d101RecoveryClosureReader == nil || c.d101PurposeAuthority == nil || c.lifecycleOperationStore == nil || !lifecycleJobIDRe.MatchString(op) || !resetEvidenceSHA.MatchString(expectedSHA) {
+	if ctx == nil || ctx.Err() != nil || c.d101RecoveryClosureReader == nil || c.d101RetainedRecovery == nil || c.lifecycleOperationStore == nil || !lifecycleJobIDRe.MatchString(op) || !resetEvidenceSHA.MatchString(expectedSHA) {
 		return nil, "", errResetExecutionEvidence
 	}
 	record, found := c.lifecycleOperationStore.Lookup(op)
@@ -44,7 +44,7 @@ func (c config) readResetD101RecoveryResult(ctx context.Context, op, expectedSHA
 	if err != nil || rootResult.OperationID != op || rootResult.ApprovalIntentSHA != record.D101IntentSHA || rootResult.VerifyingRevision != closure.VerifyingRevision || rootResult.GatewayPayloadSHA != closure.GatewayPayloadSHA || rootResult.TargetFingerprint != closure.TargetFingerprint {
 		return nil, "", errResetExecutionEvidence
 	}
-	authority, err := c.d101PurposeAuthority(ctx, op, record.D101IntentSHA)
+	authority, err := c.resetD101RecoveryAuthority(ctx, op, record.D101IntentSHA, "QUERY")
 	intent, scopeErr := requireResetD101RecoveryAuthority(authority, op, record.D101IntentSHA, time.Now())
 	if err != nil || scopeErr != nil {
 		return nil, "", errResetExecutionEvidence
@@ -68,7 +68,10 @@ func (c config) readResetD101RecoveryResult(ctx context.Context, op, expectedSHA
 		}
 		return append([]byte(nil), wire...), nil
 	}
-	signed, proof, err := issueResetD101RecoveryResultOriginalWithKeyReader(ctx, c.d101PurposeAuthority, frozen, op, record.D101IntentSHA, closure.RecoveryBeginReceiptSHA, time.Now, readResetD101SigningKey)
+	closeAuthority := func(call context.Context, requestedOp, requestedIntent string) (resetD101VerifiedPurposeAuthority, error) {
+		return c.resetD101RecoveryAuthority(call, requestedOp, requestedIntent, "RECOVERY_CLOSE")
+	}
+	signed, proof, err := issueResetD101RecoveryResultOriginalWithKeyReader(ctx, closeAuthority, frozen, op, record.D101IntentSHA, closure.RecoveryBeginReceiptSHA, time.Now, readResetD101SigningKey)
 	after, afterErr := c.d101RecoveryClosureReader(ctx, op, expectedSHA)
 	rootAfter, rootErr := readResetPrivateCustody(filepath.Join(c.serversDir, ".deployer-reset-results"), op, 0)
 	current, exists := c.lifecycleOperationStore.Lookup(op)

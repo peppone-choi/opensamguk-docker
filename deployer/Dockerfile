@@ -1,21 +1,22 @@
 # deployer 사이드카 — 멀티스테이지.
-# 1) golang:1.23-alpine에서 정적 바이너리 빌드.
+# 1) 검토된 Go1.26.8 linux/amd64 빌더에서 정적 바이너리 빌드.
 # 2) docker:27-cli(compose v2 포함) 런타임에 바이너리만 COPY.
 #    런타임은 docker compose 명령을 socket-proxy(DOCKER_HOST) 경유로 실행.
 
 # --- 빌드 스테이지 ---
-FROM golang:1.23-alpine AS build
+FROM --platform=linux/amd64 golang:1.26.8-alpine@sha256:66f9a494af2b76ecb3eab75ff47166df61caec6d200c59d556b77327493d83a8 AS build
 WORKDIR /src
-# go.mod만 먼저 복사(외부 의존 0 — go.sum 불필요). 레이어 캐시 활용.
-COPY go.mod ./
+# 검토된 module/sum/vendor 원문만 사용한다. 온라인 resolver 없음.
+COPY go.mod go.sum ./
+COPY vendor ./vendor
 # 패키지의 운영 소스 전체를 복사한다. 개별 파일 나열은 새 Go 파일 추가 시
 # 로컬 go build와 컨테이너 빌드가 달라지는 드리프트를 만든다.
 COPY *.go ./
 COPY internal ./internal
 # CGO 끈 정적 바이너리(런타임 alpine에서 그대로 동작).
 ARG D101_ROOT_SOURCE_SHA=""
-ENV CGO_ENABLED=0
-RUN go build -trimpath -ldflags="-s -w -X main.rootBuiltSourceSHA=${D101_ROOT_SOURCE_SHA}" -o /out/deployer .
+ENV CGO_ENABLED=0 GOTOOLCHAIN=local GOENV=off GOWORK=off GOPROXY=off GOSUMDB=off
+RUN --network=none go build -mod=vendor -trimpath -ldflags="-s -w -X main.rootBuiltSourceSHA=${D101_ROOT_SOURCE_SHA}" -o /out/deployer .
 
 # --- 런타임 스테이지 ---
 # docker:27-cli 이미지에는 docker CLI + compose v2 플러그인이 포함된다.

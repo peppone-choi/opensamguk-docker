@@ -135,7 +135,7 @@ type resetD101SucceededRestore struct {
 func (c config) claimResetD101SucceededRestore(ctx context.Context, op, intentSHA string) (resetD101SucceededRestore, error) {
 	closed := resetD101SucceededRestore{}
 	if ctx == nil || ctx.Err() != nil || c.operations == nil || c.lifecycleOperationStore == nil ||
-		c.d101PurposeAuthority == nil || c.d101RecoveryVerifier == nil || !lifecycleJobIDRe.MatchString(op) || !resetEvidenceSHA.MatchString(intentSHA) {
+		c.d101RetainedRecovery == nil || c.d101RecoveryVerifier == nil || !lifecycleJobIDRe.MatchString(op) || !resetEvidenceSHA.MatchString(intentSHA) {
 		return closed, errResetExecutionEvidence
 	}
 	record, found := c.lifecycleOperationStore.Lookup(op)
@@ -151,7 +151,7 @@ func (c config) claimResetD101SucceededRestore(ctx context.Context, op, intentSH
 	if err != nil || resultErr != nil || result.Status != string(lifecycleJobSucceeded) || begin.value.RootResultReceiptSHA != resetD101OriginalSHA(root) {
 		return closed, errResetExecutionEvidence
 	}
-	authority, err := c.d101PurposeAuthority(ctx, op, intentSHA)
+	authority, err := c.resetD101RecoveryAuthority(ctx, op, intentSHA, "QUERY")
 	intent, authorityErr := requireResetD101RecoveryAuthority(authority, op, intentSHA, time.Now())
 	if err != nil || authorityErr != nil {
 		return closed, errResetExecutionEvidence
@@ -218,7 +218,7 @@ func (c config) claimResetD101SucceededRestore(ctx context.Context, op, intentSH
 func (c config) requireResetD101SucceededRestore(ctx context.Context, attempt resetD101SucceededRestore, requireClaim bool) error {
 	op := attempt.binding.operation.OperationID
 	lease := attempt.lease
-	if ctx == nil || ctx.Err() != nil || c.lifecycleOperationStore == nil || c.d101PurposeAuthority == nil || lease == nil ||
+	if ctx == nil || ctx.Err() != nil || c.lifecycleOperationStore == nil || c.d101RetainedRecovery == nil || lease == nil ||
 		lease.coordinator != c.operations || lease.ctx == nil || lease.Context().Err() != nil || lease.jobID != "" {
 		return errResetExecutionEvidence
 	}
@@ -242,7 +242,7 @@ func (c config) requireResetD101SucceededRestore(ctx context.Context, attempt re
 	if err != nil || !bytes.Equal(root, attempt.root) {
 		return errResetExecutionEvidence
 	}
-	authority, err := c.d101PurposeAuthority(ctx, op, record.D101IntentSHA)
+	authority, err := c.resetD101RecoveryAuthority(ctx, op, record.D101IntentSHA, "QUERY")
 	intent, authorityErr := requireResetD101RecoveryAuthority(authority, op, record.D101IntentSHA, time.Now())
 	if err != nil || authorityErr != nil || authority.DeploymentCardSHA != attempt.binding.deploymentCardSHA || !bytes.Equal(intent.originalBytes(), attempt.binding.intent.originalBytes()) {
 		return errResetExecutionEvidence

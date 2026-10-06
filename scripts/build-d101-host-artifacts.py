@@ -10,6 +10,7 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import tarfile
 import time
 
@@ -145,12 +146,107 @@ def save_new(path, value):
         os.fsync(stream.fileno())
 
 
+GO_RELEASE = "1.26.8"
+FROZEN_DEPENDENCIES = {
+    "go_mod_sha256": "bf6ae2139f1ee8a4fcbc3424a62e32dd3fc3e75e12850bd1c4211e0db4ceb70f",
+    "go_sum_sha256": "256603def8f606f226f349c9e3ceaa511d81a64d0aeefd41dbe35792c3179a41",
+    "vendor_tree_sha256": "bca16f5a1a3295152fb435339e6a632a3f9b8bbfa9dc8583ea3debaf42cff154",
+    "vendor_modules_sha256": "b2c0f1bffd37e44adc355347db819825e60461bc87dd79a1edb3357d31b780ca",
+}
+FROZEN_VENDOR_FILES = 126
+FROZEN_VENDOR_BYTES = 625221
+ARTIFACT_ROLES = {
+    "deployer": ".",
+    "d101-host-reader": "./cmd/d101-host-reader",
+    "d101-native-installer": "./cmd/d101-native-installer",
+    "d101-management-client": "./cmd/d101-management-client",
+}
+FROZEN_RUNTIME_MODULES = {"golang.org/x/crypto": "v0.57.0", "golang.org/x/sys": "v0.48.0"}
+
+
+def check_dependency_tree(module, expected):
+    """Compare physical inputs; this generic comparator grants no authority."""
+    if set(expected) != set(FROZEN_DEPENDENCIES):
+        raise BuildUnavailable("exact dependency input pins required")
+    for value in expected.values():
+        require_hash(value)
+    module = absolute_existing(str(module), directory=True)
+    observed = {
+        "go_mod_sha256": pin_regular(module / "go.mod", 64 * 1024)["sha256"],
+        "go_sum_sha256": pin_regular(module / "go.sum", 64 * 1024)["sha256"],
+        "vendor_modules_sha256": pin_regular(module / "vendor/modules.txt", 64 * 1024)["sha256"],
+    }
+    vendor = absolute_existing(str(module / "vendor"), directory=True)
+    vendor_tree = tree_pin(vendor)
+    observed["vendor_tree_sha256"] = vendor_tree["sha256"]
+    if observed != expected:
+        raise BuildUnavailable("module/sum/vendor input changed")
+    return {"pins": observed, "vendorTree": vendor_tree}
+
+
+def require_frozen_dependencies(module, expected=None):
+    expected = FROZEN_DEPENDENCIES if expected is None else expected
+    if expected != FROZEN_DEPENDENCIES:
+        raise BuildUnavailable("unreviewed dependency closure pins")
+    result = check_dependency_tree(module, expected)
+    if result["vendorTree"]["files"] != FROZEN_VENDOR_FILES or result["vendorTree"]["byteLength"] != FROZEN_VENDOR_BYTES:
+        raise BuildUnavailable("exact dependency closure inventory mismatch")
+    return result
+
+
+def validate_artifact_metadata(metadata, role, source, architecture):
+    if role not in ARTIFACT_ROLES or not metadata.splitlines() or not metadata.splitlines()[0].endswith("\tgo" + GO_RELEASE):
+        raise BuildUnavailable("artifact role/toolchain metadata mismatch")
+    dependencies, settings = {}, {}
+    package = None
+    root_module_seen = False
+    for line in metadata.splitlines()[1:]:
+        fields = line.strip().split("\t")
+        if not fields or "=>" in fields or fields[0] == "=>":
+            raise BuildUnavailable("replacement artifact module unavailable")
+        if fields[0] == "path":
+            if len(fields) != 2 or package is not None:
+                raise BuildUnavailable("artifact package metadata mismatch")
+            package = fields[1]
+        elif fields[0] == "dep":
+            # Go omits module sums in vendor mode. Original go.sum and source
+            # closure pins supply byte integrity separately; never invent h1.
+            if len(fields) != 3 or fields[1] in dependencies:
+                raise BuildUnavailable("artifact dependency metadata mismatch")
+            dependencies[fields[1]] = fields[2]
+        elif fields[0] == "build":
+            if len(fields) != 2 or "=" not in fields[1]:
+                raise BuildUnavailable("artifact build setting unavailable")
+            key, value = fields[1].split("=", 1)
+            if key in settings or key.startswith("vcs."):
+                raise BuildUnavailable("duplicate or ambient VCS build metadata")
+            settings[key] = value
+        elif fields[0] == "mod":
+            if root_module_seen or fields != ["mod", "opensamguk-deployer", "(devel)"]:
+                raise BuildUnavailable("artifact root module unavailable")
+            root_module_seen = True
+        else:
+            raise BuildUnavailable("unknown artifact metadata record")
+    suffix = ARTIFACT_ROLES[role].removeprefix("./")
+    expected_package = "opensamguk-deployer" + ("/" + suffix if suffix != "." else "")
+    if not root_module_seen or package != expected_package or dependencies != FROZEN_RUNTIME_MODULES:
+        raise BuildUnavailable("artifact dependency role differs from reviewed closure")
+    if any(settings.get(key) != value for key, value in {"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": architecture}.items()):
+        raise BuildUnavailable("artifact platform metadata mismatch")
+    if role == "deployer" and "main.rootBuiltSourceSHA=" + source not in settings.get("-ldflags", ""):
+        raise BuildUnavailable("controlled deployer stamp flag absent")
+    return {"role": role, "package": package, "dependencies": dependencies, "vendorSumsPresent": False}
+
+
 def validate_inputs(args):
     require_source(args.source)
     require_source(args.app_source)
     require_hash(args.host_arch_evidence_sha)
     require_hash(args.toolchain_sha)
     require_hash(args.toolchain_tree_sha)
+    dependency_pins = {key: getattr(args, key, None) for key in FROZEN_DEPENDENCIES}
+    if dependency_pins != FROZEN_DEPENDENCIES or args.toolchain_version != "go version go" + GO_RELEASE + " linux/amd64":
+        raise BuildUnavailable("reviewed exact toolchain/dependency pins required")
     if args.host_arch not in ("amd64", "arm64") or not args.toolchain_version:
         raise BuildUnavailable("actual host architecture and toolchain version required")
     repo = absolute_existing(args.repo, directory=True)
@@ -207,6 +303,8 @@ def build(args):
         safe_extract_module(archive, work)
         module = work / "deployer"
         source_tree = tree_pin(module)
+        dependency_inputs = require_frozen_dependencies(module, {key: getattr(args, key) for key in FROZEN_DEPENDENCIES})
+        receipt["dependencyInputs"] = dependency_inputs
         actual_tool_tree = tree_pin(tool_root)
         if actual_tool_tree["sha256"] != args.toolchain_tree_sha:
             raise BuildUnavailable("whole toolchain tree pin mismatch")
@@ -215,7 +313,7 @@ def build(args):
         env = {"PATH": "/usr/bin:/bin", "HOME": str(output), "LANG": "C",
                "GOOS": "linux", "GOARCH": args.host_arch, "CGO_ENABLED": "0",
                "GOTOOLCHAIN": "local", "GOPROXY": "off", "GOSUMDB": "off",
-               "GOWORK": "off", "GOMAXPROCS": "2", "GOFLAGS": "", "GOROOT": str(tool_root),
+               "GOENV": "off", "GOWORK": "off", "GOMAXPROCS": "2", "GOFLAGS": "-mod=vendor", "GOROOT": str(tool_root),
                "GOCACHE": str(output / "gocache"), "GOMODCACHE": str(output / "gomodcache"),
                "GOTMPDIR": str(output / "tmp")}
         (output / "tmp").mkdir(mode=0o700)
@@ -224,13 +322,14 @@ def build(args):
             raise BuildUnavailable("toolchain version mismatch")
         receipt["toolchainVersion"] = version
         commands = []
-        for name, package, flags in (("deployer", ".", "-s -w -X main.rootBuiltSourceSHA=" + args.source),
-                                     ("d101-host-reader", "./cmd/d101-host-reader", "-s -w")):
+        for name, package in ARTIFACT_ROLES.items():
+            flags = "-s -w" + (" -X main.rootBuiltSourceSHA=" + args.source if name == "deployer" else "")
             binary = output / name
-            argv = [str(toolchain), "build", "-p=1", "-mod=readonly", "-trimpath", "-buildvcs=false",
+            argv = [str(toolchain), "build", "-p=1", "-mod=vendor", "-trimpath", "-buildvcs=false",
                     "-ldflags=" + flags, "-o", str(binary), package]
             capture_command(argv, module, env, timeout=600)
             metadata = capture_command([str(toolchain), "version", "-m", str(binary)], module, env).decode()
+            role_metadata = validate_artifact_metadata(metadata, name, args.source, args.host_arch)
             if "\tvcs." in metadata or "CGO_ENABLED=0" not in metadata or "GOOS=linux" not in metadata or "GOARCH=" + args.host_arch not in metadata:
                 raise BuildUnavailable("artifact build metadata mismatch")
             if name == "deployer" and "main.rootBuiltSourceSHA=" + args.source not in metadata:
@@ -238,7 +337,8 @@ def build(args):
             binary.chmod(0o500)
             receipt[name] = {**pin_regular(binary, 32 * 1024 * 1024),
                              "elf": inspect_elf(binary, args.host_arch), "goBuildMetadata": metadata,
-                             "helperLinkerStampClaimed": False if name == "d101-host-reader" else None}
+                             "artifactRole": role_metadata,
+                             "helperLinkerStampClaimed": False if name != "deployer" else None}
             commands.append(argv)
         launcher_wire = capture_command(["git", "show", args.source + ":scripts/d101-host-session-launcher.sh"], repo)
         launcher = output / "host-session-launcher"
@@ -249,6 +349,10 @@ def build(args):
         capture_command(["/bin/bash", "-n", str(launcher)], output)
         launcher.chmod(0o500)
         receipt["launcher"] = pin_regular(launcher, 256 * 1024)
+        if require_frozen_dependencies(module) != dependency_inputs:
+            raise BuildUnavailable("dependency input changed during build")
+        receipt["artifactRoles"] = dict(ARTIFACT_ROLES, **{"host-session-launcher": "launcher"})
+        receipt["artifactCount"] = 5
         if tree_pin(module) != source_tree or tree_pin(tool_root) != actual_tool_tree or pin_regular(archive, 256 * 1024 * 1024) != receipt["archive"]:
             raise BuildUnavailable("source archive or whole toolchain changed")
         if pin_regular(toolchain) != tool_pin or pin_regular(evidence, 256 * 1024) != evidence_pin:
@@ -269,7 +373,8 @@ def build(args):
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     for field in ("repo", "source", "app-source", "host-arch-evidence", "host-arch-evidence-sha",
-                  "toolchain", "toolchain-sha", "toolchain-version", "toolchain-root", "toolchain-tree-sha", "out"):
+                  "toolchain", "toolchain-sha", "toolchain-version", "toolchain-root", "toolchain-tree-sha", "out",
+                  "go-mod-sha256", "go-sum-sha256", "vendor-tree-sha256", "vendor-modules-sha256"):
         p.add_argument("--" + field, required=True)
     p.add_argument("--host-arch", required=True, choices=("amd64", "arm64"))
     return p
@@ -277,6 +382,12 @@ def parser():
 
 if __name__ == "__main__":
     try:
+        if len(sys.argv) > 1 and sys.argv[1] == "verify-dependencies":
+            admission = argparse.ArgumentParser(description="Check exact frozen module/vendor bytes without Go/build")
+            admission.add_argument("--module", required=True)
+            values = admission.parse_args(sys.argv[2:])
+            require_frozen_dependencies(Path(values.module).resolve(strict=True))
+            raise SystemExit(0)
         raise SystemExit(build(parser().parse_args()))
     except (BuildUnavailable, OSError, subprocess.SubprocessError, UnicodeError):
         raise SystemExit(2)

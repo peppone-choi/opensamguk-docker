@@ -122,6 +122,8 @@ func resetD101RecoveryFixture(t *testing.T) (config, *operationLease, lifecycleJ
 		a.ClockObservedAt = time.Now()
 		return a, nil
 	}
+	// Dedicated test source, never a production authentication fallback.
+	cfg.d101RetainedRecovery = productionRecoveryClaimFixture(t, op, intentSHA, authority.DeploymentCardSHA, decoded, cfg.d101PurposeAuthority)
 	cfg.d101RecoveryVerifier = func(context.Context, resetD101RecoveryBinding) error { return nil }
 	cfg.operations = newOperationCoordinator("", cfg.lifecycleJournalFile, nil)
 	lease, err := cfg.operations.beginRecovery()
@@ -201,7 +203,7 @@ func TestResetD101RecoveryRefusesUnownedLeaseMissingSourceAndChangedBindings(t *
 			case "changed-journal":
 				journal.Stage = lifecycleJournalStageEnv
 			case "missing-authority":
-				cfg.d101PurposeAuthority = nil
+				cfg.d101RetainedRecovery.purpose = nil
 			case "missing-verifier":
 				cfg.d101RecoveryVerifier = nil
 			case "verifier-refusal":
@@ -213,9 +215,9 @@ func TestResetD101RecoveryRefusesUnownedLeaseMissingSourceAndChangedBindings(t *
 					return nil
 				}
 			case "verifier-changed-card":
-				source := cfg.d101PurposeAuthority
+				source := cfg.d101RetainedRecovery.purpose
 				changed := false
-				cfg.d101PurposeAuthority = func(ctx context.Context, op, sha string) (resetD101VerifiedPurposeAuthority, error) {
+				cfg.d101RetainedRecovery.purpose = func(ctx context.Context, op, sha string) (resetD101VerifiedPurposeAuthority, error) {
 					a, err := source(ctx, op, sha)
 					if changed {
 						a.DeploymentCardSHA = strings.Repeat("f", 64)
@@ -227,8 +229,8 @@ func TestResetD101RecoveryRefusesUnownedLeaseMissingSourceAndChangedBindings(t *
 					return nil
 				}
 			case "stale-clock":
-				source := cfg.d101PurposeAuthority
-				cfg.d101PurposeAuthority = func(ctx context.Context, op, sha string) (resetD101VerifiedPurposeAuthority, error) {
+				source := cfg.d101RetainedRecovery.purpose
+				cfg.d101RetainedRecovery.purpose = func(ctx context.Context, op, sha string) (resetD101VerifiedPurposeAuthority, error) {
 					a, err := source(ctx, op, sha)
 					a.ClockObservedAt = time.Now().Add(-resetPreflightMaxAge)
 					return a, err

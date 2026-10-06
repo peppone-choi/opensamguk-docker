@@ -24,7 +24,7 @@ on:
         required: true
         type: string
       approved_build_contract_json:
-        description: Reviewed nonsecret Go pins, original architecture observation, existing driver pins and immutable runtime base
+        description: Reviewed exact Go/module/sum/vendor pins, original architecture, driver pins and immutable runtime base
         required: true
         type: string
       expected_build_contract_sha256:
@@ -133,11 +133,18 @@ jobs:
           ref: ${{ inputs.expected_root_source_sha }}
           path: source
           persist-credentials: false
-      - name: Set up reviewed Go1.23 patch
+      - name: Set up reviewed Go1.26.8
         uses: actions/setup-go@v5
         with:
           go-version: ${{ needs.admit.outputs.go_release }}
           cache: false
+        env:
+          GOTOOLCHAIN: local
+          GOENV: 'off'
+          GOWORK: 'off'
+          GOPROXY: 'off'
+          GOSUMDB: 'off'
+          GOFLAGS: '-mod=vendor'
       - name: Set up candidate Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
@@ -172,5 +179,7 @@ jobs:
             evidence/controlled-artifacts/deployer
             evidence/controlled-artifacts/d101-host-reader
             evidence/controlled-artifacts/host-session-launcher
+            evidence/controlled-artifacts/d101-native-installer
+            evidence/controlled-artifacts/d101-management-client
           if-no-files-found: error
           retention-days: 30

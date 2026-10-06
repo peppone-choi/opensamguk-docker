@@ -19,8 +19,10 @@ spec.loader.exec_module(driver)
 class ControlledHostArtifactBuildTest(unittest.TestCase):
     def test_missing_actual_inputs_never_reach_a_command(self):
         required = ["repo", "source", "app-source", "host-arch-evidence", "host-arch-evidence-sha",
-                    "toolchain", "toolchain-sha", "toolchain-version", "toolchain-root", "toolchain-tree-sha", "out", "host-arch"]
-        for omitted in ("host-arch", "host-arch-evidence", "toolchain-root", "toolchain-tree-sha"):
+                    "toolchain", "toolchain-sha", "toolchain-version", "toolchain-root", "toolchain-tree-sha", "out", "host-arch",
+                    "go-mod-sha256", "go-sum-sha256", "vendor-tree-sha256", "vendor-modules-sha256"]
+        for omitted in ("host-arch", "host-arch-evidence", "toolchain-root", "toolchain-tree-sha",
+                        "go-mod-sha256", "go-sum-sha256", "vendor-tree-sha256", "vendor-modules-sha256"):
             with self.subTest(omitted=omitted), patch.object(driver, "capture_command", side_effect=AssertionError("command must not run")):
                 argv = [value for key in required if key != omitted for value in ("--" + key, "amd64" if key == "host-arch" else "fixture")]
                 with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
@@ -90,8 +92,8 @@ class ControlledHostArtifactBuildTest(unittest.TestCase):
                 args = argparse.Namespace(source="a" * 40, app_source="b" * 40, host_arch="amd64",
                     host_arch_evidence_sha=driver.digest(evidence), host_arch_evidence=str(evidence),
                     toolchain_sha=driver.digest(binary), toolchain_tree_sha="c" * 64,
-                    toolchain_version="synthetic never executed", toolchain=str(binary), toolchain_root=str(tool),
-                    repo=str(repo), out=str(output))
+                    toolchain_version="go version go1.26.8 linux/amd64", toolchain=str(binary), toolchain_root=str(tool),
+                    repo=str(repo), out=str(output), **driver.FROZEN_DEPENDENCIES)
                 def pure_capture(argv, *_args, **_kwargs):
                     if argv[1:3] == ["rev-parse", "HEAD"]:
                         return (args.source + "\n").encode()
@@ -109,6 +111,99 @@ class ControlledHostArtifactBuildTest(unittest.TestCase):
                             driver.validate_inputs(args)
                         if name == "existing-output":
                             self.assertEqual((output / "preserved").read_bytes(), b"existing build")
+
+
+class OfflineDependencySourceTest(unittest.TestCase):
+    """Disposable data comparators only; never a production input or binary."""
+
+    def test_dependency_comparator_rejects_changed_physical_inputs(self):
+        cases = ("intact", "missing-mod", "missing-sum", "truncated-mod", "changed-sum",
+                 "extra-vendor", "missing-vendor", "changed-vendor", "changed-modules", "symlink-vendor")
+        for name in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                module = Path(temporary).resolve()
+                (module / "vendor/fixture").mkdir(parents=True)
+                (module / "go.mod").write_bytes(b"synthetic comparator fixture, not enrolled\n")
+                (module / "go.sum").write_bytes(b"synthetic sum fixture\n")
+                (module / "vendor/modules.txt").write_bytes(b"synthetic modules fixture\n")
+                leaf = module / "vendor/fixture/source.go"
+                leaf.write_bytes(b"synthetic disposable source\n")
+                expected = {"go_mod_sha256": driver.digest(module / "go.mod"),
+                            "go_sum_sha256": driver.digest(module / "go.sum"),
+                            "vendor_modules_sha256": driver.digest(module / "vendor/modules.txt"),
+                            "vendor_tree_sha256": driver.tree_pin(module / "vendor")["sha256"]}
+                if name.startswith("missing-"):
+                    {"missing-mod": module / "go.mod", "missing-sum": module / "go.sum", "missing-vendor": leaf}[name].unlink()
+                elif name == "truncated-mod":
+                    (module / "go.mod").write_bytes(b"s")
+                elif name == "changed-sum":
+                    (module / "go.sum").write_bytes(b"changed")
+                elif name == "extra-vendor":
+                    (module / "vendor/fixture/extra.go").write_bytes(b"extra")
+                elif name == "changed-vendor":
+                    leaf.write_bytes(b"changed")
+                elif name == "changed-modules":
+                    (module / "vendor/modules.txt").write_bytes(b"changed")
+                elif name == "symlink-vendor":
+                    leaf.unlink()
+                    leaf.symlink_to(module / "go.sum")
+                with patch.object(driver.subprocess, "run", side_effect=AssertionError("no external command")):
+                    if name == "intact":
+                        self.assertEqual(driver.check_dependency_tree(module, expected)["pins"], expected)
+                    else:
+                        with self.assertRaises((driver.BuildUnavailable, OSError)):
+                            driver.check_dependency_tree(module, expected)
+                    with self.assertRaises(driver.BuildUnavailable):
+                        driver.require_frozen_dependencies(module, expected)
+
+    def test_unreviewed_dependency_and_toolchain_pins_refuse_before_commands(self):
+        for name in ("module", "sum", "vendor", "modules", "toolchain"):
+            with self.subTest(name=name):
+                args = argparse.Namespace(source="a" * 40, app_source="b" * 40,
+                    host_arch_evidence_sha="c" * 64, toolchain_sha="d" * 64, toolchain_tree_sha="e" * 64,
+                    toolchain_version="go version go1.26.8 linux/amd64", **driver.FROZEN_DEPENDENCIES)
+                if name == "toolchain":
+                    args.toolchain_version = "go version go1.26.5 linux/amd64"
+                else:
+                    field = {"module": "go_mod_sha256", "sum": "go_sum_sha256", "vendor": "vendor_tree_sha256", "modules": "vendor_modules_sha256"}[name]
+                    setattr(args, field, "f" * 64)
+                with patch.object(driver, "capture_command", side_effect=AssertionError("no command")), self.assertRaises(driver.BuildUnavailable):
+                    driver.validate_inputs(args)
+
+    def test_actual_metadata_shape_requires_exact_artifact_role(self):
+        def wire(role):
+            suffix = driver.ARTIFACT_ROLES[role].removeprefix("./")
+            package = "opensamguk-deployer" + ("/" + suffix if suffix != "." else "")
+            stamp = " -X main.rootBuiltSourceSHA=" + "a" * 40 if role == "deployer" else ""
+            return ("/synthetic-never-executed:\tgo1.26.8\n\tpath\t" + package + "\n"
+                    "\tmod\topensamguk-deployer\t(devel)\t\n"
+                    "\tdep\tgolang.org/x/crypto\tv0.57.0\t\n\tdep\tgolang.org/x/sys\tv0.48.0\t\n"
+                    "\tbuild\t-ldflags=\"-s -w" + stamp + "\"\n"
+                    "\tbuild\tCGO_ENABLED=0\n\tbuild\tGOOS=linux\n\tbuild\tGOARCH=amd64\n")
+        for role in driver.ARTIFACT_ROLES:
+            with self.subTest(role=role):
+                self.assertEqual(driver.validate_artifact_metadata(wire(role), role, "a" * 40, "amd64")["role"], role)
+        good = wire("deployer")
+        cases = {
+            "old-go": good.replace("go1.26.8", "go1.26.5"),
+            "wrong-package": good.replace("\tpath\topensamguk-deployer", "\tpath\tother"),
+            "missing-root": good.replace("\tmod\topensamguk-deployer\t(devel)\t\n", ""),
+            "duplicate-root": good + "\tmod\topensamguk-deployer\t(devel)\t\n",
+            "wrong-version": good.replace("v0.57.0", "v0.41.0"),
+            "missing-dep": good.replace("\tdep\tgolang.org/x/sys\tv0.48.0\t\n", ""),
+            "extra-dep": good + "\tdep\tother/module\tv1.0.0\n",
+            "replace": good + "\t=>\tlocal/override\t(devel)\n",
+            "invented-vendor-sum": good.replace("v0.57.0\t", "v0.57.0\th1:invented"),
+            "wrong-arch": good.replace("GOARCH=amd64", "GOARCH=arm64"),
+            "wrong-cgo": good.replace("CGO_ENABLED=0", "CGO_ENABLED=1"),
+            "ambient-vcs": good + "\tbuild\tvcs.revision=synthetic\n",
+            "missing-stamp": good.replace("main.rootBuiltSourceSHA=", "unrelated.stamp="),
+            "duplicate-setting": good + "\tbuild\tGOOS=linux\n",
+            "unknown-record": good + "\tunknown\tsynthetic\n",
+        }
+        for name, metadata in cases.items():
+            with self.subTest(name=name), self.assertRaises(driver.BuildUnavailable):
+                driver.validate_artifact_metadata(metadata, "deployer", "a" * 40, "amd64")
 
 
 if __name__ == "__main__":
