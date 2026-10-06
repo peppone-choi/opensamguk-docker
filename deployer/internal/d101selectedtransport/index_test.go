@@ -20,14 +20,14 @@ func indexFixture() Index {
 		if id == "parserClass" || id == "topologyRootClass" || id == "topologyCanonical" {
 			media = "application/octet-stream"
 		}
-		value.Originals[id] = SourceReference{OriginalPath(op, id), sha, 8, d101custody.PrivateSnapshot{1, 2, 8, 3}, media}
+		value.Originals[id] = SourceReference{OriginalPath(op, id), sha, 8, d101custody.PrivateSnapshot{Device: 1, Inode: 2, ByteLength: 8, ModifiedAtUnixNano: 3}, media}
 	}
 	return value
 }
 func TestSelectedIndexExactPreIntentShape(t *testing.T) {
 	value := indexFixture()
 	id := "topology-input:dryLandProjectionPolicy"
-	value.Originals[id] = SourceReference{OriginalPath(value.OriginalOp, id), strings.Repeat("d", 64), 64 << 20, d101custody.PrivateSnapshot{1, 4, 64 << 20, 5}, "application/octet-stream"}
+	value.Originals[id] = SourceReference{OriginalPath(value.OriginalOp, id), strings.Repeat("d", 64), 64 << 20, d101custody.PrivateSnapshot{Device: 1, Inode: 4, ByteLength: 64 << 20, ModifiedAtUnixNano: 5}, "application/octet-stream"}
 	canonical := value.Originals["topologyCanonical"]
 	canonical.ByteLength, canonical.Snapshot.ByteLength = 64<<20, 64<<20
 	value.Originals["topologyCanonical"] = canonical

@@ -11,10 +11,10 @@ import (
 )
 
 func transportTestRef(prefix string, wire []byte) PageReference {
-	return PageReference{prefix, HashOriginal(wire), uint64(len(wire)), d101custody.PrivateSnapshot{1, 2, uint64(len(wire)), 3}}
+	return PageReference{prefix, HashOriginal(wire), uint64(len(wire)), d101custody.PrivateSnapshot{Device: 1, Inode: 2, ByteLength: uint64(len(wire)), ModifiedAtUnixNano: 3}}
 }
 func transportTestEntry(id string) Entry {
-	return Entry{RawReference{id, HashOriginal([]byte("{}")), 2, "application/json"}, LogicalIDDigest(id), d101custody.PrivateSnapshot{1, 4, 2, 3}}
+	return Entry{RawReference{id, HashOriginal([]byte("{}")), 2, "application/json"}, LogicalIDDigest(id), d101custody.PrivateSnapshot{Device: 1, Inode: 4, ByteLength: 2, ModifiedAtUnixNano: 3}}
 }
 func transportTestIndex(root PageReference) Index {
 	return Index{1, IndexKind, evidenceScopeFixture(), d101custody.PrivateOriginalPartBytes, "fixture-collector", RawReference{"raw:collector-source", strings.Repeat("b", 64), 1, "application/octet-stream"}, "sha256:" + strings.Repeat("c", 64), root, []RawReference{}, 1}
@@ -31,7 +31,7 @@ func TestEvidenceIndexSourcePinUseExactR4AndDataOnlyEmptyOrigins(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(got, index) {
 		t.Fatal("exact10 index or empty proof transport refused")
 	}
-	pin := SourcePin{1, SourcePinKind, scope, strings.Repeat("a", 64), HashOriginal(wire), d101custody.PrivateSnapshot{1, 2, uint64(len(wire)), 3}, strings.Repeat("e", 64), index.CollectorSource, index.CollectorImageDigest, index.CollectorIdentity, RawReference{"raw:installer-source", strings.Repeat("f", 64), 1, "application/octet-stream"}, []PublicPin{}, SourceNamespace}
+	pin := SourcePin{1, SourcePinKind, scope, strings.Repeat("a", 64), HashOriginal(wire), d101custody.PrivateSnapshot{Device: 1, Inode: 2, ByteLength: uint64(len(wire)), ModifiedAtUnixNano: 3}, strings.Repeat("e", 64), index.CollectorSource, index.CollectorImageDigest, index.CollectorIdentity, RawReference{"raw:installer-source", strings.Repeat("f", 64), 1, "application/octet-stream"}, []PublicPin{}, SourceNamespace}
 	pinWire, _ := json.Marshal(pin)
 	parsed, err := DecodeSourcePin(pinWire)
 	if err != nil || !reflect.DeepEqual(pin, parsed) {
