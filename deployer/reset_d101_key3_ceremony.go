@@ -153,11 +153,11 @@ func requireResetD101Key3Authentication(a resetD101Key3CeremonyAuthentication, e
 	return nil
 }
 
-// Read-only ABI preparation. Actual positive once/native writer is deliberately
-// not connected. This does not register any key or Root purpose authority.
-func readResetD101ReviewedKey3Ceremony(ctx context.Context, sha string) error {
+// Hold actual authentication/card descriptors through the guarded consumer.
+// This does not register any key or Root purpose authority.
+func withResetD101ReviewedKey3Ceremony(ctx context.Context, sha string, consume func(*resetD101Key3AuthenticatedSession) error) error {
 	source, p := resetD101ReviewedKey3CeremonySource, resetD101ReviewedKey3CeremonyExpected
-	if ctx == nil || ctx.Err() != nil || source == nil || reflect.ValueOf(source).Kind() == reflect.Pointer && reflect.ValueOf(source).IsNil() || p == nil ||
+	if consume == nil || ctx == nil || ctx.Err() != nil || resetD101Key3SourceMissing(source) || p == nil ||
 		runtime.GOOS != "linux" || runtime.GOARCH != "amd64" || os.Geteuid() != 0 || sha != p.CardSHA || !validResetD101Key3Ref(p.HumanAuthenticationSourceRef) {
 		return errResetD101InstallationNotSupplied
 	}
@@ -196,7 +196,21 @@ func readResetD101ReviewedKey3Ceremony(ctx context.Context, sha string) error {
 		ctx.Err() != nil || requireResetD101Key3Authentication(a, expected, time.Now()) != nil || held.recheck(ctx, 0) != nil {
 		return errResetExecutionEvidence
 	}
-	// Concrete once/conflict/retention/writer/public-freeze authorization is not
-	// supplied; never invoke entropy or a namespace writer from this reader.
-	return errResetD101InstallationNotSupplied
+	// Keep actual originals and native card FD live throughout the writer.
+	// No session is returned to a caller after the owner has closed its FD.
+	session := &resetD101Key3AuthenticatedSession{expected: expected, authentication: a}
+	session.recheck = func(current context.Context) error {
+		if current == nil || current.Err() != nil || ctx.Err() != nil || requireResetD101Key3Authentication(a, expected, time.Now()) != nil || held.recheck(current, 0) != nil || source.Recheck(current, expected, a) != nil ||
+			current.Err() != nil || requireResetD101Key3Authentication(a, expected, time.Now()) != nil || held.recheck(current, 0) != nil {
+			return errResetExecutionEvidence
+		}
+		return nil
+	}
+	if session.recheck(ctx) != nil {
+		return errResetExecutionEvidence
+	}
+	if err := consume(session); err != nil {
+		return err
+	}
+	return session.recheck(ctx)
 }

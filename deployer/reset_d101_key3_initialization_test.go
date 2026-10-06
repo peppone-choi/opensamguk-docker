@@ -297,3 +297,155 @@ func TestKey3EarlyCommandDeniesWithoutAuthorityAndNeverFallsThrough(t *testing.T
 		t.Fatal("canceled ceremony accepted")
 	}
 }
+
+// New selectors below do not install an actual authority source. The trap
+// provider must never be reached by an unavailable production entry.
+type key3MissingExecutionTrap struct{ calls *int }
+
+func (s *key3MissingExecutionTrap) Authenticate(context.Context, *resetD101Key3AuthenticatedSession, resetD101Key3NativeInitializationExpected) (resetD101Key3NativeInitializationBinding, error) {
+	*s.calls++
+	return resetD101Key3NativeInitializationBinding{}, errResetExecutionEvidence
+}
+func (s *key3MissingExecutionTrap) Recheck(context.Context, *resetD101Key3AuthenticatedSession, resetD101Key3NativeInitializationExpected, resetD101Key3NativeInitializationBinding) error {
+	*s.calls++
+	return errResetExecutionEvidence
+}
+
+func TestKey3NativeInitializationNilExecutionSourceNeverReachesWriter(t *testing.T) {
+	oldSource, oldExpected := resetD101ReviewedKey3NativeInitializationSource, resetD101ReviewedKey3NativeInitializationExpected
+	oldCeremony, oldCeremonyExpected := resetD101ReviewedKey3CeremonySource, resetD101ReviewedKey3CeremonyExpected
+	defer func() {
+		resetD101ReviewedKey3NativeInitializationSource = oldSource
+		resetD101ReviewedKey3NativeInitializationExpected = oldExpected
+		resetD101ReviewedKey3CeremonySource = oldCeremony
+		resetD101ReviewedKey3CeremonyExpected = oldCeremonyExpected
+	}()
+	for _, name := range []string{"nil-source", "typed-nil-source", "missing-expected", "missing-ceremony-source", "nil-context", "canceled", "bad-sha"} {
+		t.Run(name, func(t *testing.T) {
+			calls := 0
+			source := &key3MissingExecutionTrap{&calls}
+			resetD101ReviewedKey3NativeInitializationSource = source
+			resetD101ReviewedKey3NativeInitializationExpected = &resetD101Key3NativeInitializationExpected{}
+			resetD101ReviewedKey3CeremonySource = nil
+			resetD101ReviewedKey3CeremonyExpected = nil
+			ctx := context.Background()
+			sha := strings.Repeat("a", 64)
+			switch name {
+			case "nil-source":
+				resetD101ReviewedKey3NativeInitializationSource = nil
+			case "typed-nil-source":
+				resetD101ReviewedKey3NativeInitializationSource = (*key3MissingExecutionTrap)(nil)
+			case "missing-expected":
+				resetD101ReviewedKey3NativeInitializationExpected = nil
+			case "nil-context":
+				ctx = nil
+			case "canceled":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			case "bad-sha":
+				sha = "caller supplied approval"
+			}
+			if runResetD101Key3Initialization(ctx, sha) != 2 || calls != 0 {
+				t.Fatal("unavailable source reached actual execution or writer")
+			}
+			if withResetD101ReviewedKey3Ceremony(ctx, sha, nil) == nil {
+				t.Fatal("nil held callback admitted")
+			}
+		})
+	}
+}
+
+func TestKey3NativeInitializationOutcomeDoesNotPromotePartial(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		out    resetD101Key3NativeInitializationOutcome
+		err    error
+		status int
+	}{
+		{"empty", resetD101Key3NativeInitializationOutcome{}, nil, 2},
+		{"denied", resetD101Key3NativeInitializationOutcome{err: errResetExecutionEvidence}, errResetExecutionEvidence, 2},
+		{"partial", resetD101Key3NativeInitializationOutcome{attempted: true}, nil, 3},
+		{"false-completion", resetD101Key3NativeInitializationOutcome{complete: true}, nil, 2},
+		{"durable-complete", resetD101Key3NativeInitializationOutcome{attempted: true, complete: true}, nil, 0},
+		{"post-complete-failure", resetD101Key3NativeInitializationOutcome{attempted: true, complete: true}, errResetExecutionEvidence, 3},
+		{"outcome-error", resetD101Key3NativeInitializationOutcome{attempted: true, complete: true, err: errResetExecutionEvidence}, nil, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if resetD101Key3InitializationStatus(tc.out, tc.err) != tc.status {
+				t.Fatal("partial or late failure promoted to success")
+			}
+		})
+	}
+	_, card, now := key3PublicFixture(t)
+	directory := resetD101Key3DirectoryIdentity{Device: 1, Inode: 1, OwnerUID: 0, Mode: 0700}
+	expected := resetD101Key3NativeInitializationExpected{BaseDirectory: directory, OnceParent: directory, KeysParent: directory, PublicParent: directory, MinimumAvailableBytes: 1}
+	expected.OnceParent.Inode = 2
+	expected.KeysParent.Inode = 3
+	expected.PublicParent.Inode = 4
+	expected.InstallerPin.SHA256 = card.Card.InitializerBinarySHA256
+	expected.InstallerPin.OwnerUID = 0
+	expected.InstallerPin.FileMode = 0500
+	expected.InstallerPin.LinkCount = 1
+	expected.InstallerPin.Snapshot.Device = 1
+	expected.InstallerPin.Snapshot.Inode = 1
+	expected.InstallerPin.Snapshot.ByteLength = 1
+	expected.InstallerPin.ParentSnapshot.Device = 1
+	expected.InstallerPin.ParentSnapshot.Inode = 1
+	expected.InstallerPin.ParentOwnerUID = 0
+	expected.InstallerPin.ParentMode = 0700
+	session := &resetD101Key3AuthenticatedSession{expected: card, recheck: func(context.Context) error { return errResetExecutionEvidence }}
+	c := card.Card
+	scope := resetD101Key3NativeExecutionScope{1, "KEY3_NATIVE_INITIALIZATION", card.CardSHA, c.HostInstanceID, c.InitializerSourceSHA, c.InitializerBinarySHA256, c.HumanApprovalOriginalRef, c.CustodianAssignmentOriginalRef, c.PrivateRetentionOriginalRef,
+		"/etc/opensamguk/d101", ".once/key3-initialize", expected.BaseDirectory, expected.OnceParent, expected.KeysParent, expected.PublicParent, 1}
+	wire, err := json.Marshal(scope)
+	if err != nil {
+		t.Fatal("fixture encoding failed")
+	}
+	expected.ExecutionScopeOriginalRef = resetD101Key3OriginalRef{Path: "/fixture/execution", Bytes: uint64(len(wire)), SHA256: resetD101OriginalSHA(wire)}
+	binding := resetD101Key3NativeInitializationBinding{card.CardSHA, expected.ExecutionScopeOriginalRef.SHA256, c.HostInstanceID, c.InitializerSourceSHA, c.InitializerBinarySHA256, wire, now}
+	// This validates shape only, with no actual source or positive entry call.
+	if requireResetD101Key3NativeBinding(binding, session, expected, now) != nil {
+		t.Fatal("public shape fixture invalid")
+	}
+	for _, name := range []string{"missing-original", "source-mismatch", "host-mismatch", "binary-mismatch", "capacity-zero", "foreign-pin", "future", "stale", "unknown-field", "duplicate-field", "owner-negative-zero", "once-scope-change"} {
+		t.Run(name, func(t *testing.T) {
+			b := binding
+			e := expected
+			b.executionScopeOriginal = append([]byte(nil), wire...)
+			switch name {
+			case "missing-original":
+				b.executionScopeOriginal = nil
+			case "source-mismatch":
+				b.sourceSHA = strings.Repeat("d", 40)
+			case "host-mismatch":
+				b.hostInstanceID = "987654321"
+			case "binary-mismatch":
+				e.InstallerPin.SHA256 = strings.Repeat("d", 64)
+			case "capacity-zero":
+				e.MinimumAvailableBytes = 0
+			case "foreign-pin":
+				e.KeysParent.OwnerUID = 1
+			case "future":
+				b.observedAt = now.Add(time.Nanosecond)
+			case "stale":
+				b.observedAt = now.Add(-resetPreflightMaxAge)
+			case "unknown-field":
+				b.executionScopeOriginal = []byte(strings.Replace(string(wire), `"schemaVersion":1`, `"extra":true,"schemaVersion":1`, 1))
+			case "duplicate-field":
+				b.executionScopeOriginal = []byte(strings.Replace(string(wire), `"schemaVersion":1`, `"schemaVersion":1,"schemaVersion":1`, 1))
+			case "owner-negative-zero":
+				b.executionScopeOriginal = []byte(strings.Replace(string(wire), `"ownerUid":0`, `"ownerUid":-0`, 1))
+			case "once-scope-change":
+				b.executionScopeOriginal = []byte(strings.Replace(string(wire), `".once/key3-initialize"`, `".once/new-ceremony"`, 1))
+			}
+			// Freeze the mutated raw hash too, so parser/scope checks are exercised.
+			e.ExecutionScopeOriginalRef.Bytes = uint64(len(b.executionScopeOriginal))
+			e.ExecutionScopeOriginalRef.SHA256 = resetD101OriginalSHA(b.executionScopeOriginal)
+			b.executionScopeSHA = e.ExecutionScopeOriginalRef.SHA256
+			if requireResetD101Key3NativeBinding(b, session, e, now) == nil {
+				t.Fatal("unavailable or mismatched native execution binding accepted")
+			}
+		})
+	}
+}
