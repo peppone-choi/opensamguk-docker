@@ -310,6 +310,7 @@ type config struct {
 	d101RecoveryClosureReader     resetD101RecoveryClosureReader      // Fixed retained restore1 reader; nil until actual producer installation.
 	d101RecoveryVerifier          resetD101RecoveryVerifier           // Fixed actual backup/metadata verifier; nil until supplied.
 	d101RecoveryDatabaseSource    resetD101RecoveryDatabaseSource     // Fixed actual restored SQL original source; nil until installation.
+	d101InstallationError         error                               // Internal native adapter failure; never exposed as HTTP originals.
 	token                         string                              // Bearer 인증 토큰
 	composeDir                    string                              // compose 파일 디렉터리(/workspace)
 	composeHostDir                string
@@ -2635,6 +2636,12 @@ func main() {
 	cfg, err := loadConfig()
 	if err != nil {
 		log.Fatalf("durable operation store initialization failed: %v", err)
+	}
+	// Register the fixed installation atomically; missing actual inputs keep
+	// all D101 sources closed while ordinary service/registry checks remain.
+	cfg, err = assembleResetD101InstalledSources(context.Background(), cfg)
+	if err != nil {
+		log.Print("D101 fixed installation sources unavailable")
 	}
 	if len(os.Args) == 2 && os.Args[1] == "--check-running-registry-targets" {
 		os.Exit(checkRunningRegistryTargetsCommand(cfg, os.Stderr))

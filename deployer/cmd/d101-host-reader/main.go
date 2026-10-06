@@ -116,6 +116,12 @@ func exactJSON(wire []byte, keys []string, target any) error {
 }
 
 func readFixed(action, path string, read privateReader) ([]byte, error) {
+	if action == currentFreezeAction {
+		if path != installationPath {
+			return nil, d101custody.ErrUnavailable
+		}
+		return readCurrentFreeze(read)
+	}
 	if action == d101preinput.Action {
 		return readPreIntentInputs(read)
 	}
