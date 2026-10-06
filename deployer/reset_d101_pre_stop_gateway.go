@@ -67,7 +67,7 @@ func (c config) readResetD101PreStopGateway(ctx context.Context, s *resetD101Pre
 		return closed, errResetExecutionEvidence
 	}
 	publication, err := c.observeResetD101Publication(bounded, binding, gateway.execution.VerifyingRevision)
-	if err != nil {
+	if err != nil || requireResetD101PublicationOriginal(publication, binding, gateway.execution.VerifyingRevision) != nil {
 		return closed, errResetExecutionEvidence
 	}
 	prepareAfter, prepareErr := readResetPrivateCustody(prepareDirectory, op, 0)

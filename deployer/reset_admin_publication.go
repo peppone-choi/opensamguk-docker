@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,9 +10,11 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type resetAdminPublication struct {
@@ -28,6 +31,24 @@ type resetAdminPublicationObservation struct {
 	ObservedAt time.Time
 	BodySHA256 string
 	Current    resetAdminPublication
+	original   []byte
+}
+
+// Keep the actual GET body, including its whitespace, independently of Current.
+// Neither this original nor its digest establishes external writer authority.
+func (v resetAdminPublicationObservation) Original() []byte { return bytes.Clone(v.original) }
+
+func requireResetD101PublicationOriginal(v resetAdminPublicationObservation, binding resetExecutionPhaseBinding, revision string) error {
+	var current resetAdminPublication
+	if len(v.original) == 0 || len(v.original) > 16*1024 || !utf8.Valid(v.original) ||
+		resetD101OriginalSHA(v.original) != v.BodySHA256 ||
+		requireResetIntentShape(v.original, reflect.TypeOf(current)) != nil ||
+		decodeResetPrivateJSON(v.original, &current) != nil ||
+		validateResetAdminPublication(current, binding, revision) != nil ||
+		!reflect.DeepEqual(current, v.Current) || v.ObservedAt.IsZero() {
+		return errResetExecutionEvidence
+	}
+	return nil
 }
 
 // This proves the publisher's current stored target/revision only. It is not
@@ -69,12 +90,12 @@ func getResetAdminPublication(ctx context.Context, endpoint, accessToken string,
 	}
 	wire, err := io.ReadAll(io.LimitReader(response.Body, 16*1024+1))
 	var value resetAdminPublication
-	if err != nil || len(wire) > 16*1024 || decodeResetPrivateJSON(wire, &value) != nil ||
+	if err != nil || len(wire) > 16*1024 || !utf8.Valid(wire) || requireResetIntentShape(wire, reflect.TypeOf(value)) != nil || decodeResetPrivateJSON(wire, &value) != nil ||
 		validateResetAdminPublication(value, binding, expectedRevision) != nil || deadline.Err() != nil {
 		return resetAdminPublicationObservation{}, errResetExecutionEvidence
 	}
 	sum := sha256.Sum256(wire)
-	return resetAdminPublicationObservation{time.Now(), hex.EncodeToString(sum[:]), value}, nil
+	return resetAdminPublicationObservation{ObservedAt: time.Now(), BodySHA256: hex.EncodeToString(sum[:]), Current: value, original: bytes.Clone(wire)}, nil
 }
 
 // No caller URL/query/role/header chooses the source. Existing gateway-api JWT
