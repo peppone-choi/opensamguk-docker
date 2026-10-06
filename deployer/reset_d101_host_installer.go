@@ -161,6 +161,9 @@ func (v *resetD101NativeHostInstaller) hostIssuer(ctx context.Context, fd *os.Fi
 }
 
 func resetD101InstalledHostOperationSupplier(ctx context.Context, fd *os.File, op string) (*resetD101HostOperationInstallation, error) {
+	if resetD101ReviewedHostInstallerInputs == nil {
+		return nil, readResetD101NativeInstallNegative(ctx, op)
+	}
 	installer, err := newResetD101NativeHostInstaller(resetD101ReviewedHostInstallerInputs)
 	if err != nil {
 		return nil, err
@@ -168,6 +171,9 @@ func resetD101InstalledHostOperationSupplier(ctx context.Context, fd *os.File, o
 	return installer.hostOperation(ctx, fd, op)
 }
 func resetD101InstalledHostIssuerSupplier(ctx context.Context, fd *os.File, op string) (*resetD101HostIssuerInstallation, error) {
+	if resetD101ReviewedHostInstallerInputs == nil {
+		return nil, readResetD101NativeInstallNegative(ctx, op)
+	}
 	installer, err := newResetD101NativeHostInstaller(resetD101ReviewedHostInstallerInputs)
 	if err != nil {
 		return nil, err

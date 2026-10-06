@@ -9,9 +9,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -37,7 +40,7 @@ func TestHostRelayAdmissionLatchDoesNotLearnRejectedCandidate(t *testing.T) {
 				header = "synthetic-root." + base64.RawURLEncoding.EncodeToString(make([]byte, ed25519.SignatureSize))
 			case "auth-after-denied":
 				calls := 0
-				relay.policy.authenticate = func(context.Context, string, string, string) error {
+				relay.policy.authenticate = func(context.Context, string, string, string, resetD101RelayPeerObservation) error {
 					calls++
 					if calls == 2 {
 						return errResetExecutionEvidence
@@ -59,7 +62,7 @@ func TestHostRelayAdmissionLatchDoesNotLearnRejectedCandidate(t *testing.T) {
 				header = "synthetic-root." + base64.RawURLEncoding.EncodeToString(ed25519.Sign(private, append([]byte(resetD101PreparedDomain), wire...)))
 			}
 			relay.client.Transport = resetD101RelayFixtureTransport(func(*http.Request) (*http.Response, error) { return resetD101RelayFixtureResponse(wire, header), nil })
-			if body, _, err := relay.Read(context.Background(), relay.policy.expected.OperationID, relay.policy.expected.ApprovalPlanSHA, relay.policy.expected.ExecutionReceiptSHA); err == nil || body != nil || relay.acceptedAtUTC != "" {
+			if body, _, err := readResetD101RelayFixture(relay, context.Background(), relay.policy.expected.OperationID, relay.policy.expected.ApprovalPlanSHA, relay.policy.expected.ExecutionReceiptSHA); err == nil || body != nil || relay.acceptedAtUTC != "" {
 				t.Fatal("rejected candidate changed first admission latch")
 			}
 		})
@@ -104,7 +107,7 @@ func TestHostRelayAdmissionLatchUsesSingleCASUnderConcurrentSlots(t *testing.T) 
 				return resetD101RelayFixtureResponse(second, secondHeader), nil
 			})
 			read := func() error {
-				_, _, err := relay.Read(context.Background(), relay.policy.expected.OperationID, relay.policy.expected.ApprovalPlanSHA, relay.policy.expected.ExecutionReceiptSHA)
+				_, _, err := readResetD101RelayFixture(relay, context.Background(), relay.policy.expected.OperationID, relay.policy.expected.ApprovalPlanSHA, relay.policy.expected.ExecutionReceiptSHA)
 				return err
 			}
 			if name == "concurrent-change" {
@@ -162,11 +165,12 @@ func newResetD101RelayFixture(t *testing.T) (*resetD101HostPreparedRelay, []byte
 	}
 	header := "synthetic-root." + base64.RawURLEncoding.EncodeToString(ed25519.Sign(private, append([]byte(resetD101PreparedDomain), wire...)))
 	policy := &resetD101HostRelayInstallation{expected: proof, keyID: "synthetic-root", publicSPKI: spki, publicSPKISHA: resetD101OriginalSHA(spki),
-		authenticate: func(context.Context, string, string, string) error { return nil }}
+		authenticate: func(context.Context, string, string, string, resetD101RelayPeerObservation) error { return nil }}
 	relay, err := newResetD101HostPreparedRelay(policy, "synthetic-transport-token")
 	if err != nil {
 		t.Fatal(err)
 	}
+	relay.client = &http.Client{}
 	return relay, wire, header, private
 }
 
@@ -180,7 +184,10 @@ func resetD101RelayFixtureResponse(wire []byte, header string) *http.Response {
 func TestHostPreparedRelayPreservesOriginalAndChecksLiveTwice(t *testing.T) {
 	relay, wire, header, _ := newResetD101RelayFixture(t)
 	authCalls, requests := 0, 0
-	relay.policy.authenticate = func(context.Context, string, string, string) error { authCalls++; return nil }
+	relay.policy.authenticate = func(context.Context, string, string, string, resetD101RelayPeerObservation) error {
+		authCalls++
+		return nil
+	}
 	relay.client.Transport = resetD101RelayFixtureTransport(func(request *http.Request) (*http.Response, error) {
 		requests++
 		want := "http://d101-host/operations/" + relay.policy.expected.OperationID + "/prepared-proof/" + relay.policy.expected.ApprovalPlanSHA + "/" + relay.policy.expected.ExecutionReceiptSHA
@@ -189,7 +196,7 @@ func TestHostPreparedRelayPreservesOriginalAndChecksLiveTwice(t *testing.T) {
 		}
 		return resetD101RelayFixtureResponse(wire, header), nil
 	})
-	got, signature, err := relay.Read(context.Background(), relay.policy.expected.OperationID, relay.policy.expected.ApprovalPlanSHA, relay.policy.expected.ExecutionReceiptSHA)
+	got, signature, err := readResetD101RelayFixture(relay, context.Background(), relay.policy.expected.OperationID, relay.policy.expected.ApprovalPlanSHA, relay.policy.expected.ExecutionReceiptSHA)
 	if err != nil || !bytes.Equal(got, wire) || signature != header || requests != 1 || authCalls != 2 {
 		t.Fatal("relay did not preserve original or verify current live authority twice")
 	}
@@ -242,7 +249,7 @@ func TestHostPreparedRelayRejectsSignedStaleOrUnboundResponse(t *testing.T) {
 				relay.policy.authenticate = nil
 			case "lost-live-authority":
 				calls := 0
-				relay.policy.authenticate = func(context.Context, string, string, string) error {
+				relay.policy.authenticate = func(context.Context, string, string, string, resetD101RelayPeerObservation) error {
 					calls++
 					if calls > 1 {
 						return errors.New("keeper/lease lost")
@@ -264,7 +271,7 @@ func TestHostPreparedRelayRejectsSignedStaleOrUnboundResponse(t *testing.T) {
 				}
 				return r, nil
 			})
-			got, signature, err := relay.Read(context.Background(), relay.policy.expected.OperationID, relay.policy.expected.ApprovalPlanSHA, relay.policy.expected.ExecutionReceiptSHA)
+			got, signature, err := readResetD101RelayFixture(relay, context.Background(), relay.policy.expected.OperationID, relay.policy.expected.ApprovalPlanSHA, relay.policy.expected.ExecutionReceiptSHA)
 			if err == nil || len(got) != 0 || signature != "" {
 				t.Fatal("unbound/stale/non-live response acquired relay authority")
 			}
@@ -282,6 +289,256 @@ func TestHostPreparedRelayModeHasNoOrdinaryWriterOrFallback(t *testing.T) {
 			resetD101PreparedRelayHandler("synthetic-transport-token", nil).ServeHTTP(response, request)
 			if response.Code != 503 || response.Header().Get("Cache-Control") != "no-store" {
 				t.Fatal("missing relay source reached ordinary mode/fallback")
+			}
+		})
+	}
+}
+
+// Isolated wire/latch fixtures use a synthetic native witness explicitly. The
+// production Read entry always captures Linux actual connected descriptor data.
+func readResetD101RelayFixture(r *resetD101HostPreparedRelay, ctx context.Context, op, plan, receipt string) ([]byte, string, error) {
+	return r.readWithCallTransport(ctx, op, plan, receipt, func(call *resetD101RelayCall) http.RoundTripper {
+		call.witness = &resetD101RelayPeerWitness{}
+		call.checkNative = func(ctx context.Context) error { return ctx.Err() }
+		return resetD101RelayFixtureTransport(func(request *http.Request) (*http.Response, error) {
+			if call.authenticate(r.policy, op, plan, receipt) != nil {
+				return nil, errResetExecutionEvidence
+			}
+			return r.client.Transport.RoundTrip(request)
+		})
+	})
+}
+
+func TestHostRelayCallRetainsOwnHandlesThroughEOFAndFinalAuthentication(t *testing.T) {
+	r, wire, header, _ := newResetD101RelayFixture(t)
+	file, err := os.CreateTemp(t.TempDir(), "held-witness-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	left, right := net.Pipe()
+	defer right.Close()
+	checks := 0
+	auth := 0
+	eof := false
+	closedBody := false
+	r.policy.authenticate = func(context.Context, string, string, string, resetD101RelayPeerObservation) error {
+		auth++
+		if _, err := file.Stat(); err != nil {
+			t.Error("witness closed before authentication")
+		}
+		return nil
+	}
+	body := &resetD101RelayEOFBody{Reader: bytes.NewReader(wire), onEOF: func() { eof = true }, onClose: func() {
+		closedBody = true
+		if _, err := file.Stat(); err != nil {
+			t.Error("closed before body cleanup")
+		}
+	}}
+	got, signature, err := r.readWithCallTransport(context.Background(), r.policy.expected.OperationID, r.policy.expected.ApprovalPlanSHA, r.policy.expected.ExecutionReceiptSHA, func(call *resetD101RelayCall) http.RoundTripper {
+		call.conn = left
+		call.witness = &resetD101RelayPeerWitness{socket: file}
+		call.checkNative = func(ctx context.Context) error {
+			checks++
+			_, err := file.Stat()
+			if err != nil {
+				return err
+			}
+			return ctx.Err()
+		}
+		return resetD101RelayFixtureTransport(func(request *http.Request) (*http.Response, error) {
+			if call.authenticate(r.policy, call.op, call.plan, call.receipt) != nil {
+				return nil, errResetExecutionEvidence
+			}
+			response := resetD101RelayFixtureResponse(wire, header)
+			response.Body = body
+			return response, nil
+		})
+	})
+	if err != nil || !bytes.Equal(got, wire) || signature != header || !eof || !closedBody || auth != 2 || checks < 6 {
+		t.Fatal("call did not retain EOF/final witness", err, checks, auth)
+	}
+	if _, err := file.Stat(); err == nil {
+		t.Fatal("owner did not close own witness")
+	}
+}
+
+type resetD101RelayEOFBody struct {
+	io.Reader
+	onEOF, onClose func()
+}
+
+func (b *resetD101RelayEOFBody) Read(p []byte) (int, error) {
+	n, err := b.Reader.Read(p)
+	if err == io.EOF && b.onEOF != nil {
+		b.onEOF()
+	}
+	return n, err
+}
+func (b *resetD101RelayEOFBody) Close() error {
+	if b.onClose != nil {
+		b.onClose()
+	}
+	return nil
+}
+
+func TestHostRelayNativeLossCannotCommitAdmissionCAS(t *testing.T) {
+	for _, phase := range []string{"before-cas", "after-cas", "cancel", "partial"} {
+		t.Run(phase, func(t *testing.T) {
+			r, wire, header, _ := newResetD101RelayFixture(t)
+			r.policy.expected.AcceptedAtUTC = ""
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			checks := 0
+			got, signature, err := r.readWithCallTransport(ctx, r.policy.expected.OperationID, r.policy.expected.ApprovalPlanSHA, r.policy.expected.ExecutionReceiptSHA, func(call *resetD101RelayCall) http.RoundTripper {
+				call.witness = &resetD101RelayPeerWitness{}
+				call.checkNative = func(ctx context.Context) error {
+					checks++
+					if phase == "before-cas" && checks == 6 || phase == "after-cas" && checks == 7 {
+						return errResetExecutionEvidence
+					}
+					return ctx.Err()
+				}
+				return resetD101RelayFixtureTransport(func(request *http.Request) (*http.Response, error) {
+					if call.authenticate(r.policy, call.op, call.plan, call.receipt) != nil {
+						return nil, errResetExecutionEvidence
+					}
+					if phase == "cancel" {
+						cancel()
+					}
+					if phase == "partial" {
+						return nil, io.ErrUnexpectedEOF
+					}
+					return resetD101RelayFixtureResponse(wire, header), nil
+				})
+			})
+			if err == nil || got != nil || signature != "" || r.acceptedAtUTC != "" {
+				t.Fatal("failed call changed first admission")
+			}
+		})
+	}
+}
+func TestHostRelaySlotsUseIndependentWitnessesAndCloseOnlyOwnCall(t *testing.T) {
+	r, wire, header, _ := newResetD101RelayFixture(t)
+	ready := make(chan *resetD101RelayCall, 2)
+	release := make(chan struct{})
+	done := make(chan error, 2)
+	var mu sync.Mutex
+	calls := map[*resetD101RelayCall]*os.File{}
+	read := func() {
+		_, _, err := r.readWithCallTransport(context.Background(), r.policy.expected.OperationID, r.policy.expected.ApprovalPlanSHA, r.policy.expected.ExecutionReceiptSHA, func(call *resetD101RelayCall) http.RoundTripper {
+			f, err := os.CreateTemp(t.TempDir(), "slot-")
+			if err != nil {
+				t.Error(err)
+				return nil
+			}
+			call.witness = &resetD101RelayPeerWitness{socket: f}
+			call.checkNative = func(ctx context.Context) error {
+				_, err := f.Stat()
+				if err != nil {
+					return err
+				}
+				return ctx.Err()
+			}
+			mu.Lock()
+			calls[call] = f
+			mu.Unlock()
+			return resetD101RelayFixtureTransport(func(request *http.Request) (*http.Response, error) {
+				if call.authenticate(r.policy, call.op, call.plan, call.receipt) != nil {
+					return nil, errResetExecutionEvidence
+				}
+				ready <- call
+				select {
+				case <-release:
+				case <-request.Context().Done():
+					return nil, request.Context().Err()
+				}
+				return resetD101RelayFixtureResponse(wire, header), nil
+			})
+		})
+		done <- err
+	}
+	go read()
+	go read()
+	var one, two *resetD101RelayCall
+	select {
+	case one = <-ready:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("first slot")
+	}
+	select {
+	case two = <-ready:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("second slot")
+	}
+	if one == two || one.witness == two.witness || one.witness.socket == two.witness.socket {
+		close(release)
+		t.Fatal("shared slot witness")
+	}
+	if got, _, err := r.Read(context.Background(), r.policy.expected.OperationID, r.policy.expected.ApprovalPlanSHA, r.policy.expected.ExecutionReceiptSHA); err == nil || got != nil {
+		close(release)
+		t.Fatal("third slot admitted")
+	}
+	close(release)
+	if <-done != nil || <-done != nil {
+		t.Fatal("independent slots failed")
+	}
+	for _, file := range calls {
+		if _, err := file.Stat(); err == nil {
+			t.Fatal("call witness leaked")
+		}
+	}
+}
+func TestHostRelayTransportCloseRetainsDialDescriptorUntilOwnerRelease(t *testing.T) {
+	left, right := net.Pipe()
+	defer right.Close()
+	call := &resetD101RelayCall{conn: left}
+	wrapped := &resetD101RelayHeldConn{left}
+	if wrapped.Close() != nil {
+		t.Fatal("close deadline")
+	}
+	// Clearing the deadline proves transport Close did not close the connection.
+	if left.SetDeadline(time.Time{}) != nil {
+		t.Fatal("transport closed actual dial FD")
+	}
+	call.close()
+	if left.SetDeadline(time.Time{}) == nil {
+		t.Fatal("owner did not close dial connection")
+	}
+}
+func TestHostRelayMissingNativeWitnessOrProcessIdentityDenies(t *testing.T) {
+	r, wire, header, _ := newResetD101RelayFixture(t)
+	got, _, err := r.readWithCallTransport(context.Background(), r.policy.expected.OperationID, r.policy.expected.ApprovalPlanSHA, r.policy.expected.ExecutionReceiptSHA, func(call *resetD101RelayCall) http.RoundTripper {
+		return resetD101RelayFixtureTransport(func(*http.Request) (*http.Response, error) { return resetD101RelayFixtureResponse(wire, header), nil })
+	})
+	if err == nil || got != nil || r.acceptedAtUTC != "" {
+		t.Fatal("absent native witness accepted")
+	}
+	if _, _, err := resetD101RelayReadProcess(nil, 123); err == nil {
+		t.Fatal("missing process FD")
+	}
+	if _, err := resetD101RelayPeerCredentials(nil); err == nil {
+		t.Fatal("missing connected FD")
+	}
+}
+
+func TestHostRelayTransportRejectsRedialAndAlternateDestination(t *testing.T) {
+	for _, mode := range []string{"redial", "closed", "alternate"} {
+		t.Run(mode, func(t *testing.T) {
+			call := &resetD101RelayCall{ctx: context.Background()}
+			address := "d101-host:80"
+			switch mode {
+			case "redial":
+				call.dialed = true
+			case "closed":
+				call.closed = true
+			case "alternate":
+				address = "other-host:80"
+			}
+			conn, err := call.transport().DialContext(context.Background(), "tcp", address)
+			if conn != nil || err == nil || call.conn != nil || call.witness != nil {
+				t.Fatal("alternate dial acquired witness")
 			}
 		})
 	}

@@ -90,7 +90,15 @@ var inheritedCurrentFreezeDescriptor struct {
 }
 
 func fixedCurrentFreezeHostInstallation(original d101custody.Original) (currentFreezeHostInstallation, error) {
-	return fixedCurrentFreezeHostInstallationWithInput(original, reviewedCurrentFreezeHostInputs, runtime.GOOS)
+	input := reviewedCurrentFreezeHostInputs
+	if input == nil {
+		var err error
+		input, err = readCurrentFreezeInstallationNegative(context.Background(), original)
+		if err != nil {
+			return currentFreezeHostInstallation{}, err
+		}
+	}
+	return fixedCurrentFreezeHostInstallationWithInput(original, input, runtime.GOOS)
 }
 
 // Explicit data/platform inputs are private portable fixture seams; the

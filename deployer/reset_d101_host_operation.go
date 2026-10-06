@@ -48,7 +48,7 @@ func earlyResetD101HostCommand(args []string, getenv func(string) string, output
 		if len(args) != 2 || getenv == nil || !validResetD101ServiceToken(getenv("DEPLOYER_TOKEN")) {
 			return true, 2
 		}
-		srv := &http.Server{Addr: ":9000", Handler: resetD101PreparedRelayHandler(getenv("DEPLOYER_TOKEN"), resetD101ReviewedHostRelay), ReadHeaderTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second}
+		srv := &http.Server{Addr: ":9000", Handler: resetD101PreparedRelayHandler(getenv("DEPLOYER_TOKEN"), fixedResetD101HostRelayInstallation(context.Background())), ReadHeaderTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second}
 		if srv.ListenAndServe() != nil {
 			return true, 2
 		}
