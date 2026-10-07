@@ -5,13 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"reflect"
 	"strconv"
 	"time"
 )
 
-// This is durable identity and a bounded observation chain, not an approval
-// issuer. The worker remains closed until its real phase source is connected.
+// Retained durable identity validation. Existing native reset journals remain
+// readable and cannot be automatically replayed by ordinary maintenance repair.
 type resetExecutionJournal struct {
 	Version            int                         `json:"version"`
 	AcceptedAtUnix     int64                       `json:"acceptedAtUnix"`
@@ -99,23 +98,6 @@ func validateResetExecutionJournal(record resetExecutionJournal, operationID str
 	return nil
 }
 
-func newResetExecutionJournal(binding resetExecutionPhaseBinding, attestation resetExecutionAttestation) (resetExecutionJournal, error) {
-	record := resetExecutionJournal{Version: 1, AcceptedAtUnix: binding.AcceptedAtUnix, Evidence: binding.Evidence,
-		TargetFingerprint: resetRequestFingerprint("pep", binding.Target)}
-	var err error
-	record.RequestFingerprint, err = resetExecutionRequestFingerprint("pep", binding.Target, binding.Evidence)
-	if err != nil || binding.Phase != "prepared" || binding.PreviousAttestationSHA != "" ||
-		attestation.Phase != binding.Phase || attestation.PreviousSHA != "" {
-		return resetExecutionJournal{}, errResetExecutionEvidence
-	}
-	attestation.SHA = resetExecutionAttestationSHA(record, attestation)
-	record.Attestations = []resetExecutionAttestation{attestation}
-	if validateResetExecutionJournal(record, binding.OperationID, binding.Target) != nil {
-		return resetExecutionJournal{}, errResetExecutionEvidence
-	}
-	return record, nil
-}
-
 func validateLifecycleResetExecution(journal lifecycleJournal) error {
 	if journal.ResetExecution == nil {
 		return nil
@@ -145,54 +127,15 @@ func (c config) validateResetExecutionOperation(record resetExecutionJournal, op
 	return nil
 }
 
-func (c config) writeResetExecutionLifecycleJournal(target serverTarget, resetTarget resetLifecycleTarget, operationID string, record resetExecutionJournal) error {
-	if stateFilePresent(c.lifecycleJournalFile) || c.lifecycleJournalFile == "" || target.ID != "pep" ||
-		c.validateResetExecutionOperation(record, operationID) != nil {
-		return errResetExecutionEvidence
-	}
-	journal := lifecycleJournal{Version: lifecycleJournalVersion, Operation: "reset", OperationID: operationID,
-		OperationKind: lifecycleKindReset, Stage: lifecycleJournalStagePrepared, ServerID: target.ID,
-		Project: target.Project, ResetTarget: &resetTarget, ResetExecution: &record}
-	if err := c.writeLifecycleJournalRecord(journal); err != nil {
-		return err
-	}
-	if c.operations != nil {
-		c.operations.markLifecycleJournalPending()
-	}
-	return nil
-}
-
-func (c config) appendResetExecutionPhaseToJournal(ctx context.Context, binding resetExecutionPhaseBinding, source resetExecutionPhaseSource) error {
+// Ordinary operations can settle; retained native execution journals cannot
+// be cleared without the removed, uninstalled issuer. Leave recovery closed.
+func (c config) settleSucceededLifecycleJournal(_ context.Context, _ string) error {
 	journal, exists, err := c.readLifecycleJournal()
-	if err != nil || !exists || journal.ResetExecution == nil || journal.ResetTarget == nil ||
-		journal.OperationID != binding.OperationID || !reflect.DeepEqual(*journal.ResetTarget, binding.Target) ||
-		c.validateResetExecutionOperation(*journal.ResetExecution, binding.OperationID) != nil {
+	if err != nil {
+		return err
+	}
+	if exists && journal.ResetExecution != nil {
 		return errResetExecutionEvidence
 	}
-	a, err := c.observeResetExecutionPhase(ctx, binding, source)
-	if err != nil {
-		return err
-	}
-	next, err := appendResetExecutionAttestation(*journal.ResetExecution, binding, a)
-	if err != nil {
-		return err
-	}
-	journal.ResetExecution = &next
-	return c.writeLifecycleJournalRecord(journal)
-}
-
-func appendResetExecutionAttestation(record resetExecutionJournal, binding resetExecutionPhaseBinding, attestation resetExecutionAttestation) (resetExecutionJournal, error) {
-	if validateResetExecutionJournal(record, binding.OperationID, binding.Target) != nil ||
-		record.AcceptedAtUnix != binding.AcceptedAtUnix || !reflect.DeepEqual(record.Evidence, binding.Evidence) ||
-		len(record.Attestations) >= 3 || binding.PreviousAttestationSHA != record.Attestations[len(record.Attestations)-1].SHA ||
-		attestation.Phase != binding.Phase || attestation.PreviousSHA != binding.PreviousAttestationSHA {
-		return resetExecutionJournal{}, errResetExecutionEvidence
-	}
-	attestation.SHA = resetExecutionAttestationSHA(record, attestation)
-	// Never mutate the prior chain when a later observation is refused.
-	record.Attestations = append(append([]resetExecutionAttestation(nil), record.Attestations...), attestation)
-	if validateResetExecutionJournal(record, binding.OperationID, binding.Target) != nil {
-		return resetExecutionJournal{}, errResetExecutionEvidence
-	}
-	return record, nil
+	return c.clearLifecycleJournal()
 }

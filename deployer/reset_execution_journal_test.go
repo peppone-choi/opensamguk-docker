@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"os"
 	"reflect"
@@ -120,7 +119,7 @@ func TestResetExecutionChainRefusesTamperingAndReorderedPhases(t *testing.T) {
 
 func TestResetExecutionJournalDurablyBindsOperationAdmission(t *testing.T) {
 	cfg := configuredResetOperationTest(t)
-	plan, binding, record := resetExecutionChainFixture(t, 2)
+	plan, _, record := resetExecutionChainFixture(t, 2)
 	mustReserveOperation(t, cfg.lifecycleOperationStore, durableOperationRecord{OperationID: plan.OperationID, Kind: lifecycleKindReset,
 		SubjectID: "pep", RequestFingerprint: record.RequestFingerprint, Status: lifecycleJobRunning,
 		CreatedAt: time.Unix(record.AcceptedAtUnix, 0), UpdatedAt: time.Unix(record.AcceptedAtUnix, 0)})
@@ -128,7 +127,7 @@ func TestResetExecutionJournalDurablyBindsOperationAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cfg.writeResetExecutionLifecycleJournal(target, plan.Target, plan.OperationID, record); err != nil {
+	if err := writeResetExecutionJournalFixture(cfg, target, plan.Target, plan.OperationID, record); err != nil {
 		t.Fatal(err)
 	}
 	reopened, exists, err := cfg.readLifecycleJournal()
@@ -138,11 +137,6 @@ func TestResetExecutionJournalDurablyBindsOperationAdmission(t *testing.T) {
 	before := readFile(t, cfg.lifecycleJournalFile)
 	if cfg.advanceLifecycleJournal(lifecycleJournalStageDown) == nil || readFile(t, cfg.lifecycleJournalFile) != before {
 		t.Fatal("destructive stage advanced without third phase")
-	}
-	binding.Phase = "before-down"
-	binding.PreviousAttestationSHA = record.Attestations[1].SHA
-	if cfg.appendResetExecutionPhaseToJournal(context.Background(), binding, nil) == nil || readFile(t, cfg.lifecycleJournalFile) != before {
-		t.Fatal("missing live source changed journal")
 	}
 	bad := cloneResetExecutionChain(t, record)
 	bad.AcceptedAtUnix++
@@ -166,7 +160,7 @@ func TestResetExecutionJournalMalformedProofCannotReachRecoveryMutation(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.writeResetExecutionLifecycleJournal(target, plan.Target, plan.OperationID, record) != nil {
+	if writeResetExecutionJournalFixture(cfg, target, plan.Target, plan.OperationID, record) != nil {
 		t.Fatal("write failed")
 	}
 	before := readFile(t, cfg.lifecycleJournalFile)
@@ -186,4 +180,51 @@ func TestResetExecutionJournalMalformedProofCannotReachRecoveryMutation(t *testi
 		readFile(t, cfg.lifecycleJournalFile) != string(wire) {
 		t.Fatal("malformed proof reached recovery mutation")
 	}
+}
+
+// Pure fixture builders for persisted journal validation; no authority or worker.
+type resetExecutionPhaseBinding struct {
+	OperationID            string
+	Target                 resetLifecycleTarget
+	Evidence               resetExecutionEvidenceRefs
+	AcceptedAtUnix         int64
+	Phase                  string
+	PreviousAttestationSHA string
+}
+
+func newResetExecutionJournal(binding resetExecutionPhaseBinding, attestation resetExecutionAttestation) (resetExecutionJournal, error) {
+	record := resetExecutionJournal{Version: 1, AcceptedAtUnix: binding.AcceptedAtUnix, Evidence: binding.Evidence,
+		TargetFingerprint: resetRequestFingerprint("pep", binding.Target)}
+	var err error
+	record.RequestFingerprint, err = resetExecutionRequestFingerprint("pep", binding.Target, binding.Evidence)
+	if err != nil || binding.Phase != "prepared" || binding.PreviousAttestationSHA != "" ||
+		attestation.Phase != binding.Phase || attestation.PreviousSHA != "" {
+		return resetExecutionJournal{}, errResetExecutionEvidence
+	}
+	attestation.SHA = resetExecutionAttestationSHA(record, attestation)
+	record.Attestations = []resetExecutionAttestation{attestation}
+	if validateResetExecutionJournal(record, binding.OperationID, binding.Target) != nil {
+		return resetExecutionJournal{}, errResetExecutionEvidence
+	}
+	return record, nil
+}
+
+func appendResetExecutionAttestation(record resetExecutionJournal, binding resetExecutionPhaseBinding, attestation resetExecutionAttestation) (resetExecutionJournal, error) {
+	if validateResetExecutionJournal(record, binding.OperationID, binding.Target) != nil ||
+		record.AcceptedAtUnix != binding.AcceptedAtUnix || !reflect.DeepEqual(record.Evidence, binding.Evidence) ||
+		len(record.Attestations) >= 3 || binding.PreviousAttestationSHA != record.Attestations[len(record.Attestations)-1].SHA ||
+		attestation.Phase != binding.Phase || attestation.PreviousSHA != binding.PreviousAttestationSHA {
+		return resetExecutionJournal{}, errResetExecutionEvidence
+	}
+	attestation.SHA = resetExecutionAttestationSHA(record, attestation)
+	// Never mutate the prior chain when a later observation is refused.
+	record.Attestations = append(append([]resetExecutionAttestation(nil), record.Attestations...), attestation)
+	if validateResetExecutionJournal(record, binding.OperationID, binding.Target) != nil {
+		return resetExecutionJournal{}, errResetExecutionEvidence
+	}
+	return record, nil
+}
+
+func writeResetExecutionJournalFixture(c config, target serverTarget, resetTarget resetLifecycleTarget, operationID string, record resetExecutionJournal) error {
+	return c.writeLifecycleJournalRecord(lifecycleJournal{Version: lifecycleJournalVersion, Operation: "reset", OperationID: operationID, OperationKind: lifecycleKindReset, Stage: lifecycleJournalStagePrepared, ServerID: target.ID, Project: target.Project, ResetTarget: &resetTarget, ResetExecution: &record})
 }

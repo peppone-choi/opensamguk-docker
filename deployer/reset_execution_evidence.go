@@ -12,9 +12,20 @@ import (
 	"reflect"
 	"regexp"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
+
+type resetExecutionEvidenceRefs struct {
+	ApprovalPlanSHA     string `json:"approvalPlanSha256,omitempty"`
+	ExecutionReceiptSHA string `json:"executionReceiptSha256,omitempty"`
+}
+
+type resetExecutionEvidence struct {
+	Plan      resetApprovalPlan
+	Preflight resetPreflightReceipt
+}
 
 const resetEvidenceMaxBytes = 64 * 1024
 const resetPreflightMaxAge = 30 * time.Second
@@ -261,7 +272,7 @@ func decodeResetPrivateJSON(wire []byte, into any) error {
 	if _, plan := into.(*resetApprovalPlan); plan && requireResetApprovalTargetJSON(wire) != nil {
 		return errResetExecutionEvidence
 	}
-	if _, preflight := into.(*resetPreflightReceipt); preflight && requireResetD101PreflightProofShape(wire) != nil {
+	if _, preflight := into.(*resetPreflightReceipt); preflight && requireResetPreflightProofShape(wire) != nil {
 		return errResetExecutionEvidence
 	}
 	decoder := json.NewDecoder(bytes.NewReader(wire))
@@ -330,6 +341,77 @@ func rejectResetDuplicateJSONKeys(wire []byte) error {
 	}
 	if _, err := decoder.Token(); err != io.EOF {
 		return errResetExecutionEvidence
+	}
+	return nil
+}
+
+func requireResetPreflightProofShape(wire []byte) error {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(wire, &fields) != nil {
+		return errResetExecutionEvidence
+	}
+	shape := reflect.TypeOf(resetPreflightReceipt{})
+	allowed := make(map[string]bool)
+	for n := 0; n < shape.NumField(); n++ {
+		f := shape.Field(n)
+		key := strings.Split(f.Tag.Get("json"), ",")[0]
+		allowed[key] = true
+		raw, exists := fields[key]
+		if key == "preStopNativeProofSha256" && !exists {
+			continue
+		}
+		if !exists || requireResetPrivateJSONShape(raw, f.Type) != nil {
+			return errResetExecutionEvidence
+		}
+		if key == "preStopNativeProofSha256" {
+			var sha string
+			if json.Unmarshal(raw, &sha) != nil || !resetEvidenceSHA.MatchString(sha) {
+				return errResetExecutionEvidence
+			}
+		}
+	}
+	for key := range fields {
+		if !allowed[key] {
+			return errResetExecutionEvidence
+		}
+	}
+	return nil
+}
+
+func requireResetPrivateJSONShape(wire []byte, shape reflect.Type) error {
+	if bytes.Equal(bytes.TrimSpace(wire), []byte("null")) {
+		return errResetExecutionEvidence
+	}
+	for shape.Kind() == reflect.Pointer {
+		shape = shape.Elem()
+	}
+	switch shape.Kind() {
+	case reflect.Struct:
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(wire, &fields) != nil || len(fields) != shape.NumField() {
+			return errResetExecutionEvidence
+		}
+		for n := 0; n < shape.NumField(); n++ {
+			field := shape.Field(n)
+			key := strings.Split(field.Tag.Get("json"), ",")[0]
+			if key == "" {
+				key = field.Name
+			}
+			value, ok := fields[key]
+			if !ok || requireResetPrivateJSONShape(value, field.Type) != nil {
+				return errResetExecutionEvidence
+			}
+		}
+	case reflect.Map:
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(wire, &fields) != nil {
+			return errResetExecutionEvidence
+		}
+		for _, value := range fields {
+			if requireResetPrivateJSONShape(value, shape.Elem()) != nil {
+				return errResetExecutionEvidence
+			}
+		}
 	}
 	return nil
 }

@@ -89,6 +89,13 @@ func TestResetPublicationReceiptCannotSubstituteSuccessForExactProof(t *testing.
 
 func TestResetPublicationReceiptRetainsExactPrivateBytesAndRejectsTokenFields(t *testing.T) {
 	cfg := configuredResetOperationTest(t)
+	// The production custody reader rejects symlinked parent paths. macOS
+	// temporary roots need their canonical path even in an isolated fixture.
+	canonical, err := filepath.EvalSymlinks(cfg.serversDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.serversDir = canonical
 	receipt, evidence, record, now := resetPublicationReceiptFixture(t)
 	write := func(directory string, value any) string {
 		t.Helper()
