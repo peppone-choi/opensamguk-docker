@@ -306,6 +306,7 @@ type config struct {
 	d101RootProducer              *resetD101OldRootProducer
 	d101NativeInstaller           *resetD101NativeAuthorityInstaller
 	d101FixedInstallation         *resetD101FixedInstallation         // Independently reviewed installer pins/producers; never an env/request field.
+	d101RetainedRecovery          *resetD101ProductionRecoveryInstallation // Separate authenticated recovery lifetime; never reopens destructive admission.
 	d101SeedMaterialInputs        *resetD101SeedMaterialInputs        // Independent fixed native inputs; nil closes before any physical command.
 	d101CandidatePipeline         *resetD101CandidatePipeline         // Fixed native installation; nil fails before any physical command.
 	d101PurposeAuthority          resetD101PurposeAuthoritySource     // Fixed approved host source; no request/env enablement.

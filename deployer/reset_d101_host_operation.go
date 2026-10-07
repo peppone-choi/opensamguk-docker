@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"opensamguk-deployer/internal/d101native"
 	"opensamguk-deployer/internal/d101operatorauth"
 )
 
@@ -43,23 +44,36 @@ func earlyResetD101HostCommand(args []string, getenv func(string) string, output
 	if len(args) < 2 {
 		return false, 0
 	}
-	// Optional independently authenticated native registration. Missing input
-	// leaves legacy entries unchanged; no target reads or keeper are forced.
-	if resetD101ReviewedNativeEntryFactory != nil && (args[1] == "--d101-host-operation" || args[1] == "--d101-issue-current-receipt" || args[1] == "--d101-prepared-relay" || args[1] == "--d101-initialize-key3") {
-		op := ""
-		if len(args) == 4 && args[2] == "--operation-id" {
-			op = args[3]
+	// Each entry validates its existing selector before this optional factory
+	// can authenticate, read targets or publish any native registration.
+	registerNativeEntry := func(op string) bool {
+		if resetD101ReviewedNativeEntryFactory == nil {
+			return true
+		}
+		var key3Expected *resetD101Key3CeremonyExpected
+		if args[1] == "--d101-initialize-key3" {
+			// Only independently supplied private memory can bind the selector
+			// before OpenApprovedEntry. Never learn this SHA from a target read.
+			key3Expected = resetD101ReviewedKey3CeremonyExpected
+			if key3Expected == nil || key3Expected.CardSHA != args[3] {
+				return false
+			}
 		}
 		if installer, err := actualResetD101NativeEntry(context.Background(), args[1], op); err == nil {
-			resetD101ReviewedNativeAuthorityInstaller = installer
 			if args[1] == "--d101-initialize-key3" {
+				if resetD101ReviewedKey3CeremonyExpected != key3Expected || key3Expected.CardSHA != args[3] ||
+					installer.key3 == nil || installer.key3.ceremony == nil || installer.key3.ceremony.CardSHA != args[3] {
+					return false
+				}
 				if installer.registerKey3(context.Background()) != nil {
-					return true, 2
+					return false
 				}
 			}
+			resetD101ReviewedNativeAuthorityInstaller = installer
 		} else {
-			return true, 2
+			return false
 		}
+		return true
 	}
 	switch args[1] {
 	case "--d101-native-keeper":
@@ -83,9 +97,15 @@ func earlyResetD101HostCommand(args []string, getenv func(string) string, output
 			runtime.GOOS != "linux" || runtime.GOARCH != "amd64" || os.Geteuid() != 0 {
 			return true, 2
 		}
+		if !registerNativeEntry("") {
+			return true, 2
+		}
 		return true, runResetD101Key3Initialization(context.Background(), args[3])
 	case "--d101-prepared-relay":
 		if len(args) != 2 || getenv == nil || !validResetD101ServiceToken(getenv("DEPLOYER_TOKEN")) {
+			return true, 2
+		}
+		if !registerNativeEntry("") {
 			return true, 2
 		}
 		srv := &http.Server{Addr: ":9000", Handler: resetD101PreparedRelayHandler(getenv("DEPLOYER_TOKEN"), fixedResetD101HostRelayInstallation(context.Background())), ReadHeaderTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second}
@@ -93,8 +113,18 @@ func earlyResetD101HostCommand(args []string, getenv func(string) string, output
 			return true, 2
 		}
 		return true, 0
+	case "--d101-managed-host-operation":
+		if len(args) != 4 || args[2] != "--operation-id" || !lifecycleJobIDRe.MatchString(args[3]) {
+			return true, 2
+		}
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		return true, runResetD101ManagedHostOperation(ctx, args[3])
 	case "--d101-host-operation", "--d101-issue-current-receipt":
 		if len(args) != 4 || args[2] != "--operation-id" || !lifecycleJobIDRe.MatchString(args[3]) {
+			return true, 2
+		}
+		if !registerNativeEntry(args[3]) {
 			return true, 2
 		}
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -122,20 +152,87 @@ func earlyResetD101HostCommand(args []string, getenv func(string) string, output
 		}
 		runtime.KeepAlive(descriptor)
 		if status == 3 {
-			if errOutput != nil {
-				_, _ = io.WriteString(errOutput, "D101 same operation HOLD; explicit recovery required\n")
-			}
-			// Keep the process, keeper FD and cancellation barrier alive. A
-			// runner timeout is not permission to release or start another op.
-			for {
-				time.Sleep(time.Second)
-				runtime.KeepAlive(descriptor)
-			}
+			preserveResetD101HostOperationHold(descriptor, errOutput)
 		}
 		return true, status
 	default:
 		return false, 0
 	}
+}
+
+func preserveResetD101HostOperationHold(descriptor *os.File, errOutput io.Writer) {
+	if errOutput != nil {
+		_, _ = io.WriteString(errOutput, "D101 same operation HOLD; explicit recovery required\n")
+	}
+	// Keep the process, keeper FD and cancellation barrier alive. A
+	// runner timeout is not permission to release or start another op.
+	for {
+		time.Sleep(time.Second)
+		runtime.KeepAlive(descriptor)
+	}
+}
+
+// This route owns only management resources. The factory and original native
+// owner remain absent unless independently supplied; routing does not enroll them.
+func runResetD101ManagedHostOperation(caller context.Context, operationID string) int {
+	if d101native.Missing(caller) || caller.Err() != nil || !lifecycleJobIDRe.MatchString(operationID) ||
+		d101native.Missing(resetD101ReviewedNativeEntryFactory) || runtime.GOOS != "linux" || runtime.GOARCH != "amd64" || os.Geteuid() != 0 || !gitSHA40.MatchString(rootBuiltSourceSHA) {
+		return 2
+	}
+	if deadline, bounded := caller.Deadline(); bounded && !deadline.After(time.Now()) {
+		return 2
+	}
+	// Preserve the original entry meaning. The factory itself must acquire an
+	// independently authenticated bounded native owner, before reading targets.
+	// The old wrapper authenticates before this route's missing-field preflight.
+	v, err := resetD101ReviewedNativeEntryFactory.OpenApprovedEntry(caller, "--d101-host-operation", operationID)
+	if err != nil || v == nil || v.managementSession != nil || v.managementBinding != nil ||
+		d101native.Missing(v.current) || v.physical == nil || d101native.Missing(v.preAcquisition) {
+		return 2
+	}
+	ctx, cancel, err := resetD101ManagedEntryContext(caller, v, operationID)
+	if err != nil {
+		return 2
+	}
+	defer cancel()
+	v.expectedManagementBinding = bytes.Clone(v.expectedManagementBinding)
+	if v.installation.AuthenticateInstallation(ctx, operationID, "--d101-host-operation") != nil || ctx.Err() != nil ||
+		v.installation.RecheckInstallation(ctx, operationID, "--d101-host-operation") != nil || v.nativeOwnerContext.Err() != nil {
+		return 2
+	}
+	session, err := d101native.OpenInstalledManagementServer(ctx)
+	if err != nil || session == nil {
+		return 2
+	}
+	v.managementSession = session
+	defer v.closeManagementEntry()
+	binding, err := session.Consume(ctx)
+	if err != nil || binding == nil {
+		return 2
+	}
+	v.managementBinding = binding
+	if v.recheckManagedEntry(ctx, "--d101-host-operation", operationID) != nil ||
+		awaitResetD101NativeBirth(ctx, v, operationID) != nil || v.recheckManagedEntry(ctx, "--d101-host-operation", operationID) != nil {
+		return 2
+	}
+	// FD9 is borrowed; it is never closed/reopened/unlocked by this process.
+	descriptor := os.NewFile(9, "existing-host-keeper-fd9")
+	status := runResetD101HostOperation(ctx, descriptor, operationID, v.hostOperation)
+	if status == 0 && v.recheckManagedEntry(ctx, "--d101-host-operation", operationID) != nil {
+		status = 3
+	}
+	closeErr := v.closeManagementEntry()
+	cancel()
+	runtime.KeepAlive(descriptor)
+	if status == 0 && closeErr != nil {
+		status = 3
+	}
+	if status == 3 {
+		// Keep the same borrowed descriptor alive inside this two-argument route;
+		// returning it through a second wrapper would lose its lifetime handoff.
+		preserveResetD101HostOperationHold(descriptor, os.Stderr)
+	}
+	return status
 }
 
 // This entry is physical operation only. The current receipt issuer's private

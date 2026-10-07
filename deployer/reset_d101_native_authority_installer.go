@@ -59,6 +59,11 @@ type resetD101NativeAuthorityInstaller struct {
 	completionBusy atomic.Bool
 	mainCurrent    resetD101NativeMainCurrentSource
 	key3           *resetD101NativeKey3Inputs
+
+	nativeOwnerContext        context.Context
+	managementSession         *d101native.ManagementSession
+	managementBinding         *d101native.ManagementConnectionBinding
+	expectedManagementBinding []byte
 }
 
 func actualResetD101NativeEntry(ctx context.Context, entry, op string) (*resetD101NativeAuthorityInstaller, error) {
@@ -71,8 +76,75 @@ func actualResetD101NativeEntry(ctx context.Context, entry, op string) (*resetD1
 	}
 	return v, nil
 }
+
+// This is bounded resource plumbing only. An independently authenticated
+// current native original must supply the owner bound and expected wire.
+func resetD101ManagedEntryContext(caller context.Context, v *resetD101NativeAuthorityInstaller, op string) (context.Context, context.CancelFunc, error) {
+	if d101native.Missing(caller) || caller.Err() != nil || v == nil || op != v.operationID || !lifecycleJobIDRe.MatchString(op) ||
+		d101native.Missing(v.installation) || d101native.Missing(v.nativeOwnerContext) || v.nativeOwnerContext.Err() != nil ||
+		len(v.expectedManagementBinding) == 0 || len(v.expectedManagementBinding) > d101native.PayloadMaxBytes {
+		return nil, nil, errResetD101InstallationNotSupplied
+	}
+	deadline, bounded := v.nativeOwnerContext.Deadline()
+	if !bounded || !deadline.After(time.Now()) {
+		return nil, nil, errResetD101InstallationNotSupplied
+	}
+	if callerDeadline, bounded := caller.Deadline(); bounded {
+		if !callerDeadline.After(time.Now()) {
+			return nil, nil, errResetD101InstallationNotSupplied
+		}
+		if callerDeadline.Before(deadline) { deadline = callerDeadline }
+	}
+	child, childCancel := context.WithDeadline(v.nativeOwnerContext, deadline)
+	stopCaller := context.AfterFunc(caller, childCancel)
+	// AfterFunc stop and CancelFunc are individually safe to call repeatedly.
+	cancel := func() { stopCaller(); childCancel() }
+	if caller.Err() != nil || v.nativeOwnerContext.Err() != nil || child.Err() != nil {
+		cancel()
+		return nil, nil, errResetD101InstallationNotSupplied
+	}
+	return child, cancel, nil
+}
+
+func resetD101ManagedEntryRequired(v *resetD101NativeAuthorityInstaller) bool {
+	return v != nil && (v.nativeOwnerContext != nil || v.managementSession != nil || v.managementBinding != nil || len(v.expectedManagementBinding) != 0)
+}
+
+func (v *resetD101NativeAuthorityInstaller) recheckManagedEntry(ctx context.Context, entry, op string) error {
+	if v == nil || d101native.Missing(ctx) || ctx.Err() != nil || entry != "--d101-host-operation" || op != v.operationID || !lifecycleJobIDRe.MatchString(op) ||
+		d101native.Missing(v.installation) || d101native.Missing(v.nativeOwnerContext) || v.nativeOwnerContext.Err() != nil ||
+		v.managementSession == nil || v.managementBinding == nil || len(v.expectedManagementBinding) == 0 || len(v.expectedManagementBinding) > d101native.PayloadMaxBytes {
+		return errResetD101InstallationNotSupplied
+	}
+	deadline, bounded := ctx.Deadline()
+	ownerDeadline, ownerBounded := v.nativeOwnerContext.Deadline()
+	if !bounded || !ownerBounded || !deadline.After(time.Now()) || !ownerDeadline.After(time.Now()) || deadline.After(ownerDeadline) ||
+		v.managementBinding.RecheckExpected(ctx, v.expectedManagementBinding) != nil {
+		return errResetD101InstallationNotSupplied
+	}
+	if v.installation.AuthenticateInstallation(ctx, op, entry) != nil || ctx.Err() != nil ||
+		v.installation.RecheckInstallation(ctx, op, entry) != nil || v.nativeOwnerContext.Err() != nil ||
+		v.managementBinding.RecheckExpected(ctx, v.expectedManagementBinding) != nil {
+		return errResetD101InstallationNotSupplied
+	}
+	return nil
+}
+
+func (v *resetD101NativeAuthorityInstaller) closeManagementEntry() error {
+	if v == nil || v.managementSession == nil { return nil }
+	// Keep these opaque fields set: a closed managed instance cannot become an
+	// ordinary unguarded instance. Never cancel the original native owner here.
+	return v.managementSession.Close()
+}
+
 func (v *resetD101NativeAuthorityInstaller) consumePhase(ctx context.Context, fd *os.File, op string, sequence uint64, use func(*d101native.VerifiedCurrent) error) error {
-	if v == nil || ctx == nil || ctx.Err() != nil || op != v.operationID || d101native.Missing(v.current) || d101native.Missing(v.installation) || use == nil || v.installation.AuthenticateInstallation(ctx, op, "current") != nil {
+	if v == nil || ctx == nil || ctx.Err() != nil || op != v.operationID || d101native.Missing(v.current) || d101native.Missing(v.installation) || use == nil {
+		return errResetD101InstallationNotSupplied
+	}
+	if resetD101ManagedEntryRequired(v) && v.recheckManagedEntry(ctx, "--d101-host-operation", op) != nil {
+		return errResetD101InstallationNotSupplied
+	}
+	if v.installation.AuthenticateInstallation(ctx, op, "current") != nil {
 		return errResetD101InstallationNotSupplied
 	}
 	current, err := v.current.Current(ctx, fd, op, sequence)
@@ -85,9 +157,18 @@ func (v *resetD101NativeAuthorityInstaller) consumePhase(ctx context.Context, fd
 		if !ok || !ok2 || b.OperationID != op || seq != sequence {
 			return errResetExecutionEvidence
 		}
-		return use(a)
+		if resetD101ManagedEntryRequired(v) && v.recheckManagedEntry(ctx, "--d101-host-operation", op) != nil {
+			return errResetExecutionEvidence
+		}
+		if err := use(a); err != nil { return err }
+		if resetD101ManagedEntryRequired(v) && v.recheckManagedEntry(ctx, "--d101-host-operation", op) != nil {
+			return errResetExecutionEvidence
+		}
+		return nil
 	})
-	if err != nil || ctx.Err() != nil || v.installation.RecheckInstallation(ctx, op, "current") != nil {
+	if err != nil || ctx.Err() != nil || (resetD101ManagedEntryRequired(v) && v.recheckManagedEntry(ctx, "--d101-host-operation", op) != nil) ||
+		v.installation.RecheckInstallation(ctx, op, "current") != nil ||
+		(resetD101ManagedEntryRequired(v) && v.recheckManagedEntry(ctx, "--d101-host-operation", op) != nil) {
 		return errResetExecutionEvidence
 	}
 	return nil
@@ -144,6 +225,15 @@ func (v *resetD101NativeAuthorityInstaller) hostOperation(ctx context.Context, f
 		bootstrap.producer = &resetD101TechnicalBootstrapProducer{policy: cloneResetD101TechnicalPolicy(producer.policy), event: producer.event, jwtPath: producer.jwtPath, jwtPin: producer.jwtPin, authenticate: producer.authenticate, installation: &resetD101NativeTechnicalAdapter{installer: v, descriptor: fd}}
 		p.bootstrap = &bootstrap
 		p.configuration.d101NativeInstaller = v
+		if resetD101ManagedEntryRequired(v) {
+			authenticate := p.authenticate
+			if authenticate == nil { return errResetExecutionEvidence }
+			p.authenticate = func(ctx context.Context, descriptor *os.File, op, phase string) error {
+				if v.recheckManagedEntry(ctx, "--d101-host-operation", op) != nil { return errResetExecutionEvidence }
+				if err := authenticate(ctx, descriptor, op, phase); err != nil { return err }
+				return v.recheckManagedEntry(ctx, "--d101-host-operation", op)
+			}
+		}
 		out = p
 		return nil
 	})

@@ -54,10 +54,55 @@ func closeResetD101InstalledSources(c config) config {
 	c.d101RecoveryDatabaseSource = nil
 	c.d101SeedMaterialInputs = nil
 	c.d101CandidatePipeline = nil
-	return c
+	// Destructive atomic8 closes independently of a separately authenticated
+	// retained restore1 lifetime. Its callbacks reauthenticate on every use.
+	return bindResetD101RetainedRecovery(c)
 }
 func assembleResetD101InstalledSources(ctx context.Context, c config) (config, error) {
+	if resetD101ReviewedRetainedRecoveryInstallation != nil {
+		var err error
+		c, err = registerResetD101RetainedRecovery(ctx, c, resetD101ReviewedRetainedRecoveryInstallation)
+		if err != nil {
+			c = closeResetD101RetainedRecovery(c)
+		}
+	}
 	return assembleResetD101InstalledSourcesWithReader(ctx, c, readFixedResetD101InstalledSources)
+}
+
+// Independently installed private source; never populated by reader7, an HTTP
+// body, an environment value, or the generic/destructive phase13 mapper.
+var resetD101ReviewedRetainedRecoveryInstallation *resetD101ProductionRecoveryInstallation
+
+func bindResetD101RetainedRecovery(c config) config {
+	if p := c.d101RetainedRecovery; p != nil {
+		c.d101RecoveryClosureReader = p.ReadClosure
+		c.d101RecoveryVerifier = p.VerifyRecovery
+		c.d101RecoveryDatabaseSource = p.ReadDatabase
+	}
+	return c
+}
+
+func closeResetD101RetainedRecovery(c config) config {
+	c.d101RetainedRecovery = nil
+	c.d101RecoveryClosureReader = nil
+	c.d101RecoveryVerifier = nil
+	c.d101RecoveryDatabaseSource = nil
+	return c
+}
+
+func registerResetD101RetainedRecovery(ctx context.Context, c config, p *resetD101ProductionRecoveryInstallation) (config, error) {
+	if c.d101RetainedRecovery != nil && c.d101RetainedRecovery != p {
+		return c, errResetD101InstallationNotSupplied
+	}
+	closed := closeResetD101RetainedRecovery(c)
+	if p == nil || p.RecheckInstallation(ctx) != nil {
+		return closed, errResetD101InstallationNotSupplied
+	}
+	if _, err := p.Authority(ctx, p.operationID, p.intentSHA, "QUERY"); err != nil || p.RecheckInstallation(ctx) != nil {
+		return closed, errResetD101InstallationNotSupplied
+	}
+	closed.d101RetainedRecovery = p
+	return bindResetD101RetainedRecovery(closed), nil
 }
 
 // Input-reader injection is private to isolated assembly fixtures. Production
@@ -96,5 +141,5 @@ func assembleResetD101InstalledSourcesWithReader(ctx context.Context, c config, 
 	installed.d101SeedMaterialInputs = &seed
 	installed.d101CandidatePipeline = sources.candidatePipeline
 	installed.d101InstallationError = nil
-	return installed, nil
+	return bindResetD101RetainedRecovery(installed), nil
 }

@@ -26,7 +26,7 @@ func TestResetImageTagMutationIsRejectedByCandidateRegression(t *testing.T) {
 	scratch := t.TempDir()
 	// Include the tracked module dependency closure, not just root Go files.
 	// Untracked files from other work are never inputs to the mutation child.
-	tracked, err := exec.Command("git", "ls-files", "-z", "--", "*.go", "go.mod", "go.sum").Output()
+	tracked, err := exec.Command("git", "ls-files", "-z", "--", "*.go", "go.mod", "go.sum", "vendor").Output()
 	if err != nil {
 		t.Fatal(err)
 	}

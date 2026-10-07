@@ -5,6 +5,8 @@ on:
     paths:
       - "deployer/**"
       - "scripts/build-d101-candidate-images.py"
+      - "scripts/build-d101-host-artifacts.py"
+      - "scripts/test_build_d101_host_artifacts.py"
       - ".github/workflows/build-d101-candidate-images.yml"
       - "scripts/deploy-orchestration-admission-test.sh"
       - ".github/workflows/deploy-orchestration.yml"
@@ -15,6 +17,8 @@ on:
     paths:
       - "deployer/**"
       - "scripts/build-d101-candidate-images.py"
+      - "scripts/build-d101-host-artifacts.py"
+      - "scripts/test_build_d101_host_artifacts.py"
       - ".github/workflows/build-d101-candidate-images.yml"
       - "scripts/deploy-orchestration-admission-test.sh"
       - ".github/workflows/deploy-orchestration.yml"
@@ -41,12 +45,36 @@ jobs:
         run: git check-ignore -q --no-index servers/.deployer-operations.json
       - uses: actions/setup-go@v5
         with:
-          go-version-file: deployer/go.mod
+          go-version: '1.26.8'
+          cache: false
+      - name: exact offline dependency source
+        run: python3 ../scripts/build-d101-host-artifacts.py verify-dependencies --module .
       - name: go build
+        env:
+          GOENV: 'off'
+          GOTOOLCHAIN: 'local'
+          GOWORK: 'off'
+          GOPROXY: 'off'
+          GOSUMDB: 'off'
+          GOFLAGS: '-mod=vendor'
         run: go build ./...
       - name: go vet
+        env:
+          GOENV: 'off'
+          GOTOOLCHAIN: 'local'
+          GOWORK: 'off'
+          GOPROXY: 'off'
+          GOSUMDB: 'off'
+          GOFLAGS: '-mod=vendor'
         run: go vet ./...
       - name: go test
+        env:
+          GOENV: 'off'
+          GOTOOLCHAIN: 'local'
+          GOWORK: 'off'
+          GOPROXY: 'off'
+          GOSUMDB: 'off'
+          GOFLAGS: '-mod=vendor'
         run: go test ./...
       - name: deploy orchestration admission boundary
         working-directory: .

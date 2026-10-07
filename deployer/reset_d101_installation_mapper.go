@@ -73,6 +73,16 @@ func mapResetD101FixedInstallationWithSources(ctx context.Context, c config, ori
 	if requireResetD101FixedReaderMapping(original, pin, p) != nil {
 		return empty, errResetExecutionEvidence
 	}
+	checkIntegrity := func(ctx context.Context) error {
+		if ctx == nil || ctx.Err() != nil {
+			return errResetExecutionEvidence
+		}
+		after, afterPin, err := read(resetD101NativeReaderInstallationPath, 64<<10)
+		if err != nil || afterPin != pin || after.SHA256 != original.SHA256 || !bytes.Equal(after.Bytes, original.Bytes) || ctx.Err() != nil {
+			return errResetExecutionEvidence
+		}
+		return nil
+	}
 	checkRecord := func(ctx context.Context) error {
 		if ctx == nil || ctx.Err() != nil {
 			return errResetExecutionEvidence
@@ -82,8 +92,13 @@ func mapResetD101FixedInstallationWithSources(ctx context.Context, c config, ori
 				return err
 			}
 		}
-		after, afterPin, err := read(resetD101NativeReaderInstallationPath, 64<<10)
-		if err != nil || afterPin != pin || after.SHA256 != original.SHA256 || !bytes.Equal(after.Bytes, original.Bytes) || ctx.Err() != nil {
+		return checkIntegrity(ctx)
+	}
+	checkRecovery := func(ctx context.Context) error {
+		r := c.d101RetainedRecovery
+		if r == nil || r.operationID != p.authority.OperationID || r.intentSHA != p.authority.ApprovalIntentSHA ||
+			r.cardSHA != p.provenance.DeploymentCardSHA || r.RecheckInstallation(ctx) != nil ||
+			checkIntegrity(ctx) != nil || r.RecheckInstallation(ctx) != nil {
 			return errResetExecutionEvidence
 		}
 		return nil
@@ -147,30 +162,30 @@ func mapResetD101FixedInstallationWithSources(ctx context.Context, c config, ori
 		return nil
 	}
 	closure := func(ctx context.Context, op, sha string) ([]byte, error) {
-		if op != p.authority.OperationID || !resetEvidenceSHA.MatchString(sha) || checkRecord(ctx) != nil {
+		if op != p.authority.OperationID || !resetEvidenceSHA.MatchString(sha) || checkRecovery(ctx) != nil {
 			return nil, errResetExecutionEvidence
 		}
-		wire, err := p.recovery.ReadClosure(ctx, op, sha)
+		wire, err := c.d101RetainedRecovery.ReadClosure(ctx, op, sha)
 		wire = bytes.Clone(wire)
-		if err != nil || len(wire) == 0 || len(wire) > 16<<10 || resetD101OriginalSHA(wire) != sha || checkRecord(ctx) != nil {
+		if err != nil || len(wire) == 0 || len(wire) > 16<<10 || resetD101OriginalSHA(wire) != sha || checkRecovery(ctx) != nil {
 			return nil, errResetExecutionEvidence
 		}
 		return wire, nil
 	}
 	verifier := func(ctx context.Context, binding resetD101RecoveryBinding) error {
 		if binding.operation.OperationID != p.authority.OperationID || binding.intent.SHA != p.authority.ApprovalIntentSHA ||
-			checkRecord(ctx) != nil || p.recovery.VerifyRecovery(ctx, binding) != nil || checkRecord(ctx) != nil {
+			checkRecovery(ctx) != nil || c.d101RetainedRecovery.VerifyRecovery(ctx, binding) != nil || checkRecovery(ctx) != nil {
 			return errResetExecutionEvidence
 		}
 		return nil
 	}
 	database := func(ctx context.Context, op, sha string) (resetD101RestoredDatabaseObservation, error) {
-		if op != p.authority.OperationID || !resetEvidenceSHA.MatchString(sha) || checkRecord(ctx) != nil {
+		if op != p.authority.OperationID || !resetEvidenceSHA.MatchString(sha) || checkRecovery(ctx) != nil {
 			return resetD101RestoredDatabaseObservation{}, errResetExecutionEvidence
 		}
-		value, err := p.recovery.ReadDatabase(ctx, op, sha)
+		value, err := c.d101RetainedRecovery.ReadDatabase(ctx, op, sha)
 		value.original = bytes.Clone(value.original)
-		if err != nil || value.sha != sha || resetD101OriginalSHA(value.original) != sha || checkRecord(ctx) != nil {
+		if err != nil || value.sha != sha || resetD101OriginalSHA(value.original) != sha || checkRecovery(ctx) != nil {
 			return resetD101RestoredDatabaseObservation{}, errResetExecutionEvidence
 		}
 		return value, nil

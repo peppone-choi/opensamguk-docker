@@ -89,3 +89,54 @@ func TestNative9KeeperPhaseOrderRetainsOriginalChain(t *testing.T) {
 		t.Fatal("denied stage changed chain")
 	}
 }
+
+
+func TestNativeKeeperManagedPreChildRefusalNKPC(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	cancelled, stop := context.WithCancel(ctx); stop()
+	expired, end := context.WithDeadline(context.Background(), time.Now().Add(-time.Second)); defer end()
+	for _, item := range []struct { name string; ctx context.Context }{
+		{"nil_native_context", nil}, {"cancelled_native_context", cancelled},
+		{"expired_original_bound", expired}, {"missing_actual_parent_client_originals", ctx},
+	} {
+		t.Run(item.name, func(t *testing.T) {
+			descriptor, directory := &os.File{}, &os.File{}
+			k := &resetD101NativeKeeper{pre: &resetD101NativePreAcquisition{physicalMode: "--d101-managed-host-operation"},
+				installer: &resetD101NativeAuthorityInstaller{}, descriptor: descriptor, directory: directory}
+			if k.prepareManagedPhysicalClient(item.ctx) == nil { t.Fatal("missing source prepared parent client") }
+			if mode, err := k.approvedChildMode(item.ctx, false); mode != "" || err == nil { t.Fatal("missing mode source fell back") }
+			if k.descriptor != descriptor || k.directory != directory || k.attempted || k.acquired || k.closed || len(k.refs) != 0 ||
+				k.clientInput != nil || k.clientSession != nil || k.physicalMode != "" { t.Fatal("refusal changed native resources or created client") }
+		})
+	}
+}
+
+func TestNativeKeeperManagedClientCleanupKeepsNativeCustodyNKPC(t *testing.T) {
+	for _, name := range []string{"no_client_resources", "own_client_cancel_only", "client_already_cancelled", "native_already_cancelled"} {
+		t.Run(name, func(t *testing.T) {
+			native, cancelNative := context.WithCancel(context.Background()); defer cancelNative()
+			client, cancelClient := context.WithCancel(native); defer cancelClient()
+			if name == "client_already_cancelled" { cancelClient() }
+			if name == "native_already_cancelled" { cancelNative() }
+			beforeNative := native.Err()
+			pre := &resetD101NativePreAcquisition{physicalMode: "--d101-managed-host-operation"}
+			descriptor, directory := &os.File{}, &os.File{}
+			k := &resetD101NativeKeeper{pre: pre, descriptor: descriptor, directory: directory,
+				physicalMode: pre.physicalMode, acquired: true, attempted: true, refs: []d101native.RawRef{{SHA256: "unverified"}}}
+			calls := 0
+			if name != "no_client_resources" {
+				k.clientContext = client
+				k.clientInput = &d101native.ManagementClientInput{}
+				k.clientCancel = func() { calls++; cancelClient() }
+			}
+			if k.closeManagedPhysicalClient() != nil || k.closeManagedPhysicalClient() != nil { t.Fatal("own empty cleanup failed") }
+			want := 1; if name == "no_client_resources" { want = 0 }
+			if calls != want || native.Err() != beforeNative || k.pre != pre || k.descriptor != descriptor || k.directory != directory ||
+				!k.acquired || !k.attempted || k.closed || len(k.refs) != 1 || k.refs[0].SHA256 != "unverified" || k.physicalMode != pre.physicalMode {
+				t.Fatal("client cleanup changed native custody or selected route")
+			}
+			if name != "no_client_resources" && client.Err() == nil { t.Fatal("own client context remained active") }
+		})
+	}
+}

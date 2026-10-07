@@ -90,7 +90,7 @@ func decodeResetD101GatewayRecoveryBegin(wire []byte, intent resetDecodedApprova
 // hash-only BEGIN or live journal is used as the committed recovery source.
 func (c config) readResetD101GatewayRecoveryBegin(ctx context.Context, op, intentSHA string) (resetD101CommittedRecoveryBegin, error) {
 	closed := resetD101CommittedRecoveryBegin{}
-	if ctx == nil || ctx.Err() != nil || c.d101PurposeAuthority == nil || c.lifecycleOperationStore == nil || !lifecycleJobIDRe.MatchString(op) || !resetEvidenceSHA.MatchString(intentSHA) {
+	if ctx == nil || ctx.Err() != nil || c.d101RetainedRecovery == nil || c.lifecycleOperationStore == nil || !lifecycleJobIDRe.MatchString(op) || !resetEvidenceSHA.MatchString(intentSHA) {
 		return closed, errResetExecutionEvidence
 	}
 	bounded, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -103,7 +103,7 @@ func (c config) readResetD101GatewayRecoveryBegin(ctx context.Context, op, inten
 	if err != nil || (origin.Scheme != "http" && origin.Scheme != "https") || origin.User != nil || origin.RawQuery != "" || origin.Fragment != "" || (origin.Path != "" && origin.Path != "/") || origin.RawPath != "" || origin.ForceQuery || !resetPrivateGatewayHost(origin.Hostname()) {
 		return closed, errResetExecutionEvidence
 	}
-	authority, err := c.d101PurposeAuthority(bounded, op, intentSHA)
+	authority, err := c.resetD101RecoveryAuthority(bounded, op, intentSHA, "QUERY")
 	intent, scopeErr := requireResetD101RecoveryAuthority(authority, op, intentSHA, time.Now())
 	if err != nil || scopeErr != nil {
 		return closed, errResetExecutionEvidence
@@ -129,7 +129,7 @@ func (c config) readResetD101GatewayRecoveryBegin(ctx context.Context, op, inten
 	if err != nil || requireResetIntentShape(credentialWire, reflect.TypeOf(credential)) != nil || decodeResetPrivateJSON(credentialWire, &credential) != nil || credential.Version != 1 || credential.OperationID != op || credential.ApprovalIntentSHA != intentSHA || credential.TargetFingerprint != intent.Intent.TargetFingerprint || credential.ExpiresAtUnix <= time.Now().Unix() || !validResetD101ServiceToken(credential.ServiceToken) {
 		return closed, errResetExecutionEvidence
 	}
-	grant, err := c.issueResetD101PurposeGrant(bounded, resetD101PurposeGrantRequest{OperationID: op, ApprovalIntentSHA: intentSHA, GatewayPayloadSHA: gatewaySHA, Action: "QUERY"})
+	grant, err := c.issueResetD101RecoveryQueryGrant(bounded, resetD101PurposeGrantRequest{OperationID: op, ApprovalIntentSHA: intentSHA, GatewayPayloadSHA: gatewaySHA, Action: "QUERY"})
 	if err != nil {
 		return closed, errResetExecutionEvidence
 	}

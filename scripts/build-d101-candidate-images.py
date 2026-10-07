@@ -11,6 +11,7 @@ or deleted by this driver. No host launcher/helper mount is installed.
 import argparse
 import base64
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -39,12 +40,15 @@ CONTRACT_KEYS = {
     "host_arch", "host_arch_evidence_b64", "host_arch_evidence_sha256",
     "host_driver_sha256", "launcher_sha256", "deployer_dockerfile_sha256",
     "host_reader_dockerfile_sha256", "runtime_base",
+    "go_mod_sha256", "go_sum_sha256", "vendor_tree_sha256", "vendor_modules_sha256",
 }
 HASH_KEYS = {key for key in CONTRACT_KEYS if key.endswith("_sha256")}
 ARTIFACTS = {
     "deployer": {"receipt": "deployer", "limit": 32 * 1024 * 1024},
     "d101-host-reader": {"receipt": "d101-host-reader", "limit": 32 * 1024 * 1024},
     "host-session-launcher": {"receipt": "launcher", "limit": 256 * 1024},
+    "d101-native-installer": {"receipt": "d101-native-installer", "limit": 32 * 1024 * 1024},
+    "d101-management-client": {"receipt": "d101-management-client", "limit": 32 * 1024 * 1024},
 }
 IMAGE_PATHS = {
     "root-deployer": {
@@ -121,11 +125,10 @@ def validate_contract(raw, expected_sha):
     require(isinstance(value, dict) and set(value) == CONTRACT_KEYS,
             "unknown or missing reviewed contract field")
     require(all(isinstance(x, str) for x in value.values()), "contract fields must be strings")
-    require(value["schema"] == "d101-candidate-build-contract/v1", "contract version mismatch")
+    require(value["schema"] == "d101-candidate-build-contract/v2", "contract version mismatch")
     for key in HASH_KEYS:
         require(bool(SHA64.fullmatch(value[key])), "contract pin must be lowercase full64")
-    require(bool(re.fullmatch(r"1\.23\.(0|[1-9][0-9]*)", value["go_release"])),
-            "reviewed Go1.23 exact patch required")
+    require(value["go_release"] == "1.26.8", "reviewed exact Go1.26.8 required")
     require(value["go_version"] == "go version go" + value["go_release"] + " linux/amd64",
             "reviewed Go version/platform mismatch")
     require(value["host_arch"] == "amd64", "approved host architecture must be amd64")
@@ -153,10 +156,27 @@ def runtime_contract(source):
     helper = instructions("deployer/Dockerfile.host-reader")
     index = max(i for i, line in enumerate(helper) if line.startswith("FROM "))
     require(helper[index:] == ["FROM scratch AS host-reader-artifact",
-                              "COPY --from=build /out/d101-host-reader /d101-host-reader"],
+                              "COPY --from=build /out/d101-host-reader /d101-host-reader",
+                              "COPY --from=build /out/d101-native-installer /d101-native-installer",
+                              "COPY --from=build /out/d101-management-client /d101-management-client"],
             "existing helper artifact role changed")
-    require(instructions("deployer/go.mod") == ["module opensamguk-deployer", "go 1.23"],
-            "controlled Go module is no longer external-dependency-free Go1.23")
+    builder = "FROM --platform=linux/amd64 golang:1.26.8-alpine@sha256:66f9a494af2b76ecb3eab75ff47166df61caec6d200c59d556b77327493d83a8 AS build"
+    for path in ("deployer/Dockerfile", "deployer/Dockerfile.host-reader"):
+        steps = instructions(path)
+        require(steps[0] == builder and "COPY go.mod go.sum ./" in steps and "COPY vendor ./vendor" in steps,
+                "reviewed exact builder/module source required")
+        require("ENV CGO_ENABLED=0 GOTOOLCHAIN=local GOENV=off GOWORK=off GOPROXY=off GOSUMDB=off" in steps,
+                "offline local Go contract absent")
+        require(all(line.startswith("RUN --network=none go build -mod=vendor ")
+                    for line in steps[:next(i for i, line in enumerate(steps[1:], 1) if line.startswith("FROM "))]
+                    if line.startswith("RUN ")), "online builder command rejected")
+
+
+def reviewed_host_driver(source):
+    spec = importlib.util.spec_from_file_location("d101_controlled_host_driver", source / HOST_DRIVER)
+    driver = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(driver)
+    return driver
 
 
 def main_sha(repo):
@@ -217,6 +237,9 @@ def validate_inputs(args):
                         ("host_reader_dockerfile_sha256", "deployer/Dockerfile.host-reader")):
         require(file_sha(source / path) == contract[field], "existing approved input changed")
     runtime_contract(source)
+    driver = reviewed_host_driver(source)
+    expected = {key: contract[key] for key in driver.FROZEN_DEPENDENCIES}
+    driver.require_frozen_dependencies(source / "deployer", expected)
     require(main_sha(ROOT_REPO) == args.source_sha and main_sha(APP_REPO) == args.app_source_sha,
             "current Root/App main differs from approved source")
     return source, issuer, contract, evidence
@@ -256,9 +279,11 @@ def regular_pin(path, limit):
 def controlled_artifacts(source, output, contract, arch_wire, args):
     evidence = output / "host-architecture.raw"
     evidence.write_bytes(arch_wire)
-    go_root_wire = command(["go", "env", "GOROOT"], timeout=30)
-    go_root = Path(go_root_wire.decode().strip()).resolve(strict=True)
-    go = go_root / "bin/go"
+    located = shutil.which("go")
+    require(bool(located), "actual reviewed Go binary absent")
+    go = Path(located).resolve(strict=True)
+    go_root = go.parent.parent
+    require(go == go_root / "bin/go", "actual Go distribution path mismatch")
     require(file_sha(go) == contract["go_binary_sha256"], "actual Go binary differs from reviewed pin")
     require(command([str(go), "version"]).decode().strip() == contract["go_version"],
             "actual Go version differs from reviewed version")
@@ -270,6 +295,10 @@ def controlled_artifacts(source, output, contract, arch_wire, args):
             "--toolchain", str(go), "--toolchain-sha", contract["go_binary_sha256"],
             "--toolchain-version", contract["go_version"], "--toolchain-root", str(go_root),
             "--toolchain-tree-sha", contract["go_tree_sha256"], "--out", str(dest)]
+    driver = reviewed_host_driver(source)
+    dependency_inputs = driver.require_frozen_dependencies(source / "deployer", {key: contract[key] for key in driver.FROZEN_DEPENDENCIES})
+    for key in driver.FROZEN_DEPENDENCIES:
+        argv.extend(["--" + key.replace("_", "-"), contract[key]])
     save_new(output / "controlled-build-invocation.json", {"argv": argv, "driver_sha256": file_sha(source / HOST_DRIVER)})
     command(argv, cwd=source, timeout=1500)
     receipt_path = dest / "receipt.json"
@@ -282,6 +311,9 @@ def controlled_artifacts(source, output, contract, arch_wire, args):
             receipt.get("toolchainVersion") == contract["go_version"] and receipt.get("installSignOperations") == 0 and
             receipt.get("architectureEvidence", {}).get("sha256") == contract["host_arch_evidence_sha256"],
             "controlled build receipt differs from reviewed source/toolchain/architecture")
+    require(receipt.get("dependencyInputs") == dependency_inputs and receipt.get("artifactCount") == 5 and
+            receipt.get("artifactRoles") == dict(driver.ARTIFACT_ROLES, **{"host-session-launcher": "launcher"}),
+            "controlled dependency/artifact roles mismatch")
     pins = {}
     for name, spec in ARTIFACTS.items():
         pin = regular_pin(dest / name, spec["limit"])
@@ -290,6 +322,7 @@ def controlled_artifacts(source, output, contract, arch_wire, args):
                 pin["mode"] == 0o500, "controlled artifact bytes/mode mismatch")
         if name != "host-session-launcher":
             metadata = claimed.get("goBuildMetadata", "")
+            driver.validate_artifact_metadata(metadata, name, args.source_sha, "amd64")
             require("GOOS=linux" in metadata and "GOARCH=amd64" in metadata and "CGO_ENABLED=0" in metadata and
                     claimed.get("elf", {}).get("machine") == 62, "controlled ELF platform/Go metadata mismatch")
             if name == "deployer":
@@ -297,6 +330,8 @@ def controlled_artifacts(source, output, contract, arch_wire, args):
         else:
             require(pin["sha256"] == contract["launcher_sha256"], "launcher differs from approved source")
         pins[name] = pin
+    require(driver.require_frozen_dependencies(source / "deployer") == dependency_inputs,
+            "original dependency inputs changed during controlled build")
     return dest, pins, {"path": str(receipt_path), "sha256": file_sha(receipt_path)}, go
 
 
@@ -311,9 +346,8 @@ def recipe(name, runtime_base):
                 "COPY --chmod=0500 host-session-launcher /opt/opensamguk-candidate-artifacts/host-session-launcher\n"
                 "WORKDIR /workspace\nUSER 0:0\nEXPOSE 9000\n"
                 'ENTRYPOINT ["/usr/local/bin/deployer"]\n')
-    return ("FROM scratch\nCOPY --chmod=0500 deployer /deployer\n"
-            "COPY --chmod=0500 d101-host-reader /d101-host-reader\n"
-            "COPY --chmod=0500 host-session-launcher /host-session-launcher\n")
+    return "FROM scratch\n" + "".join("COPY --chmod=0500 " + artifact + " /" + artifact + "\n"
+                                    for artifact in IMAGE_PATHS[name])
 
 
 def base_readback(contract, output):
@@ -483,7 +517,7 @@ def verify_packaging(name, metadata, record, packaging, output):
             "provenance_scope": "packaging only; separate controlled Go receipt binds source/binary/toolchain"}
 
 
-def extracted_readback(name, candidate, pins, go, output, source_sha):
+def extracted_readback(name, candidate, pins, go, output, source_sha, source):
     # A GitHub-hosted filesystem probe only, with a deliberately absent entry
     # point. No start/exec/rm, host bind mount, production daemon or Docker API.
     argv = ["docker", "create", "--platform", PLATFORM, "--entrypoint",
@@ -509,6 +543,9 @@ def extracted_readback(name, candidate, pins, go, output, source_sha):
                 pin["mode"] == 0o500, "extracted artifact differs from controlled output")
         if artifact != "host-session-launcher":
             info = command([str(go), "version", "-m", str(path)]).decode()
+            # Uses the independently pinned source driver, not an extracted
+            # binary callback or a candidate-provided expectation.
+            reviewed_host_driver(source).validate_artifact_metadata(info, artifact, source_sha, "amd64")
             require("GOOS=linux" in info and "GOARCH=amd64" in info and "CGO_ENABLED=0" in info,
                     "extracted Go metadata platform mismatch")
             if artifact == "deployer":
@@ -535,7 +572,7 @@ def issue(args):
         artifacts, pins, controlled_receipt, go = controlled_artifacts(source, output, contract, arch_wire, args)
         bundle = {"root_source": args.source_sha, "app_source": args.app_source_sha,
                   "issuer_source": args.issuer_sha, "source_fingerprint64": args.fingerprint,
-                  "controlled_build_receipt": controlled_receipt, "artifact_pins3": pins,
+                  "controlled_build_receipt": controlled_receipt, "artifact_pins": pins, "artifact_count": 5,
                   "toolchain_binary_sha256": contract["go_binary_sha256"],
                   "toolchain_tree_sha256": contract["go_tree_sha256"], "host_arch_evidence_sha256": contract["host_arch_evidence_sha256"],
                   "install_or_launcher_execution": False}
@@ -549,7 +586,8 @@ def issue(args):
                     fingerprint(source) == args.fingerprint, "source changed during artifact build")
             context = output / (name + "-context")
             context.mkdir(mode=0o700)
-            for artifact, spec in ARTIFACTS.items():
+            for artifact in IMAGE_PATHS[name]:
+                spec = ARTIFACTS[artifact]
                 require(regular_pin(artifacts / artifact, spec["limit"]) == pins[artifact], "controlled output changed")
                 shutil.copyfile(artifacts / artifact, context / artifact)
                 (context / artifact).chmod(0o500)
@@ -562,7 +600,8 @@ def issue(args):
                       "io.opensamguk.generated-recipe-sha256": sha(recipe_wire),
                       "io.opensamguk.toolchain-tree-sha256": contract["go_tree_sha256"]}
             packaging = {"recipe_sha256": sha(recipe_wire), "artifacts_manifest_sha256": bundle_hash,
-                         "labels": labels, "artifact_pins3": pins, "context_files_only": list(ARTIFACTS) + ["Dockerfile"]}
+                         "labels": labels, "artifact_pins": {artifact: pins[artifact] for artifact in IMAGE_PATHS[name]},
+                         "artifact_count": len(IMAGE_PATHS[name]), "context_files_only": list(IMAGE_PATHS[name]) + ["Dockerfile"]}
             save_new(output / (name + "-packaging-contract.json"), packaging)
             metadata_file = output / (name + "-build-metadata.json")
             argv = ["docker", "buildx", "build", "--platform", PLATFORM, "--file", "Dockerfile",
@@ -574,7 +613,8 @@ def issue(args):
             save_new(output / (name + "-push-intent.json"), {"argv": argv, "tag": record["tags"][name], "packaging": packaging})
             command(argv, cwd=context, timeout=1800)
             candidate = verify_packaging(name, json.loads(metadata_file.read_bytes()), record, packaging, output)
-            candidate["extracted_artifacts3"] = extracted_readback(name, candidate, pins, go, output, args.source_sha)
+            candidate["extracted_artifacts"] = extracted_readback(name, candidate, pins, go, output, args.source_sha, source)
+            candidate["extracted_artifact_count"] = len(IMAGE_PATHS[name])
             candidates[name] = candidate
             save_new(output / (name + "-verified.json"), candidate)
         require(main_sha(ROOT_REPO) == args.source_sha and main_sha(APP_REPO) == args.app_source_sha,

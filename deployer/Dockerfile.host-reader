@@ -1,11 +1,18 @@
 # Candidate artifact only. Build/digest/card review and root-only host install
 # are separate gates; this file installs no originals, key, token or authority.
-FROM golang:1.23-alpine AS build
+FROM --platform=linux/amd64 golang:1.26.8-alpine@sha256:66f9a494af2b76ecb3eab75ff47166df61caec6d200c59d556b77327493d83a8 AS build
 WORKDIR /src
-COPY go.mod ./
+COPY go.mod go.sum ./
+COPY vendor ./vendor
 COPY internal ./internal
 COPY cmd/d101-host-reader ./cmd/d101-host-reader
-ENV CGO_ENABLED=0
-RUN go build -trimpath -ldflags="-s -w" -o /out/d101-host-reader ./cmd/d101-host-reader
+COPY cmd/d101-native-installer ./cmd/d101-native-installer
+COPY cmd/d101-management-client ./cmd/d101-management-client
+ENV CGO_ENABLED=0 GOTOOLCHAIN=local GOENV=off GOWORK=off GOPROXY=off GOSUMDB=off
+RUN --network=none go build -mod=vendor -trimpath -ldflags="-s -w" -o /out/d101-host-reader ./cmd/d101-host-reader
+RUN --network=none go build -mod=vendor -trimpath -ldflags="-s -w" -o /out/d101-native-installer ./cmd/d101-native-installer
+RUN --network=none go build -mod=vendor -trimpath -ldflags="-s -w" -o /out/d101-management-client ./cmd/d101-management-client
 FROM scratch AS host-reader-artifact
 COPY --from=build /out/d101-host-reader /d101-host-reader
+COPY --from=build /out/d101-native-installer /d101-native-installer
+COPY --from=build /out/d101-management-client /d101-management-client
