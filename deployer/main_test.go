@@ -3920,6 +3920,16 @@ func TestServerComposeRendersScenarioLookupMatrix(t *testing.T) {
 				if got := service.Environment["SCENARIO_DIR"]; got != testCase.wantLookup {
 					t.Errorf("%s lookup = %q, want %q", name, got, testCase.wantLookup)
 				}
+				// API also mounts the immutable topdown bundle; compare the scenario mount itself.
+				if name == "game-api" {
+					var scenarioVolumes = service.Volumes[:0]
+					for _, volume := range service.Volumes {
+						if volume.Target != "/app/data/map/topdown" {
+							scenarioVolumes = append(scenarioVolumes, volume)
+						}
+					}
+					service.Volumes = scenarioVolumes
+				}
 				if len(service.Volumes) != 1 || service.Volumes[0].Target != testCase.wantTarget || !service.Volumes[0].ReadOnly {
 					t.Errorf("%s scenario mount = %#v, want target=%q read-only", name, service.Volumes, testCase.wantTarget)
 				}
@@ -8092,6 +8102,55 @@ func TestNative9PresentUnknownOwnerHoldsBeforeRecovery(t *testing.T) {
 			info, statErr := os.Stat(storePath)
 			if err != nil || statErr != nil || !bytes.Equal(before, after) || info.Mode().Perm() != 0644 {
 				t.Fatal("startup HOLD opened/chmodded/pruned store")
+			}
+		})
+	}
+}
+
+func TestServerComposeRendersImmutableTopdownBinding(t *testing.T) {
+	const required = "SERVER_ID=pep\nGAME_POSTGRES_PASSWORD=fixture-password\nJWT_PUBLIC_KEY=fixture-public-key\nINTERNAL_SERVICE_TOKEN=fixture-token\nGAME_API_PORT=8101\nWEB_GAME_PORT=3101\nCOMPOSE_HOST_DIR=/synthetic-host\n"
+	for _, bake := range []string{"", strings.Repeat("a", 64)} {
+		t.Run(bake, func(t *testing.T) {
+			fixture := filepath.Join(t.TempDir(), "server.env")
+			writeEnv(t, fixture, required+"TOPDOWN_BAKE_ID="+bake+"\n")
+			cmd := exec.Command("docker", "compose", "-f", filepath.Join("..", "docker-compose.server.yml"), "--env-file", fixture, "config", "--format", "json")
+			cfg := config{composeHostDir: "/synthetic-host"}
+			cmd.Env = cfg.serverComposeEnvironment(append(os.Environ(), "TOPDOWN_BAKE_ID=attacker"))
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("compose config: %v %s", err, output)
+			}
+			var rendered struct {
+				Services map[string]struct {
+					Environment map[string]string `json:"environment"`
+					Volumes     []struct {
+						Source   string `json:"source"`
+						Target   string `json:"target"`
+						ReadOnly bool   `json:"read_only"`
+					} `json:"volumes"`
+				} `json:"services"`
+			}
+			if err := json.Unmarshal(output, &rendered); err != nil {
+				t.Fatal(err)
+			}
+			api := rendered.Services["game-api"]
+			if api.Environment["TOPDOWN_BAKE_ID"] != bake || api.Environment["TOPDOWN_MAP_ROOT"] != "/app/data/map/topdown" {
+				t.Fatalf("topdown binding not preserved")
+			}
+			count := 0
+			for _, volume := range api.Volumes {
+				if volume.Target == "/app/data/map/topdown" {
+					count++
+					if volume.Source != "/synthetic-host/data/topdown/pep" || !volume.ReadOnly {
+						t.Fatalf("topdown mount must be per-server and read-only: %#v", volume)
+					}
+				}
+			}
+			if count != 1 {
+				t.Fatalf("topdown mount count=%d", count)
+			}
+			if _, exists := rendered.Services["game-engine"].Environment["TOPDOWN_BAKE_ID"]; exists {
+				t.Fatal("render bake must not change engine selection")
 			}
 		})
 	}

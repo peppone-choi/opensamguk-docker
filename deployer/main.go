@@ -214,6 +214,7 @@ var serverComposeInterpolationKeys = map[string]struct{}{
 	"SERVER_GENERATION":              {},
 	"SERVER_ID":                      {},
 	"SERVER_NAME":                    {},
+	"TOPDOWN_BAKE_ID":                {},
 	"TURN_PROFILE_NAME":              {},
 	"WEB_GAME_PORT":                  {},
 	"WEB_GAME_TAG":                   {},
