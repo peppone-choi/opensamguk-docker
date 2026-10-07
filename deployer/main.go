@@ -24,7 +24,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"opensamguk-deployer/internal/d101native"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -303,46 +302,34 @@ var sharedEnvAllowlist = map[string]envFieldSpec{
 
 // 환경변수 묶음.
 type config struct {
-	d101RootProducer              *resetD101OldRootProducer
-	d101NativeInstaller           *resetD101NativeAuthorityInstaller
-	d101FixedInstallation         *resetD101FixedInstallation         // Independently reviewed installer pins/producers; never an env/request field.
-	d101SeedMaterialInputs        *resetD101SeedMaterialInputs        // Independent fixed native inputs; nil closes before any physical command.
-	d101CandidatePipeline         *resetD101CandidatePipeline         // Fixed native installation; nil fails before any physical command.
-	d101PurposeAuthority          resetD101PurposeAuthoritySource     // Fixed approved host source; no request/env enablement.
-	d101PhaseSource               resetExecutionPhaseSource           // Actual installed current writer source; nil closes pre-stop collection.
-	d101PreStopNativeInstallation *resetD101PreStopNativeInstallation // Independently installed producer/custody; nil denies all pre-stop commands.
-	d101RecoveryClosureReader     resetD101RecoveryClosureReader      // Fixed retained restore1 reader; nil until actual producer installation.
-	d101RecoveryVerifier          resetD101RecoveryVerifier           // Fixed actual backup/metadata verifier; nil until supplied.
-	d101RecoveryDatabaseSource    resetD101RecoveryDatabaseSource     // Fixed actual restored SQL original source; nil until installation.
-	d101InstallationError         error                               // Internal native adapter failure; never exposed as HTTP originals.
-	token                         string                              // Bearer 인증 토큰
-	composeDir                    string                              // compose 파일 디렉터리(/workspace)
-	composeHostDir                string
-	serversDir                    string // 서버 env 파일 디렉터리(/workspace/servers)
-	composeServer                 string // 서버 compose 파일 절대경로
-	composeShared                 string
-	ghcrOwner                     string // GHCR 패키지 소유자(태그 조회)
-	ghcrToken                     string // GHCR 조회 토큰(private면 필요, 없으면 익명)
-	ghcrAPIBaseURL                string
-	localHTTPBaseURL              string
-	authenticatedHTTPTimeout      time.Duration
-	dockerRunner                  func(args ...string) (string, error)
-	dockerRunnerContext           func(context.Context, ...string) (string, error)
-	httpGet                       func(context.Context, string) (int, []byte, error)
-	gameAPIInternalPort           string
-	gameEngineInternalPort        string
-	gatewayAPIURL                 string
-	resetVerifyTimeout            time.Duration
-	resetVerifyPollInterval       time.Duration
-	lifecycleJobs                 *lifecycleJobManager
-	lifecycleOperationStore       *durableOperationStore
-	maintenanceFile               string
-	lifecycleJournalFile          string
-	sharedEnvMu                   *sync.Mutex
-	registryRewriteHook           func()
-	lifecycleJournalWriteHook     func(lifecycleJournal)
-	lifecycleJournalClearHook     func()
-	operations                    *operationCoordinator
+	token                     string // Bearer 인증 토큰
+	composeDir                string // compose 파일 디렉터리(/workspace)
+	composeHostDir            string
+	serversDir                string // 서버 env 파일 디렉터리(/workspace/servers)
+	composeServer             string // 서버 compose 파일 절대경로
+	composeShared             string
+	ghcrOwner                 string // GHCR 패키지 소유자(태그 조회)
+	ghcrToken                 string // GHCR 조회 토큰(private면 필요, 없으면 익명)
+	ghcrAPIBaseURL            string
+	localHTTPBaseURL          string
+	authenticatedHTTPTimeout  time.Duration
+	dockerRunner              func(args ...string) (string, error)
+	dockerRunnerContext       func(context.Context, ...string) (string, error)
+	httpGet                   func(context.Context, string) (int, []byte, error)
+	gameAPIInternalPort       string
+	gameEngineInternalPort    string
+	gatewayAPIURL             string
+	resetVerifyTimeout        time.Duration
+	resetVerifyPollInterval   time.Duration
+	lifecycleJobs             *lifecycleJobManager
+	lifecycleOperationStore   *durableOperationStore
+	maintenanceFile           string
+	lifecycleJournalFile      string
+	sharedEnvMu               *sync.Mutex
+	registryRewriteHook       func()
+	lifecycleJournalWriteHook func(lifecycleJournal)
+	lifecycleJournalClearHook func()
+	operations                *operationCoordinator
 }
 
 type lifecycleJobStatus string
@@ -2054,7 +2041,6 @@ func loadConfig() (config, error) {
 		return config{}, err
 	}
 	c := config{
-		d101FixedInstallation:    resetD101ReviewedFixedInstallation,
 		token:                    os.Getenv("DEPLOYER_TOKEN"),
 		composeDir:               envOr("COMPOSE_DIR", "/workspace"),
 		composeHostDir:           envOr("COMPOSE_HOST_DIR", envOr("PWD", ".")),
@@ -2705,29 +2691,12 @@ type envLine struct {
 }
 
 func main() {
-	if handled, status := earlyResetD101HostCommand(os.Args, os.Getenv, os.Stdout, os.Stderr); handled {
-		os.Exit(status)
-	}
 	if handled, status := earlyCommand(os.Args, os.Getenv, os.Stdin, os.Stdout, os.Stderr); handled {
 		os.Exit(status)
 	}
 	cfg, err := loadConfig()
 	if err != nil {
 		log.Fatalf("durable operation store initialization failed: %v", err)
-	}
-	// Register the fixed installation atomically; missing actual inputs keep
-	// all D101 sources closed while ordinary service/registry checks remain.
-	if !d101native.Missing(resetD101ReviewedNativeEntryFactory) {
-		if actual, nativeErr := actualResetD101NativeEntry(context.Background(), "main", ""); nativeErr == nil {
-			resetD101ReviewedNativeAuthorityInstaller = actual
-		}
-	}
-	if resetD101ReviewedNativeAuthorityInstaller != nil {
-		cfg.d101NativeInstaller = resetD101ReviewedNativeAuthorityInstaller
-	}
-	cfg, err = assembleResetD101InstalledSources(context.Background(), cfg)
-	if err != nil {
-		log.Print("D101 fixed installation sources unavailable")
 	}
 	if len(os.Args) == 2 && os.Args[1] == "--check-running-registry-targets" {
 		os.Exit(checkRunningRegistryTargetsCommand(cfg, os.Stderr))
@@ -2742,22 +2711,11 @@ func main() {
 		log.Fatal("DEPLOYER_TOKEN 미설정 — 인증 토큰 필수")
 	}
 
-	var rootSource resetD101RootSource
-	if cfg.d101NativeInstaller != nil {
-		rootSource = cfg.d101NativeInstaller.rootSource
-	}
-	cfg.d101RootProducer = registerResetD101OldRoot(&cfg, rootSource)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "up"})
 	})
 	mux.HandleFunc("/readyz", cfg.handleReady)
-	if cfg.d101RootProducer != nil {
-		mux.HandleFunc("/d101/native/root", cfg.withAuth(cfg.withLoopback(cfg.d101RootProducer.handler())))
-	}
-	if cfg.d101NativeInstaller != nil {
-		mux.HandleFunc("/d101/native/completion", cfg.withAuth(cfg.withLoopback(cfg.d101NativeInstaller.completionHandler())))
-	}
 	mux.HandleFunc("/status", cfg.withAuth(cfg.handleStatus))
 	mux.HandleFunc("/deploy", cfg.withAuth(cfg.handleDeploy))
 	mux.HandleFunc("/servers", cfg.withAuth(cfg.handleServers))
@@ -2864,17 +2822,7 @@ func authenticatedHTTPCommand(c config, method, requestPath string, input io.Rea
 		return 1
 	}
 	defer response.Body.Close()
-	if isResetD101ResultPath(strings.TrimPrefix(requestPath, "/operations/")) {
-		original, err := io.ReadAll(io.LimitReader(response.Body, resetD101ResultMaxBytes+1))
-		if err != nil || len(original) > resetD101ResultMaxBytes {
-			fmt.Fprintln(errOutput, "authenticated HTTP response read failed")
-			return 1
-		}
-		if _, err := output.Write(original); err != nil {
-			fmt.Fprintln(errOutput, "authenticated HTTP response read failed")
-			return 1
-		}
-	} else if _, err := io.Copy(output, response.Body); err != nil {
+	if _, err := io.Copy(output, response.Body); err != nil {
 		fmt.Fprintln(errOutput, "authenticated HTTP response read failed")
 		return 1
 	}
@@ -2889,11 +2837,6 @@ func isAuthenticatedHTTPRouteAllowed(method, requestPath string) bool {
 	switch method {
 	case http.MethodGet:
 		if requestPath == "/maintenance" {
-			return true
-		}
-		parts := strings.Split(strings.TrimPrefix(requestPath, "/operations/"), "/")
-		if strings.HasPrefix(requestPath, "/operations/") && len(parts) == 3 && lifecycleJobIDRe.MatchString(parts[0]) &&
-			parts[1] == "execution-result" && resetEvidenceSHA.MatchString(parts[2]) {
 			return true
 		}
 		return strings.HasPrefix(requestPath, "/jobs/") && lifecycleJobIDRe.MatchString(strings.TrimPrefix(requestPath, "/jobs/"))
@@ -2984,22 +2927,6 @@ func (c config) handleOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/operations/")
-	if strings.Contains(path, "/seed-approval") {
-		c.handleResetD101SeedApproval(w, r, strings.Split(path, "/"))
-		return
-	}
-	if strings.Contains(path, "/recovery-result") {
-		c.handleResetD101RecoveryResult(w, r, strings.Split(path, "/"))
-		return
-	}
-	if isResetD101PreparedPath(path) {
-		c.handleResetD101PreparedProof(w, r, strings.Split(path, "/"))
-		return
-	}
-	if isResetD101ResultPath(path) {
-		c.handleResetD101ExecutionResult(w, r, strings.Split(path, "/"))
-		return
-	}
 	if isResetPublicationReceiptPath(path) {
 		c.handleResetPublicationReceipt(w, r, strings.Split(path, "/"))
 		return
@@ -6078,15 +6005,6 @@ func (c config) runDockerContextWithEnvironment(parent context.Context, environm
 	if err := parent.Err(); err != nil {
 		return "", err
 	}
-	completeNativeTrace, traceErr := resetD101TraceActualDocker(parent, args)
-	if traceErr != nil {
-		return "", traceErr
-	}
-	defer func() {
-		if completeNativeTrace() != nil {
-			resultErr = errResetExecutionEvidence
-		}
-	}()
 	if c.dockerRunnerContext != nil {
 		out, err := c.dockerRunnerContext(parent, args...)
 		if parentErr := parent.Err(); parentErr != nil {
