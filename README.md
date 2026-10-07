@@ -501,3 +501,7 @@ GCP Compute Engine **e2-standard-2**(2 vCPU / 8 GiB) 기준(단일서버). LLM·
 수동 전콘 편집은 원본8MiB와 자르기 좌표를 전송합니다. nginx는 HTTP·HTTPS의
 `/api/account/profile-icon` 및 직접 API 경로 `/api/gateway/auth/account/profile-icon`만9MiB까지 허용합니다.
 그 외 API의2MiB 한도와 요청 속도 제한은 유지합니다. 대응하는 앱 이미지가 배포되어야 원본과 세 구도 저장 기능을 사용할 수 있습니다.
+
+### 와룡전 지도 묶음 연결
+
+게임 API는 `data/topdown/<public SERVER_ID>/`를 `/app/data/map/topdown`에 읽기 전용으로 연결한다. 완성된 immutable bundle을 `<bakeId>/` 아래 설치하고 서버 env의 `TOPDOWN_BAKE_ID`를 해당 ID로 지정한 뒤 `game-api`만 갱신한다. manifest의 원본 지문·지도 릴리스가 현재 월드와 일치해야 API가 `topdownBakeId`를 노출한다. 미설정·손상·불일치이면 웹은 지도 준비 상태를 표시한다. 배포 시에도 서버 env와 지도 디렉터리를 보존한다.
