@@ -4,6 +4,9 @@ on:
   pull_request:
     paths:
       - "deployer/**"
+      - "docker-compose.shared.yml"
+      - "docker-compose.yml"
+      - "infra/nginx/**"
       - "scripts/build-d101-candidate-images.py"
       - ".github/workflows/build-d101-candidate-images.yml"
       - "scripts/deploy-orchestration-admission-test.sh"
@@ -14,6 +17,9 @@ on:
     branches: [main]
     paths:
       - "deployer/**"
+      - "docker-compose.shared.yml"
+      - "docker-compose.yml"
+      - "infra/nginx/**"
       - "scripts/build-d101-candidate-images.py"
       - ".github/workflows/build-d101-candidate-images.yml"
       - "scripts/deploy-orchestration-admission-test.sh"
@@ -48,6 +54,42 @@ jobs:
         run: go vet ./...
       - name: go test
         run: go test ./...
+      - name: Validate pinned nginx image with canonical configuration
+        working-directory: .
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          image="$(python3 - <<'PY_IMAGE'
+          from pathlib import Path
+          import re
+
+          images = []
+          for name in ("docker-compose.shared.yml", "docker-compose.yml"):
+              source = Path(name).read_text()
+              block = re.search(r"(?ms)^  nginx:\n(.*?)(?=^  \S|\Z)", source)
+              if block is None:
+                  raise SystemExit(f"{name}: nginx service missing")
+              pins = re.findall(r"(?m)^    image: (nginx:[A-Za-z0-9_.-]+)$", block[1])
+              if len(pins) != 1:
+                  raise SystemExit(f"{name}: expected one explicit nginx image")
+              images.extend(pins)
+          if images[0] != images[1]:
+              raise SystemExit("Shared and local nginx image pins differ")
+          print(images[0])
+          PY_IMAGE
+          )"
+          cert_dir="$(mktemp -d)"
+          trap 'rm -rf "$cert_dir"' EXIT
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj /CN=nginx-ci.invalid \
+            -keyout "$cert_dir/opensamguk.key" \
+            -out "$cert_dir/opensamguk.crt" >/dev/null 2>&1
+          docker run --rm --network none --read-only \
+            --tmpfs /var/cache/nginx --tmpfs /var/run \
+            --add-host gateway-api:127.0.0.1 --add-host web-gateway:127.0.0.1 \
+            --volume "$PWD/infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" \
+            --volume "$cert_dir:/etc/nginx/certs:ro" \
+            --entrypoint nginx "$image" -t
       - name: deploy orchestration admission boundary
         working-directory: .
         run: bash scripts/deploy-orchestration-admission-test.sh
