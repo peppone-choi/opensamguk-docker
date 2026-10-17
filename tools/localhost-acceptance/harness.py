@@ -471,9 +471,9 @@ def build(args):
     print('Six images built and verified')
 
 
-def compose(directory, record, *args, timeout=60):
+def compose(directory, record, *args, timeout=60, log_path=None):
     return run(['docker', 'compose', '--project-name', record['project'], '--env-file', '/dev/null',
-                '--project-directory', str(directory), '-f', str(directory / 'compose.json'), *args], timeout=timeout)
+                '--project-directory', str(directory), '-f', str(directory / 'compose.json'), *args], timeout=timeout, log_path=log_path)
 
 
 def verify_running(record, resources, model):
@@ -521,7 +521,7 @@ def up(args):
                 'Compose normalization changed identity')
         record['status'] = 'STARTING'
         write_json(directory / 'contract.json', record, replace=True)
-        compose(directory, record, 'up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '600', timeout=660)
+        compose(directory, record, 'up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '600', timeout=660, log_path=directory / 'startup.log')
         verify_running(record, inventory(record), model)
         record['status'] = 'RUNNING'
         write_json(directory / 'contract.json', record, replace=True)
@@ -539,7 +539,8 @@ def smoke(args):
     model = verify_files(directory, record)
     verify_images(record)
     verify_running(record, inventory(record), model)
-    compose(directory, record, 'exec', '-T', 'nginx', 'nginx', '-t')
+    compose(directory, record, 'exec', '-T', 'nginx', 'nginx', '-t',
+            log_path=directory / ('nginx-test-' + secrets.token_hex(4) + '.log'))
     context = ssl.create_default_context(cafile=str(directory / 'certs/opensamguk.crt'))
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context))
     checks = [('/health', {200}), ('/api/gateway/auth/me', {401}),
