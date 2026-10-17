@@ -3,6 +3,7 @@
 import argparse
 import base64
 import contextlib
+import errno
 import hashlib
 import io
 import json
@@ -25,6 +26,7 @@ SERVICES = ('gateway-api', 'board-api', 'game-api', 'game-engine', 'web-gateway'
 NONCE_LABEL = 'org.opensamguk.local.nonce'
 SESSION_LABEL = 'org.opensamguk.local.session'
 PROJECT_LABEL = 'com.docker.compose.project'
+SUPPORT_IMAGES = ('postgres:16-alpine', 'redis:7-alpine', 'nginx:1.30.5-alpine')
 GIB = 1024 ** 3
 ORIGIN = 'https://localhost'
 
@@ -225,8 +227,15 @@ def port_free():
     with socket.socket() as sock:
         try:
             sock.bind(('127.0.0.1', 443))
-        except OSError:
-            raise Refused('Loopback 443 unavailable; no port/origin substitution') from None
+        except OSError as error:
+            if error.errno != errno.EACCES:
+                raise Refused('Loopback 443 unavailable; no port/origin substitution') from None
+            # macOS nonroot bind is denied even when Desktop's privileged port mapper can publish.
+            # A refused TCP connection rules out a listener; Docker's bind is still authoritative.
+            with socket.socket() as probe:
+                probe.settimeout(2)
+                require(probe.connect_ex(('127.0.0.1', 443)) == errno.ECONNREFUSED,
+                        'Loopback 443 listener or uncertain port state; preserved')
 
 
 def resource_gate(directory):
@@ -397,6 +406,10 @@ def check_image(record, service, image):
 
 
 def verify_images(record):
+    require(set(record.get('supportImages', {})) == set(SUPPORT_IMAGES), 'Support image receipts required')
+    for image, expected_id in record['supportImages'].items():
+        require(json.loads(run(['docker', 'image', 'inspect', image]))[0]['Id'] == expected_id,
+                'Support image changed')
     require(set(record['images']) == set(SERVICES), 'All six source images required')
     for svc in SERVICES:
         check_image(record, svc, json.loads(run(['docker', 'image', 'inspect', image_ref(record, svc)]))[0])
@@ -410,6 +423,18 @@ def build(args):
         assert_owned(record, inventory(record), empty=True)
         record['status'] = 'BUILDING'
         write_json(directory / 'contract.json', record, replace=True)
+        record.setdefault('supportImages', {})
+        for ref in SUPPORT_IMAGES:
+            found = run(['docker', 'image', 'ls', '-q', '--filter', 'reference=' + ref])
+            if not found.strip():
+                print('Preparing support image ' + ref, flush=True)
+                run(['docker', 'pull', ref], timeout=600,
+                    log_path=directory / (ref.replace(':', '-') + '.pull.log'))
+            image_id = json.loads(run(['docker', 'image', 'inspect', ref]))[0]['Id']
+            require(ref not in record['supportImages'] or record['supportImages'][ref] == image_id,
+                    'Support image receipt changed')
+            record['supportImages'][ref] = image_id
+            write_json(directory / 'contract.json', record, replace=True)
         for svc in SERVICES:
             if svc in record['images']:
                 check_image(record, svc, json.loads(run(['docker', 'image', 'inspect', image_ref(record, svc)]))[0])
@@ -454,8 +479,9 @@ def verify_running(record, resources, model):
         seen.add(svc)
         require(row['State']['Running'] and row['State'].get('Health', {}).get('Status') == 'healthy',
                 'Service not healthy')
-        if svc in SERVICES:
-            require(row['Image'] == record['images'][svc]['imageId'], 'Running image differs from receipt')
+        expected_image = (record['images'][svc]['imageId'] if svc in SERVICES else
+                          record.get('supportImages', {}).get(model['services'][svc]['image']))
+        require(expected_image and row['Image'] == expected_image, 'Running image differs from receipt')
         networks = row['NetworkSettings']['Networks']
         require(set(networks) == {record['project'] + '_local'}, 'Foreign runtime network')
         ports = row['HostConfig'].get('PortBindings') or {}

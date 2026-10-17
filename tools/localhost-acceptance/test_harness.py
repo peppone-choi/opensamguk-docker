@@ -39,6 +39,23 @@ class HarnessTests(unittest.TestCase):
         with self.assertRaises(h.Refused):
             h.validate_model(model, self.record)
 
+    def test_privileged_port_probe_handles_mac_denial_without_ignoring_listener(self):
+        from unittest.mock import MagicMock
+        import errno
+        primary, probe = MagicMock(), MagicMock()
+        primary.bind.side_effect = OSError(errno.EACCES,'denied')
+        probe.connect_ex.return_value = errno.ECONNREFUSED
+        primary.__enter__.return_value = primary
+        probe.__enter__.return_value = probe
+        with patch.object(h.socket,'socket',side_effect=[primary,probe]):
+            h.port_free()
+        probe.connect_ex.return_value = 0
+        with patch.object(h.socket,'socket',side_effect=[primary,probe]):
+            with self.assertRaises(h.Refused): h.port_free()
+        primary.bind.side_effect = OSError(errno.EADDRINUSE,'occupied')
+        with patch.object(h.socket,'socket',return_value=primary):
+            with self.assertRaises(h.Refused): h.port_free()
+
     def test_valid_model_is_separate_auth_world_and_no_private_key_in_verifiers(self):
         h.validate_model(self.model, self.record)
         services = self.model['services']
@@ -307,6 +324,38 @@ class HarnessTests(unittest.TestCase):
             self.assertNotIn('log_entry.body', query)
             self.assertNotIn('password', query)
             self.assertNotIn('UPDATE', query)
+
+    def running_resources(self):
+        for svc in h.SERVICES: self.image(svc)
+        self.record['supportImages']={ref:'sha256:'+str(i)*64 for i,ref in enumerate(h.SUPPORT_IMAGES)}
+        rows=[]
+        for index,(svc,model) in enumerate(self.model['services'].items()):
+            own={**h.labels(self.record),h.PROJECT_LABEL:self.record['project'],'com.docker.compose.service':svc}
+            image=(self.record['images'][svc]['imageId'] if svc in h.SERVICES else self.record['supportImages'][model['image']])
+            row={'Id':'container-'+str(index),'Name':self.record['project']+'-'+svc+'-1',
+                 'Config':{'Labels':own},'State':{'Running':True,'Health':{'Status':'healthy'}},'Image':image,
+                 'NetworkSettings':{'Networks':{self.record['project']+'_local':{}}},
+                 'HostConfig':{'PortBindings':({'443/tcp':[{'HostIp':'127.0.0.1','HostPort':'443'}]} if svc=='nginx' else {})},
+                 'Mounts':[]}
+            for mount in model.get('volumes',[]):
+                if mount['type']=='bind': row['Mounts'].append({'Type':'bind','Source':mount['source'],'RW':False})
+                else: row['Mounts'].append({'Type':'volume','Name':self.model['volumes'][mount['source']]['name']})
+            rows.append(row)
+        network=self.resource('network',Driver='bridge',Containers={r['Id']:{} for r in rows})
+        return {'container':rows,'network':[network],'volume':[]}
+
+    def test_actual_runtime_ports_images_mounts_health_and_network_members_are_checked(self):
+        resources=self.running_resources()
+        h.verify_running(self.record,resources,self.model)
+        for mutate in [lambda r:r['container'][0]['NetworkSettings']['Networks'].update(foreign={}),
+                       lambda r:r['container'][0]['HostConfig'].update(PortBindings={'5432/tcp':[{'HostIp':'0.0.0.0','HostPort':'5432'}]}),
+                       lambda r:r['container'][0].update(Image='different'),
+                       lambda r:r['container'][0]['State']['Health'].update(Status='unhealthy'),
+                       lambda r:r['container'][0]['Mounts'].append({'Type':'volume','Name':'qa160'}),
+                       lambda r:r['network'][0]['Containers'].update(foreign={})]:
+            bad=copy.deepcopy(resources)
+            mutate(bad)
+            with self.assertRaises(h.Refused):h.verify_running(self.record,bad,self.model)
 
     def test_source_requires_clean_head_and_rejects_ignored_data_without_reading_it(self):
         with patch.object(h, 'git', side_effect=[('a'*40+'\n').encode(),b'',b'.env\n']) as git:

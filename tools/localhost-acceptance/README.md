@@ -2,7 +2,7 @@
 
 This harness builds all six app images from one clean exact main SHA, without CI run IDs or GHCR. It uses Docker main's unmodified `infra/nginx/nginx.conf`, new local RSA/TLS fixtures, separate fresh auth/game databases and Redis instances, and a nonce project. Existing `tools/qa/local-stack.py`, qa160 resources and deployment files are never used.
 
-The only host publish is `127.0.0.1:443:443`; origin is exactly `https://localhost`. Occupied 443 fails closed. TLS verification uses the custody certificate, or the USER runner's temporary browser context. Never install this certificate into the host trust store.
+The only host publish is `127.0.0.1:443:443`; origin is exactly `https://localhost`. Occupied 443 fails closed. On macOS, when the nonroot bind probe is denied, a refused loopback TCP connection is required and Docker Desktop’s port bind remains authoritative. TLS verification uses the custody certificate, or the USER runner's temporary browser context. Never install this certificate into the host trust store.
 
 ## Commands
 
@@ -26,7 +26,7 @@ python3 tools/localhost-acceptance/harness.py down --custody <directory> --meta 
 
 `build` runs the four JVM and two web Dockerfiles sequentially under the metarepo's atomic `.locks/heavy-run` lock. It waits for another owner and never removes that lock. Fresh disk must be at least **12 GiB**, Docker VM allocation at least **2 CPUs / 6 GiB**, available Docker memory at least **6 GiB**, and host five-minute load at most **4 × Docker CPU count**. Gates rerun before each image. Compilation uses the source Dockerfiles as written, including real packaged map/curated inputs. No RTK14 credential enrichment or toy source is injected. Original private build output is retained even on failure. Full Gradle test suites are not run here.
 
-Receipt fields in `contract.json` bind the exact app SHA, source bytes/modes digest, nginx digest from Docker main, Dockerfile digests, explicit public build arguments, nonce/session labels and image IDs. `up` checks these again and never rebuilds or pulls app images. Base/support images must already be installed locally for `up --pull never`; normal source Docker builds may download their public base images/dependencies.
+Receipt fields in `contract.json` bind the exact app SHA, source bytes/modes digest, nginx digest from Docker main, Dockerfile digests, explicit public build arguments, nonce/session labels and image IDs. `up` checks these again and never rebuilds or pulls app images. `build` prepares missing public postgres/Redis/nginx support images under the same lock and records their IDs, preserving existing shared images. `up --pull never` checks their IDs too. Normal source Docker builds may download their public base images/dependencies.
 
 `up` refuses any existing container/network/volume matching the project name, compose project label or nonce label. It checks all services become healthy, actual runtime image IDs/networks/mounts/loopback bindings, `nginx -t`, HTTPS health and unauthenticated boundary routes, actual world160, and registry PUBLIC revision1/gen0. A partial failure leaves the original custody/resources intact. It never silently retries or substitutes a synthetic nginx.
 
