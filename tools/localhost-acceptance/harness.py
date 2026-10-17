@@ -255,8 +255,11 @@ def port_free():
                         'Loopback 443 listener or uncertain port state; preserved')
 
 
-def resource_gate(directory):
-    require(shutil.disk_usage(directory).free >= 12 * GIB, 'At least 12 GiB free disk required for source builds')
+def resource_gate(directory, phase):
+    require(phase in ('build', 'startup'), 'Unknown resource phase')
+    minimum = {'build': 12, 'startup': 8}[phase]
+    require(shutil.disk_usage(directory).free >= minimum * GIB,
+            f'At least {minimum} GiB free disk required for {phase}')
     info = json.loads(run(['docker', 'info', '--format', '{"NCPU":{{json .NCPU}},"MemTotal":{{json .MemTotal}}}'], timeout=30))
     require(info['NCPU'] >= 2 and info['MemTotal'] >= 6 * GIB, 'Docker needs 2 CPUs and 6 GiB memory')
     # Account for other running stacks without reading their environments or logs.
@@ -275,7 +278,8 @@ def resource_gate(directory):
 
 
 @contextlib.contextmanager
-def heavy(meta, record, cleanup=False):
+def heavy(meta, record, phase):
+    require(phase in ('build', 'startup', 'cleanup'), 'Unknown resource phase')
     lock = Path(meta).resolve() / '.locks/heavy-run'
     require((Path(meta) / 'bin/start-task').is_file(), 'Managed meta root required')
     lock.parent.mkdir(exist_ok=True)
@@ -291,8 +295,8 @@ def heavy(meta, record, cleanup=False):
     marker = f"LHA {nonce} driver-pid={os.getpid()} session={record['session']}\n"
     try:
         private_write(owner, marker.encode())
-        if not cleanup:
-            resource_gate(record['custody'])
+        if phase != 'cleanup':
+            resource_gate(record['custody'], phase)
         yield
     finally:
         if owner.is_file() and not owner.is_symlink() and owner.read_text() == marker:
@@ -476,7 +480,7 @@ def build(args):
     directory, record = load(args.custody)
     require(record['status'] in ('PREPARED', 'BUILDING'), 'Stack already built/started')
     verify_files(directory, record)
-    with heavy(args.meta, record):
+    with heavy(args.meta, record, 'build'):
         assert_owned(record, inventory(record), empty=True)
         record['status'] = 'BUILDING'
         write_json(directory / 'contract.json', record, replace=True)
@@ -496,7 +500,7 @@ def build(args):
             if svc in record['images']:
                 check_image(record, svc, inspect_image(image_ref(record, svc)))
                 continue
-            resource_gate(directory)
+            resource_gate(directory, 'build')
             verify_files(directory, record)
             existing = run(['docker', 'image', 'ls', '-q', '--filter', 'reference=' + image_ref(record, svc)])
             require(not existing.strip(), 'Unrecorded image already exists; preserved')
@@ -557,21 +561,35 @@ def verify_running(record, resources, model):
         require(set(row.get('Containers', {})) <= own_ids, 'Foreign network member; preserved')
 
 
+def startup_disk_check(directory, stage, initial_free=None):
+    require(stage in ('afterStartupFreeBytes', 'beforeSmokePassedFreeBytes'), 'Unknown disk observation')
+    path = directory / 'startup-disk.json'
+    report = ({'startupFreeBytes': initial_free} if initial_free is not None else
+              json.loads(private_path(path).read_bytes()))
+    report[stage] = shutil.disk_usage(directory).free
+    report['consumedBytes'] = report['startupFreeBytes'] - report[stage]
+    write_json(path, report, replace=path.exists())
+    require(report[stage] >= 3 * GIB, 'Startup reserve below 3 GiB; resources preserved')
+
+
 def up(args):
     directory, record = load(args.custody)
     require(record['status'] == 'BUILT', 'Build six images first; do not reuse a started project')
     model = verify_files(directory, record)
     verify_images(record)
-    with heavy(args.meta, record):
+    with heavy(args.meta, record, 'startup'):
         assert_owned(record, inventory(record), empty=True)
         port_free()
         # config output contains credentials and stays in process memory.
         normalized = json.loads(compose(directory, record, 'config', '--format', 'json'))
         require(normalized['name'] == record['project'] and set(normalized['services']) == set(model['services']),
                 'Compose normalization changed identity')
+        initial_free = shutil.disk_usage(directory).free
+        write_json(directory / 'startup-disk.json', {'startupFreeBytes': initial_free})
         record['status'] = 'STARTING'
         write_json(directory / 'contract.json', record, replace=True)
         compose(directory, record, 'up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '600', timeout=660, log_path=directory / 'startup.log')
+        startup_disk_check(directory, 'afterStartupFreeBytes', initial_free)
         verify_running(record, inventory(record), model)
         record['status'] = 'RUNNING'
         write_json(directory / 'contract.json', record, replace=True)
@@ -610,6 +628,7 @@ def smoke(args):
     actual = sql(directory, record, 'gateway-postgres',
                  f"SELECT count(*) FROM game_server s JOIN game_server_publication p USING(server_id) WHERE s.server_id='{sid}' AND s.generation=0 AND p.state='PUBLIC' AND p.revision=1;")
     require(actual == '1', 'Registry identity mismatch')
+    startup_disk_check(directory, 'beforeSmokePassedFreeBytes')
     record['status'] = 'SMOKE_PASSED'
     write_json(directory / 'contract.json', record, replace=True)
     print('nginx, healthy services, seed identity and unauthenticated boundaries passed; USER stories remain separate')
@@ -660,7 +679,7 @@ def down(args):
     directory, record = load(args.custody)
     # Cleanup does not require healthy services or all six successful builds.
     verify_files(directory, record)
-    with heavy(args.meta, record, cleanup=True):
+    with heavy(args.meta, record, 'cleanup'):
         resources = inventory(record)
         assert_owned(record, resources)
         own_ids = {r['Id'] for r in resources['container']}

@@ -270,15 +270,58 @@ class HarnessTests(unittest.TestCase):
         free=type('Disk',(),{'free':20*h.GIB})()
         with patch.object(h.shutil,'disk_usage',return_value=free), patch.object(h.os,'getloadavg',return_value=(10,400,10)), \
              patch.object(h,'run',side_effect=[info,b'']):
-            h.resource_gate(self.directory)
+            h.resource_gate(self.directory, 'build')
         with patch.object(h.shutil,'disk_usage',return_value=free), patch.object(h.os,'getloadavg',return_value=(10,401,10)), \
              patch.object(h,'run',side_effect=[info,b'']):
-            with self.assertRaises(h.Refused):h.resource_gate(self.directory)
+            with self.assertRaises(h.Refused):h.resource_gate(self.directory, 'build')
         with patch.object(h.shutil,'disk_usage',return_value=free), patch.object(h,'run',return_value=json.dumps({'NCPU':1,'MemTotal':8*h.GIB}).encode()):
-            with self.assertRaises(h.Refused):h.resource_gate(self.directory)
+            with self.assertRaises(h.Refused):h.resource_gate(self.directory, 'build')
         with patch.object(h.shutil,'disk_usage',return_value=free), \
              patch.object(h,'run',side_effect=[info,json.dumps({'MemUsage':'3GiB / 8GiB'}).encode()]):
-            with self.assertRaises(h.Refused):h.resource_gate(self.directory)
+            with self.assertRaises(h.Refused):h.resource_gate(self.directory, 'build')
+
+    def test_build_and_startup_disk_admission_are_explicit_and_keep_memory_gate(self):
+        info=json.dumps({'NCPU':8,'MemTotal':8*h.GIB}).encode()
+        for phase, gib, accepted, stats in [('build',11.9,False,b''), ('build',12,True,b''),
+                ('startup',7.9,False,b''), ('startup',8,True,b''),
+                ('startup',8,False,json.dumps({'MemUsage':'3GiB / 8GiB'}).encode())]:
+            with self.subTest(phase=phase, gib=gib, stats=stats), \
+                 patch.object(h.shutil,'disk_usage',return_value=type('Disk',(),{'free':gib*h.GIB})()), \
+                 patch.object(h.os,'getloadavg',return_value=(10,10,10)), patch.object(h,'run',side_effect=[info,stats]):
+                if accepted:h.resource_gate(self.directory,phase)
+                else:
+                    with self.assertRaises(h.Refused):h.resource_gate(self.directory,phase)
+        with patch.object(h,'run') as run:
+            with self.assertRaises(h.Refused):h.resource_gate(self.directory,'unknown')
+            with self.assertRaises(h.Refused):
+                with h.heavy(self.directory,self.record,'unknown'):self.fail('Unknown phase entered')
+            run.assert_not_called()
+
+    def test_up_keeps_verified_images_no_build_no_pull_and_explicit_startup_phase(self):
+        self.record['status']='BUILT'
+        args=type('Args',(),{'custody':self.directory,'meta':self.directory})()
+        with patch.object(h,'load',return_value=(self.directory,self.record)), \
+             patch.object(h,'verify_files',return_value=self.model), patch.object(h,'verify_images'), \
+             patch.object(h,'heavy',return_value=__import__('contextlib').nullcontext()) as heavy, \
+             patch.object(h,'inventory',return_value={'container':[],'network':[],'volume':[]}), \
+             patch.object(h,'port_free'), patch.object(h,'verify_running'), patch.object(h,'smoke'), \
+             patch.object(h,'startup_disk_check') as disk, \
+             patch.object(h,'compose',side_effect=[json.dumps(self.model).encode(),b'']) as compose:
+            h.up(args)
+            heavy.assert_called_once_with(self.directory,self.record,'startup')
+            self.assertEqual(('up','-d','--no-build','--pull','never','--wait','--wait-timeout','600'),compose.call_args.args[2:])
+            self.assertEqual('afterStartupFreeBytes',disk.call_args.args[1])
+
+    def test_startup_disk_observations_preserve_consumption_and_refuse_low_reserve(self):
+        with patch.object(h.shutil,'disk_usage',return_value=type('Disk',(),{'free':8*h.GIB})()):
+            h.startup_disk_check(self.directory,'afterStartupFreeBytes',10*h.GIB)
+        with patch.object(h.shutil,'disk_usage',return_value=type('Disk',(),{'free':2.9*h.GIB})()):
+            with self.assertRaises(h.Refused):h.startup_disk_check(self.directory,'beforeSmokePassedFreeBytes')
+        report=json.loads((self.directory/'startup-disk.json').read_text())
+        self.assertEqual(10*h.GIB,report['startupFreeBytes'])
+        self.assertEqual(8*h.GIB,report['afterStartupFreeBytes'])
+        self.assertEqual(2.9*h.GIB,report['beforeSmokePassedFreeBytes'])
+        self.assertAlmostEqual(7.1*h.GIB,report['consumedBytes'])
 
     def test_foreign_heavy_lock_is_never_deleted(self):
         meta = self.directory / 'meta'
@@ -289,7 +332,7 @@ class HarnessTests(unittest.TestCase):
         owner.write_text('FOREIGN')
         with patch.object(h.time, 'sleep', side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
-                with h.heavy(meta, self.record):
+                with h.heavy(meta, self.record, 'build'):
                     self.fail('Must not enter')
         self.assertEqual('FOREIGN', owner.read_text())
 
@@ -299,10 +342,10 @@ class HarnessTests(unittest.TestCase):
         (meta / 'bin/start-task').touch()
         with patch.object(h, 'resource_gate', side_effect=h.Refused('low disk')):
             with self.assertRaises(h.Refused):
-                with h.heavy(meta, self.record):
+                with h.heavy(meta, self.record, 'build'):
                     self.fail('Gate must run')
             self.assertFalse((meta / '.locks/heavy-run').exists())
-            with h.heavy(meta, self.record, cleanup=True):
+            with h.heavy(meta, self.record, 'cleanup'):
                 self.assertTrue((meta / '.locks/heavy-run/owner').is_file())
             self.assertFalse((meta / '.locks/heavy-run').exists())
 
