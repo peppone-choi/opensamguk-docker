@@ -29,6 +29,16 @@ PROJECT_LABEL = 'com.docker.compose.project'
 SUPPORT_IMAGES = ('postgres:16-alpine', 'redis:7-alpine', 'nginx:1.30.5-alpine')
 GIB = 1024 ** 3
 ORIGIN = 'https://localhost'
+# Inspect projections exclude Env, command arguments, health logs and volume driver options.
+IMAGE_FORMAT = '{"Id":{{json .Id}},"RepoTags":{{json .RepoTags}},"Config":{"Labels":{{json .Config.Labels}}}}'
+CONTAINER_FORMAT = ('{"Id":{{json .Id}},"Name":{{json .Name}},"Image":{{json .Image}},'
+    '"Config":{"Labels":{{json .Config.Labels}}},"State":{"Running":{{json .State.Running}},'
+    '"Health":{"Status":{{if .State.Health}}{{json .State.Health.Status}}{{else}}null{{end}}}},'
+    '"HostConfig":{"PortBindings":{{json .HostConfig.PortBindings}}},"Mounts":{{json .Mounts}},'
+    '"NetworkSettings":{"Networks":{{json .NetworkSettings.Networks}}}}')
+NETWORK_FORMAT = ('{"Id":{{json .Id}},"Name":{{json .Name}},"Labels":{{json .Labels}},'
+                  '"Driver":{{json .Driver}},"Containers":{{json .Containers}}}')
+VOLUME_FORMAT = '{"Name":{{json .Name}},"Labels":{{json .Labels}}}'
 
 
 class Refused(RuntimeError):
@@ -212,7 +222,8 @@ def inventory(record):
             ids.update(run(['docker', *listing, '--filter', filt]).decode().split())
         rows = []
         for rid in sorted(ids):
-            row = json.loads(run(['docker', *inspection, rid]))[0]
+            projection = {'container': CONTAINER_FORMAT, 'network': NETWORK_FORMAT, 'volume': VOLUME_FORMAT}[kind]
+            row = json.loads(run(['docker', *inspection, '--format', projection, rid]))
             rows.append(row)
         result[kind] = rows
     return result
@@ -395,6 +406,11 @@ def verify_files(directory, record):
     return model
 
 
+
+def inspect_image(reference):
+    return json.loads(run(['docker', 'image', 'inspect', '--format', IMAGE_FORMAT, reference]))
+
+
 def image_metadata(record, service, image):
     return {**labels(record), 'org.opencontainers.image.revision': record['appSha'],
             'org.opensamguk.local.source-tree': record['sourceTreeSha256'],
@@ -415,11 +431,11 @@ def check_image(record, service, image):
 def verify_images(record):
     require(set(record.get('supportImages', {})) == set(SUPPORT_IMAGES), 'Support image receipts required')
     for image, expected_id in record['supportImages'].items():
-        require(json.loads(run(['docker', 'image', 'inspect', image]))[0]['Id'] == expected_id,
+        require(inspect_image(image)['Id'] == expected_id,
                 'Support image changed')
     require(set(record['images']) == set(SERVICES), 'All six source images required')
     for svc in SERVICES:
-        check_image(record, svc, json.loads(run(['docker', 'image', 'inspect', image_ref(record, svc)]))[0])
+        check_image(record, svc, inspect_image(image_ref(record, svc)))
 
 
 def build(args):
@@ -437,14 +453,14 @@ def build(args):
                 print('Preparing support image ' + ref, flush=True)
                 run(['docker', 'pull', ref], timeout=600,
                     log_path=directory / (ref.replace(':', '-') + '.pull.log'))
-            image_id = json.loads(run(['docker', 'image', 'inspect', ref]))[0]['Id']
+            image_id = inspect_image(ref)['Id']
             require(ref not in record['supportImages'] or record['supportImages'][ref] == image_id,
                     'Support image receipt changed')
             record['supportImages'][ref] = image_id
             write_json(directory / 'contract.json', record, replace=True)
         for svc in SERVICES:
             if svc in record['images']:
-                check_image(record, svc, json.loads(run(['docker', 'image', 'inspect', image_ref(record, svc)]))[0])
+                check_image(record, svc, inspect_image(image_ref(record, svc)))
                 continue
             resource_gate(directory)
             verify_files(directory, record)
@@ -460,7 +476,7 @@ def build(args):
             print('Building ' + svc, flush=True)
             # Build output contains no fixture values; keep it private and never echo errors.
             run(command, timeout=3600, log_path=directory / (svc + '.build.log'))
-            image = json.loads(run(['docker', 'image', 'inspect', image_ref(record, svc)]))[0]
+            image = inspect_image(image_ref(record, svc))
             record['images'][svc] = {'imageId': image['Id'], 'dockerfileSha256': image_metadata(record, svc, {})['org.opensamguk.local.dockerfile'],
                                      'buildArgs': build_args(record, svc)}
             check_image(record, svc, image)
@@ -619,7 +635,7 @@ def down(args):
             require(all(any(r['Id'].startswith(c) for r in resources['container']) for c in consumers),
                     'Foreign volume consumer; no cleanup')
         for svc in record['images']:
-            check_image(record, svc, json.loads(run(['docker', 'image', 'inspect', image_ref(record, svc)]))[0])
+            check_image(record, svc, inspect_image(image_ref(record, svc)))
         # Delete inspected IDs/names explicitly. Compose down could also act on unknown orphans.
         if own_ids:
             run(['docker', 'container', 'rm', '-f', *sorted(own_ids)])

@@ -100,6 +100,33 @@ class HarnessTests(unittest.TestCase):
         row.update(changes)
         return row
 
+    def test_inventory_and_image_inspect_never_request_env_or_health_log(self):
+        own=self.resource('container',Id='owned')
+        calls=[]
+        def run(args,**kwargs):
+            calls.append(args)
+            if 'inspect' in args:
+                self.assertIn('--format',args)
+                projection=args[args.index('--format')+1]
+                self.assertNotIn('.Env',projection)
+                self.assertNotIn('.Log',projection)
+                self.assertNotIn('.Options',projection)
+                return json.dumps(own).encode()
+            return b'owned\n'
+        with patch.object(h,'run',side_effect=run):
+            resources=h.inventory(self.record)
+            h.inspect_image('public-image')
+        self.assertEqual(3,len(resources))
+        self.assertEqual(4,len([args for args in calls if 'inspect' in args]))
+
+    def test_real_support_image_inspect_projection_excludes_environment(self):
+        if not __import__('shutil').which('docker'):self.skipTest('docker absent')
+        try:image=h.inspect_image('postgres:16-alpine')
+        except h.Refused:self.skipTest('local support image absent')
+        self.assertEqual({'Id','RepoTags','Config'},set(image))
+        self.assertEqual({'Labels'},set(image['Config']))
+        self.assertTrue(image['Id'].startswith('sha256:'))
+
     def test_name_alone_or_nonce_alone_does_not_authorize_cleanup(self):
         for kind in ('container', 'network', 'volume'):
             row = self.resource(kind)
