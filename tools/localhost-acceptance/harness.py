@@ -256,8 +256,8 @@ def port_free():
 
 
 def resource_gate(directory, phase):
-    require(phase in ('build', 'startup'), 'Unknown resource phase')
-    minimum = {'build': 12, 'startup': 8}[phase]
+    require(phase in ('build', 'startup', 'gateway-repair'), 'Unknown resource phase')
+    minimum = {'build': 12, 'startup': 8, 'gateway-repair': 8}[phase]
     require(shutil.disk_usage(directory).free >= minimum * GIB,
             f'At least {minimum} GiB free disk required for {phase}')
     info = json.loads(run(['docker', 'info', '--format', '{"NCPU":{{json .NCPU}},"MemTotal":{{json .MemTotal}}}'], timeout=30))
@@ -272,14 +272,15 @@ def resource_gate(directory, phase):
         units = {'B': 1, 'kB': 1000, 'KB': 1000, 'MB': 1000**2, 'GB': 1000**3,
                  'KiB': 1024, 'MiB': 1024**2, 'GiB': GIB, 'TiB': 1024**4}
         used += float(match[1]) * units[match[2]]
-    require(info['MemTotal'] - used >= 6 * GIB, 'At least 6 GiB available Docker memory required')
+    available_minimum = 768 * 1024**2 if phase == 'gateway-repair' else 6 * GIB
+    require(info['MemTotal'] - used >= available_minimum, 'Insufficient available Docker memory for phase')
     # Match the managed QA bound in app tools/qa/local-stack.py; VM capacity is checked separately.
     require(os.getloadavg()[1] <= 400, 'Host load5 exceeds the managed QA limit of 400')
 
 
 @contextlib.contextmanager
 def heavy(meta, record, phase):
-    require(phase in ('build', 'startup', 'cleanup'), 'Unknown resource phase')
+    require(phase in ('build', 'startup', 'gateway-repair', 'cleanup'), 'Unknown resource phase')
     lock = Path(meta).resolve() / '.locks/heavy-run'
     require((Path(meta) / 'bin/start-task').is_file(), 'Managed meta root required')
     lock.parent.mkdir(exist_ok=True)
@@ -428,7 +429,7 @@ def prepare(args):
     print(str(directory))
 
 
-def verify_files(directory, record):
+def verify_custody_files(directory, record):
     require(sha(private_path(directory / 'nginx.conf').read_bytes()) == record['nginxSha256'] and
             sha(git(ROOT, 'show', record['dockerSha'] + ':infra/nginx/nginx.conf')) == record['nginxSha256'],
             'Canonical nginx mismatch')
@@ -440,6 +441,11 @@ def verify_files(directory, record):
     require(sha(private_path(directory / 'compose.json').read_bytes()) == record['configSha256'], 'Compose changed')
     fixtures = json.loads(private_path(directory / 'runtime.json').read_bytes())
     model = json.loads((directory / 'compose.json').read_bytes())
+    return fixtures, model
+
+
+def verify_files(directory, record):
+    fixtures, model = verify_custody_files(directory, record)
     require(model == model_for(record, fixtures), 'Compose differs from owned inputs')
     return model
 
@@ -559,6 +565,97 @@ def verify_running(record, resources, model):
         require(row.get('Driver') == 'bridge', 'Foreign runtime network driver')
         own_ids = {r['Id'] for r in resources['container']}
         require(set(row.get('Containers', {})) <= own_ids, 'Foreign network member; preserved')
+
+
+def registry_repair_model(record, fixtures, model):
+    canonical = model_for(record, fixtures)
+    legacy = json.loads(json.dumps(canonical))
+    changed_services = []
+    for name, service in legacy['services'].items():
+        env = service.get('environment', {})
+        if 'SERVER_REGISTRY_JSON' in env:
+            rows = json.loads(env['SERVER_REGISTRY_JSON'])
+            require(len(rows) == 1 and rows[0]['id'] == record['serverId'], 'Unexpected registry membership')
+            rows[0]['deployProject'] = record['project']
+            env['SERVER_REGISTRY_JSON'] = json.dumps(rows, separators=(',', ':'))
+            changed_services.append(name)
+    require(set(changed_services) == {'gateway-api', 'web-gateway', 'web-game'}, 'Unexpected registry consumers')
+    require(model == legacy, 'Repair permits only the known registry deployment-coordinate defect')
+    return canonical
+
+
+def runtime_caps(model, resources):
+    total = 0
+    for row in resources['container']:
+        svc = row['Config']['Labels']['com.docker.compose.service']
+        limit = model['services'][svc]['mem_limit']
+        require(re.fullmatch(r'[1-9][0-9]*[mg]', limit), 'Unknown runtime memory limit')
+        expected = int(limit[:-1]) * {'m': 1024**2, 'g': GIB}[limit[-1]]
+        actual = int(run(['docker', 'inspect', '--format', '{{.HostConfig.Memory}}', row['Id']]))
+        require(actual == expected, 'Runtime memory cap differs')
+        total += actual
+    require(total == 6016 * 1024**2, 'Runtime memory budget differs')
+    return total
+
+
+def repair_registry(args):
+    directory, record = load(args.custody)
+    require(record['status'] == 'RUNNING', 'Registry repair requires the unpassed running stack')
+    proof = json.loads(private_path(directory / 'pre-repair-c56171e-verification.json').read_bytes())
+    require(proof.get('verifierHead') == 'c56171ee5d583672235fea8fece5b3ab2b38b217' and
+            proof.get('oldPublicContract') == record and proof.get('gatewaySeed') == {'count': 0, 'initialized': False},
+            'Original verifier receipt mismatch')
+    fixtures, model = verify_custody_files(directory, record)
+    canonical = registry_repair_model(record, fixtures, model)
+    verify_images(record)
+    require(not (directory / 'registry-repair.json').exists(), 'Registry repair already attempted; no automatic retry')
+    with heavy(args.meta, record, 'gateway-repair'):
+        resources = inventory(record)
+        verify_running(record, resources, model)
+        caps = runtime_caps(model, resources)
+        query = """BEGIN READ ONLY; SELECT json_build_object(
+            'count',(SELECT count(*) FROM game_server),
+            'initialized',(SELECT initialized FROM game_server_registry_seed_state WHERE id=1)); COMMIT;"""
+        require(json.loads(sql(directory, record, 'gateway-postgres', query)) == {'count': 0, 'initialized': False},
+                'Registry already initialized; no repair')
+        before = {name: sha(private_path(directory / name).read_bytes()) for name in ('runtime.json', 'fixture.json')}
+        old_compose = private_path(directory / 'compose.json').read_bytes()
+        old_record = private_path(directory / 'contract.json').read_bytes()
+        private_write(directory / 'registry-repair-original-compose.json', old_compose)
+        private_write(directory / 'registry-repair-original-contract.json', old_record)
+        audit = {'status': 'PREPARED', 'oldConfigSha256': record['configSha256'],
+                 'oldRegistrySha256': sha(model['services']['gateway-api']['environment']['SERVER_REGISTRY_JSON'].encode()),
+                 'newRegistrySha256': sha(canonical['services']['gateway-api']['environment']['SERVER_REGISTRY_JSON'].encode()),
+                 'unchangedPrivateFileHashes': before, 'runtimeCapsBytes': caps,
+                 'replacedServiceMemoryBytes': 768 * 1024**2, 'hostFreeBefore': shutil.disk_usage(directory).free,
+                 'originalContainers': {r['Config']['Labels']['com.docker.compose.service']: r['Id'] for r in resources['container']},
+                 'originalNetworks': [r['Id'] for r in resources['network']],
+                 'originalVolumes': [r['Name'] for r in resources['volume']]}
+        write_json(directory / 'registry-repair.json', audit)
+        write_json(directory / 'compose.json', canonical, replace=True)
+        record['configSha256'] = sha((directory / 'compose.json').read_bytes())
+        write_json(directory / 'contract.json', record, replace=True)
+        verify_files(directory, record)
+        require(all(sha(private_path(directory / name).read_bytes()) == digest for name, digest in before.items()),
+                'Private fixture changed; repair stopped')
+        audit.update(status='CONFIG_REPAIRED', newConfigSha256=record['configSha256'])
+        write_json(directory / 'registry-repair.json', audit, replace=True)
+        compose(directory, record, 'up', '-d', '--no-build', '--pull', 'never', '--no-deps',
+                '--wait', '--wait-timeout', '180', 'gateway-api', timeout=240,
+                log_path=directory / 'registry-repair-gateway-startup.log')
+        after = inventory(record)
+        verify_running(record, after, canonical)
+        runtime_caps(canonical, after)
+        require(all(r['Id'] == audit['originalContainers'][r['Config']['Labels']['com.docker.compose.service']]
+                    for r in after['container'] if r['Config']['Labels']['com.docker.compose.service'] != 'gateway-api') and
+                sorted(r['Id'] for r in after['network']) == sorted(audit['originalNetworks']) and
+                sorted(r['Name'] for r in after['volume']) == sorted(audit['originalVolumes']),
+                'A resource outside gateway replacement changed')
+        audit.update(status='GATEWAY_RECREATED', hostFreeAfter=shutil.disk_usage(directory).free)
+        write_json(directory / 'registry-repair.json', audit, replace=True)
+    smoke(args)
+    audit['status'] = 'SMOKE_PASSED'
+    write_json(directory / 'registry-repair.json', audit, replace=True)
 
 
 def startup_disk_check(directory, stage, initial_free=None):
@@ -721,10 +818,10 @@ def main():
     p.add_argument('--custody', required=True, type=Path)
     p.add_argument('--general-id', required=True)
     p.add_argument('--request-id')
-    for command in ('build', 'up', 'smoke', 'validate', 'down'):
+    for command in ('build', 'up', 'smoke', 'validate', 'down', 'repair-registry'):
         p = sub.add_parser(command)
         p.add_argument('--custody', required=True, type=Path)
-        if command in ('build', 'up', 'down'):
+        if command in ('build', 'up', 'down', 'repair-registry'):
             p.add_argument('--meta', required=True, type=Path)
     args = parser.parse_args()
     try:
@@ -734,7 +831,7 @@ def main():
             assert_owned(record, inventory(record))
             print('Owned source/config validated')
         else:
-            globals()[args.command](args)
+            globals()[args.command.replace('-', '_')](args)
     except (Refused, OSError, ValueError, KeyError) as e:
         # Never print child exceptions, config values, tokens or arbitrary untrusted filenames.
         print('REFUSED: ' + str(e) if isinstance(e, Refused) else 'REFUSED: invalid input or unavailable dependency; custody preserved')

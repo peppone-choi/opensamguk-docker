@@ -245,6 +245,60 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(['s'+sid+'-'+svc], self.model['services'][svc]['networks']['local']['aliases'])
         self.assertNotIn('qa160', json.dumps(self.model))
 
+    def test_registry_repair_accepts_only_exact_legacy_deployment_coordinate(self):
+        legacy=copy.deepcopy(self.model)
+        for service in legacy['services'].values():
+            env=service.get('environment',{})
+            if 'SERVER_REGISTRY_JSON' in env:
+                rows=json.loads(env['SERVER_REGISTRY_JSON']);rows[0]['deployProject']=self.record['project']
+                env['SERVER_REGISTRY_JSON']=json.dumps(rows,separators=(',',':'))
+        self.assertEqual(self.model,h.registry_repair_model(self.record,self.fixture,legacy))
+        for change in [lambda m:m['services']['gateway-api']['environment'].update(ADMIN_PASSWORD='changed'),
+                       lambda m:m['services']['game-engine'].update(image='foreign'),
+                       lambda m:m['services']['gateway-api']['environment'].update(SERVER_REGISTRY_JSON='[]')]:
+            bad=copy.deepcopy(legacy);change(bad)
+            with self.assertRaises(h.Refused):h.registry_repair_model(self.record,self.fixture,bad)
+        with self.assertRaises(h.Refused):h.registry_repair_model(self.record,self.fixture,self.model)
+
+    def test_registry_repair_recreates_only_gateway_and_preserves_other_resources(self):
+        resources=self.running_resources()
+        resources['network'][0]['Id']='owned-network'
+        self.record['status']='RUNNING'
+        legacy=copy.deepcopy(self.model)
+        for service in legacy['services'].values():
+            env=service.get('environment',{})
+            if 'SERVER_REGISTRY_JSON' in env:
+                rows=json.loads(env['SERVER_REGISTRY_JSON']);rows[0]['deployProject']=self.record['project']
+                env['SERVER_REGISTRY_JSON']=json.dumps(rows,separators=(',',':'))
+        h.write_json(self.directory/'compose.json',legacy)
+        self.record['configSha256']=h.sha((self.directory/'compose.json').read_bytes())
+        h.write_json(self.directory/'contract.json',self.record)
+        h.write_json(self.directory/'runtime.json',self.fixture)
+        h.write_json(self.directory/'fixture.json',{'private':'unchanged'})
+        h.write_json(self.directory/'pre-repair-c56171e-verification.json',{
+            'verifierHead':'c56171ee5d583672235fea8fece5b3ab2b38b217',
+            'oldPublicContract':copy.deepcopy(self.record),'gatewaySeed':{'count':0,'initialized':False}})
+        after=copy.deepcopy(resources)
+        for row in after['container']:
+            if row['Config']['Labels']['com.docker.compose.service']=='gateway-api':row['Id']='new-gateway'
+        args=type('Args',(),{'custody':self.directory,'meta':self.directory})()
+        with patch.object(h,'load',return_value=(self.directory,self.record)), \
+             patch.object(h,'verify_custody_files',return_value=(self.fixture,legacy)), \
+             patch.object(h,'verify_files',return_value=self.model),patch.object(h,'verify_images'), \
+             patch.object(h,'verify_running'),patch.object(h,'runtime_caps',return_value=6016*1024**2), \
+             patch.object(h,'heavy',return_value=__import__('contextlib').nullcontext()) as heavy, \
+             patch.object(h,'inventory',side_effect=[resources,after]), \
+             patch.object(h,'sql',return_value='{"count":0,"initialized":false}'), \
+             patch.object(h,'compose',return_value=b'') as compose,patch.object(h,'smoke') as smoke:
+            h.repair_registry(args)
+            heavy.assert_called_once_with(self.directory,self.record,'gateway-repair')
+            self.assertEqual(('up','-d','--no-build','--pull','never','--no-deps','--wait','--wait-timeout','180','gateway-api'),compose.call_args.args[2:])
+            smoke.assert_called_once_with(args)
+        self.assertEqual(self.model,json.loads((self.directory/'compose.json').read_text()))
+        self.assertEqual(legacy,json.loads((self.directory/'registry-repair-original-compose.json').read_text()))
+        self.assertEqual({'private':'unchanged'},json.loads((self.directory/'fixture.json').read_text()))
+        self.assertEqual('SMOKE_PASSED',json.loads((self.directory/'registry-repair.json').read_text())['status'])
+
     def test_remote_docker_host_and_context_refused_before_daemon_access(self):
         with patch.dict(os.environ,DOCKER_HOST='tcp://remote.example:2375',clear=True), \
              patch.object(h.subprocess,'run') as run:
@@ -289,6 +343,8 @@ class HarnessTests(unittest.TestCase):
         info=json.dumps({'NCPU':8,'MemTotal':8*h.GIB}).encode()
         for phase, gib, accepted, stats in [('build',11.9,False,b''), ('build',12,True,b''),
                 ('startup',7.9,False,b''), ('startup',8,True,b''),
+                ('gateway-repair',8,True,json.dumps({'MemUsage':'5GiB / 8GiB'}).encode()),
+                ('gateway-repair',8,False,json.dumps({'MemUsage':'7.5GiB / 8GiB'}).encode()),
                 ('startup',8,False,json.dumps({'MemUsage':'3GiB / 8GiB'}).encode())]:
             with self.subTest(phase=phase, gib=gib, stats=stats), \
                  patch.object(h.shutil,'disk_usage',return_value=type('Disk',(),{'free':gib*h.GIB})()), \
