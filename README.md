@@ -54,6 +54,20 @@ scripts/deploy.sh           # GCP 멀티서버 배포에서는 fail-fast (GitHub
   `web-gateway`를 항상 통과한다. direct `/api/admin/...`도 game-api bypass가 없는 `/api/` surface라
   `web-gateway`가 안전하게 404 처리할 수 있다. `sam_server` 쿠키를 가진
   `/game/_next/static`은 같은 게임 웹으로 프록시한다. 잘못된 path/cookie id는 404로 fail-closed 한다.
+- **전술 전투 WebSocket 준비 경로**: `/api/battle-ws/<public-id>/<world-id>/<battle-id>`만
+  해당 `s<public-id>-game-api:8081/ws/battles/...`로 Upgrade 프록시한다. `public-id`는
+  소문자 1–48자, `world-id`는 양의 십진수, `battle-id`는 제한된 영숫자·`_`·`-`다.
+  nginx는 deployer가 서버 레지스트리에서 생성한 명시 map에 있는 ID만 프록시한다. 생성물은
+  `infra/nginx/runtime/battle-ws-allowlist.map`이며 nginx에는 읽기 전용으로 마운트된다. 비어 있거나
+  없는 map은 전 서버의 WS 입장을 거절한다. 서버 생성·삭제·레지스트리 갱신 시 deployer는 후보 설정을
+  `nginx -t`로 검증한 뒤 nginx에 HUP을 보내며, 배포 workflow는 nginx 재생성 전에 같은 검증을 한다.
+  nginx는 장기 `Authorization`·`Proxy-Authorization`·`Cookie`를 지우고 이 경로의 access log를 끈다.
+  game-api가 별도로 서명된 JoinTicket의 서버 ID·세계·현재 참가 권한과 Origin을 검증한다.
+  나머지 `/api/`는 기존대로 `web-gateway`를 지난다. 이 설정의 main 반영은 nginx 자동 재생성을
+  유발하므로 운영 승인 전에는 draft PR로 유지한다.
+  game-api의 입장 기능은 서버별 env의 `BATTLE_JOIN_TICKET_ENABLED=false`가 기본이며, 실제 활성화에는
+  별도 `BATTLE_JOIN_TICKET_KEY_BASE64`와 `BATTLE_WS_ALLOWED_ORIGINS`가 필요하다. 세 값은 서버별
+  compose에서 game-api로만 전달한다. 키는 어드민 env PATCH 허용 목록에 넣지 않는다.
 - **게시판 진입**: `/api/board/...`는 `web-gateway`의 httpOnly 쿠키→Bearer 프록시를 거쳐 `board-api`로 간다.
   `board-api`는 토큰을 발급하지 않고 gateway-api가 발급한 RS256 토큰을 `JWT_PUBLIC_KEY`(공개키)로만 검증한다.
 
