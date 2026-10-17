@@ -121,8 +121,10 @@ class HarnessTests(unittest.TestCase):
 
     def test_real_support_image_inspect_projection_excludes_environment(self):
         if not __import__('shutil').which('docker'):self.skipTest('docker absent')
-        try:image=h.inspect_image('postgres:16-alpine')
-        except h.Refused:self.skipTest('local support image absent')
+        try:exists=h.run(['docker','image','ls','-q','--filter','reference=postgres:16-alpine'])
+        except h.Refused:self.skipTest('local Docker daemon unavailable')
+        if not exists.strip():self.skipTest('local support image absent')
+        image=h.inspect_image('postgres:16-alpine')
         self.assertEqual({'Id','RepoTags','Config'},set(image))
         self.assertEqual({'Labels'},set(image['Config']))
         self.assertTrue(image['Id'].startswith('sha256:'))

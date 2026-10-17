@@ -30,15 +30,15 @@ SUPPORT_IMAGES = ('postgres:16-alpine', 'redis:7-alpine', 'nginx:1.30.5-alpine')
 GIB = 1024 ** 3
 ORIGIN = 'https://localhost'
 # Inspect projections exclude Env, command arguments, health logs and volume driver options.
-IMAGE_FORMAT = '{"Id":{{json .Id}},"RepoTags":{{json .RepoTags}},"Config":{"Labels":{{json .Config.Labels}}}}'
+IMAGE_FORMAT = '{"Id":{{json .Id}},"RepoTags":{{json .RepoTags}},"Config":{"Labels":{{json (index .Config "Labels")}}}}'
 CONTAINER_FORMAT = ('{"Id":{{json .Id}},"Name":{{json .Name}},"Image":{{json .Image}},'
-    '"Config":{"Labels":{{json .Config.Labels}}},"State":{"Running":{{json .State.Running}},'
-    '"Health":{"Status":{{if .State.Health}}{{json .State.Health.Status}}{{else}}null{{end}}}},'
+    '"Config":{"Labels":{{json (index .Config "Labels")}}},"State":{"Running":{{json .State.Running}},'
+    '"Health":{"Status":{{with index .State "Health"}}{{json .Status}}{{else}}null{{end}}}},'
     '"HostConfig":{"PortBindings":{{json .HostConfig.PortBindings}}},"Mounts":{{json .Mounts}},'
     '"NetworkSettings":{"Networks":{{json .NetworkSettings.Networks}}}}')
-NETWORK_FORMAT = ('{"Id":{{json .Id}},"Name":{{json .Name}},"Labels":{{json .Labels}},'
-                  '"Driver":{{json .Driver}},"Containers":{{json .Containers}}}')
-VOLUME_FORMAT = '{"Name":{{json .Name}},"Labels":{{json .Labels}}}'
+NETWORK_FORMAT = ('{"Id":{{json .Id}},"Name":{{json .Name}},"Labels":{{json (index . "Labels")}},'
+                  '"Driver":{{json .Driver}},"Containers":{{with index . "Containers"}}{{json .}}{{else}}{}{{end}}}')
+VOLUME_FORMAT = '{"Name":{{json .Name}},"Labels":{{json (index . "Labels")}}}'
 
 
 class Refused(RuntimeError):
