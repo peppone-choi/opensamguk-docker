@@ -1,0 +1,654 @@
+{
+  "name": "@PROJECT@",
+  "services": {
+    "gateway-postgres": {
+      "image": "postgres:16-alpine",
+      "environment": {
+        "POSTGRES_DB": "gateway",
+        "POSTGRES_USER": "lha",
+        "POSTGRES_PASSWORD": "@DB_PASSWORD@"
+      },
+      "volumes": [
+        {
+          "type": "volume",
+          "source": "gateway-pgdata",
+          "target": "/var/lib/postgresql/data"
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "pg_isready",
+          "-U",
+          "lha",
+          "-d",
+          "gateway"
+        ],
+        "interval": "5s",
+        "timeout": "3s",
+        "retries": 30
+      },
+      "mem_limit": "384m",
+      "labels": {
+        "org.opensamguk.local.nonce": "@NONCE@",
+        "org.opensamguk.local.session": "@SESSION@"
+      },
+      "networks": {
+        "local": {}
+      },
+      "restart": "no",
+      "logging": {
+        "driver": "local",
+        "options": {
+          "max-size": "10m",
+          "max-file": "2"
+        }
+      }
+    },
+    "gateway-redis": {
+      "image": "redis:7-alpine",
+      "command": [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--maxmemory",
+        "64mb",
+        "--maxmemory-policy",
+        "allkeys-lru"
+      ],
+      "volumes": [
+        {
+          "type": "volume",
+          "source": "gateway-redisdata",
+          "target": "/data"
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "redis-cli",
+          "ping"
+        ],
+        "interval": "5s",
+        "timeout": "3s",
+        "retries": 30
+      },
+      "mem_limit": "128m",
+      "labels": {
+        "org.opensamguk.local.nonce": "@NONCE@",
+        "org.opensamguk.local.session": "@SESSION@"
+      },
+      "networks": {
+        "local": {}
+      },
+      "restart": "no",
+      "logging": {
+        "driver": "local",
+        "options": {
+          "max-size": "10m",
+          "max-file": "2"
+        }
+      }
+    },
+    "game-postgres": {
+      "image": "postgres:16-alpine",
+      "environment": {
+        "POSTGRES_DB": "game",
+        "POSTGRES_USER": "lha",
+        "POSTGRES_PASSWORD": "@DB_PASSWORD@"
+      },
+      "volumes": [
+        {
+          "type": "volume",
+          "source": "game-pgdata",
+          "target": "/var/lib/postgresql/data"
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "pg_isready",
+          "-U",
+          "lha",
+          "-d",
+          "game"
+        ],
+        "interval": "5s",
+        "timeout": "3s",
+        "retries": 30
+      },
+      "mem_limit": "384m",
+      "labels": {
+        "org.opensamguk.local.nonce": "@NONCE@",
+        "org.opensamguk.local.session": "@SESSION@"
+      },
+      "networks": {
+        "local": {}
+      },
+      "restart": "no",
+      "logging": {
+        "driver": "local",
+        "options": {
+          "max-size": "10m",
+          "max-file": "2"
+        }
+      }
+    },
+    "game-redis": {
+      "image": "redis:7-alpine",
+      "command": [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--maxmemory",
+        "64mb",
+        "--maxmemory-policy",
+        "allkeys-lru"
+      ],
+      "volumes": [
+        {
+          "type": "volume",
+          "source": "game-redisdata",
+          "target": "/data"
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "redis-cli",
+          "ping"
+        ],
+        "interval": "5s",
+        "timeout": "3s",
+        "retries": 30
+      },
+      "mem_limit": "128m",
+      "labels": {
+        "org.opensamguk.local.nonce": "@NONCE@",
+        "org.opensamguk.local.session": "@SESSION@"
+      },
+      "networks": {
+        "local": {}
+      },
+      "restart": "no",
+      "logging": {
+        "driver": "local",
+        "options": {
+          "max-size": "10m",
+          "max-file": "2"
+        }
+      }
+    },
+    "gateway-api": {
+      "image": "@IMAGE_gateway-api@",
+      "environment": {
+        "GAME_DATABASE_URL": "jdbc:postgresql://gateway-postgres:5432/gateway",
+        "GAME_DB_USER": "lha",
+        "GAME_DB_PASSWORD": "@DB_PASSWORD@",
+        "REDIS_HOST": "gateway-redis",
+        "REDIS_PORT": "6379",
+        "JAVA_OPTS": "-XX:+UseG1GC -XX:MaxRAMPercentage=65 -XX:InitialRAMPercentage=15",
+        "SENTRY_DSN": "",
+        "TZ": "Asia/Seoul",
+        "JWT_PUBLIC_KEY": "@JWT_PUBLIC_KEY@",
+        "GATEWAY_API_URL": "http://gateway-api:8080",
+        "INTERNAL_SERVICE_TOKEN": "@INTERNAL_TOKEN@",
+        "JWT_PRIVATE_KEY": "@JWT_PRIVATE_KEY@",
+        "JWT_SIGNING_MODE": "RS256",
+        "ADMIN_USERNAME": "@ADMIN_USERNAME@",
+        "ADMIN_PASSWORD": "@ADMIN_PASSWORD@",
+        "SERVER_REGISTRY_JSON": "@REGISTRY@",
+        "DEPLOYER_URL": "http://127.0.0.1:9",
+        "DEPLOYER_TOKEN": "@DEPLOYER_TOKEN@",
+        "PROFILE_ICON_STORAGE_ROOT": "/var/lib/opensamguk/profile-icons"
+      },
+      "depends_on": {
+        "gateway-postgres": {
+          "condition": "service_healthy"
+        },
+        "gateway-redis": {
+          "condition": "service_healthy"
+        }
+      },
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "curl",
+          "-fsS",
+          "http://localhost:8080/actuator/health/readiness"
+        ],
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 40,
+        "start_period": "90s"
+      },
+      "mem_limit": "768m",
+      "volumes": [
+        {
+          "type": "volume",
+          "source": "profile-icons",
+          "target": "/var/lib/opensamguk/profile-icons"
+        }
+      ],
+      "labels": {
+        "org.opensamguk.local.nonce": "@NONCE@",
+        "org.opensamguk.local.session": "@SESSION@"
+      },
+      "networks": {
+        "local": {}
+      },
+      "restart": "no",
+      "logging": {
+        "driver": "local",
+        "options": {
+          "max-size": "10m",
+          "max-file": "2"
+        }
+      }
+    },
+    "board-api": {
+      "image": "@IMAGE_board-api@",
+      "environment": {
+        "GAME_DATABASE_URL": "jdbc:postgresql://gateway-postgres:5432/gateway",
+        "GAME_DB_USER": "lha",
+        "GAME_DB_PASSWORD": "@DB_PASSWORD@",
+        "REDIS_HOST": "gateway-redis",
+        "REDIS_PORT": "6379",
+        "JAVA_OPTS": "-XX:+UseG1GC -XX:MaxRAMPercentage=65 -XX:InitialRAMPercentage=15",
+        "SENTRY_DSN": "",
+        "TZ": "Asia/Seoul",
+        "JWT_PUBLIC_KEY": "@JWT_PUBLIC_KEY@"
+      },
+      "depends_on": {
+        "gateway-postgres": {
+          "condition": "service_healthy"
+        },
+        "gateway-redis": {
+          "condition": "service_healthy"
+        },
+        "gateway-api": {
+          "condition": "service_healthy"
+        }
+      },
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "curl",
+          "-fsS",
+          "http://localhost:8083/actuator/health/readiness"
+        ],
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 40,
+        "start_period": "90s"
+      },
+      "mem_limit": "512m",
+      "labels": {
+        "org.opensamguk.local.nonce": "@NONCE@",
+        "org.opensamguk.local.session": "@SESSION@"
+      },
+      "networks": {
+        "local": {}
+      },
+      "restart": "no",
+      "logging": {
+        "driver": "local",
+        "options": {
+          "max-size": "10m",
+          "max-file": "2"
+        }
+      }
+    },
+    "game-engine": {
+      "image": "@IMAGE_game-engine@",
+      "environment": {
+        "GAME_DATABASE_URL": "jdbc:postgresql://game-postgres:5432/game",
+        "GAME_DB_USER": "lha",
+        "GAME_DB_PASSWORD": "@DB_PASSWORD@",
+        "REDIS_HOST": "game-redis",
+        "REDIS_PORT": "6379",
+        "JAVA_OPTS": "-XX:+UseG1GC -XX:MaxRAMPercentage=65 -XX:InitialRAMPercentage=15",
+        "SENTRY_DSN": "",
+        "TZ": "Asia/Seoul",
+        "OPENSAMGUK_WORLD_ID": "160",
+        "SERVER_ID": "@SERVER_ID@",
+        "SERVER_GENERATION": "0",
+        "TURN_PROFILE_NAME": "pep:scenario_3190",
+        "SCENARIO_SEED_ENABLED": "true",
+        "SCENARIO_CODE": "scenario_3190",
+        "RESET_TURNTERM": "2",
+        "RESET_MAXGENERAL": "50",
+        "RESET_BLOCK_GENERAL_CREATE": "0",
+        "RESET_FIRST_TURN": "immediate"
+      },
+      "depends_on": {
+        "game-postgres": {
+          "condition": "service_healthy"
+        },
+        "game-redis": {
+          "condition": "service_healthy"
+        }
+      },
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "curl",
+          "-fsS",
+          "http://localhost:8082/actuator/health/readiness"
+        ],
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 40,
+        "start_period": "90s"
+      },
+      "mem_limit": "2g",
+      "labels": {
+        "org.opensamguk.local.nonce": "@NONCE@",
+        "org.opensamguk.local.session": "@SESSION@"
+      },
+      "networks": {
+        "local": {
+          "aliases": [
+            "s@SERVER_ID@-game-engine"
+          ]
+        }
+      },
+      "restart": "no",
+      "logging": {
+        "driver": "local",
+        "options": {
+          "max-size": "10m",
+          "max-file": "2"
+        }
+      }
+    },
+    "game-api": {
+      "image": "@IMAGE_game-api@",
+      "environment": {
+        "GAME_DATABASE_URL": "jdbc:postgresql://game-postgres:5432/game",
+        "GAME_DB_USER": "lha",
+        "GAME_DB_PASSWORD": "@DB_PASSWORD@",
+        "REDIS_HOST": "game-redis",
+        "REDIS_PORT": "6379",
+        "JAVA_OPTS": "-XX:+UseG1GC -XX:MaxRAMPercentage=65 -XX:InitialRAMPercentage=15",
+        "SENTRY_DSN": "",
+        "TZ": "Asia/Seoul",
+        "JWT_PUBLIC_KEY": "@JWT_PUBLIC_KEY@",
+        "GATEWAY_API_URL": "http://gateway-api:8080",
+        "INTERNAL_SERVICE_TOKEN": "@INTERNAL_TOKEN@",
+        "OPENSAMGUK_WORLD_ID": "160",
+        "SERVER_ID": "@SERVER_ID@",
+        "SERVER_GENERATION": "0",
+        "OPENSAMGUK_PROFILE": "pep:scenario_3190",
+        "SERVER_NAME": "Local acceptance"
+      },
+      "depends_on": {
+        "game-postgres": {
+          "condition": "service_healthy"
+        },
+        "game-redis": {
+          "condition": "service_healthy"
+        },
+        "game-engine": {
+          "condition": "service_healthy"
+        }
+      },
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "curl",
+          "-fsS",
+          "http://localhost:8081/actuator/health/readiness"
+        ],
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 40,
+        "start_period": "90s"
+      },
+      "mem_limit": "1g",
+      "labels": {
+        "org.opensamguk.local.nonce": "@NONCE@",
+        "org.opensamguk.local.session": "@SESSION@"
+      },
+      "networks": {
+        "local": {
+          "aliases": [
+            "s@SERVER_ID@-game-api"
+          ]
+        }
+      },
+      "restart": "no",
+      "logging": {
+        "driver": "local",
+        "options": {
+          "max-size": "10m",
+          "max-file": "2"
+        }
+      }
+    },
+    "web-gateway": {
+      "image": "@IMAGE_web-gateway@",
+      "environment": {
+        "NODE_ENV": "production",
+        "PORT": "3000",
+        "SERVER_ID": "@SERVER_ID@",
+        "GATEWAY_API_URL": "http://gateway-api:8080",
+        "GATEWAY_WEB_URL": "http://web-gateway:3000",
+        "BOARD_API_URL": "http://board-api:8083",
+        "GAME_API_URL": "http://game-api:8081",
+        "SERVER_REGISTRY_JSON": "@REGISTRY@",
+        "COOKIE_SECURE": "true",
+        "SENTRY_DSN": "",
+        "NEXT_TELEMETRY_DISABLED": "1"
+      },
+      "mem_limit": "256m",
+      "depends_on": {
+        "gateway-api": {
+          "condition": "service_healthy"
+        }
+      },
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
+        ],
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 30
+      },
+      "labels": {
+        "org.opensamguk.local.nonce": "@NONCE@",
+        "org.opensamguk.local.session": "@SESSION@"
+      },
+      "networks": {
+        "local": {}
+      },
+      "restart": "no",
+      "logging": {
+        "driver": "local",
+        "options": {
+          "max-size": "10m",
+          "max-file": "2"
+        }
+      }
+    },
+    "web-game": {
+      "image": "@IMAGE_web-game@",
+      "environment": {
+        "NODE_ENV": "production",
+        "PORT": "3001",
+        "SERVER_ID": "@SERVER_ID@",
+        "GATEWAY_API_URL": "http://gateway-api:8080",
+        "GATEWAY_WEB_URL": "http://web-gateway:3000",
+        "BOARD_API_URL": "http://board-api:8083",
+        "GAME_API_URL": "http://game-api:8081",
+        "SERVER_REGISTRY_JSON": "@REGISTRY@",
+        "COOKIE_SECURE": "true",
+        "SENTRY_DSN": "",
+        "NEXT_TELEMETRY_DISABLED": "1"
+      },
+      "mem_limit": "256m",
+      "depends_on": {
+        "gateway-api": {
+          "condition": "service_healthy"
+        },
+        "game-api": {
+          "condition": "service_healthy"
+        }
+      },
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3001/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
+        ],
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 30
+      },
+      "labels": {
+        "org.opensamguk.local.nonce": "@NONCE@",
+        "org.opensamguk.local.session": "@SESSION@"
+      },
+      "networks": {
+        "local": {
+          "aliases": [
+            "s@SERVER_ID@-web-game"
+          ]
+        }
+      },
+      "restart": "no",
+      "logging": {
+        "driver": "local",
+        "options": {
+          "max-size": "10m",
+          "max-file": "2"
+        }
+      }
+    },
+    "nginx": {
+      "image": "nginx:1.30.5-alpine",
+      "mem_limit": "128m",
+      "ports": [
+        {
+          "target": 443,
+          "published": "443",
+          "host_ip": "127.0.0.1",
+          "protocol": "tcp"
+        }
+      ],
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "@CUSTODY@/nginx.conf",
+          "target": "/etc/nginx/nginx.conf",
+          "read_only": true
+        },
+        {
+          "type": "bind",
+          "source": "@CUSTODY@/certs",
+          "target": "/etc/nginx/certs",
+          "read_only": true
+        },
+        {
+          "type": "bind",
+          "source": "@CUSTODY@/battle-ws",
+          "target": "/etc/nginx/battle-ws",
+          "read_only": true
+        },
+        {
+          "type": "volume",
+          "source": "profile-icons",
+          "target": "/var/lib/opensamguk/profile-icons",
+          "read_only": true
+        }
+      ],
+      "depends_on": {
+        "web-gateway": {
+          "condition": "service_healthy"
+        },
+        "web-game": {
+          "condition": "service_healthy"
+        }
+      },
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "wget",
+          "-q",
+          "--no-check-certificate",
+          "-O",
+          "/dev/null",
+          "https://127.0.0.1/health"
+        ],
+        "interval": "5s",
+        "timeout": "3s",
+        "retries": 30
+      },
+      "labels": {
+        "org.opensamguk.local.nonce": "@NONCE@",
+        "org.opensamguk.local.session": "@SESSION@"
+      },
+      "networks": {
+        "local": {}
+      },
+      "restart": "no",
+      "logging": {
+        "driver": "local",
+        "options": {
+          "max-size": "10m",
+          "max-file": "2"
+        }
+      }
+    }
+  },
+  "networks": {
+    "local": {
+      "name": "@PROJECT@_local",
+      "labels": {
+        "org.opensamguk.local.nonce": "@NONCE@",
+        "org.opensamguk.local.session": "@SESSION@"
+      }
+    }
+  },
+  "volumes": {
+    "gateway-pgdata": {
+      "name": "@PROJECT@_gateway-pgdata",
+      "labels": {
+        "org.opensamguk.local.nonce": "@NONCE@",
+        "org.opensamguk.local.session": "@SESSION@"
+      }
+    },
+    "game-pgdata": {
+      "name": "@PROJECT@_game-pgdata",
+      "labels": {
+        "org.opensamguk.local.nonce": "@NONCE@",
+        "org.opensamguk.local.session": "@SESSION@"
+      }
+    },
+    "gateway-redisdata": {
+      "name": "@PROJECT@_gateway-redisdata",
+      "labels": {
+        "org.opensamguk.local.nonce": "@NONCE@",
+        "org.opensamguk.local.session": "@SESSION@"
+      }
+    },
+    "game-redisdata": {
+      "name": "@PROJECT@_game-redisdata",
+      "labels": {
+        "org.opensamguk.local.nonce": "@NONCE@",
+        "org.opensamguk.local.session": "@SESSION@"
+      }
+    },
+    "profile-icons": {
+      "name": "@PROJECT@_profile-icons",
+      "labels": {
+        "org.opensamguk.local.nonce": "@NONCE@",
+        "org.opensamguk.local.session": "@SESSION@"
+      }
+    }
+  }
+}
