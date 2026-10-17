@@ -1049,6 +1049,7 @@ type lifecycleJournal struct {
 	Project        string                 `json:"project"`
 	ResetTarget    *resetLifecycleTarget  `json:"resetTarget,omitempty"`
 	ResetExecution *resetExecutionJournal `json:"resetExecution,omitempty"`
+	WebGameTarget *webGameDeployTarget  `json:"webGameTarget,omitempty"`
 }
 
 type resetLifecycleTarget struct {
@@ -1069,11 +1070,11 @@ const (
 )
 
 func (c config) writeLifecycleJournal(operation string, target serverTarget) error {
-	return c.writeLifecycleJournalWithResetTarget(operation, target, nil, "", "")
+	return c.writeLifecycleJournalWithResetTarget(operation, target, nil, "", "", nil)
 }
 
 func (c config) writeLinkedLifecycleJournal(operation string, target serverTarget, operationID string, kind lifecycleKind) error {
-	return c.writeLifecycleJournalWithResetTarget(operation, target, nil, operationID, kind)
+	return c.writeLifecycleJournalWithResetTarget(operation, target, nil, operationID, kind, nil)
 }
 
 func (c config) writeResetLifecycleJournal(target serverTarget, resetTarget resetLifecycleTarget) error {
@@ -1085,10 +1086,10 @@ func (c config) writeLinkedResetLifecycleJournal(target serverTarget, resetTarge
 	if err != nil {
 		return err
 	}
-	return c.writeLifecycleJournalWithResetTarget("reset", target, &normalized, operationID, kind)
+	return c.writeLifecycleJournalWithResetTarget("reset", target, &normalized, operationID, kind, nil)
 }
 
-func (c config) writeLifecycleJournalWithResetTarget(operation string, target serverTarget, resetTarget *resetLifecycleTarget, operationID string, kind lifecycleKind) error {
+func (c config) writeLifecycleJournalWithResetTarget(operation string, target serverTarget, resetTarget *resetLifecycleTarget, operationID string, kind lifecycleKind, webTarget *webGameDeployTarget) error {
 	if c.lifecycleJournalFile == "" {
 		return errors.New("lifecycle journal path is unavailable")
 	}
@@ -1100,6 +1101,9 @@ func (c config) writeLifecycleJournalWithResetTarget(operation string, target se
 	}
 	if operation != "reset" && resetTarget != nil {
 		return errors.New("only reset journals can carry a reset target")
+	}
+	if err := validateJournalWebGameTarget(operation, webTarget); err != nil {
+		return err
 	}
 	if err := validateLifecycleJournalOperationLink(operation, operationID, kind); err != nil {
 		return err
@@ -1113,6 +1117,7 @@ func (c config) writeLifecycleJournalWithResetTarget(operation string, target se
 		ServerID:      target.ID,
 		Project:       target.Project,
 		ResetTarget:   resetTarget,
+		WebGameTarget: webTarget,
 	}); err != nil {
 		return err
 	}
@@ -1145,7 +1150,7 @@ func (c config) advanceLifecycleJournal(stage string) error {
 
 func isLifecycleJournalOperation(operation string) bool {
 	switch operation {
-	case "create", "delete", "deploy", "patch", "reset":
+	case "create", "delete", "deploy", "deploy-web", "patch", "reset":
 		return true
 	default:
 		return false
@@ -1223,6 +1228,9 @@ func (c config) readLifecycleJournal() (lifecycleJournal, bool, error) {
 	}
 	if journal.Version != lifecycleJournalVersion || !isLifecycleJournalOperation(journal.Operation) || !isLifecycleJournalStage(journal.Stage) {
 		return lifecycleJournal{}, false, errors.New("lifecycle journal is invalid")
+	}
+	if err := validateJournalWebGameTarget(journal.Operation, journal.WebGameTarget); err != nil {
+		return lifecycleJournal{}, false, err
 	}
 	if err := validateLifecycleJournalOperationLink(journal.Operation, journal.OperationID, journal.OperationKind); err != nil {
 		return lifecycleJournal{}, false, err
@@ -1451,6 +1459,10 @@ func (c config) repairLifecycleJournal() (repairErr error) {
 			return err
 		}
 		if _, err := c.reloadSharedRegistry(lease.Context()); err != nil {
+			return err
+		}
+	case "deploy-web":
+		if err := c.repairWebGameDeploy(lease.Context(), target, journal); err != nil {
 			return err
 		}
 	case "deploy":
@@ -2742,6 +2754,7 @@ func main() {
 	mux.HandleFunc("/readyz", cfg.handleReady)
 	mux.HandleFunc("/status", cfg.withAuth(cfg.handleStatus))
 	mux.HandleFunc("/deploy", cfg.withAuth(cfg.handleDeploy))
+	mux.HandleFunc("/deploy/web-game", cfg.webGameDeployHTTPHandler())
 	mux.HandleFunc("/servers", cfg.withAuth(cfg.handleServers))
 	mux.HandleFunc("/servers/create", cfg.withAuth(cfg.handleServerCreate))
 	mux.HandleFunc("/servers/close", cfg.withAuth(cfg.handleServerClose))
@@ -2866,7 +2879,7 @@ func isAuthenticatedHTTPRouteAllowed(method, requestPath string) bool {
 		return strings.HasPrefix(requestPath, "/jobs/") && lifecycleJobIDRe.MatchString(strings.TrimPrefix(requestPath, "/jobs/"))
 	case http.MethodPost:
 		switch requestPath {
-		case "/maintenance/enter", "/maintenance/enter-if-idle", "/maintenance/leave", "/maintenance/repair", "/servers/create":
+		case "/maintenance/enter", "/maintenance/enter-if-idle", "/maintenance/leave", "/maintenance/repair", "/servers/create", "/deploy/web-game":
 			return true
 		}
 		if !strings.HasPrefix(requestPath, "/jobs/") {

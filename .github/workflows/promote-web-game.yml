@@ -1,0 +1,89 @@
+name: Promote Web Game Only
+
+on:
+  workflow_dispatch:
+    inputs:
+      server:
+        description: Public server id explicitly approved for this promotion
+        required: true
+        default: pep
+        type: string
+      source_sha:
+        description: Approved merged 40-character source SHA including both frontend PRs
+        required: true
+        type: string
+      image_digest:
+        description: Approved web-game image digest (sha256 plus 64 lowercase hex characters)
+        required: true
+        type: string
+      expected_web_game_tag:
+        description: Expected current effective WEB_GAME_TAG (or IMAGE_TAG fallback)
+        required: true
+        type: string
+      expected_world_id:
+        description: Approved process world id (configuration precondition, not a DB query)
+        required: true
+        type: string
+      expected_generation:
+        description: Approved registered server generation
+        required: true
+        type: string
+
+concurrency:
+  group: promote-web-game
+  cancel-in-progress: false
+
+jobs:
+  promote-web:
+    runs-on: [self-hosted, Linux, X64, gcp-prod]
+    timeout-minutes: 35
+    steps:
+      # No checkout, git sync, build, scenario generation or shared-stack refresh.
+      # Requires the separately reviewed/approved control release exposing this NEW route.
+      - name: Promote exactly the approved web image
+        shell: bash
+        env:
+          APPROVED_SERVER: ${{ inputs.server }}
+          APPROVED_SOURCE_SHA: ${{ inputs.source_sha }}
+          APPROVED_IMAGE_DIGEST: ${{ inputs.image_digest }}
+          EXPECTED_WEB_GAME_TAG: ${{ inputs.expected_web_game_tag }}
+          EXPECTED_WORLD_ID: ${{ inputs.expected_world_id }}
+          EXPECTED_GENERATION: ${{ inputs.expected_generation }}
+        run: |
+          set -euo pipefail
+          payload="$(python3 - <<'PY'
+          import json,os,re
+          server=os.environ['APPROVED_SERVER']
+          sha=os.environ['APPROVED_SOURCE_SHA']
+          digest=os.environ['APPROVED_IMAGE_DIGEST']
+          expected=os.environ['EXPECTED_WEB_GAME_TAG']
+          world=os.environ['EXPECTED_WORLD_ID']
+          generation=os.environ['EXPECTED_GENERATION']
+          if not re.fullmatch(r'[a-z0-9]{1,48}',server): raise SystemExit('invalid server')
+          if not re.fullmatch(r'[0-9a-f]{40}',sha): raise SystemExit('invalid source SHA')
+          if not re.fullmatch(r'sha256:[0-9a-f]{64}',digest): raise SystemExit('invalid image digest')
+          if not re.fullmatch(r'(?:[A-Za-z0-9._-]+|[0-9a-f]{40}@sha256:[0-9a-f]{64})',expected): raise SystemExit('invalid expected web pin')
+          if not re.fullmatch(r'[1-9][0-9]{0,9}',world) or int(world)>2147483647: raise SystemExit('invalid world')
+          if not re.fullmatch(r'[1-9][0-9]{0,9}',generation) or int(generation)>2147483647: raise SystemExit('invalid generation')
+          print(json.dumps({'project':'opensamguk-s'+server,'tag':sha,'digest':digest,'expectedWebGameTag':expected,'expectedWorldId':int(world),'expectedGeneration':int(generation)}))
+          PY
+          )"
+          exec 9>/tmp/opensamguk-production.lock
+          if ! flock -w 1800 9; then
+            echo 'Production lock unavailable; no promotion request sent' >&2
+            exit 1
+          fi
+          # Token is read inside the existing deployer CLI, never expanded into host args.
+          # Older CLI/route rejects /deploy/web-game; never fall back to /deploy.
+          response="$(printf '%s' "$payload" | timeout 930s sudo -n docker exec -i opensamguk-deployer \
+            /usr/local/bin/deployer --authenticated-http POST /deploy/web-game 900)"
+          RESPONSE_JSON="$response" python3 - <<'PY'
+          import json,os
+          value=json.loads(os.environ['RESPONSE_JSON'])
+          assert value.get('ok') is True
+          assert value.get('service')=='web-game'
+          assert value.get('project')=='opensamguk-s'+os.environ['APPROVED_SERVER']
+          assert value.get('tag')==os.environ['APPROVED_SOURCE_SHA']
+          assert value.get('digest')==os.environ['APPROVED_IMAGE_DIGEST']
+          print('Approved web image pin verified; frontend behavior verification still required')
+          PY
