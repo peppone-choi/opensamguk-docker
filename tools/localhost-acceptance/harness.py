@@ -634,6 +634,8 @@ def snapshot(args):
             FROM general_turn WHERE world_id=160 AND general_id={gid} AND request_id='{request_id}') r),
           'logCount', (SELECT count(*) FROM log_entry WHERE world_id=160 AND general_id={gid}
               AND meta->'refs'->>'requestId'='{request_id}'),
+          'appliedCount', (SELECT count(*) FROM command_result WHERE world_id=160
+              AND request_id='{request_id}' AND terminal_status='APPLIED' AND ok=true),
           'terminal', (SELECT row_to_json(t) FROM (
             SELECT terminal_status AS status, ok, committed_world_version AS version FROM command_result
             WHERE world_id=160 AND request_id='{request_id}' ORDER BY result_seq DESC LIMIT 1) t)"""
@@ -643,7 +645,8 @@ def snapshot(args):
         'turnTime',g.turn_time,'personal',json_build_object('requestId',g.meta->'personalLastTurn'->>'requestId',
           'inputId',g.meta->'personalLastTurn'->>'inputId'),
         'world',(SELECT json_build_object('year',current_year,'month',current_month,'phase',current_phase,
-          'lastTurnTime',meta->>'lastTurnTime','tickSeconds',tick_seconds) FROM world_state WHERE id=160)
+          'lastTurnTime',meta->>'lastTurnTime','tickSeconds',tick_seconds,
+          'worldVersion',world_version,'writerEpoch',writer_epoch) FROM world_state WHERE id=160)
         {extra}) FROM general g WHERE g.world_id=160 AND g.id={gid};
       COMMIT;"""
     raw = sql(directory, record, 'game-postgres', query)

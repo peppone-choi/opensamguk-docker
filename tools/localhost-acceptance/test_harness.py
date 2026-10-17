@@ -382,7 +382,8 @@ class HarnessTests(unittest.TestCase):
         self.record['configSha256'] = h.sha((self.directory / 'compose.json').read_bytes())
         result = {'generalId': 123, 'cityId': 1, 'userId': 2, 'nationId': 0, 'npcState': 0,
                   'experience': 5, 'dedication': 5, 'turnTime': '2026-10-17T01:00:00Z',
-                  'world': {'tickSeconds': 120}, 'personal': None}
+                  'world': {'tickSeconds': 120, 'worldVersion': 42, 'writerEpoch': 0},
+                  'appliedCount': 2, 'personal': None}
         args = type('Args', (), {'general_id':'123', 'request_id':'12345678-1234-1234-1234-123456789abc',
                                 'custody':self.directory})()
         with patch.object(h, 'load', return_value=(self.directory,self.record)), \
@@ -392,11 +393,31 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(result, json.loads(out.getvalue()))
             query = sql.call_args.args[-1]
             self.assertIn('BEGIN READ ONLY', query)
+            self.assertIn("'worldVersion',world_version,'writerEpoch',writer_epoch", query)
+            self.assertIn("'appliedCount', (SELECT count(*) FROM command_result WHERE world_id=160", query)
+            self.assertIn("AND request_id='12345678-1234-1234-1234-123456789abc' AND terminal_status='APPLIED' AND ok=true", query)
             self.assertIn('g.id=123', query)
             self.assertIn('g.world_id=160', query)
             self.assertNotIn('log_entry.body', query)
             self.assertNotIn('password', query)
             self.assertNotIn('UPDATE', query)
+
+    def test_snapshot_without_request_has_raw_world_counters_and_no_applied_count(self):
+        h.write_json(self.directory / 'compose.json', self.model)
+        self.record['configSha256'] = h.sha((self.directory / 'compose.json').read_bytes())
+        result = {'generalId': 123, 'world': {'worldVersion': 0, 'writerEpoch': 0}}
+        args = type('Args', (), {'general_id': '123', 'request_id': None,
+                                'custody': self.directory})()
+        with patch.object(h, 'load', return_value=(self.directory, self.record)), \
+             patch.object(h, 'inventory', return_value={}), patch.object(h, 'verify_running'), \
+             patch.object(h, 'sql', return_value=json.dumps(result)) as sql, patch('sys.stdout', new_callable=io.StringIO) as out:
+            h.snapshot(args)
+            self.assertEqual(result, json.loads(out.getvalue()))
+            query = sql.call_args.args[-1]
+            self.assertIn("'worldVersion',world_version,'writerEpoch',writer_epoch", query)
+            self.assertNotIn('appliedCount', query)
+            self.assertNotIn('command_result', query)
+            self.assertIn('BEGIN READ ONLY', query)
 
     def running_resources(self):
         for svc in h.SERVICES: self.image(svc)
