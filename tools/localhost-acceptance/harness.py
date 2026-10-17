@@ -259,7 +259,8 @@ def resource_gate(directory):
                  'KiB': 1024, 'MiB': 1024**2, 'GiB': GIB, 'TiB': 1024**4}
         used += float(match[1]) * units[match[2]]
     require(info['MemTotal'] - used >= 6 * GIB, 'At least 6 GiB available Docker memory required')
-    require(os.getloadavg()[1] <= 4 * info['NCPU'], 'Host load too high for local heavy build')
+    # Match the managed QA bound in app tools/qa/local-stack.py; VM capacity is checked separately.
+    require(os.getloadavg()[1] <= 400, 'Host load5 exceeds the managed QA limit of 400')
 
 
 @contextlib.contextmanager

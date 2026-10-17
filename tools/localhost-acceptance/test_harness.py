@@ -219,6 +219,21 @@ class HarnessTests(unittest.TestCase):
         self.assertIn(canary, logfile.read_text())
         self.assertEqual(0o600, logfile.stat().st_mode & 0o777)
 
+    def test_resource_gate_matches_managed_load_bound_and_independent_vm_capacity(self):
+        info=json.dumps({'NCPU':8,'MemTotal':8*h.GIB}).encode()
+        free=type('Disk',(),{'free':20*h.GIB})()
+        with patch.object(h.shutil,'disk_usage',return_value=free), patch.object(h.os,'getloadavg',return_value=(10,400,10)), \
+             patch.object(h,'run',side_effect=[info,b'']):
+            h.resource_gate(self.directory)
+        with patch.object(h.shutil,'disk_usage',return_value=free), patch.object(h.os,'getloadavg',return_value=(10,401,10)), \
+             patch.object(h,'run',side_effect=[info,b'']):
+            with self.assertRaises(h.Refused):h.resource_gate(self.directory)
+        with patch.object(h.shutil,'disk_usage',return_value=free), patch.object(h,'run',return_value=json.dumps({'NCPU':1,'MemTotal':8*h.GIB}).encode()):
+            with self.assertRaises(h.Refused):h.resource_gate(self.directory)
+        with patch.object(h.shutil,'disk_usage',return_value=free), \
+             patch.object(h,'run',side_effect=[info,json.dumps({'MemUsage':'3GiB / 8GiB'}).encode()]):
+            with self.assertRaises(h.Refused):h.resource_gate(self.directory)
+
     def test_foreign_heavy_lock_is_never_deleted(self):
         meta = self.directory / 'meta'
         (meta / 'bin').mkdir(parents=True)
