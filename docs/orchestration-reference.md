@@ -86,6 +86,13 @@ scripts/deploy.sh           # GCP 멀티서버 배포에서는 fail-fast (GitHub
 게임 웹의 top-level route(`main`, `join`, `map`, `history` 등)는 public id로 예약할 수 없고, create 요청은 경로
 충돌을 명시한 오류를 반환한다. source-promote의 전체 서버 sentinel `all`도 public id로 예약되어 있다. 이런
 게임 경로는 canonical `sam_server` 쿠키가 있을 때만 해당 게임 웹으로 간다.
+`admin`, `battle-replay`, `corps`, `council`, `create`, `help`, `mail`, `records`, `stratagem`,
+`territory`도 게임 경로다. HTTP·HTTPS의 cookie 라우팅과 path/cookie 예약 map, Deployer의
+생성 ID 예약을 함께 유지한다. 중첩 경로와 query는 게임 웹에 그대로 전달하며, 쿠키가 없거나 잘못되면 404다.
+`python3 scripts/test_nginx_campaign_routes.py`로 앱 기준 경로·경계·예약 집합을 Docker 없이 검사한다.
+`python3 scripts/test_nginx_campaign_routes_runtime.py`는 이미 있는 `nginx:1.27-alpine` 이미지로
+임시 네트워크·컨테이너·TLS fixture와 localhost 동적 포트만 사용하는 HTTP/HTTPS 라우팅 시험이다.
+기존 환경·볼륨을 읽지 않고 이미지 pull/build도 하지 않는다. 합성 upstream 시험은 실제 게임 인수와 별개다.
 기존 레지스트리의 `id`/`deployProject` 쌍이 이 계약과 맞지 않으면 제어면은 추측해 접두 `s`를 제거하지 않고
 one-time migration 필요 오류로 fail-close한다.
 
