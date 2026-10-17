@@ -1,0 +1,51 @@
+OpenSamguk Docker — attribution and licensing boundaries
+
+1. Code and documentation
+
+The OpenSamguk contributors' deployment code and documentation in this
+repository are offered under the MIT License in LICENSE. Existing copyright
+notices and licenses on third-party material remain applicable. This notice
+does not replace them or grant rights the contributors do not hold.
+
+2. Original project attribution
+
+OpenSamguk acknowledges HideD's devsam as the original project:
+https://storage.hided.net/gitea/devsam
+The previous README identified devsam as MIT. Preserve the original
+copyright and license notices when copying upstream material; the exact
+upstream notice must be checked at its source, rather than inferred from
+this repository's MIT declaration.
+
+3. Original-game derivative assets and data
+
+The code license does not license original-game artwork, maps, extracted
+statistics, sound, trademarks, or other third-party assets. Original-game
+and derivative assets are retained with their existing notices; no asset
+is deleted or relicensed by adding LICENSE or this NOTICE.
+
+Relevant existing notices in the companion source repositories include:
+- opensamguk-images/waryong/LICENSE-NOTICE.md
+- opensamguk-images/.license-boundaries.json
+- opensamguk/data/map/waryong/273d596/NOTICE.md
+- opensamguk/data/battle/waryong/NOTICE.md
+- the NOTICE files shipped with the corresponding web asset exports
+
+Those Waryong notices identify derivatives of the original game
+제갈공명 와룡전 and classify their project use as "owner-accepted".
+That classification records a repository owner's product decision; it
+provides no license grant to third parties and claims no ownership of the
+original artwork or map data. RTK14-related extracted data and other assets
+must likewise retain their own source and applicable rights information.
+Asset-by-asset permission is not established by this deployment repository.
+
+4. Third-party runtime software
+
+Docker/Compose, PostgreSQL, Redis, nginx, the socket-proxy image, Go,
+Java runtimes, Node.js, and application dependencies have their own
+licenses and notices. The MIT declaration here does not relicense
+container images or dependencies. Preserve the notices supplied with the
+specific versions and images you distribute.
+
+Source repositories:
+https://github.com/peppone-choi/opensamguk
+https://github.com/peppone-choi/opensamguk-images

@@ -108,9 +108,11 @@ var reservedGameRouteIDs = map[string]struct{}{
 	"chief-center":     {},
 	"city":             {},
 	"coming-soon":      {},
+	"court":            {},
 	"diplomacy":        {},
 	"generals":         {},
 	"global-diplomacy": {},
+	"hand":             {},
 	"history":          {},
 	"inherit":          {},
 	"join":             {},
@@ -126,15 +128,23 @@ var reservedGameRouteIDs = map[string]struct{}{
 	"nation-betting":   {},
 	"nation-finance":   {},
 	"npc-control":      {},
+	"orders":           {},
+	"posts":            {},
 	"rankings":         {},
 	"register":         {},
+	"retinue":          {},
 	"select-pool":      {},
+	"siege":            {},
 	"simulator":        {},
+	"supply":           {},
 	"tournament":       {},
 	"tournament-admin": {},
 	"troop":            {},
+	"v2-lab":           {},
 	"vote":             {},
+	"war-room":         {},
 	"world-log":        {},
+	"yuedan":           {},
 }
 
 var serverEnvAllowlist = map[string]envFieldSpec{
@@ -185,6 +195,9 @@ var serverComposeInterpolationKeys = map[string]struct{}{
 	"GAME_REDIS_IMAGE":               {},
 	"RESET_MAXGENERAL":               {},
 	"RESET_FIRST_TURN":               {},
+	"BATTLE_JOIN_TICKET_ENABLED":     {},
+	"BATTLE_JOIN_TICKET_KEY_BASE64":  {},
+	"BATTLE_WS_ALLOWED_ORIGINS":      {},
 	"COMPOSE_HOST_DIR":               {},
 	"GATEWAY_API_URL":                {},
 	"INTERNAL_SERVICE_TOKEN":         {},
@@ -328,6 +341,7 @@ type config struct {
 	lifecycleJournalFile      string
 	sharedEnvMu               *sync.Mutex
 	registryRewriteHook       func()
+	battleWSAllowlistEnabled  bool
 	lifecycleJournalWriteHook func(lifecycleJournal)
 	lifecycleJournalClearHook func()
 	operations                *operationCoordinator
@@ -1035,6 +1049,7 @@ type lifecycleJournal struct {
 	Project        string                 `json:"project"`
 	ResetTarget    *resetLifecycleTarget  `json:"resetTarget,omitempty"`
 	ResetExecution *resetExecutionJournal `json:"resetExecution,omitempty"`
+	WebGameTarget  *webGameDeployTarget   `json:"webGameTarget,omitempty"`
 }
 
 type resetLifecycleTarget struct {
@@ -1055,11 +1070,11 @@ const (
 )
 
 func (c config) writeLifecycleJournal(operation string, target serverTarget) error {
-	return c.writeLifecycleJournalWithResetTarget(operation, target, nil, "", "")
+	return c.writeLifecycleJournalWithResetTarget(operation, target, nil, "", "", nil)
 }
 
 func (c config) writeLinkedLifecycleJournal(operation string, target serverTarget, operationID string, kind lifecycleKind) error {
-	return c.writeLifecycleJournalWithResetTarget(operation, target, nil, operationID, kind)
+	return c.writeLifecycleJournalWithResetTarget(operation, target, nil, operationID, kind, nil)
 }
 
 func (c config) writeResetLifecycleJournal(target serverTarget, resetTarget resetLifecycleTarget) error {
@@ -1071,10 +1086,10 @@ func (c config) writeLinkedResetLifecycleJournal(target serverTarget, resetTarge
 	if err != nil {
 		return err
 	}
-	return c.writeLifecycleJournalWithResetTarget("reset", target, &normalized, operationID, kind)
+	return c.writeLifecycleJournalWithResetTarget("reset", target, &normalized, operationID, kind, nil)
 }
 
-func (c config) writeLifecycleJournalWithResetTarget(operation string, target serverTarget, resetTarget *resetLifecycleTarget, operationID string, kind lifecycleKind) error {
+func (c config) writeLifecycleJournalWithResetTarget(operation string, target serverTarget, resetTarget *resetLifecycleTarget, operationID string, kind lifecycleKind, webTarget *webGameDeployTarget) error {
 	if c.lifecycleJournalFile == "" {
 		return errors.New("lifecycle journal path is unavailable")
 	}
@@ -1086,6 +1101,9 @@ func (c config) writeLifecycleJournalWithResetTarget(operation string, target se
 	}
 	if operation != "reset" && resetTarget != nil {
 		return errors.New("only reset journals can carry a reset target")
+	}
+	if err := validateJournalWebGameTarget(operation, webTarget); err != nil {
+		return err
 	}
 	if err := validateLifecycleJournalOperationLink(operation, operationID, kind); err != nil {
 		return err
@@ -1099,6 +1117,7 @@ func (c config) writeLifecycleJournalWithResetTarget(operation string, target se
 		ServerID:      target.ID,
 		Project:       target.Project,
 		ResetTarget:   resetTarget,
+		WebGameTarget: webTarget,
 	}); err != nil {
 		return err
 	}
@@ -1131,7 +1150,7 @@ func (c config) advanceLifecycleJournal(stage string) error {
 
 func isLifecycleJournalOperation(operation string) bool {
 	switch operation {
-	case "create", "delete", "deploy", "patch", "reset":
+	case "create", "delete", "deploy", "deploy-web", "patch", "reset":
 		return true
 	default:
 		return false
@@ -1209,6 +1228,9 @@ func (c config) readLifecycleJournal() (lifecycleJournal, bool, error) {
 	}
 	if journal.Version != lifecycleJournalVersion || !isLifecycleJournalOperation(journal.Operation) || !isLifecycleJournalStage(journal.Stage) {
 		return lifecycleJournal{}, false, errors.New("lifecycle journal is invalid")
+	}
+	if err := validateJournalWebGameTarget(journal.Operation, journal.WebGameTarget); err != nil {
+		return lifecycleJournal{}, false, err
 	}
 	if err := validateLifecycleJournalOperationLink(journal.Operation, journal.OperationID, journal.OperationKind); err != nil {
 		return lifecycleJournal{}, false, err
@@ -1437,6 +1459,10 @@ func (c config) repairLifecycleJournal() (repairErr error) {
 			return err
 		}
 		if _, err := c.reloadSharedRegistry(lease.Context()); err != nil {
+			return err
+		}
+	case "deploy-web":
+		if err := c.repairWebGameDeploy(lease.Context(), target, journal); err != nil {
 			return err
 		}
 	case "deploy":
@@ -2061,6 +2087,7 @@ func loadConfig() (config, error) {
 		maintenanceFile:          envOr("DEPLOYER_MAINTENANCE_FILE", "/workspace/servers/.deployer-maintenance"),
 		lifecycleJournalFile:     envOr("DEPLOYER_LIFECYCLE_JOURNAL_FILE", filepath.Join(serversDir, ".deployer-lifecycle-journal")),
 		sharedEnvMu:              &sync.Mutex{},
+		battleWSAllowlistEnabled: true,
 	}
 	c.operations = newOperationCoordinator(c.maintenanceFile, c.lifecycleJournalFile, jobs)
 	if err := c.recoverDurableLifecycleOperations(); err != nil {
@@ -2708,6 +2735,14 @@ func main() {
 	if len(os.Args) == 2 && os.Args[1] == "--check-registry" {
 		os.Exit(checkRegistryCommand(cfg, os.Stderr))
 	}
+	if len(os.Args) == 2 && os.Args[1] == "--sync-battle-ws-allowlist" {
+		degraded, err := cfg.syncBattleWSAllowlist(context.Background())
+		if err != nil || degraded {
+			fmt.Fprintln(os.Stderr, "battle websocket allowlist sync failed or registry unavailable")
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if cfg.token == "" {
 		log.Fatal("DEPLOYER_TOKEN 미설정 — 인증 토큰 필수")
 	}
@@ -2719,6 +2754,7 @@ func main() {
 	mux.HandleFunc("/readyz", cfg.handleReady)
 	mux.HandleFunc("/status", cfg.withAuth(cfg.handleStatus))
 	mux.HandleFunc("/deploy", cfg.withAuth(cfg.handleDeploy))
+	mux.HandleFunc("/deploy/web-game", cfg.webGameDeployHTTPHandler())
 	mux.HandleFunc("/servers", cfg.withAuth(cfg.handleServers))
 	mux.HandleFunc("/servers/create", cfg.withAuth(cfg.handleServerCreate))
 	mux.HandleFunc("/servers/close", cfg.withAuth(cfg.handleServerClose))
@@ -2843,7 +2879,7 @@ func isAuthenticatedHTTPRouteAllowed(method, requestPath string) bool {
 		return strings.HasPrefix(requestPath, "/jobs/") && lifecycleJobIDRe.MatchString(strings.TrimPrefix(requestPath, "/jobs/"))
 	case http.MethodPost:
 		switch requestPath {
-		case "/maintenance/enter", "/maintenance/enter-if-idle", "/maintenance/leave", "/maintenance/repair", "/servers/create":
+		case "/maintenance/enter", "/maintenance/enter-if-idle", "/maintenance/leave", "/maintenance/repair", "/servers/create", "/deploy/web-game":
 			return true
 		}
 		if !strings.HasPrefix(requestPath, "/jobs/") {
@@ -5767,6 +5803,14 @@ func (c config) downServerStack(ctx context.Context, project, envFile string) (s
 }
 
 func (c config) reloadSharedRegistry(ctx context.Context) (string, error) {
+	degraded := false
+	if c.battleWSAllowlistEnabled {
+		var err error
+		degraded, err = c.syncBattleWSAllowlist(ctx)
+		if err != nil {
+			return "", err
+		}
+	}
 	services := withoutService(sharedRegistryReloadServices, "nginx")
 	args := append([]string{
 		"compose",
@@ -5789,7 +5833,13 @@ func (c config) reloadSharedRegistry(ctx context.Context) (string, error) {
 	if nginxDetail != "" {
 		detail += "\n=== nginx reload ===\n" + nginxDetail
 	}
-	return detail, nginxErr
+	if nginxErr != nil {
+		return detail, nginxErr
+	}
+	if degraded {
+		return detail, errors.New("battle websocket registry unavailable; route disabled")
+	}
+	return detail, nil
 }
 
 func withoutService(values []string, remove string) []string {
