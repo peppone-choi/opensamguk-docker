@@ -45,6 +45,12 @@ def run(args, *, input=None, timeout=60, cwd=None, log_path=None):
     env = {k: os.environ[k] for k in ('PATH', 'HOME', 'TMPDIR', 'DOCKER_HOST',
            'DOCKER_CONTEXT', 'DOCKER_CONFIG', 'SSH_AUTH_SOCK') if k in os.environ}
     env.update(LANG='C.UTF-8', COMPOSE_DISABLE_ENV_FILE='1', NEXT_TELEMETRY_DISABLED='1')
+    if args[0] == 'docker' and args[1:3] != ['context', 'inspect']:
+        # DOCKER_CONTEXT overrides DOCKER_HOST; a remote daemon would violate localhost custody.
+        endpoint = env.get('DOCKER_HOST') if not env.get('DOCKER_CONTEXT') else None
+        if endpoint is None:
+            endpoint = run(['docker', 'context', 'inspect', '--format', '{{.Endpoints.docker.Host}}']).decode().strip()
+        require(endpoint.startswith('unix:///') and '\n' not in endpoint, 'Only a local Unix Docker endpoint is allowed')
     log = None
     try:
         if log_path is not None:

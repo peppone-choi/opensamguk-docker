@@ -2,7 +2,7 @@
 
 This harness builds all six app images from one clean exact main SHA, without CI run IDs or GHCR. It uses Docker main's unmodified `infra/nginx/nginx.conf`, new local RSA/TLS fixtures, separate fresh auth/game databases and Redis instances, and a nonce project. Existing `tools/qa/local-stack.py`, qa160 resources and deployment files are never used.
 
-The only host publish is `127.0.0.1:443:443`; origin is exactly `https://localhost`. Occupied 443 fails closed. On macOS, when the nonroot bind probe is denied, a refused loopback TCP connection is required and Docker Desktop’s port bind remains authoritative. TLS verification uses the custody certificate, or the USER runner's temporary browser context. Never install this certificate into the host trust store.
+A remote Docker host/context is refused; daemon access must use a local Unix socket. The only host publish is `127.0.0.1:443:443`; origin is exactly `https://localhost`. Occupied 443 fails closed. On macOS, when the nonroot bind probe is denied, a refused loopback TCP connection is required and Docker Desktop’s port bind remains authoritative. TLS verification uses the custody certificate, or the USER runner's temporary browser context. Never install this certificate into the host trust store.
 
 ## Commands
 

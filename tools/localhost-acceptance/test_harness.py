@@ -194,6 +194,17 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(['s'+sid+'-'+svc], self.model['services'][svc]['networks']['local']['aliases'])
         self.assertNotIn('qa160', json.dumps(self.model))
 
+    def test_remote_docker_host_and_context_refused_before_daemon_access(self):
+        with patch.dict(os.environ,DOCKER_HOST='tcp://remote.example:2375',clear=True), \
+             patch.object(h.subprocess,'run') as run:
+            with self.assertRaises(h.Refused):h.run(['docker','ps'])
+            run.assert_not_called()
+        with patch.dict(os.environ,DOCKER_HOST='unix:///tmp/local.sock',DOCKER_CONTEXT='remote',clear=True), \
+             patch.object(h.subprocess,'run',return_value=type('P',(),{'returncode':0,'stdout':b'ssh://remote.example\n'})()) as run:
+            with self.assertRaises(h.Refused):h.run(['docker','ps'])
+            self.assertEqual(1,run.call_count)
+            self.assertEqual(['docker','context','inspect'],run.call_args.args[0][:3])
+
     def test_run_suppresses_arbitrary_child_output_and_drops_inherited_secrets(self):
         canary = 'NEVER_PRINT_NEW_FIXTURE_123'
         with patch.dict(os.environ, LHA_TEST_SECRET=canary, COMPOSE_FILE='/tmp/foreign.yml'):
