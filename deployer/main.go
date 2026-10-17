@@ -1049,7 +1049,7 @@ type lifecycleJournal struct {
 	Project        string                 `json:"project"`
 	ResetTarget    *resetLifecycleTarget  `json:"resetTarget,omitempty"`
 	ResetExecution *resetExecutionJournal `json:"resetExecution,omitempty"`
-	WebGameTarget *webGameDeployTarget  `json:"webGameTarget,omitempty"`
+	WebGameTarget  *webGameDeployTarget   `json:"webGameTarget,omitempty"`
 }
 
 type resetLifecycleTarget struct {
