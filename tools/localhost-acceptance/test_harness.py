@@ -235,6 +235,11 @@ class HarnessTests(unittest.TestCase):
         sid = self.record['serverId']
         self.assertEqual(h.ORIGIN + '/game/' + sid, h.build_args(self.record, 'web-gateway')['NEXT_PUBLIC_GAME_URL'])
         registry = h.registry(self.record)[0]
+        self.assertEqual('opensamguk-s'+sid, registry['deployProject'])
+        self.assertNotEqual(self.record['project'], registry['deployProject'])
+        self.assertEqual('http://s'+sid+'-game-engine:8082', registry['gameEngineUrl'])
+        self.assertEqual(0, registry['generation'])
+        self.assertEqual('scenario_3190', registry['scenarioCode'])
         self.assertEqual('http://s'+sid+'-game-api:8081', registry['gameApiUrl'])
         for svc in ('game-api', 'game-engine', 'web-game'):
             self.assertEqual(['s'+sid+'-'+svc], self.model['services'][svc]['networks']['local']['aliases'])

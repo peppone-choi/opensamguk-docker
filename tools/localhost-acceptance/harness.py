@@ -148,7 +148,7 @@ def registry(record):
     return [{'id': sid, 'name': 'Local acceptance', 'generation': 0,
              'gameUrl': ORIGIN + '/game/' + sid, 'gameApiUrl': f'http://s{sid}-game-api:8081',
              'gameEngineUrl': f'http://s{sid}-game-engine:8082',
-             'deployProject': record['project'], 'scenarioCode': 'scenario_3190'}]
+             'deployProject': 'opensamguk-s' + sid, 'scenarioCode': 'scenario_3190'}]
 
 
 def substitute(value, values):
