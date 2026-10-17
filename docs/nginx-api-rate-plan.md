@@ -1,6 +1,6 @@
 # API 조회 rate 제한 복구
 
-상태: DRAFT / PENDING. C0의 기능 RED 복구 배정으로 구현 중. 무거운 합성 실행은 fullweb 잠금 반환 뒤 C0 명시 신호 대기. 현재 C/운영 반영 없음.
+상태: DRAFT / PENDING 독립리뷰. C0 명시 신호 후 실제 합성1회 완료, 현재 C/운영 반영 없음. [draft PR77](https://github.com/peppone-choi/opensamguk-docker/pull/77).
 
 - GitHub: https://github.com/peppone-choi/opensamguk-docker/issues/76
 - Jira: https://pepponechoi-jira.atlassian.net/browse/OPENSAM-362
@@ -29,3 +29,14 @@ C 소유 nginx image·nonce/session labels·read-only canonical config mount와 
 6. 검증완료후별도draftPR·attach·양티켓링크·정확head/원본hash/결과연결. 현재head 독립Claude 접근pending으로병합/C overlay/운영반영은하지않는다. Docker main의기능RED 복구PR만대상이며일반병합은중지상태다.
 
 공식근거: https://nginx.org/en/docs/http/ngx_http_limit_req_module.html (빈key제외·복수limit_req·상속·delay·기본503), https://nginx.org/en/docs/http/ngx_http_map_module.html (map분류).
+
+## 실제 검증 결과
+
+검증 코드 head dee0101a8025a49b3f6d2d6941e80699081bdd08, 원본 canonical hash f0507d5a8bf0ea90cb6cc722b2dde99c2e049c1d517605adbfe764b39721b5e7, 수리 config hash e2a4a6fa66cf4a2583b83f90a7d38c13c6e7dad02e163f6974fc6029f83f4268.
+
+- 정적4+기존정적5 PASS. 실제 proxy 합성13검증 PASS, 기존route451 PASS. 실제합성은각1회이며재실행/기대값·timeout변경없음.
+- 원본32fanout HTTP11/TLS10건이limiter503,수리본은양쪽32개전부upstream200. 수리본최대지연HTTP2.3055초/TLS2.5788초.
+- 혼합쓰기40개와loginPOST40개는HTTP/TLS각19건씩거절. 읽기96폭주는HTTP53/TLS52건거절,최대3.4018초/4.1466초로지연도관측. 프로세스/전송시간을포함한벽시계값이며이론queue3.2초와같다고하지않음.
+- 읽기/쓰기bucket독립·HTTP/TLS쓰기bucket공유·실제upstream503보존통과. 합성원본503HTML관측은현재C의미보존본문을직접관측한것으로확대하지않음.
+- 자기합성container/network잔존0·자기heavy정상반환. C11healthy·6image·composehash·원nginxhash보존확인. C추가HTTP요청0·서비스/DB/설정변경0.
+- 로컬원본: /Users/apple/Documents/Codex/2026-10-17/nginx-rate-01a14994-run1/result.json 및각case requests.json/nginx.log,existing-route-result.json/log,final-verification.json. 별도CI결과없음/독립Claude현재head리뷰pending. 합성을actualUSER/auth/rolePASS로세지않음.
