@@ -257,7 +257,7 @@ def port_free():
 
 def resource_gate(directory):
     require(shutil.disk_usage(directory).free >= 12 * GIB, 'At least 12 GiB free disk required for source builds')
-    info = json.loads(run(['docker', 'info', '--format', '{{json .}}'], timeout=30))
+    info = json.loads(run(['docker', 'info', '--format', '{"NCPU":{{json .NCPU}},"MemTotal":{{json .MemTotal}}}'], timeout=30))
     require(info['NCPU'] >= 2 and info['MemTotal'] >= 6 * GIB, 'Docker needs 2 CPUs and 6 GiB memory')
     # Account for other running stacks without reading their environments or logs.
     stats = run(['docker', 'stats', '--no-stream', '--format', '{{json .}}'], timeout=30).decode().splitlines()
