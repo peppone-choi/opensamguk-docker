@@ -452,7 +452,7 @@
           "CMD",
           "node",
           "-e",
-          "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
+          "fetch('http://web-gateway:3000/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
         ],
         "interval": "10s",
         "timeout": "5s",
@@ -503,7 +503,7 @@
           "CMD",
           "node",
           "-e",
-          "fetch('http://127.0.0.1:3001/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
+          "fetch('http://web-game:3001/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
         ],
         "interval": "10s",
         "timeout": "5s",
