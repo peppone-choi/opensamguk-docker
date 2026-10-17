@@ -310,17 +310,44 @@ def source_archive(repo, revision):
     return git(repo, 'archive', '--format=tar', revision)
 
 
+def checked_members(tar):
+    members = tar.getmembers()
+    for member in members:
+        path = Path(member.name)
+        require(not path.is_absolute() and '..' not in path.parts and (member.isfile() or member.isdir()),
+                'Unsafe source archive member')
+        require(not any(p == '.env' or (p.startswith('.env.') and not p.endswith(('example', 'sample', 'template')))
+                        or p.endswith(('.pem', '.key', '.p12', '.pfx')) for p in path.parts),
+                'Credential-like tracked source refused')
+    return members
+
+
+def archive_tree_hash(archive):
+    digest = hashlib.sha256()
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        for member in sorted(checked_members(tar), key=lambda m: Path(m.name).parts):
+            if member.isfile():
+                digest.update(member.name.encode() + b'\0')
+                # tarfile's data filter strips group/other write bits and retains tracked executable mode.
+                digest.update(str(member.mode & 0o755).encode() + b'\0')
+                digest.update(hashlib.sha256(tar.extractfile(member).read()).digest())
+    return digest.hexdigest()
+
+
 def unpack_archive(archive, destination):
     destination.mkdir(mode=0o700)
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-        for member in tar.getmembers():
-            path = Path(member.name)
-            require(not path.is_absolute() and '..' not in path.parts and (member.isfile() or member.isdir()),
-                    'Unsafe source archive member')
-            require(not any(p == '.env' or (p.startswith('.env.') and not p.endswith(('example', 'sample', 'template')))
-                            or p.endswith(('.pem', '.key', '.p12', '.pfx')) for p in path.parts),
-                    'Credential-like tracked source refused')
+        checked_members(tar)
         tar.extractall(destination, filter='data')
+
+
+def clone_export(archive, source, destination):
+    expected = archive_tree_hash(archive)
+    require(tree_hash(source) == expected, 'Clone source differs from clean Git archive')
+    require(not destination.exists(), 'Clone destination already exists')
+    # APFS copies share storage while later writes remain independent. Never copy runtime fixtures.
+    run(['/bin/cp', '-cRp', str(source), str(destination)], timeout=300)
+    require(tree_hash(destination) == expected, 'APFS clone bytes/modes differ from Git archive')
 
 
 def tree_hash(directory):
@@ -357,7 +384,14 @@ def prepare(args):
     write_json(directory / 'contract.json', record)
     assert_owned(record, inventory(record), empty=True)
     port_free()
-    unpack_archive(archive, directory / 'source')
+    if args.clone_source_custody:
+        previous, previous_record = load(args.clone_source_custody)
+        require(previous_record['appSha'] == record['appSha'], 'Clone source SHA mismatch')
+        clone_export(archive, previous / 'source', directory / 'source')
+        record['sourceExport'] = 'apfs-clone-of-git-archive'
+    else:
+        unpack_archive(archive, directory / 'source')
+        record['sourceExport'] = 'git-archive'
     record['sourceTreeSha256'] = tree_hash(directory / 'source')
     (directory / 'certs').mkdir(mode=0o700)
     (directory / 'battle-ws').mkdir(mode=0o700)
@@ -659,6 +693,8 @@ def main():
     p.add_argument('--app-sha', required=True)
     p.add_argument('--docker-sha', required=True)
     p.add_argument('--custody', required=True, type=Path)
+    p.add_argument('--clone-source-custody', type=Path,
+                   help='Optional owned prior custody; clone public source only after exact Git archive comparison')
     p = sub.add_parser('snapshot')
     p.add_argument('--custody', required=True, type=Path)
     p.add_argument('--general-id', required=True)

@@ -179,6 +179,23 @@ class HarnessTests(unittest.TestCase):
             with self.assertRaises(h.Refused):
                 h.unpack_archive(data.getvalue(), self.directory / ('bad' + str(len(list(self.directory.iterdir())))))
 
+    def test_apfs_clone_matches_archive_and_preserves_original_on_later_write(self):
+        if sys.platform!='darwin':self.skipTest('APFS clone is macOS-only')
+        data=io.BytesIO()
+        with tarfile.open(fileobj=data,mode='w') as tar:
+            member=tarfile.TarInfo('file');member.mode=0o644;member.size=8
+            tar.addfile(member,io.BytesIO(b'original'))
+        archive=data.getvalue()
+        source=self.directory/'original-export'
+        h.unpack_archive(archive,source)
+        self.assertEqual(h.archive_tree_hash(archive),h.tree_hash(source))
+        destination=self.directory/'clone-export'
+        h.clone_export(archive,source,destination)
+        (destination/'file').write_text('changed')
+        self.assertEqual('original',(source/'file').read_text())
+        (source/'file').write_text('wrong')
+        with self.assertRaises(h.Refused):h.clone_export(archive,source,self.directory/'bad-clone')
+
     def test_private_write_refuses_existing_file_and_symlink(self):
         path = self.directory / 'fixture.json'
         h.private_write(path, b'new-local-fixture')
@@ -346,6 +363,7 @@ class HarnessTests(unittest.TestCase):
         export=self.directory/'export'
         h.unpack_archive(archive,export)
         self.assertEqual(['tracked'],[p.name for p in export.iterdir()])
+        self.assertEqual(h.archive_tree_hash(archive),h.tree_hash(export))
         self.assertEqual(0o755,(export/'tracked').stat().st_mode & 0o777)
         (repo/'untracked').write_text('ignored by archive but fail closed')
         with self.assertRaises(h.Refused):
