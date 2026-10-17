@@ -228,6 +228,57 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(1, run.call_count)
             self.assertNotIn('rm', run.call_args.args[0])
 
+    def owned_files(self):
+        h.private_write(self.directory/'nginx.conf',b'canonical nginx bytes')
+        (self.directory/'certs').mkdir()
+        h.private_write(self.directory/'certs/opensamguk.crt',b'new local cert')
+        (self.directory/'battle-ws').mkdir()
+        h.write_json(self.directory/'runtime.json',self.fixture)
+        h.write_json(self.directory/'compose.json',self.model)
+        self.record.update(nginxSha256=h.sha(b'canonical nginx bytes'),
+            templateSha256=h.sha((h.ROOT/'docker-compose.localhost-acceptance.yml').read_bytes()),
+            sourceTreeSha256=h.tree_hash(self.directory/'source'),certsSha256=h.tree_hash(self.directory/'certs'),
+            configSha256=h.sha((self.directory/'compose.json').read_bytes()))
+
+    def test_canonical_nginx_config_fixture_and_source_changes_refuse_before_up(self):
+        self.owned_files()
+        with patch.object(h,'git',return_value=b'canonical nginx bytes'):
+            h.verify_files(self.directory,self.record)
+            (self.directory/'nginx.conf').write_text('synthetic nginx')
+            with self.assertRaises(h.Refused):
+                h.verify_files(self.directory,self.record)
+            (self.directory/'nginx.conf').write_bytes(b'canonical nginx bytes')
+            (self.directory/'compose.json').write_text('{}')
+            with self.assertRaises(h.Refused):
+                h.verify_files(self.directory,self.record)
+            h.write_json(self.directory/'compose.json',self.model,replace=True)
+            h.private_write(self.directory/'runtime.json',b'{}',replace=True)
+            with self.assertRaises((h.Refused,KeyError)):
+                h.verify_files(self.directory,self.record)
+        with patch.object(h,'git',return_value=b'other Docker nginx'):
+            with self.assertRaises(h.Refused):
+                h.verify_files(self.directory,self.record)
+
+    def test_real_git_archive_removes_worktree_state_and_preserves_tracked_modes(self):
+        repo=self.directory/'git-source'
+        repo.mkdir()
+        subprocess.run(['git','init','-q',str(repo)],check=True)
+        for key,value in [('user.name','Local Fixture'),('user.email','fixture@localhost')]:
+            subprocess.run(['git','-C',str(repo),'config',key,value],check=True)
+        (repo/'tracked').write_text('source fixture')
+        (repo/'tracked').chmod(0o755)
+        subprocess.run(['git','-C',str(repo),'add','tracked'],check=True)
+        subprocess.run(['git','-C',str(repo),'commit','-qm','fixture'],check=True)
+        revision=h.git(repo,'rev-parse','HEAD').decode().strip()
+        archive=h.source_archive(repo,revision)
+        export=self.directory/'export'
+        h.unpack_archive(archive,export)
+        self.assertEqual(['tracked'],[p.name for p in export.iterdir()])
+        self.assertEqual(0o755,(export/'tracked').stat().st_mode & 0o777)
+        (repo/'untracked').write_text('ignored by archive but fail closed')
+        with self.assertRaises(h.Refused):
+            h.source_archive(repo,revision)
+
     def test_snapshot_rejects_sql_input_before_any_docker_command(self):
         for gid, request in [('0', None), ('1;DELETE',None), ('1', "x' OR true")]:
             args = type('Args', (), {'general_id':gid, 'request_id':request, 'custody':self.directory})()
