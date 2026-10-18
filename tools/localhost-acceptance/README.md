@@ -35,6 +35,10 @@ Inventory/image inspect uses explicit projections that exclude environment, comm
 
 ## Private handoff and logs
 
+For a separately approved fresh fixture whose exact app pin includes the engine startup-pause support, add `--startup-paused` to `prepare`. It records boolean `startupPaused=true` and supplies only game-engine with `OPENSAMGUK_DAEMON_STARTUP_PAUSED=true`, the Spring environment binding for `opensamguk.daemon.startup-paused` (default false). Without the flag, no contract field or environment key is added; existing standard, tactical and selected-map models stay unchanged. The flag composes with `--profile tactical` and all three explicit topdown inputs. Unknown pause keys, nonboolean records, missing/false flags and other-service leaks are refused.
+
+The conditional strict smoke reads the owned engine's status and requires paused, materialized, live, recovery READY, the exact world and no unfinished scheduled tick before SMOKE_PASSED. This is a scheduled-tick hold: IMMEDIATE intake and health remain available. After fresh H strict smoke, the owning writer runs the separately reviewed 1723 fresh16 account/role Given before C0's USER01/02 and battle acceptance. Normal engine `POST /admin/turn-daemon/resume` releases the hold; every process restart under the same startup-paused environment begins paused again, including role bootstrap and recovery restarts. Recheck paused/readiness after restart and explicitly resume only when the operator approves. This option never modifies an existing custody, accounts, database rows or startup source.
+
 `resume-startup` revalidates an existing STARTING or unpassed RUNNING stack without building, restarting, or changing Compose/fixtures/databases. It requires a clean verifier checkout, unchanged source/config/image receipts, eleven healthy owned services, exact model/runtime mount pairs, port/network boundaries, 6016MiB service caps, VM capacity and host load. Only then does it save the original contract, record the separate `runtimeVerifierHead` and `runtimeVerifierPath` without changing the build `dockerSha`, transition to RUNNING, and execute the normal strict smoke. A validation failure leaves the contract unchanged; a smoke failure cannot mark SMOKE_PASSED. Runtime mount matching permits an exact `/host_mnt` + declared host path alias only on macOS with a current local Unix Docker Desktop daemon. Missing, extra, duplicate or mismatched type/source/destination/write-mode mounts are refused, including named volumes.
 
 Custody is owned by the current OS user, mode0700; JSON/log/key files are mode0600. `contract.json` is safe to summarize but remains private. It supplies project, nonce, dynamic `serverId=lha<nonce>`, world160/gen0, exact origin/source and image identities. `fixture.json` is only `{admin:{username,password}, user:{username,password,name}}`; the USER runner consumes it internally. DB/JWT/internal credentials live in separate `runtime.json` and `compose.json`. Never print or commit these files, run `compose config` to the terminal, dump container inspect/env/logs, or record raw auth/cookie bodies.
@@ -42,6 +46,24 @@ Custody is owned by the current OS user, mode0700; JSON/log/key files are mode06
 All child process stdout/stderr is captured. Errors returned to chat are fixed messages, never argv or child output. Build output is held in private per-service files; container logs stay with their nonce containers, bounded to two 10MB files per service. Only the fixed read-only `snapshot` projection crosses stdout. It validates general ID/UUID, checks running resource ownership, and executes only SELECT inside `BEGIN READ ONLY`. It returns actor IDs, numeric progress, turn timestamps, selected reservation/terminal fields and log count. World counters `world.worldVersion` and `world.writerEpoch` are returned unchanged; a clean engine restart may leave the epoch unchanged. With a request ID, `appliedCount` counts successful APPLIED command-result rows for that world/request, including duplicates. These observations do not establish BattleSession epoch handover. No log text, arbitrary metadata or credentials are returned. Same-user integration runners may call snapshot without assuming the writer session; mutations require the writer session.
 
 `down` does not require healthy services or spare build memory/disk. It takes the shared lock, inventories all name/label matches, verifies nonce + writing session + compose project on every resource, checks no foreign network members or volume consumers, then removes only inspected owned container IDs, network IDs, volume names and validated app image tags. It does not prune Docker caches, remove shared base images, touch other stacks, remove the private custody or erase failure records. If any ownership check fails, it performs no deletion.
+
+## 전술 실행 opt-in profile
+
+새 fixture를 준비할 때만 `prepare ... --profile tactical`을 지정할 수 있다. 생략한 기본
+profile의 구성은 유지되며, 준비된 custody나 기존 스택을 이 옵션으로 변경하지 않는다.
+실제 전술 runtime/readiness를 포함한 앱 main이 선행해야 한다.
+
+이 profile은 fixture 전용 32바이트 join-ticket 키를 private `runtime.json`에 생성하고,
+game-api에 기존 네 전술 flag·serverId·정확한 `https://localhost` WS origin을 결속한다.
+engine에는 `BATTLE_PIPELINE_ENABLED=true`와
+`BATTLE_PIPELINE_API_BASE_URL=http://game-api:8081`을 지정한다. 키는 game-api만 받으며
+JWT·DB·internal-service 비밀을 재사용하지 않는다. 공개 gateway/nginx 경로는 추가하지 않는다.
+
+전술 profile의 무인증 WS 경계 기대값은 **403**이다. 기본 profile의 미노출 **404**를
+전술 기능 성공으로 인정하지 않는다. 추가 smoke는 owned game-api 내부의 읽기 전용
+readiness를 호출해 정확한 world·D177 encoding·여섯 hash·5초 이내 UTC 시각·빈 reasons와
+READY를 확인한다. HTTP 200 하나나 일반 health를 readiness 대신 사용하지 않는다.
+이 검사는 실제 조우·한 판 종료·캠페인 정산·성능 인수를 대신하지 않는다.
 
 ## Regression
 

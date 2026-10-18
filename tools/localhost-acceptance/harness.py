@@ -3,6 +3,7 @@
 import argparse
 import base64
 import contextlib
+import datetime
 import errno
 import hashlib
 import io
@@ -36,6 +37,12 @@ PROJECT_LABEL = 'com.docker.compose.project'
 SUPPORT_IMAGES = ('postgres:16-alpine', 'redis:7-alpine', 'nginx:1.30.5-alpine')
 GIB = 1024 ** 3
 ORIGIN = 'https://localhost'
+TACTICAL_KEY = 'BATTLE_JOIN_TICKET_KEY_BASE64'
+STARTUP_PAUSE_ENV = 'OPENSAMGUK_DAEMON_STARTUP_PAUSED'
+TACTICAL_API = {'BATTLE_SESSION_ENABLED': 'true', 'BATTLE_JOIN_TICKET_ENABLED': 'true',
+                'BATTLE_V3_COMMAND_INGRESS_ENABLED': 'true', 'BATTLE_V3_PROJECTION_ENABLED': 'true',
+                'BATTLE_WS_ALLOWED_ORIGINS': ORIGIN}
+TACTICAL_ENGINE = {'BATTLE_PIPELINE_ENABLED': 'true', 'BATTLE_PIPELINE_API_BASE_URL': 'http://game-api:8081'}
 # Inspect projections exclude Env, command arguments, health logs and volume driver options.
 IMAGE_FORMAT = '{"Id":{{json .Id}},"RepoTags":{{json .RepoTags}},"Config":{"Labels":{{json (index .Config "Labels")}}}}'
 CONTAINER_FORMAT = ('{"Id":{{json .Id}},"Name":{{json .Name}},"Image":{{json .Image}},'
@@ -112,6 +119,8 @@ def private_path(path, directory=False):
 
 
 def identity(record, read_only=False):
+    profile(record)
+    startup_paused(record)
     nonce = record.get('nonce', '')
     require(re.fullmatch('[a-f0-9]{16}', nonce), 'Invalid nonce')
     require(record.get('project') == 'osglha' + nonce and record.get('serverId') == 'lha' + nonce,
@@ -138,6 +147,42 @@ def labels(record):
 
 def image_ref(record, service):
     return f"opensamguk-local/{service}:{record['appSha']}-{record['nonce']}"
+
+
+def profile(record):
+    value = record.get('profile', 'standard')
+    require(value in ('standard', 'tactical'), 'Unknown local fixture profile')
+    return value
+
+
+def tactical_key(value):
+    require(isinstance(value, str), 'Dedicated tactical signing key is missing')
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except ValueError:
+        raise Refused('Dedicated tactical signing key is invalid') from None
+    require(len(decoded) == 32 and base64.b64encode(decoded).decode() == value,
+            'Dedicated tactical signing key is invalid')
+    return value
+
+
+def startup_pause_key(name):
+    return 'startuppaus' in re.sub(r'[^a-z0-9]', '', name.lower())
+
+
+def startup_paused(record):
+    require({key for key in record if startup_pause_key(key)} <= {'startupPaused'},
+            'Unknown startup pause contract key')
+    value = record.get('startupPaused', False)
+    require(type(value) is bool, 'Startup pause contract must be boolean')
+    return value
+
+
+def profile_fixtures(record, fixtures):
+    if profile(record) == 'standard':
+        return fixtures
+    require(TACTICAL_KEY not in fixtures, 'Fresh tactical fixture key required')
+    return {**fixtures, TACTICAL_KEY: base64.b64encode(secrets.token_bytes(32)).decode()}
 
 
 def build_args(record, service):
@@ -170,16 +215,25 @@ def substitute(value, values):
 
 
 def model_for(record, fixtures):
+    paused = startup_paused(record)
     values = dict(fixtures)
     values.update(CUSTODY=record['custody'], PROJECT=record['project'], NONCE=record['nonce'],
                   SESSION=record['session'], SERVER_ID=record['serverId'],
                   REGISTRY=json.dumps(registry(record), separators=(',', ':')))
     values.update({'IMAGE_' + s: image_ref(record, s) for s in SERVICES})
     model = substitute(json.loads((ROOT / 'docker-compose.localhost-acceptance.yml').read_bytes()), values)
+    if profile(record) == 'tactical':
+        key = tactical_key(fixtures.get(TACTICAL_KEY))
+        require(key not in [value for name, value in fixtures.items() if name != TACTICAL_KEY],
+                'Dedicated tactical signing key must not be reused')
+        model['services']['game-api']['environment'].update({**TACTICAL_API, TACTICAL_KEY: key})
+        model['services']['game-engine']['environment'].update(TACTICAL_ENGINE)
     map_env, map_mounts = topdown.settings(record)
     model['services']['game-api']['environment'].update(map_env)
     if map_mounts:
         model['services']['game-api']['volumes'] = map_mounts
+    if paused:
+        model['services']['game-engine']['environment'][STARTUP_PAUSE_ENV] = 'true'
     validate_model(model, record)
     return model
 
@@ -202,6 +256,9 @@ def validate_model(model, record):
     map_env, map_mounts = topdown.settings(record)
     require(model['services']['game-api'].get('volumes', []) == map_mounts, 'Topdown mount differs from explicit pin')
     for name, svc in model['services'].items():
+        pause_env = {key: value for key, value in svc.get('environment', {}).items() if startup_pause_key(key)}
+        require(pause_env == ({STARTUP_PAUSE_ENV: 'true'} if name == 'game-engine' and startup_paused(record) else {}),
+                'Startup pause environment differs from its contract or service')
         require({k: v for k, v in svc.get('environment', {}).items() if k.startswith('TOPDOWN_')} ==
                 (map_env if name == 'game-api' else {}), 'Topdown environment differs from explicit pin')
         require(not set(svc) & {'build', 'container_name', 'privileged', 'network_mode', 'pid', 'ipc', 'devices',
@@ -224,6 +281,31 @@ def validate_model(model, record):
                 require(mount['type'] == 'volume' and mount['source'] in model['volumes'], 'Foreign volume mount')
     require('JWT_PRIVATE_KEY' not in model['services']['game-api']['environment'] and
             'JWT_PRIVATE_KEY' not in model['services']['board-api']['environment'], 'Private key escaped issuer')
+    validate_profile_model(model, record)
+
+
+def validate_profile_model(model, record):
+    tactical = profile(record) == 'tactical'
+    reserved = set(TACTICAL_API) | set(TACTICAL_ENGINE) | {TACTICAL_KEY}
+    for service, spec in model['services'].items():
+        allowed = (set(TACTICAL_API) | {TACTICAL_KEY} if service == 'game-api' else
+                   set(TACTICAL_ENGINE) if service == 'game-engine' else set()) if tactical else set()
+        require(not ((reserved & set(spec.get('environment', {}))) - allowed),
+                'Tactical configuration escaped its profile or service')
+    if not tactical:
+        return
+    api = model['services']['game-api']['environment']
+    engine = model['services']['game-engine']['environment']
+    require(all(api.get(key) == value for key, value in TACTICAL_API.items()) and
+            all(engine.get(key) == value for key, value in TACTICAL_ENGINE.items()),
+            'Tactical runtime configuration differs from its contract')
+    key = tactical_key(api.get(TACTICAL_KEY))
+    require(api.get('SERVER_ID') == record['serverId'] and
+            api.get('OPENSAMGUK_WORLD_ID') == engine.get('OPENSAMGUK_WORLD_ID') == str(record['worldId']),
+            'Tactical server or world binding differs')
+    require(sum(value == key for spec in model['services'].values()
+                for value in spec.get('environment', {}).values()) == 1,
+            'Dedicated tactical signing key must stay in game-api')
 
 
 def inventory(record):
@@ -435,6 +517,9 @@ def tree_hash(directory):
 
 
 def prepare(args):
+    selected_profile = getattr(args, 'profile', 'standard')
+    require(selected_profile in ('standard', 'tactical'), 'Unknown local fixture profile')
+    selected_pause = startup_paused({'startupPaused': getattr(args, 'startup_paused', False)})
     session = os.environ.get('OPENSAMGUK_TASK_OWNER_SESSION', '')
     require(re.fullmatch('[a-f0-9-]{36}', session), 'Set writer session before prepare')
     require(re.fullmatch('[a-f0-9]{40}', args.docker_sha), 'Exact Docker SHA required')
@@ -461,6 +546,10 @@ def prepare(args):
               'appSha': args.app_sha, 'dockerSha': args.docker_sha, 'nginxSha256': sha(nginx),
               'templateSha256': sha((ROOT / 'docker-compose.localhost-acceptance.yml').read_bytes()),
               'status': 'PREPARED', 'images': {}}
+    if selected_profile == 'tactical':
+        record['profile'] = selected_profile
+    if selected_pause:
+        record['startupPaused'] = True
     if map_record:
         record['topdown'] = map_record
     write_json(directory / 'contract.json', record)
@@ -497,6 +586,7 @@ def prepare(args):
                 'JWT_PUBLIC_KEY': base64.b64encode(public).decode(), 'ADMIN_USERNAME': 'admin' + nonce[:8],
                 'ADMIN_PASSWORD': secrets.token_urlsafe(24), 'USER_USERNAME': 'user' + nonce[:8],
                 'USER_PASSWORD': secrets.token_urlsafe(24)}
+    fixtures = profile_fixtures(record, fixtures)
     write_json(directory / 'runtime.json', fixtures)
     write_json(directory / 'fixture.json', {
         'admin': {'username': fixtures['ADMIN_USERNAME'], 'password': fixtures['ADMIN_PASSWORD']},
@@ -840,6 +930,88 @@ def sql(directory, record, service, query):
                    '-U', 'lha', '-d', db, '-c', query).decode().strip()
 
 
+def validate_tactical_readiness(payload, record, now=None):
+    pins = ('dbFingerprint', 'nativeFenceSha256', 'ruleSha256', 'catalogSha256', 'combatSha256', 'spaceSha256')
+    require(isinstance(payload, dict) and set(payload) == set(pins) | {
+        'schemaVersion', 'status', 'worldId', 'moraleEncoding', 'checkedAt', 'reasons'},
+        'Tactical readiness response schema differs')
+    require(type(payload['schemaVersion']) is int and payload['schemaVersion'] == 1 and
+            type(payload['worldId']) is int and payload['worldId'] == record['worldId'] and
+            payload['status'] == 'READY' and payload['reasons'] == [] and
+            payload['moraleEncoding'] == 'CAMPAIGN_NATIVE_D177_V1', 'Tactical pipeline is not ready')
+    require(all(isinstance(payload[key], str) and re.fullmatch('[a-f0-9]{64}', payload[key]) for key in pins),
+            'Tactical readiness pin is missing or invalid')
+    try:
+        stamp = datetime.datetime.fromisoformat(payload['checkedAt'].replace('Z', '+00:00'))
+    except (AttributeError, TypeError, ValueError):
+        raise Refused('Tactical readiness time is invalid') from None
+    require(stamp.tzinfo is not None and stamp.utcoffset() == datetime.timedelta(0),
+            'Tactical readiness time must be UTC')
+    age = (time.time() if now is None else now) - stamp.timestamp()
+    require(0 <= age <= 5, 'Tactical readiness observation is not fresh')
+
+
+def tactical_smoke(directory, record):
+    # Probe inside the owned API container; no new public gateway route or credential is needed.
+    raw = compose(directory, record, 'exec', '-T', 'game-api', 'curl', '--silent', '--show-error',
+                  '--max-time', '3', '--noproxy', '*', '--write-out', '\nSTATUS:%{http_code}',
+                  f'http://127.0.0.1:8081/internal/battles/pipeline-readiness?worldId={record["worldId"]}')
+    body, separator, status = raw.rpartition(b'\nSTATUS:')
+    require(separator and status == b'200' and len(body) <= 16384, 'Tactical readiness HTTP probe failed')
+    def unique_fields(pairs):
+        result = {}
+        for key, value in pairs:
+            require(key not in result, 'Tactical readiness response has duplicate fields')
+            result[key] = value
+        return result
+    try:
+        payload = json.loads(body, object_pairs_hook=unique_fields)
+    except (ValueError, UnicodeDecodeError):
+        raise Refused('Tactical readiness response is invalid') from None
+    validate_tactical_readiness(payload, record)
+
+
+def validate_startup_pause_status(payload, record):
+    require(isinstance(payload, dict) and payload.get('state') == 'paused' and
+            payload.get('running') is False and all(payload.get(key) is True for key in
+            ('paused', 'loopAlive', 'serviceMaterialized', 'recoveryReady', 'autoStartEnabled')) and
+            payload.get('recoveryMode') == 'READY', 'Engine startup pause is not ready')
+    clock = payload.get('clock')
+    require(isinstance(clock, dict) and type(clock.get('worldId')) is int and
+            clock['worldId'] == record['worldId'], 'Startup pause world differs')
+    started, completed = payload.get('lastTickStartedAt'), payload.get('lastTickCompletedAt')
+    if started is None and completed is None:
+        return
+    try:
+        start = datetime.datetime.fromisoformat(started.replace('Z', '+00:00'))
+        end = datetime.datetime.fromisoformat(completed.replace('Z', '+00:00'))
+        require(start.tzinfo is not None and end.tzinfo is not None and end >= start,
+                'Startup pause has an unfinished tick')
+    except (AttributeError, TypeError, ValueError):
+        raise Refused('Startup pause tick observation is invalid') from None
+
+
+def startup_pause_smoke(directory, record):
+    if not startup_paused(record):
+        return
+    raw = compose(directory, record, 'exec', '-T', 'game-engine', 'curl', '--silent', '--show-error',
+                  '--max-time', '3', '--noproxy', '*', '--write-out', '\nSTATUS:%{http_code}',
+                  'http://127.0.0.1:8082/admin/turn-daemon/status')
+    body, separator, status = raw.rpartition(b'\nSTATUS:')
+    require(separator and status == b'200' and len(body) <= 16384, 'Startup pause HTTP probe failed')
+    def unique_fields(pairs):
+        result = {}
+        for key, value in pairs:
+            require(key not in result, 'Startup pause status has duplicate fields')
+            result[key] = value
+        return result
+    try:
+        payload = json.loads(body, object_pairs_hook=unique_fields)
+    except (ValueError, UnicodeDecodeError):
+        raise Refused('Startup pause status is invalid') from None
+    validate_startup_pause_status(payload, record)
+
+
 def smoke(args):
     directory, record = load(args.custody)
     model = verify_files(directory, record)
@@ -850,7 +1022,8 @@ def smoke(args):
     context = ssl.create_default_context(cafile=str(directory / 'certs/opensamguk.crt'))
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context))
     checks = [('/health', {200}), ('/api/gateway/auth/me', {401}),
-              ('/api/battle-ws/' + record['serverId'] + '/160/probe', {404}),
+              ('/api/battle-ws/' + record['serverId'] + '/160/probe',
+               {403 if profile(record) == 'tactical' else 404}),
               ('/d_pic/.ops/private', {404}), ('/game/', {404}), ('/', {200})]
     for path, expected in checks:
         try:
@@ -866,8 +1039,11 @@ def smoke(args):
     actual = sql(directory, record, 'gateway-postgres',
                  f"SELECT count(*) FROM game_server s JOIN game_server_publication p USING(server_id) WHERE s.server_id='{sid}' AND s.generation=0 AND p.state='PUBLIC' AND p.revision=1;")
     require(actual == '1', 'Registry identity mismatch')
+    if profile(record) == 'tactical':
+        tactical_smoke(directory, record)
     topdown.smoke(record, lambda path: compose(directory, record, 'exec', '-T', 'game-api',
         'curl', '-fsS', '--max-time', '15', 'http://localhost:8081' + path))
+    startup_pause_smoke(directory, record)
     startup_disk_check(directory, 'beforeSmokePassedFreeBytes')
     record['status'] = 'SMOKE_PASSED'
     write_json(directory / 'contract.json', record, replace=True)
@@ -950,11 +1126,15 @@ def down(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
-    p = sub.add_parser('prepare')
+    p = sub.add_parser('prepare', allow_abbrev=False)
     p.add_argument('--source', required=True, type=Path)
     p.add_argument('--app-sha', required=True)
     p.add_argument('--docker-sha', required=True)
     p.add_argument('--custody', required=True, type=Path)
+    p.add_argument('--profile', choices=('standard', 'tactical'), default='standard',
+                   help='Explicit opt-in for a new fixture; never modifies an existing custody')
+    p.add_argument('--startup-paused', action='store_true',
+                   help='Hold scheduled ticks from engine startup; normal resume releases the hold')
     p.add_argument('--clone-source-custody', type=Path,
                    help='Optional owned prior custody; clone public source only after exact Git archive comparison')
     p.add_argument('--topdown-bundle', type=Path, help='Existing approved full bake directory; new custody only')
