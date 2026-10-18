@@ -14,6 +14,7 @@ import secrets
 import time
 
 from storage import Refused, need, private, newdir, put, write, read, digest, seal, verify_bundle, archive_root
+from storage import canonical_path, isolated_output, overlaps
 from transport import LocalIO
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -30,6 +31,7 @@ VOLUMES = ('gateway-pgdata', 'game-pgdata', 'gateway-redisdata', 'game-redisdata
 
 
 def permission(path, source):
+    source = canonical_path(source)
     token = read(path)
     need(token.get('schema') == 1 and token.get('sourceCustody') == str(Path(source).absolute()), 'HANDOFF_TARGET')
     owner = os.environ.get('OPENSAMGUK_TASK_OWNER_SESSION', '')
@@ -298,6 +300,7 @@ class Recovery:
         self.io.stream(args, path, incoming=incoming)
 
     def backup(self, source_path, output, general_id, request_id):
+        output = isolated_output(output, [source_path])
         directory, record, model = self.source(source_path)
         rows = self.verify(record, model, healthy=True)
         probe = self.io.user_probe(directory, identity(record), general_id, request_id)
@@ -357,6 +360,7 @@ class Recovery:
 
     def version(self, bundle, app_sha, pins, output, source_path):
         m = self.bundle(bundle)
+        output = isolated_output(output, [m['source']['custody'], bundle, source_path])
         need(SHA.fullmatch(app_sha) and app_sha != m['source']['appSha'], 'DIFFERENT_VERSION_REQUIRED')
         need(set(pins) == set(fresh.SERVICES), 'SIX_VERSION_IMAGES')
         source_tree = set()
@@ -382,6 +386,7 @@ class Recovery:
     def restore(self, bundle, target, version=None):
         m = self.bundle(bundle)
         source = m['source']
+        target = isolated_output(target, [source['custody'], bundle])
         model = read(Path(bundle) / 'custody/compose.json')
         rows = self.verify(source, model)
         need(not any(self.state(c['Id'])['Running'] for c in rows.values()), 'ORIGINAL_MUST_BE_STOPPED')
@@ -504,6 +509,7 @@ class Recovery:
 
     def rollback(self, bundle, prior_target, target):
         m = self.bundle(bundle)
+        target = isolated_output(target, [m['source']['custody'], bundle, prior_target])
         b, b_model = self.target(prior_target)
         need(b['bundle'] == str(Path(bundle).absolute()) and b['observation'] is not None and
              b['record']['appSha'] != m['source']['appSha'] and
@@ -522,6 +528,9 @@ class Recovery:
 
 
 def authorize_inputs(a, token):
+    for name in ('source_custody', 'bundle', 'target', 'logs', 'output', 'from_target', 'source', 'version', 'meta', 'handoff'):
+        if getattr(a, name, None) is not None:
+            setattr(a, name, canonical_path(getattr(a, name)))
     bundle = getattr(a, 'bundle', None)
     if a.action in ('observe', 'stop-target'):
         bundle = read(a.target / 'target.json')['bundle']
@@ -529,15 +538,20 @@ def authorize_inputs(a, token):
         source = read(Path(bundle) / 'custody/contract.json')
         need(source['custody'] == str(a.source_custody.absolute()) and
              digest(Path(bundle) / 'custody/contract.json') == token['sourceContractSha256'], 'HANDOFF_BUNDLE')
-    if getattr(a, 'target', None) and a.action in ('restore', 'rollback'):
-        dest = a.target.absolute()
-        need(not dest.is_relative_to(a.source_custody.absolute()) and
-             not dest.is_relative_to(Path(bundle).absolute()), 'TARGET_OVERLAPS_SOURCE')
-    if a.action == 'backup':
-        need(not a.bundle.absolute().is_relative_to(a.source_custody.absolute()), 'BACKUP_OVERLAPS_SOURCE')
-    need(not a.logs.absolute().is_relative_to(a.source_custody.absolute()), 'LOGS_OVERLAP_SOURCE')
-    if bundle:
-        need(not a.logs.absolute().is_relative_to(Path(bundle).absolute()), 'LOGS_OVERLAP_BUNDLE')
+    protected = [a.source_custody]
+    outputs = [a.logs]
+    if a.action == 'backup': outputs.append(a.bundle)
+    elif bundle: protected.append(bundle)
+    if a.action in ('restore', 'rollback'): outputs.append(a.target)
+    if a.action in ('observe', 'stop-target'): protected.append(a.target)
+    if a.action == 'rollback': protected.append(a.from_target)
+    if a.action == 'pin-version':
+        outputs.append(a.output)
+        protected.append(a.source)
+    for path in outputs:
+        isolated_output(path, protected)
+    need(not any(overlaps(a, b) for i, a in enumerate(outputs) for b in outputs[i+1:]),
+         'OUTPUTS_OVERLAP')
 
 
 def main():

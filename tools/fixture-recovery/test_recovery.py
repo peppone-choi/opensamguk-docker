@@ -225,7 +225,7 @@ class RecoveryTests(unittest.TestCase):
             self.io.image_data[iid]={'Id':iid,'RepoTags':[], 'Config':{'Labels':labels}}
         out=self.root/'B.json'
         with patch.object(r.fresh,'source_archive',return_value=b'fake public archive'), patch.object(r.fresh,'archive_tree_hash',return_value='f'*64), patch.object(r.fresh,'git',return_value=b'FROM fixture'):
-            self.engine.version(self.bundle,'b'*40,pins,out,self.root)
+            self.engine.version(self.bundle,'b'*40,pins,out,self.root/'B-source')
         return out
 
     def test_full_A_backup_B_observation_A_rollback_and_original_return(self):
@@ -378,7 +378,7 @@ class RecoveryTests(unittest.TestCase):
         m['volumes']['game-redisdata']=archive_root(self.bundle/'data/game-redisdata.tar')
         write(self.bundle/'manifest.json',m,replace=True)
         with self.assertRaisesRegex(Refused,'SIX_VERSION_IMAGES'):
-            self.engine.version(self.bundle,'b'*40,{},self.root/'v',self.root)
+            self.engine.version(self.bundle,'b'*40,{},self.root/'v',self.root/'B-source')
 
     def test_foreign_network_member_refused_before_stop(self):
         next(iter(self.io.networks.values()))['Containers']['foreign']={}

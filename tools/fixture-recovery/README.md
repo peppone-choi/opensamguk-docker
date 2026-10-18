@@ -44,6 +44,12 @@ The writer sets `OPENSAMGUK_TASK_OWNER_SESSION` to its existing chat ID. Do not 
 another installation's env/key files. A backup preserves F's private files internally; it never
 prints their values. Use an independently approved fresh log directory for **each** invocation.
 Logs must be outside the immutable backup bundle and original custody.
+Every input/output path rejects `..` and symlink components before log creation or Docker
+contact. Relative paths without those components become absolute resolved paths. New
+bundle, target, log and `pin-version --output` paths must be separate from each other and
+from original custody, the sealed bundle and any prior target used by the command.
+Version output must also be outside the B source checkout. Existing filesystem ancestor
+identity is checked as well, so a case alias cannot bypass these boundaries on macOS.
 
 ## Ordered commands
 

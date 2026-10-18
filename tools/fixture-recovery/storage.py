@@ -17,6 +17,30 @@ def need(ok, code):
         raise Refused(code)
 
 
+def canonical_path(path):
+    path = Path(path).absolute()
+    need('..' not in path.parts, 'PATH_TRAVERSAL')
+    need(not any(p.is_symlink() for p in (path, *path.parents)), 'SYMLINK')
+    return path.resolve()
+
+
+def overlaps(path, protected):
+    path, protected = canonical_path(path), canonical_path(protected)
+    if path.is_relative_to(protected) or protected.is_relative_to(path):
+        return True
+    # Existing ancestor identity also catches case aliases on macOS volumes.
+    return any(a.exists() and b.exists() and os.path.samefile(a, b)
+               for a, b in [(p, protected) for p in (path, *path.parents)] +
+                           [(path, p) for p in protected.parents])
+
+
+def isolated_output(path, protected):
+    path = canonical_path(path)
+    need(not any(overlaps(path, root) for root in protected), 'OUTPUT_OVERLAPS_INPUT')
+    need(not path.exists(), 'OUTPUT_EXISTS')
+    return path
+
+
 def digest(path):
     h = hashlib.sha256()
     with Path(path).open('rb') as f:
@@ -26,8 +50,7 @@ def digest(path):
 
 
 def private(path, directory=False):
-    path = Path(path).absolute()
-    need(not any(p.is_symlink() for p in (path, *path.parents)), 'SYMLINK')
+    path = canonical_path(path)
     s = path.stat()
     need(s.st_uid == os.getuid() and not s.st_mode & 0o077, 'PRIVATE_OWNER_MODE')
     need(stat.S_ISDIR(s.st_mode) if directory else stat.S_ISREG(s.st_mode), 'FILE_TYPE')
@@ -36,7 +59,7 @@ def private(path, directory=False):
 
 
 def newdir(path):
-    path = Path(path).absolute()
+    path = canonical_path(path)
     need(not path.exists() and not path.is_symlink(), 'OUTPUT_EXISTS')
     need(not any(p.is_symlink() for p in path.parents), 'SYMLINK')
     path.mkdir(mode=0o700)
@@ -44,7 +67,7 @@ def newdir(path):
 
 
 def put(path, content, replace=False):
-    path = Path(path)
+    path = canonical_path(path)
     if replace:
         private(path)
     flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | (os.O_TRUNC if replace else os.O_EXCL)
@@ -56,7 +79,7 @@ def put(path, content, replace=False):
 
 
 def write(path, value, replace=False):
-    path = Path(path)
+    path = canonical_path(path)
     content = (json.dumps(value, sort_keys=True, indent=2) + '\n').encode()
     if not replace:
         put(path, content)
