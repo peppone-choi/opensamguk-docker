@@ -264,7 +264,7 @@ class TopdownTests(unittest.TestCase):
                 if args[2]=='nginx':return b''
                 return (t.canonical({'topdownBakeId':self.bake_id} if valid else {})
                         if args[-1].endswith('/preview') else (self.bundle/'manifest.json').read_bytes())
-            opener=SimpleNamespace(open=Mock(side_effect=[nullcontext(SimpleNamespace(status=s)) for s in (200,401,404,404,404,200)]))
+            opener=SimpleNamespace(open=Mock(side_effect=[nullcontext(SimpleNamespace(status=s)) for s in (200,401,*([404]*10),200)]))
             with patch.object(h,'load',return_value=(self.root,candidate)),patch.object(h,'verify_files',return_value=model), \
                  patch.object(h,'verify_images'),patch.object(h,'verify_running'),patch.object(h,'inventory'), \
                  patch.object(h,'compose',side_effect=compose),patch.object(h.ssl,'create_default_context'), \

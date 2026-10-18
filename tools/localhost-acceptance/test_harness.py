@@ -220,7 +220,9 @@ class HarnessTests(unittest.TestCase):
                 record = {**self.record, 'profile': mode, 'status': 'RUNNING'}
                 opener = MagicMock()
                 def response(url, **kwargs):
-                    status = websocket_status if '/api/battle-ws/' in url else 401 if '/auth/me' in url else (
+                    ws = '/api/battle-ws/' in url or '/ws/battles/' in url
+                    own = '/' + record['serverId'] + '/160/probe' in url
+                    status = (websocket_status if own else 404) if ws else 401 if '/auth/me' in url else (
                         404 if '/d_pic/' in url or url.endswith('/game/') else 200)
                     result = MagicMock()
                     result.__enter__.return_value.status = status
@@ -805,7 +807,7 @@ class HarnessTests(unittest.TestCase):
         h.private_write(self.directory/'nginx.conf',b'canonical nginx bytes')
         (self.directory/'certs').mkdir()
         h.private_write(self.directory/'certs/opensamguk.crt',b'new local cert')
-        (self.directory/'battle-ws').mkdir()
+        (self.directory/'battle-ws').mkdir(mode=0o700)
         h.write_json(self.directory/'runtime.json',self.fixture)
         h.write_json(self.directory/'compose.json',self.model)
         self.record.update(nginxSha256=h.sha(b'canonical nginx bytes'),

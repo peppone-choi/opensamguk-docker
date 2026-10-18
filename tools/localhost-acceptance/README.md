@@ -57,13 +57,82 @@ profile의 구성은 유지되며, 준비된 custody나 기존 스택을 이 옵
 game-api에 기존 네 전술 flag·serverId·정확한 `https://localhost` WS origin을 결속한다.
 engine에는 `BATTLE_PIPELINE_ENABLED=true`와
 `BATTLE_PIPELINE_API_BASE_URL=http://game-api:8081`을 지정한다. 키는 game-api만 받으며
-JWT·DB·internal-service 비밀을 재사용하지 않는다. 공개 gateway/nginx 경로는 추가하지 않는다.
+JWT·DB·internal-service 비밀을 재사용하지 않는다. nginx는 아래 계약의 두 WS alias만 연결한다.
 
 전술 profile의 무인증 WS 경계 기대값은 **403**이다. 기본 profile의 미노출 **404**를
 전술 기능 성공으로 인정하지 않는다. 추가 smoke는 owned game-api 내부의 읽기 전용
 readiness를 호출해 정확한 world·D177 encoding·여섯 hash·5초 이내 UTC 시각·빈 reasons와
 READY를 확인한다. HTTP 200 하나나 일반 health를 readiness 대신 사용하지 않는다.
 이 검사는 실제 조우·한 판 종료·캠페인 정산·성능 인수를 대신하지 않는다.
+
+Tactical prepare writes exactly one private `battle-ws/localhost-allowlist.map` entry:
+the contract's exact server ID to `http://s<serverId>-game-api:8081`. The canonical nginx
+already includes this directory; prepare copies canonical nginx as-is, and Compose/Dockerfiles remain unchanged. Standard
+prepare keeps the directory empty. The contract binds canonical map bytes and SHA256;
+verification rejects extra files, arbitrary targets, changed receipts, symlinks/hardlinks,
+public or foreign-owned files, and changed model/runtime aliases. Only the owned game-api
+endpoint may carry that alias. Canonical HTTP and HTTPS locations accept the actual browser
+contract `/ws/battles/...` and the compatibility `/api/battle-ws/...` through the same strict
+SID/world/battle ID expression, short-ticket/Origin handling and stripped cookie/auth headers.
+No general `/ws` proxy exists. Strict smoke requires own SID **403**, foreign SID **404** and
+malformed world/battle paths **404** on both aliases.
+
+### Existing d35 tactical boundary failure
+
+The d35 build created an empty map while expecting tactical 403, and lacked the browser's
+`/ws/battles` public path. The existing H's six
+images and eleven healthy containers can be retained through a separately approved,
+single-attempt `repair-tactical-route`. Source review alone does not authorize this operation.
+Use a **separately registered stable verifier worktree**, for example
+`localhost-h-route-verifier-20261019`, at the exact reviewed revision. Keep the author PR's
+worktree separate because normal post-merge cleanup may remove it. C0 must also update
+its private USER/snapshot wrappers to this exact verifier path/revision and harness blob;
+the original d35 verifier intentionally rejects a nonempty map.
+
+```sh
+python3 -B <stable-verifier>/tools/localhost-acceptance/harness.py repair-tactical-route \
+  --custody <existing-H-directory> --meta <metarepo> \
+  --verifier-sha <exact-reviewed-verifier-SHA> --authorize-project <exact-owned-project>
+```
+
+Admission requires the original d35 tactical RUNNING contract, the original supervisor's
+specific WS boundary failure, unchanged source/config/images/custody, eleven healthy owned
+services, actual model/mount/network/alias bindings and 6016MiB caps, a clean exact verifier,
+the writing session, an explicit project and the global heavy lock with no GUI operation.
+The reload adds no container workload, so it retains resume-startup's 2CPU/6GiB VM/load5≤400
+checks rather than reserving another six GiB. Any separately authorized D174 disk-floor
+override remains an operator concern; this command does not disable source smoke checks.
+
+The operation preserves the original contract bytes in `tactical-route-original-contract.json`
+and public nginx bytes in `tactical-route-original-nginx.conf` inside the same private custody. It leaves
+`h-execution.json` and all original failure/diagnosis logs untouched, makes no copies of
+auth/runtime/certificates, and records the separate verifier SHA/path/harness SHA256 in the
+current contract and `tactical-route-recovery.json`. Build `dockerSha` and `nginxSha256` remain
+d35's original pins. Separate `runtimeNginxSha256` and `runtimeNginxFileIdentity` bind the new
+canonical config to that reviewed verifier revision and the original host device/inode.
+Only the exact two-location alias/fallback addition is allowed; an unrelated nginx change
+is refused. All other original contract fields must match, except status and these explicit
+routing/config/verifier bindings. Normal validation and snapshot recheck them against the
+preserved originals and exact Git bytes. Compose and Dockerfiles remain unchanged.
+
+Only then does it write the canonical map and new canonical nginx bytes. The nginx file is
+a file-level bind: an atomic rename would leave the container on the old inode. The writer
+opens the original with O_NOFOLLOW, checks fstat device/inode/owner/private mode/single-link
+and old bytes, writes in place, fsyncs, and rechecks the inode and bytes. A write exception
+attempts to restore the old bytes through the same FD. It then runs `nginx -t` and sends
+**one normal nginx reload**. It waits for own403/foreign404 on both aliases with a 30-second
+observation deadline, runs the complete
+tactical/map/startup-pause smoke, and verifies unchanged container/image/network/volume IDs
+before publishing `SMOKE_PASSED`. No image build/pull, Compose up/recreate, engine restart,
+SQL, policy/account/role mutation or resume occurs. `tactical-route-execution.json` records
+the attempt. On failure, restoration first rechecks the same healthy resource IDs, original
+backups, exact known current contract/map/config bytes and original inode. If they match,
+it restores the old config in place, removes only its canonical map file, and restores the
+original FAIL-state contract bytes. If a reload was attempted, restoration runs `nginx -t`
+and at most **one additional normal reload** for the old config. This is restoration of the
+original failing configuration, not a USER pass. Foreign edits, changed IDs or failed restore
+checks prevent overwrites and are recorded as requiring operator action. Both failure records
+and originals remain; no automatic repair retry is allowed.
 
 ## Regression
 
@@ -96,6 +165,11 @@ The approved existing candidate is artifact11486607528 from app run37632390499, 
 This profile cannot be added to G by editing its existing contract/Compose/environment. Existing role bootstrap1723 and full-recovery83 have separate strict mount assumptions: their current versions must not be treated as accepting this additional bind. C0 coordinates their compatibility and the frozen tactical profile82 separately before a combined acceptance run. Actual new H startup, image reuse/build approval, USER/GUI acceptance and runtime rollback remain separate.
 
 The new pure suite is `python3 -B tools/localhost-acceptance/test_topdown_bundle.py`. It uses temporary public fixtures and mocked runtime/key operations only. The existing suite's real Docker image-inspect and Compose-normalization cases still require a separately allowed Docker window.
+
+`python3 -B tools/localhost-acceptance/test_tactical_route.py -v` covers routing tampering,
+endpoint aliases, exact verifier binding, operation refusals, original failure retention,
+reload boundaries and refusal to publish PASS when final runtime identities change. It uses
+temporary custody and mocked runtime calls; it is not an actual H repair result.
 
 Startup uses an explicit separate phase: **8 GiB** free disk, with the same **2 CPUs / 6 GiB allocated and available Docker memory / load5 ≤400** checks. Unknown phases are refused. All six app images and three support images are already verified, and startup retains `--no-build --pull never`; new writes are the five nonce volumes, eleven container writable layers and bounded logs (11 × 20MiB). Service memory ceilings total 6016MiB. This separates source compilation storage from runtime admission. `startup-disk.json` records initial and observed disk consumption. After startup and immediately before `SMOKE_PASSED`, free disk must remain **at least 3 GiB**; failure preserves resources and cannot pass smoke. DB/WAL growth is not hard-capped, so these observations remain required. Original resource refusals remain in custody.
 
