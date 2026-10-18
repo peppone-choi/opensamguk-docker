@@ -28,6 +28,9 @@ import importlib.util
 _topdown_spec = importlib.util.spec_from_file_location('localhost_topdown', Path(__file__).with_name('topdown_bundle.py'))
 topdown = importlib.util.module_from_spec(_topdown_spec)
 _topdown_spec.loader.exec_module(topdown)
+_observation_spec = importlib.util.spec_from_file_location('localhost_engine_observation', Path(__file__).with_name('engine_observation.py'))
+observation = importlib.util.module_from_spec(_observation_spec)
+_observation_spec.loader.exec_module(observation)
 
 ROOT = Path(__file__).resolve().parents[2]
 SERVICES = ('gateway-api', 'board-api', 'game-api', 'game-engine', 'web-gateway', 'web-game')
@@ -62,6 +65,11 @@ VOLUME_FORMAT = '{"Name":{{json .Name}},"Labels":{{json (index . "Labels")}}}'
 
 class Refused(RuntimeError):
     pass
+
+
+class ObservationNoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise Refused('Public observation redirect refused')
 
 
 def require(condition, message):
@@ -126,6 +134,7 @@ def private_path(path, directory=False):
 def identity(record, read_only=False):
     profile(record)
     startup_paused(record)
+    observation.selected(record)
     nonce = record.get('nonce', '')
     require(re.fullmatch('[a-f0-9]{16}', nonce), 'Invalid nonce')
     require(record.get('project') == 'osglha' + nonce and record.get('serverId') == 'lha' + nonce,
@@ -338,6 +347,7 @@ def model_for(record, fixtures):
         model['services']['game-api']['volumes'] = map_mounts
     if paused:
         model['services']['game-engine']['environment'][STARTUP_PAUSE_ENV] = 'true'
+    model['services']['game-api']['environment'].update(observation.environment(record))
     validate_model(model, record)
     return model
 
@@ -388,6 +398,7 @@ def validate_model(model, record):
     require('JWT_PRIVATE_KEY' not in model['services']['game-api']['environment'] and
             'JWT_PRIVATE_KEY' not in model['services']['board-api']['environment'], 'Private key escaped issuer')
     validate_profile_model(model, record)
+    observation.validate_model(model, record)
 
 
 def validate_profile_model(model, record):
@@ -629,6 +640,8 @@ def prepare(args):
     selected_profile = getattr(args, 'profile', 'standard')
     require(selected_profile in ('standard', 'tactical'), 'Unknown local fixture profile')
     selected_pause = startup_paused({'startupPaused': getattr(args, 'startup_paused', False)})
+    selected_observation = getattr(args, 'engine_observation', False)
+    require(type(selected_observation) is bool, 'Engine observation requires an explicit boolean selection')
     session = os.environ.get('OPENSAMGUK_TASK_OWNER_SESSION', '')
     require(re.fullmatch('[a-f0-9-]{36}', session), 'Set writer session before prepare')
     require(re.fullmatch('[a-f0-9]{40}', args.docker_sha), 'Exact Docker SHA required')
@@ -637,6 +650,8 @@ def prepare(args):
     require(git(args.source, 'rev-parse', 'origin/main').decode().strip() == args.app_sha,
             'App SHA must match fetched origin/main')
     archive = source_archive(args.source, args.app_sha)
+    observation_pins = (observation.source_pins(lambda path: git(args.source, 'show', args.app_sha + ':' + path))
+                        if selected_observation else None)
     nginx = git(ROOT, 'show', args.docker_sha + ':infra/nginx/nginx.conf')
     directory = Path(args.custody).absolute()
     map_args = [getattr(args, key, None) for key in ('topdown_bundle', 'topdown_bake_id', 'topdown_manifest_sha256')]
@@ -660,6 +675,8 @@ def prepare(args):
         record['battleRouting'] = battle_route_binding(record)
     if selected_pause:
         record['startupPaused'] = True
+    if selected_observation:
+        record['engineObservation'] = {'schema': 1, 'sourcePins': observation_pins, 'binding': None}
     if map_record:
         record['topdown'] = map_record
     write_json(directory / 'contract.json', record)
@@ -720,6 +737,10 @@ def verify_custody_files(directory, record, *, legacy_route=False):
     require(sha((ROOT / 'docker-compose.localhost-acceptance.yml').read_bytes()) == record['templateSha256'],
             'Harness template changed; prepare a fresh stack')
     require(tree_hash(directory / 'source') == record['sourceTreeSha256'], 'Source bytes/modes changed')
+    option = observation.selected(record)
+    if option is not None:
+        require(option['sourcePins'] == observation.source_pins(lambda path: topdown.read_file(directory / 'source' / path)),
+                'Engine observation source pins changed')
     if record.get('topdown'):
         selected = record['topdown']
         pins = topdown.source_pins(lambda path: topdown.read_file(directory / 'source' / path))
@@ -859,13 +880,15 @@ def verify_mounts(actual, service, model):
             and set(observed) == set(expected), 'Runtime mounts differ from declared model')
 
 
-def verify_running(record, resources, model):
+def verify_running(record, resources, model, *, bootstrap=False):
     assert_owned(record, resources)
-    require(len(resources['container']) == len(model['services']), 'Incomplete stack')
+    expected = set(observation.BOOTSTRAP) if bootstrap else set(model['services'])
+    require(not bootstrap or observation.selected(record) is not None, 'Unselected bootstrap refused')
+    require(len(resources['container']) == len(expected), 'Incomplete stack')
     seen = set()
     for row in resources['container']:
         svc = row['Config']['Labels'].get('com.docker.compose.service')
-        require(svc in model['services'] and svc not in seen, 'Unexpected or duplicate container')
+        require(svc in expected and svc not in seen, 'Unexpected or duplicate container')
         seen.add(svc)
         require(row['State']['Running'] and row['State'].get('Health', {}).get('Status') == 'healthy',
                 'Service not healthy')
@@ -882,7 +905,28 @@ def verify_running(record, resources, model):
         require(row.get('Driver') == 'bridge', 'Foreign runtime network driver')
         own_ids = {r['Id'] for r in resources['container']}
         require(set(row.get('Containers', {})) <= own_ids, 'Foreign network member; preserved')
-    verify_battle_route_runtime(record, resources)
+    if not bootstrap:
+        verify_battle_route_runtime(record, resources)
+    if observation.selected(record) is not None:
+        verify_observation_network(record, resources)
+
+
+def verify_observation_network(record, resources):
+    services = {r['Config']['Labels'].get('com.docker.compose.service') for r in resources['container']}
+    require('game-engine' in services, 'Owned observation engine required')
+    for endpoint in ('game-engine', 'game-api'):
+        found = 0
+        alias = 's' + record['serverId'] + '-' + endpoint
+        for row in resources['container']:
+            service = row['Config']['Labels'].get('com.docker.compose.service')
+            aliases = row['NetworkSettings']['Networks'][record['project'] + '_local'].get('Aliases') or []
+            if service == endpoint:
+                found += 1
+                require(len(aliases) == 3 and set(aliases) == {row['Name'].lstrip('/'), endpoint, alias},
+                        'Owned observation endpoint aliases differ')
+            else:
+                require(not {endpoint, alias} & set(aliases), 'Observation endpoint belongs to another service')
+        require(found == (1 if endpoint in services else 0), 'Unique owned observation endpoint required')
 
 
 def verify_battle_route_runtime(record, resources):
@@ -994,7 +1038,8 @@ def repair_registry(args):
 
 
 def startup_disk_check(directory, stage, initial_free=None):
-    require(stage in ('afterStartupFreeBytes', 'beforeSmokePassedFreeBytes'), 'Unknown disk observation')
+    require(stage in ('afterObservationBootstrapFreeBytes', 'afterStartupFreeBytes', 'beforeSmokePassedFreeBytes'),
+            'Unknown disk observation')
     path = directory / 'startup-disk.json'
     report = ({'startupFreeBytes': initial_free} if initial_free is not None else
               json.loads(private_path(path).read_bytes()))
@@ -1020,9 +1065,36 @@ def up(args):
         write_json(directory / 'startup-disk.json', {'startupFreeBytes': initial_free})
         record['status'] = 'STARTING'
         write_json(directory / 'contract.json', record, replace=True)
+        bootstrap_ids = None
+        if observation.selected(record) is not None:
+            require(record['engineObservation']['binding'] is None, 'Fresh observation bootstrap is already bound')
+            compose(directory, record, 'up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '600',
+                    *observation.BOOTSTRAP, timeout=660, log_path=directory / 'observation-bootstrap.log')
+            startup_disk_check(directory, 'afterObservationBootstrapFreeBytes', initial_free)
+            resources = inventory(record)
+            verify_running(record, resources, model, bootstrap=True)
+            bootstrap_ids = observation_resource_ids(resources)
+            world = observation_metadata(directory, record)
+            status = observation_status(directory, record, 'game-engine', 'http://127.0.0.1:8082')
+            option = observation.bind(record, world, status, time.time(), observation.seed_tick(model))
+            verify_files(directory, record)
+            current = inventory(record)
+            verify_running(record, current, model, bootstrap=True)
+            require(observation_resource_ids(current) == bootstrap_ids, 'Bootstrap resources changed before binding')
+            record['engineObservation'] = option
+            fixtures = json.loads(private_path(directory / 'runtime.json').read_bytes())
+            model = model_for(record, fixtures)
+            write_json(directory / 'compose.json', model, replace=True)
+            record['configSha256'] = sha((directory / 'compose.json').read_bytes())
+            write_json(directory / 'contract.json', record, replace=True)
+            verify_files(directory, record)
         compose(directory, record, 'up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '600', timeout=660, log_path=directory / 'startup.log')
         startup_disk_check(directory, 'afterStartupFreeBytes', initial_free)
-        verify_running(record, inventory(record), model)
+        resources = inventory(record)
+        verify_running(record, resources, model)
+        if bootstrap_ids is not None:
+            require(observation_resource_ids(resources, bootstrap_only=True) == bootstrap_ids,
+                    'Bootstrap resources changed during full startup')
         record['status'] = 'RUNNING'
         write_json(directory / 'contract.json', record, replace=True)
     smoke(args)
@@ -1212,6 +1284,58 @@ def sql(directory, record, service, query):
                    '-U', 'lha', '-d', db, '-c', query).decode().strip()
 
 
+def observation_resource_ids(resources, *, bootstrap_only=False):
+    containers = resources['container']
+    if bootstrap_only:
+        containers = [r for r in containers if r['Config']['Labels']['com.docker.compose.service'] in observation.BOOTSTRAP]
+    return {'container': sorted(r['Id'] for r in containers), 'network': sorted(r['Id'] for r in resources['network']),
+            'volume': sorted(r['Name'] for r in resources['volume'] if
+                             r['Name'].endswith(('_game-pgdata', '_game-redisdata')))}
+
+
+def observation_metadata(directory, record):
+    require(type(record['worldId']) is int, 'Observation world must be an integer')
+    # Only identity/timing metadata is projected, never the complete meta/env or account tables.
+    query = f"""BEGIN READ ONLY;
+        SELECT json_build_object('worldCount',(SELECT count(*) FROM world_state),
+          'worldId',w.id,'tickSeconds',w.tick_seconds,'serverId',w.meta->>'serverId',
+          'serverIdAlias',w.meta->>'server_id',
+          'games',(SELECT json_agg(json_build_object('worldId',g.world_id,'serverId',g.server_id))
+                   FROM ng_games g WHERE g.world_id=w.id))
+        FROM world_state w WHERE w.id={record['worldId']}; COMMIT;"""
+    return observation.decode(sql(directory, record, 'game-postgres', query))
+
+
+def observation_status(directory, record, service, origin):
+    require((service, origin) in (('game-engine', 'http://127.0.0.1:8082'), ('game-api', observation.ORIGIN)),
+            'Observation probe endpoint differs')
+    raw = compose(directory, record, 'exec', '-T', service, 'curl', '--silent', '--show-error',
+                  '--max-time', '1', '--noproxy', '*', '--write-out', '\nSTATUS:%{http_code}',
+                  origin + '/admin/turn-daemon/status')
+    body, separator, status = raw.rpartition(b'\nSTATUS:')
+    require(separator and status == b'200', 'Observation status HTTP probe failed')
+    return observation.decode(body)
+
+
+def observation_smoke(directory, record, model, opener):
+    option = observation.selected(record)
+    if option is None:
+        return
+    binding = option['binding']
+    require(binding is not None, 'Collector is not bound to generated metadata')
+    require(observation.metadata(observation_metadata(directory, record), record, observation.seed_tick(model)) == binding,
+            'Generated observation binding changed')
+    observation.validate_status(observation_status(directory, record, 'game-api', observation.ORIGIN), binding, time.time())
+    # The public response need not claim RUNNING: PAUSED/STALLED are valid observed states.
+    try:
+        with opener.open(ORIGIN + '/api/server-basic-info/' + record['serverId'], timeout=5) as response:
+            require(response.status == 200, 'Public collector HTTP probe failed')
+            payload = observation.decode(response.read(65537))
+        observation.validate_public(payload, binding, time.time())
+    except urllib.error.URLError:
+        raise Refused('Public collector HTTP probe failed') from None
+
+
 def validate_tactical_readiness(payload, record, now=None):
     pins = ('dbFingerprint', 'nativeFenceSha256', 'ruleSha256', 'catalogSha256', 'combatSha256', 'spaceSha256')
     require(isinstance(payload, dict) and set(payload) == set(pins) | {
@@ -1302,7 +1426,10 @@ def smoke(args, *, finalize=True):
     compose(directory, record, 'exec', '-T', 'nginx', 'nginx', '-t',
             log_path=directory / ('nginx-test-' + secrets.token_hex(4) + '.log'))
     context = ssl.create_default_context(cafile=str(directory / 'certs/opensamguk.crt'))
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context))
+    handlers = [urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context)]
+    if observation.selected(record) is not None:
+        handlers.append(ObservationNoRedirect())
+    opener = urllib.request.build_opener(*handlers)
     checks = [('/health', {200}), ('/api/gateway/auth/me', {401}), *battle_boundary_checks(record),
               ('/d_pic/.ops/private', {404}), ('/game/', {404}), ('/', {200})]
     for path, expected in checks:
@@ -1324,6 +1451,7 @@ def smoke(args, *, finalize=True):
     topdown.smoke(record, lambda path: compose(directory, record, 'exec', '-T', 'game-api',
         'curl', '-fsS', '--max-time', '15', 'http://localhost:8081' + path))
     startup_pause_smoke(directory, record)
+    observation_smoke(directory, record, model, opener)
     startup_disk_check(directory, 'beforeSmokePassedFreeBytes')
     if finalize:
         record['status'] = 'SMOKE_PASSED'
@@ -1416,6 +1544,8 @@ def main():
                    help='Explicit opt-in for a new fixture; never modifies an existing custody')
     p.add_argument('--startup-paused', action='store_true',
                    help='Hold scheduled ticks from engine startup; normal resume releases the hold')
+    p.add_argument('--engine-observation', action='store_true',
+                   help='New stack only: bind the API collector to generated engine metadata before starting API')
     p.add_argument('--clone-source-custody', type=Path,
                    help='Optional owned prior custody; clone public source only after exact Git archive comparison')
     p.add_argument('--topdown-bundle', type=Path, help='Existing approved full bake directory; new custody only')
@@ -1444,7 +1574,7 @@ def main():
             globals()[args.command.replace('-', '_')](args)
     except (Refused, OSError, ValueError, KeyError, TypeError, EOFError) as e:
         # Never print child exceptions, config values, tokens or arbitrary untrusted filenames.
-        print('REFUSED: ' + str(e) if isinstance(e, (Refused, topdown.Refused)) else 'REFUSED: invalid input or unavailable dependency; custody preserved')
+        print('REFUSED: ' + str(e) if isinstance(e, (Refused, topdown.Refused, observation.Refused)) else 'REFUSED: invalid input or unavailable dependency; custody preserved')
         return 1
     return 0
 
