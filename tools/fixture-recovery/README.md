@@ -181,3 +181,10 @@ ENOSPC, private output, unsafe archives, foreign ownership, changed IDs/config, 
 normal-stop failures and missing/unobserved versions. Run the real fixture stages separately
 after current-head independent review and explicit C0/Docker handoff. Fake successes are never
 recorded as actual backup, restore, rollback, USER or operational3-point acceptance.
+
+
+## 선택 topdown 지도 보존
+
+PR88의 선택 profile만 지원한다. 백업은 `contract.topdown`의 bakeId/manifest SHA/source pins와 manifest 전체 파일·목록·해시를 검증한 뒤 bundle의 `custody/topdown/<bakeId>`에 **0700/0600**으로 복사한다. 기존 private seal은 완화하지 않는다. 복원된 별도 runtime만 **0755/0644**로 복사하며 game-api에는 그 runtime의 topdown 부모 하나를 RO로 연결한다. 원본이나 백업을 직접 mount하지 않는다.
+
+B 버전 pin 시 B app Git의 catalog/export/원본 파일이 A의 선택 source pins와 같아야 한다. version receipt, B target, A rollback은 같은 선택 metadata를 유지한다. 누락·추가 파일·바이트/권한 drift·다른 source pin·RW/추가 mount·외부 RO/정지 bind consumer도 거절한다. 각 target 관측은 실제 API preview bakeId와 제공 manifest SHA까지 일치해야 완료된다. 파일 검증과 fake 회귀는 실제 backup/restore/rollback·USER 인수 성공을 뜻하지 않으며, 기존 명시 유지보수 승인 창과 private handoff 관문이 필요하다. 선택하지 않은 legacy 기본값은 동일하다.

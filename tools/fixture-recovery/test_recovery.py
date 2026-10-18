@@ -105,6 +105,12 @@ class FakeCLI:
             labels = dict(a[i+1].split('=', 1) for i, v in enumerate(a) if v == '--label')
             self.volumes[name] = {'Name': name, 'Labels': labels, 'Driver': 'local', 'Options': None, 'content': None}
             return name.encode()
+        if a[:3] == ['ps', '-aq', '--no-trunc'] and '--filter' not in a:
+            return '\n'.join(self.containers).encode()
+        if a[0] == 'exec':
+            record = self.map_record
+            return (json.dumps({'topdownBakeId': record['topdown']['bakeId']}).encode()
+                    if a[-1].endswith('/preview') else self.map_manifest)
         if a[0] in ('ps', 'network', 'volume') and '--filter' in a:
             kind = 'container' if a[0] == 'ps' else a[0]
             rows = {'container': self.containers, 'volume': self.volumes, 'network': self.networks}[kind]
@@ -222,7 +228,10 @@ class RecoveryTests(unittest.TestCase):
             labels=r.fresh.image_metadata(dict(self.record,appSha='b'*40,sourceTreeSha256='f'*64),svc,{})
             self.io.image_data[iid]={'Id':iid,'RepoTags':[], 'Config':{'Labels':labels}}
         out=self.root/'B.json'
-        with patch.object(r.fresh,'source_archive',return_value=b'fake public archive'), patch.object(r.fresh,'archive_tree_hash',return_value='f'*64), patch.object(r.fresh,'git',return_value=b'FROM fixture'):
+        def git(repo, *args):
+            path = args[-1].split(':', 1)[-1]
+            return getattr(self, 'version_sources', {}).get(path, b'FROM fixture')
+        with patch.object(r.fresh,'source_archive',return_value=b'fake public archive'), patch.object(r.fresh,'archive_tree_hash',return_value='f'*64), patch.object(r.fresh,'git',side_effect=git):
             self.engine.version(self.bundle,'b'*40,pins,out,self.root/'B-source')
         return out
 

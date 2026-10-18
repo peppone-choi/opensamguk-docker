@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import stat
 import time
 
 from storage import Refused, need, private, newdir, put, write, read, digest, seal, verify_bundle, archive_root
@@ -81,7 +82,23 @@ def images(record, model):
             record['supportImages'][spec['image']] for svc, spec in model['services'].items()}
 
 
-def copy_private(source, dest):
+def selected_tree(directory, record, public=False):
+    root = Path(directory) / 'topdown'
+    selected = record.get('topdown')
+    if selected is None:
+        need(not root.exists(), 'UNSELECTED_TOPDOWN')
+        return None
+    fresh.topdown.settings(record)
+    fresh.topdown.path_checked(root, True)
+    need({p.name for p in root.iterdir()} == {selected['bakeId']}, 'TOPDOWN_ROOT')
+    if public:
+        need(stat.S_IMODE(root.stat().st_mode) == 0o755, 'TOPDOWN_PUBLIC_MODE')
+    tree = root / selected['bakeId']
+    fresh.topdown.validate(tree, selected['bakeId'], selected['manifestSha256'], selected['sourcePins'], public)
+    return tree
+
+
+def copy_private(source, dest, public_topdown=False):
     newdir(dest)
     for name in ('runtime.json', 'fixture.json', 'compose.json', 'contract.json', 'nginx.conf'):
         put(Path(dest) / name, private(Path(source) / name).read_bytes())
@@ -89,6 +106,22 @@ def copy_private(source, dest):
         newdir(Path(dest) / name)
         for path in sorted(private(Path(source) / name, True).iterdir()):
             put(Path(dest) / name / path.name, private(path).read_bytes())
+    record = read(Path(source) / 'contract.json')
+    tree = selected_tree(source, record)
+    if tree is not None:
+        if public_topdown:
+            fresh.topdown.copy_bundle(tree, Path(dest), record['topdown'])
+        else:
+            # The backup remains wholly private; only the restored runtime is public.
+            newdir(Path(dest) / 'topdown')
+            target = newdir(Path(dest) / 'topdown' / tree.name)
+            for path in sorted(tree.rglob('*')):
+                out = target / path.relative_to(tree)
+                if path.is_dir():
+                    newdir(out)
+                else:
+                    put(out, fresh.topdown.read_file(path))
+        selected_tree(dest, record, public_topdown)
 
 
 def target_model(model, source, target, nonce, pins):
@@ -124,6 +157,7 @@ class Recovery:
         model = read(custody / 'compose.json')
         need(m['source'] == record and m['identity'] == identity(record) and
              m['pins'] == images(record, model), 'BUNDLE_SOURCE_BINDING')
+        selected_tree(custody, record)
         fresh.identity(record)
         fresh.validate_model(model, record)
         need(digest(custody / 'compose.json') == record['configSha256'] and
@@ -137,6 +171,8 @@ class Recovery:
         t = read(path / 'target.json')
         m = self.bundle(t['bundle'])
         rec = t['record']
+        need(rec.get('topdown') == m['source'].get('topdown'), 'TARGET_TOPDOWN_BINDING')
+        selected_tree(path / 'runtime', rec, True)
         need(re.fullmatch('[a-f0-9]{16}', rec.get('nonce', '')) and rec['nonce'] != m['source']['nonce'] and
              rec['project'] == 'osgfr' + rec['nonce'] and rec['custody'] == str(path) and
              rec['session'] == m['source']['session'] and identity(rec) == m['identity'], 'TARGET_IDENTITY')
@@ -167,6 +203,7 @@ class Recovery:
         return directory, record, model
 
     def verify(self, record, model, healthy=False, partial=False):
+        selected_tree(Path(record['custody']) / ('runtime' if record['project'].startswith('osgfr') else ''), record, True)
         inventory = fresh.inventory(record)
         fresh.assert_owned(record, inventory)
         if not partial:
@@ -187,23 +224,27 @@ class Recovery:
             need(all(any(cid.startswith(c) for cid in own_ids) for c in consumers), 'FOREIGN_VOLUME_CONSUMER')
         for network in inventory['network']:
             need(network['Driver'] == 'bridge' and set(network.get('Containers', {})) <= own_ids, 'FOREIGN_NETWORK')
+        if record.get('topdown'):
+            all_ids = set(self.io.run(['docker', 'ps', '-aq', '--no-trunc']).decode().split())
+            need(own_ids <= all_ids and all(re.fullmatch('[a-f0-9]{64}', cid) for cid in all_ids), 'CONSUMER_INVENTORY')
+            for cid in sorted(all_ids - own_ids):
+                row = json.loads(self.io.run(['docker', 'inspect', '--format',
+                    '{"Id":{{json .Id}},"Mounts":{{json .Mounts}}}', cid]))
+                need(row.get('Id') == cid and isinstance(row.get('Mounts'), list), 'CONSUMER_INSPECT')
+                for mount in row['Mounts']:
+                    if mount.get('Type') == 'bind':
+                        source = mount.get('Source')
+                        need(isinstance(source, str) and Path(source).is_absolute(), 'CONSUMER_BIND')
+                        # Alias normalization can only reject a foreign consumer, never authorize one.
+                        candidate = source.removeprefix('/host_mnt') if source.startswith('/host_mnt/') else source
+                        need(not fresh.topdown.overlap(Path(candidate), Path(record['custody'])), 'FOREIGN_BIND_CONSUMER')
         pins = images(record, model)
         for svc, row in by_service.items():
             need(row['Image'] == pins[svc], 'RUNTIME_IMAGE')
             need(set(row['NetworkSettings']['Networks']) == {record['project'] + '_local'}, 'RUNTIME_NETWORK')
             ports = row['HostConfig'].get('PortBindings') or {}
             need(ports == ({'443/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '443'}]} if svc == 'nginx' else {}), 'RUNTIME_PORT')
-            expected = model['services'][svc].get('volumes', [])
-            actual = row.get('Mounts', [])
-            need(len(actual) == len(expected), 'RUNTIME_MOUNTS')
-            for mount in expected:
-                found = [a for a in actual if a['Destination'] == mount['target'] and a['Type'] == mount['type']]
-                need(len(found) == 1, 'RUNTIME_MOUNTS')
-                a = found[0]
-                if mount['type'] == 'volume':
-                    need(a.get('Name') == model['volumes'][mount['source']]['name'], 'RUNTIME_VOLUME')
-                else:
-                    need(a.get('Source') == mount['source'] and not a['RW'], 'RUNTIME_BIND')
+            fresh.verify_mounts(row.get('Mounts', []), model['services'][svc], model)
         if healthy:
             need(all(c['State']['Running'] and c['State'].get('Health', {}).get('Status') == 'healthy'
                      for c in by_service.values()), 'SERVICE_NOT_HEALTHY')
@@ -384,8 +425,15 @@ class Recovery:
         need(len(source_tree) == 1 and re.fullmatch('[a-f0-9]{64}', next(iter(source_tree)) or ''), 'VERSION_SOURCE_TREE')
         need(fresh.archive_tree_hash(fresh.source_archive(source_path, app_sha)) == next(iter(source_tree)),
              'VERSION_TRACKED_SOURCE')
-        write(output, {'schema': 1, 'appSha': app_sha, 'images': pins,
-                       'identity': m['identity'], 'sourceTreeSha256': next(iter(source_tree)), 'dockerfiles': dockerfiles})
+        selected = m['source'].get('topdown')
+        if selected is not None:
+            candidate_pins = fresh.topdown.source_pins(lambda path: fresh.git(source_path, 'show', app_sha + ':' + path))
+            need(candidate_pins == selected['sourcePins'], 'VERSION_TOPDOWN_SOURCE')
+        version_record = {'schema': 1, 'appSha': app_sha, 'images': pins,
+                       'identity': m['identity'], 'sourceTreeSha256': next(iter(source_tree)), 'dockerfiles': dockerfiles}
+        if selected is not None:
+            version_record['topdown'] = selected
+        write(output, version_record)
         return {'phase': 'VERSION_PINNED', 'appSha': app_sha}
 
     def restore(self, bundle, target, version=None):
@@ -400,6 +448,7 @@ class Recovery:
         app_sha = source['appSha']
         if version:
             v = read(version)
+            need(v.get('topdown') == source.get('topdown'), 'VERSION_TOPDOWN_BINDING')
             need(v.get('schema') == 1 and v.get('identity') == m['identity'] and
                  v.get('appSha') != app_sha and SHA.fullmatch(v.get('appSha', '')), 'VERSION_INPUT')
             need(set(v.get('images', {})) == set(fresh.SERVICES), 'SIX_VERSION_IMAGES')
@@ -425,7 +474,7 @@ class Recovery:
         for image in pins.values():
             need(fresh.inspect_image(image)['Id'] == image, 'IMAGE_MISSING')
         target = newdir(target)
-        copy_private(Path(bundle) / 'custody', target / 'runtime')
+        copy_private(Path(bundle) / 'custody', target / 'runtime', public_topdown=True)
         nonce = secrets.token_hex(8)
         rec = dict(source, nonce=nonce, project='osgfr' + nonce, custody=str(target), appSha=app_sha)
         if version:
@@ -480,6 +529,9 @@ class Recovery:
             "BEGIN READ ONLY; SELECT count(*) FROM game_server s JOIN game_server_publication p USING(server_id) "
             f"WHERE s.server_id='{sid}' AND s.generation=0 AND p.state='PUBLIC' AND p.revision=1; COMMIT;")
         need(world == '160' and registry == '1', 'STRICT_SMOKE_IDENTITY')
+        fresh.topdown.smoke(t['record'], lambda path: self.io.run([
+            'docker', 'exec', rows['game-api']['Id'], 'curl', '-fsS', '--max-time', '15',
+            'http://localhost:8081' + path]))
         before = m['checkpoint']
         after = self.checkpoint(target, t['record'], before['generalId'], before['requestId'])
         need(after == before, 'CHECKPOINT_CHANGED')
