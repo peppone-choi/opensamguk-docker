@@ -21,6 +21,12 @@ import time
 import urllib.error
 import urllib.request
 import ssl
+import importlib.util
+
+# Recovery callers load this harness by file path; resolve its own helper, never another checkout's module.
+_topdown_spec = importlib.util.spec_from_file_location('localhost_topdown', Path(__file__).with_name('topdown_bundle.py'))
+topdown = importlib.util.module_from_spec(_topdown_spec)
+_topdown_spec.loader.exec_module(topdown)
 
 ROOT = Path(__file__).resolve().parents[2]
 SERVICES = ('gateway-api', 'board-api', 'game-api', 'game-engine', 'web-gateway', 'web-game')
@@ -170,6 +176,10 @@ def model_for(record, fixtures):
                   REGISTRY=json.dumps(registry(record), separators=(',', ':')))
     values.update({'IMAGE_' + s: image_ref(record, s) for s in SERVICES})
     model = substitute(json.loads((ROOT / 'docker-compose.localhost-acceptance.yml').read_bytes()), values)
+    map_env, map_mounts = topdown.settings(record)
+    model['services']['game-api']['environment'].update(map_env)
+    if map_mounts:
+        model['services']['game-api']['volumes'] = map_mounts
     validate_model(model, record)
     return model
 
@@ -189,7 +199,11 @@ def validate_model(model, record):
             require(spec.get('driver', 'bridge' if kind == 'networks' else 'local') ==
                     ('bridge' if kind == 'networks' else 'local'), 'Foreign resource driver')
     allowed_binds = {'/etc/nginx/nginx.conf': 'nginx.conf', '/etc/nginx/certs': 'certs', '/etc/nginx/battle-ws': 'battle-ws'}
+    map_env, map_mounts = topdown.settings(record)
+    require(model['services']['game-api'].get('volumes', []) == map_mounts, 'Topdown mount differs from explicit pin')
     for name, svc in model['services'].items():
+        require({k: v for k, v in svc.get('environment', {}).items() if k.startswith('TOPDOWN_')} ==
+                (map_env if name == 'game-api' else {}), 'Topdown environment differs from explicit pin')
         require(not set(svc) & {'build', 'container_name', 'privileged', 'network_mode', 'pid', 'ipc', 'devices',
                                 'volumes_from', 'env_file', 'cap_add', 'extends', 'configs', 'secrets', 'external_links'},
                 'Unsafe service option')
@@ -203,8 +217,9 @@ def validate_model(model, record):
         for mount in svc.get('volumes', []):
             if mount['type'] == 'bind':
                 target = mount.get('target')
-                require(name == 'nginx' and target in allowed_binds and mount.get('read_only') is True and
-                        mount['source'] == record['custody'] + '/' + allowed_binds[target], 'Foreign host bind')
+                require((name == 'nginx' and target in allowed_binds and mount.get('read_only') is True and
+                         mount['source'] == record['custody'] + '/' + allowed_binds[target]) or
+                        (name == 'game-api' and map_mounts and mount == map_mounts[0]), 'Foreign host bind')
             else:
                 require(mount['type'] == 'volume' and mount['source'] in model['volumes'], 'Foreign volume mount')
     require('JWT_PRIVATE_KEY' not in model['services']['game-api']['environment'] and
@@ -430,6 +445,13 @@ def prepare(args):
     archive = source_archive(args.source, args.app_sha)
     nginx = git(ROOT, 'show', args.docker_sha + ':infra/nginx/nginx.conf')
     directory = Path(args.custody).absolute()
+    map_args = [getattr(args, key, None) for key in ('topdown_bundle', 'topdown_bake_id', 'topdown_manifest_sha256')]
+    map_record = None
+    if any(value is not None for value in map_args):
+        require(all(value is not None for value in map_args), 'All three explicit topdown inputs are required')
+        require(not topdown.overlap(Path(map_args[0]), directory), 'Topdown source overlaps custody')
+        pins = topdown.source_pins(lambda path: git(args.source, 'show', args.app_sha + ':' + path))
+        map_record = topdown.validate(*map_args, pins)
     require(not directory.exists() and not directory.is_symlink(), 'Custody already exists')
     require(not any(p.is_symlink() for p in directory.parents), 'Symlink parent refused')
     directory.mkdir(mode=0o700)
@@ -439,6 +461,8 @@ def prepare(args):
               'appSha': args.app_sha, 'dockerSha': args.docker_sha, 'nginxSha256': sha(nginx),
               'templateSha256': sha((ROOT / 'docker-compose.localhost-acceptance.yml').read_bytes()),
               'status': 'PREPARED', 'images': {}}
+    if map_record:
+        record['topdown'] = map_record
     write_json(directory / 'contract.json', record)
     assert_owned(record, inventory(record), empty=True)
     port_free()
@@ -451,6 +475,8 @@ def prepare(args):
         unpack_archive(archive, directory / 'source')
         record['sourceExport'] = 'git-archive'
     record['sourceTreeSha256'] = tree_hash(directory / 'source')
+    if map_record:
+        topdown.copy_bundle(Path(args.topdown_bundle), directory, map_record)
     (directory / 'certs').mkdir(mode=0o700)
     (directory / 'battle-ws').mkdir(mode=0o700)
     private_write(directory / 'nginx.conf', nginx)
@@ -489,6 +515,16 @@ def verify_custody_files(directory, record):
     require(sha((ROOT / 'docker-compose.localhost-acceptance.yml').read_bytes()) == record['templateSha256'],
             'Harness template changed; prepare a fresh stack')
     require(tree_hash(directory / 'source') == record['sourceTreeSha256'], 'Source bytes/modes changed')
+    if record.get('topdown'):
+        selected = record['topdown']
+        pins = topdown.source_pins(lambda path: topdown.read_file(directory / 'source' / path))
+        require(selected['sourcePins'] == pins, 'Topdown source pins changed')
+        root = directory / 'topdown'
+        require(stat.S_IMODE(topdown.path_checked(root, True).stat().st_mode) == 0o755 and
+                {p.name for p in root.iterdir()} == {selected['bakeId']}, 'Topdown root changed')
+        topdown.validate(root / selected['bakeId'], selected['bakeId'], selected['manifestSha256'], pins, True)
+    else:
+        require(not (directory / 'topdown').exists(), 'Unselected topdown files')
     require(tree_hash(directory / 'certs') == record['certsSha256'] and not list((directory / 'battle-ws').iterdir()),
             'TLS or battle routing changed')
     require(sha(private_path(directory / 'compose.json').read_bytes()) == record['configSha256'], 'Compose changed')
@@ -830,6 +866,8 @@ def smoke(args):
     actual = sql(directory, record, 'gateway-postgres',
                  f"SELECT count(*) FROM game_server s JOIN game_server_publication p USING(server_id) WHERE s.server_id='{sid}' AND s.generation=0 AND p.state='PUBLIC' AND p.revision=1;")
     require(actual == '1', 'Registry identity mismatch')
+    topdown.smoke(record, lambda path: compose(directory, record, 'exec', '-T', 'game-api',
+        'curl', '-fsS', '--max-time', '15', 'http://localhost:8081' + path))
     startup_disk_check(directory, 'beforeSmokePassedFreeBytes')
     record['status'] = 'SMOKE_PASSED'
     write_json(directory / 'contract.json', record, replace=True)
@@ -919,6 +957,9 @@ def main():
     p.add_argument('--custody', required=True, type=Path)
     p.add_argument('--clone-source-custody', type=Path,
                    help='Optional owned prior custody; clone public source only after exact Git archive comparison')
+    p.add_argument('--topdown-bundle', type=Path, help='Existing approved full bake directory; new custody only')
+    p.add_argument('--topdown-bake-id', help='Explicit approved 64-hex bake identity')
+    p.add_argument('--topdown-manifest-sha256', help='Explicit approved manifest byte SHA256')
     p = sub.add_parser('snapshot')
     p.add_argument('--custody', required=True, type=Path)
     p.add_argument('--general-id', required=True)
@@ -937,9 +978,9 @@ def main():
             print('Owned source/config validated')
         else:
             globals()[args.command.replace('-', '_')](args)
-    except (Refused, OSError, ValueError, KeyError) as e:
+    except (Refused, OSError, ValueError, KeyError, TypeError, EOFError) as e:
         # Never print child exceptions, config values, tokens or arbitrary untrusted filenames.
-        print('REFUSED: ' + str(e) if isinstance(e, Refused) else 'REFUSED: invalid input or unavailable dependency; custody preserved')
+        print('REFUSED: ' + str(e) if isinstance(e, (Refused, topdown.Refused)) else 'REFUSED: invalid input or unavailable dependency; custody preserved')
         return 1
     return 0
 
