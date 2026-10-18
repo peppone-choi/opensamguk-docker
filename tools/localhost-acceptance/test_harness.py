@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -169,15 +170,183 @@ class HarnessTests(unittest.TestCase):
 
     def test_archive_refuses_path_traversal_symlink_and_tracked_key(self):
         for name, kind in [('../escape', tarfile.REGTYPE), ('key.pem', tarfile.REGTYPE),
-                           ('.env',tarfile.REGTYPE), ('link',tarfile.SYMTYPE)]:
+                           ('.env',tarfile.REGTYPE), ('link',tarfile.SYMTYPE),
+                           ('hardlink', tarfile.LNKTYPE), ('pipe', tarfile.FIFOTYPE),
+                           ('device', tarfile.CHRTYPE), ('/outside', tarfile.REGTYPE)]:
             data = io.BytesIO()
             with tarfile.open(fileobj=data, mode='w') as tar:
                 member = tarfile.TarInfo(name)
                 member.type = kind
                 member.linkname = '/etc/passwd' if kind == tarfile.SYMTYPE else ''
                 tar.addfile(member)
+            destination = self.directory / ('bad' + str(len(list(self.directory.iterdir()))))
             with self.assertRaises(h.Refused):
-                h.unpack_archive(data.getvalue(), self.directory / ('bad' + str(len(list(self.directory.iterdir())))))
+                h.unpack_archive(data.getvalue(), destination)
+            self.assertFalse(destination.exists())
+
+    def public_archive(self):
+        data = io.BytesIO()
+        files = {'public/battle/asset.json': (b'{"public":true}', 0o644),
+                 'bin/start': (b'#!/bin/sh\nexit 0\n', 0o755)}
+        with tarfile.open(fileobj=data, mode='w') as tar:
+            for name in ('public', 'public/battle', 'bin'):
+                member = tarfile.TarInfo(name)
+                member.type = tarfile.DIRTYPE
+                member.mode = 0o755
+                tar.addfile(member)
+            for name, (body, mode) in files.items():
+                member = tarfile.TarInfo(name)
+                member.mode, member.size = mode, len(body)
+                tar.addfile(member, io.BytesIO(body))
+        return data.getvalue(), files
+
+    def assert_public_export(self, destination, archive, files):
+        for directory in (destination, destination/'public', destination/'public/battle', destination/'bin'):
+            self.assertEqual(0o755, directory.stat().st_mode & 0o777)
+        for name, (body, mode) in files.items():
+            self.assertEqual(body, (destination/name).read_bytes())
+            self.assertEqual(mode, (destination/name).stat().st_mode & 0o777)
+        self.assertEqual(h.archive_tree_hash(archive), h.tree_hash(destination))
+
+    def test_archive_export_under_private_umask_preserves_files_and_private_boundary(self):
+        archive, files = self.public_archive()
+        private = self.directory/'private'
+        private.mkdir(mode=0o700)
+        key = private/'test-fixture.key'
+        h.private_write(key, b'new-test-fixture')
+        destination = self.directory/'public-export'
+        before = os.umask(0o077)
+        try:
+            h.unpack_archive(archive, destination)
+        finally:
+            os.umask(before)
+        self.assert_public_export(destination, archive, files)
+        self.assertEqual(0o700, self.directory.stat().st_mode & 0o777)
+        self.assertEqual(0o700, private.stat().st_mode & 0o777)
+        self.assertEqual(0o600, key.stat().st_mode & 0o777)
+        self.assertEqual(b'new-test-fixture', key.read_bytes())
+
+    def test_clone_normalizes_only_destination_under_private_umask(self):
+        archive, files = self.public_archive()
+        source, destination = self.directory/'original-public', self.directory/'cloned-public'
+        h.unpack_archive(archive, source)
+        private = self.directory/'clone-private-fixture.json'
+        h.private_write(private, b'private-clone-test-fixture')
+        original_directories = [source, *[p for p in source.rglob('*') if p.is_dir()]]
+        for directory in original_directories:
+            directory.chmod(0o700)
+        source_hash = h.tree_hash(source)
+
+        def clone(args, **kwargs):
+            self.assertEqual(['/bin/cp', '-cRp', str(source), str(destination)], args)
+            shutil.copytree(source, destination)
+
+        before = os.umask(0o077)
+        try:
+            with patch.object(h, 'run', side_effect=clone):
+                h.clone_export(archive, source, destination)
+        finally:
+            os.umask(before)
+        self.assert_public_export(destination, archive, files)
+        self.assertEqual(source_hash, h.tree_hash(source))
+        for directory in original_directories:
+            self.assertEqual(0o700, directory.stat().st_mode & 0o777)
+        for name, (body, mode) in files.items():
+            self.assertEqual(body, (source/name).read_bytes())
+            self.assertEqual(mode, (source/name).stat().st_mode & 0o777)
+        self.assertEqual(0o700, self.directory.stat().st_mode & 0o777)
+        self.assertEqual(0o600, private.stat().st_mode & 0o777)
+        self.assertEqual(b'private-clone-test-fixture', private.read_bytes())
+        self.assertFalse((destination/private.name).exists())
+
+    def test_normalization_refuses_links_and_special_files_before_any_chmod(self):
+        outside = self.directory/'outside-private'
+        outside.mkdir(mode=0o700)
+        marker = outside/'marker'
+        h.private_write(marker, b'untouched')
+        for kind in ('symlink', 'fifo'):
+            with self.subTest(kind=kind):
+                root = self.directory/kind
+                nested = root/'public'
+                nested.mkdir(parents=True, mode=0o700)
+                root.chmod(0o700)
+                if kind == 'symlink':
+                    (nested/'unsafe').symlink_to(outside, target_is_directory=True)
+                else:
+                    os.mkfifo(nested/'unsafe')
+                with patch.object(h.os, 'fchmod', wraps=os.fchmod) as chmod:
+                    with self.assertRaises(h.Refused):
+                        h.normalize_export_directories(root)
+                    chmod.assert_not_called()
+                self.assertEqual(0o700, root.stat().st_mode & 0o777)
+                self.assertEqual(0o700, nested.stat().st_mode & 0o777)
+        self.assertEqual(0o700, outside.stat().st_mode & 0o777)
+        self.assertEqual(0o600, marker.stat().st_mode & 0o777)
+        self.assertEqual(b'untouched', marker.read_bytes())
+
+    def test_export_refuses_symlink_parents_and_traversal_before_outside_changes(self):
+        archive, _ = self.public_archive()
+        outside = self.directory/'outside'
+        outside.mkdir(mode=0o700)
+        alias = self.directory/'alias'
+        alias.symlink_to(outside, target_is_directory=True)
+        for target in (alias/'export', self.directory/'missing/../escape'):
+            with self.subTest(target=str(target)), self.assertRaises(h.Refused):
+                h.unpack_archive(archive, target)
+        self.assertEqual([], list(outside.iterdir()))
+        self.assertEqual(0o700, outside.stat().st_mode & 0o777)
+
+    def test_clone_rejects_unsafe_source_before_hash_or_copy(self):
+        archive, _ = self.public_archive()
+        for kind in ('symlink-root', 'symlink-child', 'fifo'):
+            with self.subTest(kind=kind):
+                source = self.directory/kind
+                if kind == 'symlink-root':
+                    source.symlink_to(self.directory/'source', target_is_directory=True)
+                else:
+                    h.unpack_archive(archive, source)
+                    if kind == 'symlink-child':
+                        (source/'unsafe').symlink_to(self.directory/'source', target_is_directory=True)
+                    else:
+                        os.mkfifo(source/'unsafe')
+                destination = self.directory/('clone-'+kind)
+                with patch.object(h, 'tree_hash') as digest, patch.object(h, 'run') as clone:
+                    with self.assertRaises(h.Refused):
+                        h.clone_export(archive, source, destination)
+                    digest.assert_not_called()
+                    clone.assert_not_called()
+                self.assertFalse(destination.exists())
+
+    def test_clone_refuses_destination_inside_source(self):
+        archive, _ = self.public_archive()
+        source = self.directory/'original-public'
+        h.unpack_archive(archive, source)
+        source.chmod(0o700)
+        with patch.object(h, 'run') as clone:
+            with self.assertRaises(h.Refused):
+                h.clone_export(archive, source, source/'recursive-copy')
+            clone.assert_not_called()
+
+    def test_clone_refuses_unsafe_copy_result_before_hash_or_chmod(self):
+        archive, _ = self.public_archive()
+        source, destination = self.directory/'original-public', self.directory/'cloned-public'
+        h.unpack_archive(archive, source)
+        digest = h.tree_hash
+
+        def hash_source_only(path):
+            self.assertEqual(source, path)
+            return digest(path)
+
+        def unsafe_copy(*args, **kwargs):
+            shutil.copytree(source, destination)
+            (destination/'unsafe').symlink_to(self.directory/'source', target_is_directory=True)
+
+        with patch.object(h, 'run', side_effect=unsafe_copy), \
+                patch.object(h, 'tree_hash', side_effect=hash_source_only), \
+                patch.object(h.os, 'fchmod', wraps=os.fchmod) as chmod:
+            with self.assertRaises(h.Refused):
+                h.clone_export(archive, source, destination)
+            chmod.assert_not_called()
 
     def test_apfs_clone_matches_archive_and_preserves_original_on_later_write(self):
         if sys.platform!='darwin':self.skipTest('APFS clone is macOS-only')
@@ -189,8 +358,13 @@ class HarnessTests(unittest.TestCase):
         source=self.directory/'original-export'
         h.unpack_archive(archive,source)
         self.assertEqual(h.archive_tree_hash(archive),h.tree_hash(source))
+        source.chmod(0o700)
         destination=self.directory/'clone-export'
-        h.clone_export(archive,source,destination)
+        before=os.umask(0o077)
+        try:h.clone_export(archive,source,destination)
+        finally:os.umask(before)
+        self.assertEqual(0o755,destination.stat().st_mode & 0o777)
+        self.assertEqual(0o700,source.stat().st_mode & 0o777)
         (destination/'file').write_text('changed')
         self.assertEqual('original',(source/'file').read_text())
         (source/'file').write_text('wrong')

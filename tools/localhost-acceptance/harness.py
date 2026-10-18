@@ -339,20 +339,72 @@ def archive_tree_hash(archive):
     return digest.hexdigest()
 
 
+def export_path(directory):
+    directory = Path(directory)
+    require('..' not in directory.parts, 'Source export traversal refused')
+    directory = directory.absolute()
+    require(not any(p.is_symlink() for p in (directory, *directory.parents)),
+            'Source export symlink refused')
+    private_path(directory.parent, True)
+    return directory
+
+
+def export_directories(directory):
+    directory = export_path(directory)
+    root = directory.lstat()
+    require(stat.S_ISDIR(root.st_mode) and root.st_uid == os.getuid(), 'Foreign source export root')
+    directories = [(directory, root)]
+
+    def inaccessible(_error):
+        raise Refused('Source export cannot be inspected')
+
+    for parent, names, files in os.walk(directory, followlinks=False, onerror=inaccessible):
+        for name in names + files:
+            path = Path(parent) / name
+            info = path.lstat()
+            require(info.st_uid == os.getuid() and
+                    (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)),
+                    'Source export link, special file or foreign owner refused')
+            if stat.S_ISDIR(info.st_mode):
+                directories.append((path, info))
+    return directories
+
+
+def normalize_export_directories(directory):
+    # Validate the whole public tree before chmod; custody and tracked files stay private/unchanged.
+    for path, before in export_directories(directory):
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            current = os.fstat(fd)
+            require((current.st_dev, current.st_ino) == (before.st_dev, before.st_ino),
+                    'Source export directory changed during normalization')
+            os.fchmod(fd, 0o755)
+        finally:
+            os.close(fd)
+
+
 def unpack_archive(archive, destination):
-    destination.mkdir(mode=0o700)
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         checked_members(tar)
+        destination = export_path(destination)
+        destination.mkdir(mode=0o700)
         tar.extractall(destination, filter='data')
+    normalize_export_directories(destination)
 
 
 def clone_export(archive, source, destination):
     expected = archive_tree_hash(archive)
+    source = export_path(source)
+    export_directories(source)
+    destination = export_path(destination)
+    require(not destination.is_relative_to(source), 'Clone destination overlaps source')
     require(tree_hash(source) == expected, 'Clone source differs from clean Git archive')
     require(not destination.exists(), 'Clone destination already exists')
     # APFS copies share storage while later writes remain independent. Never copy runtime fixtures.
     run(['/bin/cp', '-cRp', str(source), str(destination)], timeout=300)
+    export_directories(destination)
     require(tree_hash(destination) == expected, 'APFS clone bytes/modes differ from Git archive')
+    normalize_export_directories(destination)
 
 
 def tree_hash(directory):
