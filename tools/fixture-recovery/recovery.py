@@ -17,6 +17,7 @@ import time
 from storage import Refused, need, private, newdir, put, write, read, digest, seal, verify_bundle, archive_root
 from storage import canonical_path, isolated_output, overlaps
 from transport import LocalIO
+import runtime_binding as route
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location('fresh_recovery_adapter', ROOT / 'tools/localhost-acceptance/harness.py')
@@ -183,6 +184,10 @@ def copy_private(source, dest, public_topdown=False):
         for path in sorted(private(Path(source) / name, True).iterdir()):
             put(Path(dest) / name / path.name, private(path).read_bytes())
     record = read(Path(source) / 'contract.json')
+    if route.active(record):
+        route.snapshot(source, record, fresh)
+        for name in route.PROOF_FILES:
+            put(Path(dest) / name, private(Path(source) / name).read_bytes())
     tree = selected_tree(source, record)
     if tree is not None:
         if public_topdown:
@@ -240,8 +245,9 @@ class Recovery:
             validate_stop(proof['stopAttempts'][svc], svc, record, model)
         fresh.identity(record)
         fresh.validate_model(model, record)
+        route.snapshot(custody, record, fresh)
         need(digest(custody / 'compose.json') == record['configSha256'] and
-             digest(custody / 'nginx.conf') == record['nginxSha256'] and
+             digest(custody / 'nginx.conf') == record.get('runtimeNginxSha256', record['nginxSha256']) and
              fresh.tree_hash(custody / 'certs') == record['certsSha256'], 'BUNDLE_CUSTODY_BINDING')
         need(model == fresh.model_for(record, read(custody / 'runtime.json')), 'BUNDLE_APP_CONFIG')
         return m
@@ -251,6 +257,14 @@ class Recovery:
         t = read(path / 'target.json')
         m = self.bundle(t['bundle'])
         rec = t['record']
+        need({k: v for k, v in rec.items() if k.startswith('runtime') or k == 'battleRouting'} ==
+             {k: v for k, v in m['source'].items() if k.startswith('runtime') or k == 'battleRouting'} and
+             rec.get('dockerSha') == m['source'].get('dockerSha'), 'TARGET_RUNTIME_PROVENANCE')
+        if route.active(m['source']):
+            need(t.get('runtimeBinding') == route.copied_binding(path / 'runtime',
+                 Path(t['bundle']) / 'custody', m['source'], fresh), 'TARGET_RUNTIME_COPY_BINDING')
+        else:
+            need('runtimeBinding' not in t, 'UNEXPECTED_RUNTIME_COPY_BINDING')
         same_profile(rec, m['source'], 'TARGET_PROFILE_BINDING')
         need(rec.get('topdown') == m['source'].get('topdown'), 'TARGET_TOPDOWN_BINDING')
         selected_tree(path / 'runtime', rec, True)
@@ -278,12 +292,18 @@ class Recovery:
     def source(self, path):
         directory, record = fresh.load(path)
         need(record.get('status') == 'SMOKE_PASSED', 'SOURCE_NOT_ACCEPTED')
-        model = fresh.verify_files(directory, record)
+        model = (route.live_model(directory, record, fresh) if route.active(record)
+                 else fresh.verify_files(directory, record))
         fresh.verify_images(record)
         self.verify(record, model, healthy=False)
         return directory, record, model
 
     def verify(self, record, model, healthy=False, partial=False):
+        if route.active(record):
+            if record['project'].startswith('osgfr'):
+                self.target(record['custody'])
+            else:
+                route.live_model(record['custody'], record, fresh)
         selected_tree(Path(record['custody']) / ('runtime' if record['project'].startswith('osgfr') else ''), record, True)
         inventory = fresh.inventory(record)
         fresh.assert_owned(record, inventory)
@@ -329,6 +349,8 @@ class Recovery:
         if healthy:
             need(all(c['State']['Running'] and c['State'].get('Health', {}).get('Status') == 'healthy'
                      for c in by_service.values()), 'SERVICE_NOT_HEALTHY')
+        if route.active(record) and not partial:
+            route.runtime_aliases(record, by_service.values())
         return by_service
 
     def state(self, cid):
@@ -653,6 +675,9 @@ class Recovery:
         write(target / 'compose.json', transformed)
         t = {'schema': 1, 'bundle': str(Path(bundle).absolute()), 'record': rec, 'pins': pins,
              'composeSha256': digest(target / 'compose.json'), 'phase': 'PREPARED', 'observation': None}
+        if route.active(source):
+            t['runtimeBinding'] = route.copied_binding(target / 'runtime',
+                Path(bundle) / 'custody', source, fresh)
         write(target / 'target.json', t)
         j = read(Path(bundle) / 'journal.json')
         j['targets'].append(str(target))

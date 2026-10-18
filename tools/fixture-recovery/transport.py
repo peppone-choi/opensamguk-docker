@@ -10,6 +10,7 @@ import urllib.request
 import urllib.error
 
 from storage import need, put, private, Refused
+import runtime_binding as route
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -108,8 +109,10 @@ class LocalIO:
                 raw = response.read(4 * 1024 * 1024)
                 return json.loads(raw) if json_body else True
         request('/health', json_body=False)
-        for path, status in [('/api/gateway/auth/me', 401),
-            ('/api/battle-ws/' + identity['serverId'] + '/160/probe', 404),
+        contract_path = Path(custody) / 'contract.json'
+        record = json.loads(private(contract_path).read_bytes()) if contract_path.exists() else identity
+        need(record.get('serverId') == identity['serverId'], 'USER_PROBE_IDENTITY')
+        for path, status in [('/api/gateway/auth/me', 401), *route.boundaries(record),
             ('/d_pic/.ops/private', 404), ('/game/', 404), ('/', 200)]:
             try:
                 with opener.open('https://localhost' + path, timeout=30) as response:

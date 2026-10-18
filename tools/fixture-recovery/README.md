@@ -220,3 +220,23 @@ B 버전 pin 시 B app Git의 catalog/export/원본 파일이 A의 선택 source
 Docker90의 `startupPaused`와82의 tactical profile을 선택한 원본은 같은 metadata/engine 환경을 A 백업·다른 B·A rollback까지 보존한다. 새 target의 `RUNNING_NOT_ACCEPTED` 전과 USER 관측 전에는90의 own-engine 초기 pause 검사 및 tactical readiness 검사를 다시 통과해야 한다. map source pins·전체 파일·private 백업/RO public 복원 권한도 그대로 검증한다. profile/flag를 삭제하거나 false로 바꾸어 검사에서 빠질 수 없다.
 
 선택 환경은 프로세스가 시작될 때마다 다시 pause한다. `restore`, `rollback`, `resume-original`은 컨테이너를 기동할 뿐 scheduled pause를 해제하지 않으며, 도구가 설정을 지우거나 `/admin/turn-daemon/resume`를 호출하지 않는다. 재기동 뒤 관측/검증을 끝내고 C0의 별도 승인 창에서 정식 engine resume API를 사용한다. 실제 초기 pause/정상 USER/전투는 fake 검증과 별개의 인수다.
+
+## Reviewed runtime route binding
+
+Docker91로 수리된 d35 tactical 원본은 build Docker/image pin과 별도 runtime verifier를 함께 보존한다.
+현재 지원하는 verifier는 exact `b1ad1f956105a6bdc6e8a3378ea8de81bcd224cb`다. 계약에 적힌
+checkout의 물리 Git root·NFC 동등성·head·tracked/ignored clean·Git/file harness bytes와 고정 SHA를
+검산한다. 이 checkout은 전체 복구 흐름 동안 보존해야 하며 외부 Python 코드는 실행하지 않는다.
+다른 verifier를 지문 교체로 승인하지 않고 새 source 검토를 거친다.
+
+원 live nginx는 원래 inode와 canonical d35→b1 바이트 전이, same-SID map, 원 contract/nginx/proof를
+모두 검증한다. 세 원본 proof 파일은 private bundle과 각 runtime에 바이트 그대로 복사한다.
+archive는 원 inode의 출처를 보존하며 자기 inode를 원본이라고 주장하지 않는다. 새 target은
+`target.json.runtimeBinding`에 봉인된 source/proof/config/map hash와 **새 nginx inode**를 별도 결속한다.
+원 record/proof의 inode·build pin·runtime verifier를 새 target에 맞춰 고쳐 쓰지 않는다.
+같은 바이트라도 target nginx가 교체되면 거절한다.
+
+target의 game-api alias는 보존한 SID 하나에만 속해야 한다. USER 로그인 전 `/api/battle-ws`와
+`/ws/battles` 양쪽에서 own SID의 무인증403, foreign SID·다른 world·잘못된 ID의404를 확인한다.
+정상stop proof, 다른 B 여섯 이미지, A rollback과 profile/map/인증 보존 관문은 동일하다.
+이 지원의 순수 회귀는 실제 H 백업·복구·B 빌드·USER·WSS101 성공을 뜻하지 않는다.
