@@ -25,10 +25,75 @@ SPEC.loader.exec_module(fresh)
 DATA = ('gateway-postgres', 'game-postgres', 'gateway-redis', 'game-redis')
 STOP = ('nginx', 'web-gateway', 'web-game', 'gateway-api', 'board-api', 'game-api', 'game-engine', *DATA)
 START = (*DATA, 'gateway-api', 'board-api', 'game-api', 'game-engine', 'web-gateway', 'web-game', 'nginx')
-STATE = '{"Running":{{json .State.Running}},"ExitCode":{{json .State.ExitCode}},"OOMKilled":{{json .State.OOMKilled}}}'
+STATE = ('{"Id":{{json .Id}},"Image":{{json .Image}},"RestartCount":{{json .RestartCount}},'
+         '"Running":{{json .State.Running}},"Restarting":{{json .State.Restarting}},'
+         '"Paused":{{json .State.Paused}},"Dead":{{json .State.Dead}},'
+         '"Pid":{{json .State.Pid}},"ExitCode":{{json .State.ExitCode}},'
+         '"OOMKilled":{{json .State.OOMKilled}},"Error":{{json (ne .State.Error "")}},'
+         '"StartedAt":{{json .State.StartedAt}},"FinishedAt":{{json .State.FinishedAt}}}')
+DAEMON = '{"ID":{{json .ID}},"SystemTime":{{json .SystemTime}}}'
+STOP_FIELDS = ('Id', 'Image', 'RestartCount', 'Running', 'Restarting', 'Pid', 'ExitCode',
+               'OOMKilled', 'Error', 'StartedAt', 'FinishedAt', 'Paused', 'Dead')
 IMAGE = re.compile(r'sha256:[0-9a-f]{64}\Z')
 SHA = re.compile(r'[0-9a-f]{40}\Z')
 VOLUMES = ('gateway-pgdata', 'game-pgdata', 'gateway-redisdata', 'game-redisdata', 'profile-icons')
+
+
+def timestamp_ns(value):
+    """Keep Docker's nanoseconds and timezone offsets when bounding a signal interval."""
+    need(isinstance(value, str), 'STOP_TIMESTAMP')
+    match = re.fullmatch(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})', value)
+    need(match is not None, 'STOP_TIMESTAMP')
+    try:
+        stamp = datetime.fromisoformat(match[1] + match[3].replace('Z', '+00:00'))
+        delta = stamp - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    except ValueError:
+        raise Refused('STOP_TIMESTAMP') from None
+    result = (delta.days * 86400 + delta.seconds) * 10**9 + int((match[2] or '').ljust(9, '0'))
+    need(result > 0, 'STOP_TIMESTAMP')
+    return result
+
+
+def stop_binding(record, model):
+    # Only hashes enter the proof, never environment values or private config contents.
+    return hashlib.sha256(json.dumps([record, model], sort_keys=True).encode()).hexdigest()
+
+
+def checked_stop_state(state):
+    need(isinstance(state, dict) and set(state) == set(STOP_FIELDS), 'STOP_STATE_FIELDS')
+    need(all(type(state[k]) is bool for k in ('Running', 'Restarting', 'OOMKilled', 'Error', 'Paused', 'Dead')) and
+         all(type(state[k]) is int and state[k] >= 0 for k in ('Pid', 'ExitCode', 'RestartCount')) and
+         isinstance(state['Id'], str) and re.fullmatch('[a-f0-9]{64}', state['Id']) and
+         isinstance(state['Image'], str) and IMAGE.fullmatch(state['Image']) and
+         all(isinstance(state[k], str) for k in ('StartedAt', 'FinishedAt')), 'STOP_STATE_TYPES')
+    return state
+
+
+def validate_stop(attempt, service, record, model):
+    need(isinstance(attempt, dict) and attempt.get('status') == 'PROVEN' and
+         attempt.get('binding') == stop_binding(record, model) and
+         re.fullmatch('[a-f0-9]{32}', attempt.get('nonce', '')), 'STOP_PROOF_MISSING')
+    before, after = (checked_stop_state(attempt[key]) for key in ('before', 'after'))
+    need(before['Running'] is True and before['Restarting'] is False and before['Pid'] > 0 and
+         before['ExitCode'] == 0 and before['OOMKilled'] is False and before['Error'] is False and
+         before['Paused'] is False and before['Dead'] is False,
+         'STOP_BEFORE_STATE')
+    need(all(before[k] == after[k] for k in ('Id', 'Image', 'StartedAt', 'RestartCount')) and
+         IMAGE.fullmatch(before['Image']) and re.fullmatch('[a-f0-9]{64}', before['Id']) and
+         before['Image'] == images(record, model)[service], 'STOP_INSTANCE_CHANGED')
+    signal = attempt['signal']
+    need(signal in ('SIGTERM', 'TERM', 'SIGINT', 'INT') and
+         attempt['command'] == ['docker', 'kill', '--signal=' + signal, before['Id']], 'STOP_SIGNAL_PROOF')
+    first, last = attempt['daemonBefore'], attempt['daemonAfter']
+    need(isinstance(first['ID'], str) and first['ID'] and first['ID'] == last['ID'], 'STOP_DAEMON_CHANGED')
+    need(timestamp_ns(before['StartedAt']) <= timestamp_ns(first['SystemTime']) <=
+         timestamp_ns(after['FinishedAt']) <= timestamp_ns(last['SystemTime']), 'STOP_FINISH_INTERVAL')
+    clean = (after['Running'] is False and after['Restarting'] is False and after['Pid'] == 0 and
+             after['OOMKilled'] is False and after['Error'] is False and
+             after['Paused'] is False and after['Dead'] is False)
+    allowed = {0} if service in DATA else {0, 143 if signal in ('SIGTERM', 'TERM') else 130}
+    need(clean and type(after['ExitCode']) is int and after['ExitCode'] in allowed,
+         'UNCLEAN_DATA_STOP' if service in DATA else 'UNCLEAN_APP_STOP')
 
 
 def permission(path, source):
@@ -169,6 +234,10 @@ class Recovery:
         need(m['source'] == record and m['identity'] == identity(record) and
              m['pins'] == images(record, model), 'BUNDLE_SOURCE_BINDING')
         selected_tree(custody, record)
+        proof = read(Path(path) / 'stop-proof.json')
+        need(not proof.get('stopFailed') and set(proof.get('stopAttempts', {})) == set(STOP), 'BUNDLE_STOP_PROOF')
+        for svc in STOP:
+            validate_stop(proof['stopAttempts'][svc], svc, record, model)
         fresh.identity(record)
         fresh.validate_model(model, record)
         need(digest(custody / 'compose.json') == record['configSha256'] and
@@ -263,7 +332,15 @@ class Recovery:
         return by_service
 
     def state(self, cid):
-        return json.loads(self.io.run(['docker', 'inspect', '--format', STATE, cid]))
+        state = checked_stop_state(json.loads(self.io.run(['docker', 'inspect', '--format', STATE, cid])))
+        need(state['Id'] == cid, 'STOP_INSTANCE_CHANGED')
+        return state
+
+    def daemon(self):
+        result = json.loads(self.io.run(['docker', 'info', '--format', DAEMON]))
+        need(isinstance(result.get('ID'), str) and result['ID'], 'STOP_DAEMON_ID')
+        timestamp_ns(result.get('SystemTime'))
+        return result
 
     def wait(self, cid, running, clean=False, timeout=180):
         deadline = time.monotonic() + timeout
@@ -271,29 +348,83 @@ class Recovery:
             state = self.state(cid)
             if state['Running'] == running:
                 need(not clean or (state['ExitCode'] == 0 and not state['OOMKilled']), 'UNCLEAN_DATA_STOP')
-                return
+                return state
             need(time.monotonic() < deadline, 'NORMAL_STOP_TIMEOUT')
             time.sleep(0.25)
 
+    def stopped_proof(self, record, model, journal, rows, services=STOP):
+        need(not journal.get('stopFailed'), 'STOP_PREVIOUS_FAILURE')
+        daemon = self.daemon()
+        for svc in services:
+            attempt = journal.get('stopAttempts', {}).get(svc)
+            validate_stop(attempt, svc, record, model)
+            need(svc in rows and rows[svc]['Id'] == attempt['before']['Id'] and
+                 rows[svc]['Image'] == attempt['before']['Image'] and
+                 daemon['ID'] == attempt['daemonAfter']['ID'] and
+                 timestamp_ns(daemon['SystemTime']) >= timestamp_ns(attempt['daemonAfter']['SystemTime']) and
+                 self.state(rows[svc]['Id']) == attempt['after'], 'STOP_INSTANCE_CHANGED')
+
     def stop(self, record, model, journal, journal_path, services=STOP, partial=False):
         rows = self.verify(record, model, partial=partial)
+        failure = Refused('STOP_PREVIOUS_FAILURE') if journal.get('stopFailed') else None
         for svc in services:
             if svc not in rows:
                 continue
             cid = rows[svc]['Id']
-            if self.state(cid)['Running']:
-                journal['phase'] = 'STOPPING_' + svc
-                journal.setdefault('stopped', {})[svc] = cid
-                write(journal_path, journal, replace=journal_path.exists())
+            attempt = journal.setdefault('stopAttempts', {}).get(svc)
+            try:
+                state = self.state(cid)
+                need(state['Image'] == rows[svc]['Image'], 'STOP_INSTANCE_CHANGED')
+                if attempt is not None:
+                    validate_stop(attempt, svc, record, model)
+                    need(state == attempt['after'] and cid == attempt['before']['Id'], 'STOP_INSTANCE_CHANGED')
+                    continue
+                need(state['Running'] is True and state['Restarting'] is False and state['Pid'] > 0 and
+                     state['ExitCode'] == 0 and state['OOMKilled'] is False and state['Error'] is False and
+                     state['Paused'] is False and state['Dead'] is False,
+                     'STOP_BEFORE_STATE')
+                timestamp_ns(state['StartedAt'])
                 signal = json.loads(self.io.run(['docker', 'image', 'inspect', '--format',
                                                  '{{json .Config.StopSignal}}', rows[svc]['Image']])) or 'SIGTERM'
                 need(signal in ('SIGTERM', 'SIGINT', 'TERM', 'INT'), 'UNSAFE_STOP_SIGNAL')
-                self.io.run(['docker', 'kill', '--signal=' + signal, cid])
-                self.wait(cid, False, clean=svc in DATA)
-            elif svc in DATA:
-                self.wait(cid, False, clean=True)
-        journal['phase'] = 'STOPPED'
+                daemon = self.daemon()
+                need(self.state(cid) == state and timestamp_ns(state['StartedAt']) <= timestamp_ns(daemon['SystemTime']),
+                     'STOP_INSTANCE_CHANGED')
+                attempt = {'nonce': secrets.token_hex(16), 'binding': stop_binding(record, model),
+                           'status': 'SIGNAL_PENDING', 'before': state, 'daemonBefore': daemon, 'signal': signal,
+                           'command': ['docker', 'kill', '--signal=' + signal, cid]}
+                journal['stopAttempts'][svc] = attempt
+                journal['phase'] = 'STOPPING_' + svc
+                journal.setdefault('stopped', {})[svc] = cid
+                write(journal_path, journal, replace=journal_path.exists())
+                # No forced-stop fallback; an unknown child result never authorizes a later exit143.
+                self.io.run(attempt['command'])
+                attempt['status'] = 'SIGNAL_SENT'
+                write(journal_path, journal, replace=True)
+                attempt['after'] = self.wait(cid, False)
+                attempt['daemonAfter'] = self.daemon()
+                candidate = dict(attempt, status='PROVEN')
+                validate_stop(candidate, svc, record, model)
+                attempt['status'] = 'PROVEN'
+                write(journal_path, journal, replace=True)
+            except Exception as exc:
+                # Preserve the first failure while still stopping other owned services for cleanup.
+                failure = failure or exc
+                journal['stopFailed'] = True
+                if attempt is not None:
+                    attempt['status'] = 'FAILED'
+                journal['phase'] = 'STOP_FAILED'
+                write(journal_path, journal, replace=journal_path.exists())
+        if failure is None:
+            try:
+                self.stopped_proof(record, model, journal, rows, services=set(services) & set(rows))
+            except Exception as exc:
+                failure = exc
+                journal['stopFailed'] = True
+        journal['phase'] = 'STOP_FAILED' if failure else 'STOPPED'
         write(journal_path, journal, replace=journal_path.exists())
+        if failure:
+            raise failure
         return rows
 
     def wait_healthy(self, record, model, services=START, timeout=180):
@@ -314,14 +445,31 @@ class Recovery:
         original = self.verify(source, model)
         need({s: c['Id'] for s, c in original.items()} == j['originalIds'], 'ORIGINAL_IDS_CHANGED')
         # All recovery copies must be stopped before the original is allowed to regain 443.
+        targets_stopped_cleanly = True
         for target in j.get('targets', []):
             t, target_compose = self.target(target)
             rows = self.verify(t['record'], target_compose, partial=True)
             need(not any(self.state(c['Id'])['Running'] for c in rows.values()), 'TARGET_STILL_RUNNING')
+            try:
+                need(t['phase'] == 'STOPPED_PRESERVED' and set(rows) == set(STOP), 'TARGET_STOP_NOT_ACCEPTED')
+                self.stopped_proof(t['record'], target_compose, read(Path(target) / 'stop.json'), rows)
+            except Exception:
+                targets_stopped_cleanly = False
+        def original_state(svc, cid):
+            before = j.get('stopAttempts', {}).get(svc, {}).get('before')
+            current = self.state(cid)
+            need(svc in original and original[svc]['Id'] == cid and before is not None and
+                 all(current[k] == before[k] for k in ('Id', 'Image', 'StartedAt', 'RestartCount')),
+                 'ORIGINAL_RUN_CHANGED')
+            return current
+
+        # Check every original run before starting any dependency after an external change.
+        for svc, cid in j.get('stopped', {}).items():
+            original_state(svc, cid)
         self.io.port_free()
         for svc in START:
             cid = j.get('stopped', {}).get(svc)
-            if cid and not self.state(cid)['Running']:
+            if cid and not original_state(svc, cid)['Running']:
                 self.io.run(['docker', 'start', cid])
                 self.wait(cid, True)
             if svc == DATA[-1]:
@@ -342,7 +490,8 @@ class Recovery:
         write(Path(bundle) / 'journal.json', j, replace=True)
         observed = [read(Path(p) / 'target.json') for p in j.get('targets', [])]
         complete = any(t.get('rollbackFrom') and (t.get('observation') or {}).get('rollback') is True for t in observed)
-        return {'phase': j['phase'], 'backupComplete': bool(m), 'fullFlowObserved': bool(m and complete)}
+        return {'phase': j['phase'], 'backupComplete': bool(m),
+                'fullFlowObserved': bool(m and complete and targets_stopped_cleanly and not j.get('stopFailed'))}
 
     def volume_command(self, record, image, volume, mode, path, incoming=False):
         need(IMAGE.fullmatch(image), 'IMAGE_ID')
@@ -374,6 +523,8 @@ class Recovery:
             self.stop(record, model, j, output / 'journal.json', services=STOP[:-len(DATA)])
             checkpoint = self.checkpoint(directory, record, general_id, request_id)
             self.stop(record, model, j, output / 'journal.json', services=DATA)
+            self.stopped_proof(record, model, j, rows)
+            write(output / 'stop-proof.json', {'stopAttempts': j['stopAttempts']})
             roots = {}
             pg = record['supportImages']['postgres:16-alpine']
             for name in VOLUMES:
@@ -383,6 +534,7 @@ class Recovery:
             pins = images(record, model)
             self.io.stream(['docker', 'image', 'save', *sorted(set(pins.values()))], output / 'images.tar')
             archive_root(output / 'images.tar')
+            self.stopped_proof(record, model, j, self.verify(record, model))
             m = {'schema': 1, 'status': 'BACKUP_COMPLETE', 'source': record, 'pins': pins,
                  'identity': identity(record), 'checkpoint': checkpoint, 'volumes': roots,
                  'files': seal(output)}
@@ -575,8 +727,13 @@ class Recovery:
         journal = read(journal_path) if journal_path.exists() else {}
         rows = self.verify(t['record'], target_compose, partial=True)
         need(all(s in rows and rows[s]['Id'] == cid for s, cid in journal.get('stopped', {}).items()), 'TARGET_IDS_CHANGED')
-        self.stop(t['record'], target_compose, journal, journal_path, partial=True)
-        t['phase'] = 'STOPPED_PRESERVED'
+        try:
+            self.stop(t['record'], target_compose, journal, journal_path, partial=True)
+        except BaseException:
+            t['phase'] = 'STOP_FAILED_PRESERVED'
+            write(target / 'target.json', t, replace=True)
+            raise
+        t['phase'] = 'STOPPED_PRESERVED' if set(rows) == set(STOP) else 'STOPPED_PARTIAL_PRESERVED'
         write(target / 'target.json', t, replace=True)
         return {'phase': t['phase']}
 
@@ -593,6 +750,7 @@ class Recovery:
              all(b['pins'][s] != m['pins'][s] and fresh.inspect_image(b['pins'][s])['Config']['Labels'].get(
                  'org.opencontainers.image.revision') == b['record']['appSha'] for s in fresh.SERVICES), 'B_VERSION_NOT_PROVEN')
         need(not any(self.state(c['Id'])['Running'] for c in rows.values()), 'B_STILL_RUNNING')
+        self.stopped_proof(b['record'], b_model, read(Path(prior_target) / 'stop.json'), rows)
         result = self.restore(bundle, target)
         t = read(Path(target) / 'target.json')
         t['rollbackFrom'] = str(Path(prior_target).absolute())

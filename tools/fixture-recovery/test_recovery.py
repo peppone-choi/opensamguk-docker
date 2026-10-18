@@ -41,6 +41,11 @@ class FakeCLI:
         self.calls = []
         self.containers, self.volumes, self.networks, self.image_data, self.tags = {}, {}, {}, {}, {}
         self.clean = True
+        self.clock = 100
+        self.daemon_id = 'fake-local-daemon'
+        self.stop_hook = lambda svc, row: None
+        self.signal = 'SIGTERM'
+        self.stop_errors = set()
         self.fail_export = False
         self.fail_start = False
         self.corrupt_restore = False
@@ -72,11 +77,20 @@ class FakeCLI:
                 mounts.append(a)
             row = {'Id': cid, 'Name': project + '-' + svc + '-1', 'Image': pins[svc],
                 'Config': {'Labels': {**labels, 'com.docker.compose.service': svc}},
-                'State': {'Running': running, 'Health': {'Status': 'healthy'}},
+                'State': {'Running': running, 'Health': {'Status': 'healthy'},
+                    'Restarting': False, 'Paused': False, 'Dead': False, 'Pid': 42 if running else 0, 'OOMKilled': False, 'Error': '',
+                    'StartedAt': self.timestamp(1), 'FinishedAt': self.timestamp(0)},
+                'RestartCount': 0,
                 'HostConfig': {'PortBindings': {'443/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '443'}]} if svc == 'nginx' else {}},
                 'Mounts': mounts, 'NetworkSettings': {'Networks': {net: {}}}, 'ExitCode': 0}
             self.containers[cid] = row
             self.networks[net]['Containers'][cid] = {}
+
+    def timestamp(self, tick=None):
+        if tick is None:
+            self.clock += 1
+            tick = self.clock
+        return '2026-10-19T00:%02d:%02d.123456789Z' % divmod(tick, 60)
 
     def local(self): pass
 
@@ -95,9 +109,11 @@ class FakeCLI:
         if args[0] == 'git': return b'canonical nginx'
         need(args[0] == 'docker', 'UNEXPECTED_FAKE_CLI')
         a = args[1:]
+        if a[0] == 'info':
+            return json.dumps({'ID': self.daemon_id, 'SystemTime': self.timestamp()}).encode()
         if a[:2] == ['image', 'inspect']:
             ident = self.tags.get(a[-1], a[-1])
-            if a[a.index('--format')+1] == '{{json .Config.StopSignal}}': return b'"SIGTERM"'
+            if a[a.index('--format')+1] == '{{json .Config.StopSignal}}': return json.dumps(self.signal).encode()
             need(ident in self.image_data, 'IMAGE_MISSING')
             return json.dumps(self.image_data[ident]).encode()
         if a[:2] == ['image', 'ls']:
@@ -132,7 +148,9 @@ class FakeCLI:
         if a[0] == 'inspect':
             row = self.containers[a[-1]]
             if a[a.index('--format')+1] == r.STATE:
-                return json.dumps({'Running': row['State']['Running'], 'ExitCode': row['ExitCode'], 'OOMKilled': False}).encode()
+                state = dict(row['State'], Id=row['Id'], Image=row['Image'], RestartCount=row['RestartCount'],
+                             ExitCode=row['ExitCode'], Error=bool(row['State']['Error']))
+                return json.dumps({k: v for k, v in state.items() if k != 'Health'}).encode()
             return json.dumps(row).encode()
         if a[:2] == ['volume', 'inspect']:
             row = self.volumes[a[-1]]
@@ -142,12 +160,15 @@ class FakeCLI:
             return json.dumps(row).encode()
         if a[0] == 'kill':
             row = self.containers[a[-1]]
-            row['State']['Running'] = False
-            row['ExitCode'] = 0 if self.clean else 137
+            svc = row['Config']['Labels']['com.docker.compose.service']
+            need(svc not in self.stop_errors, 'FAKE_SIGNAL_FAILED')
+            row['State'].update(Running=False, Pid=0, FinishedAt=self.timestamp())
+            row['ExitCode'] = 0 if self.clean or svc not in r.DATA else 137
+            self.stop_hook(svc, row)
             return b''
         if a[0] == 'start':
             need(not self.fail_start, 'START_FAILED')
-            self.containers[a[-1]]['State']['Running'] = True
+            self.containers[a[-1]]['State'].update(Running=True, Pid=42, StartedAt=self.timestamp())
             return b''
         if a[0] == 'run': return b'existing file' if self.nonempty else b''
         if a[0] == 'compose':

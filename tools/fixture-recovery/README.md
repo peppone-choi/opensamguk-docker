@@ -65,7 +65,21 @@ python3 -B "$R" --handoff "$P" --source-custody "$F" --meta "$M" --logs "$L1" \
 Backup first checks normal USER login/readback before stopping anything. It then normally
 stops ingress, APIs and engine, captures the committed USER checkpoint while
 PG is still online, then normally stops both PostgreSQL and both Redis instances. Data service
-exit must be clean (exit0, not OOM); no SIGKILL fallback exists. Only then does it read-only
+exit must be clean (exit0, not OOM); no SIGKILL fallback exists. Each service must have
+an owned, running, unpaused, non-restarting instance immediately before this tool sends its
+image's TERM/INT signal. A private atomic intent records the exact CID/image/StartedAt/restart
+count, source/config hash, signal argv and local daemon ID/time. The same instance must finish
+inside that daemon-time interval with no OOM, error, live PID, paused/dead/restarting state.
+Non-data exit0 or signal-matching TERM143/INT130 is accepted only with that completed tool
+proof. A previously stopped service, unknown signal result, exit137 or unrelated exit is refused;
+external termination is never adopted as this tool's normal-stop proof. Error text is projected
+to a boolean and private config values are hashed, never copied into the proof.
+
+The immutable `stop-proof.json` is sealed into the backup. A bundle without it is refused;
+never backfill a proof or reseal an old backup to bypass this requirement. The tool rechecks all stopped runs
+before and after archival; a restarted/replaced run cannot become `BACKUP_COMPLETE`. Repeating
+a proven stop is read-only and requires the same final state/daemon, while a failed/pending
+attempt remains failed and is never silently retried. Only then does it read-only
 archive all five volumes, including **all** Redis AOF segments/manifest and profile icons.
 It also preserves private runtime/config/fixture/certs/nginx and exact image bytes in `images.tar`.
 Every archive entry is validated; checksum, content, internal ownership/modes and source pins
@@ -145,14 +159,23 @@ and icons before boot; the USER probe is not a replay of all gameplay stories.
 `resume-original` refuses any live copy and changed original container IDs. It starts only the
 original IDs this operation stopped, waits for data/gateway dependencies and health, and checks
 the original USER/checkpoint. Its `fullFlowObserved` is false for backup-only or a same-version
-exercise; true requires the B observation, stopped B, observed rollback A and original return.
+exercise; true requires the B observation, stopped B, observed rollback A and original return,
+plus complete, current, successful stop proofs for every target. Rollback revalidates B's exact
+stopped instance instead of trusting its saved phase. Original restart is restricted to the
+same source runs this invocation attempted to stop, including failure recovery.
 This is tool evidence, not an automatic readiness score or independent acceptance verdict.
 
 ## Failures and evidence
 
 - Never delete a partial bundle, failed B target, original volume/image or journal to retry.
   Restore outputs are single-use. Use `stop-target` on an owned partial target before returning
-  to F. Repeating stop only follows its recorded IDs. Expired handoffs need C0's renewed window.
+  to F. Repeating stop only follows its recorded IDs. A failure still attempts normal stops
+  of the remaining owned services and keeps `STOP_FAILED_PRESERVED`; an incomplete resource
+  set keeps `STOPPED_PARTIAL_PRESERVED`. Neither phase permits rollback acceptance. If every
+  copy is physically stopped, original resume remains available, but cleanup is never full-flow
+  success. A still-running copy blocks original resume. Failed attempts/outputs are preserved
+  for the owner to reconcile, without forced signals, exit-code edits or proof replacement.
+  Expired handoffs need C0's renewed window.
 - A Docker client timeout can leave an owned helper/container alive. Inventory/foreign-consumer
   checks then refuse resume. Preserve its private child log and ask the Docker owner to reconcile
   the exact owned helper in the same window; do not prune or force-remove it.
@@ -178,7 +201,9 @@ python3 -B -m unittest discover -s tools/fixture-recovery -p 'test_*.py' -v
 
 The stateful fake CLI covers A→B→A, source preservation, AOF segments, partial restore,
 ENOSPC, private output, unsafe archives, foreign ownership, changed IDs/config, handoff binding,
-normal-stop failures and missing/unobserved versions. Run the real fixture stages separately
+normal-stop failures and missing/unobserved versions. Stop regressions cover proven TERM143/
+INT130, data-exit0, OOM/137/errors, absent/pending proof, changed instances/daemon/timestamps,
+nanosecond/offset bounds, idempotence and partial-target cleanup without full-flow success. Run the real fixture stages separately
 after current-head independent review and explicit C0/Docker handoff. Fake successes are never
 recorded as actual backup, restore, rollback, USER or operational3-point acceptance.
 
