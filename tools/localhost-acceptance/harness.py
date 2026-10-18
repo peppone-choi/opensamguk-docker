@@ -43,6 +43,10 @@ TACTICAL_API = {'BATTLE_SESSION_ENABLED': 'true', 'BATTLE_JOIN_TICKET_ENABLED': 
                 'BATTLE_V3_COMMAND_INGRESS_ENABLED': 'true', 'BATTLE_V3_PROJECTION_ENABLED': 'true',
                 'BATTLE_WS_ALLOWED_ORIGINS': ORIGIN}
 TACTICAL_ENGINE = {'BATTLE_PIPELINE_ENABLED': 'true', 'BATTLE_PIPELINE_API_BASE_URL': 'http://game-api:8081'}
+LEGACY_TACTICAL_DOCKER = 'd35b3815e4f3edea119c4eff3b9678766be756b7'
+ROUTE_FILE = 'localhost-allowlist.map'
+ROUTE_ORIGINAL = 'tactical-route-original-contract.json'
+ROUTE_PROOF = 'tactical-route-recovery.json'
 # Inspect projections exclude Env, command arguments, health logs and volume driver options.
 IMAGE_FORMAT = '{"Id":{{json .Id}},"RepoTags":{{json .RepoTags}},"Config":{"Labels":{{json (index .Config "Labels")}}}}'
 CONTAINER_FORMAT = ('{"Id":{{json .Id}},"Name":{{json .Name}},"Image":{{json .Image}},'
@@ -155,6 +159,63 @@ def profile(record):
     return value
 
 
+def battle_route_bytes(record):
+    identity(record, read_only=True)
+    return ('"' + record['serverId'] + '" "http://s' + record['serverId'] + '-game-api:8081";\n').encode()
+
+
+def battle_route_binding(record):
+    return {'schema': 1, 'file': ROUTE_FILE, 'sha256': sha(battle_route_bytes(record))}
+
+
+def verify_battle_route(directory, record, legacy=False):
+    require({key for key in record if 'battlerout' in re.sub('[^a-z]', '', key.lower())} <= {'battleRouting'},
+            'Unknown battle routing contract key')
+    route = private_path(directory / 'battle-ws', True)
+    files = list(route.iterdir())
+    if profile(record) == 'standard' or legacy:
+        require(not legacy or (record.get('dockerSha') == LEGACY_TACTICAL_DOCKER and
+                profile(record) == 'tactical' and record.get('status') == 'RUNNING' and
+                not any(key.startswith('runtimeVerifier') for key in record)), 'Invalid legacy route admission')
+        require('battleRouting' not in record and not files, 'Unexpected battle routing')
+        return
+    require(record.get('battleRouting') == battle_route_binding(record) and
+            {path.name for path in files} == {ROUTE_FILE}, 'Tactical battle routing binding differs')
+    path = private_path(route / ROUTE_FILE)
+    require(path.stat().st_nlink == 1 and path.read_bytes() == battle_route_bytes(record),
+            'Tactical battle routing bytes or links differ')
+    if 'runtimeVerifierHarnessSha256' in record:
+        verify_route_recovery_binding(directory, record)
+
+
+def route_verifier_identity(expected_head):
+    require(re.fullmatch('[a-f0-9]{40}', expected_head or '') and
+            git(ROOT, 'rev-parse', 'HEAD').decode().strip() == expected_head, 'Exact route verifier head required')
+    require(not git(ROOT, 'status', '--porcelain', '--untracked-files=all').strip() and
+            not git(ROOT, 'ls-files', '--others', '--ignored', '--exclude-standard').strip(),
+            'Route verifier must be clean')
+    source = git(ROOT, 'show', expected_head + ':tools/localhost-acceptance/harness.py')
+    require(source == Path(__file__).read_bytes(), 'Route verifier source differs')
+    return {'runtimeVerifierHead': expected_head, 'runtimeVerifierPath': str(ROOT),
+            'runtimeVerifierHarnessSha256': sha(source)}
+
+
+def verify_route_recovery_binding(directory, record):
+    proof = json.loads(private_path(directory / ROUTE_PROOF).read_bytes())
+    original_bytes = private_path(directory / ROUTE_ORIGINAL).read_bytes()
+    original = json.loads(original_bytes)
+    require(original.get('dockerSha') == LEGACY_TACTICAL_DOCKER and
+            original.get('profile') == 'tactical' and original.get('status') == 'RUNNING' and
+            'battleRouting' not in original and 'runtimeVerifierHarnessSha256' not in original,
+            'Original tactical failure binding differs')
+    verifier = route_verifier_identity(record.get('runtimeVerifierHead'))
+    expected = {**original, **verifier, 'battleRouting': battle_route_binding(original)}
+    require(record.get('status') in ('RUNNING', 'SMOKE_PASSED') and
+            {**record, 'status': 'RUNNING'} == expected and
+            proof == {'schema': 1, 'originalContractSha256': sha(original_bytes), **verifier,
+                      'battleRouting': expected['battleRouting']}, 'Recovered contract differs from original inputs')
+
+
 def tactical_key(value):
     require(isinstance(value, str), 'Dedicated tactical signing key is missing')
     try:
@@ -255,6 +316,8 @@ def validate_model(model, record):
     allowed_binds = {'/etc/nginx/nginx.conf': 'nginx.conf', '/etc/nginx/certs': 'certs', '/etc/nginx/battle-ws': 'battle-ws'}
     map_env, map_mounts = topdown.settings(record)
     require(model['services']['game-api'].get('volumes', []) == map_mounts, 'Topdown mount differs from explicit pin')
+    require(model['services']['game-api'].get('networks', {}).get('local', {}).get('aliases') ==
+            ['s' + record['serverId'] + '-game-api'], 'Owned game API alias differs')
     for name, svc in model['services'].items():
         pause_env = {key: value for key, value in svc.get('environment', {}).items() if startup_pause_key(key)}
         require(pause_env == ({STARTUP_PAUSE_ENV: 'true'} if name == 'game-engine' and startup_paused(record) else {}),
@@ -378,7 +441,7 @@ def resource_gate(directory, phase):
 
 @contextlib.contextmanager
 def heavy(meta, record, phase):
-    require(phase in ('build', 'startup', 'gateway-repair', 'cleanup'), 'Unknown resource phase')
+    require(phase in ('build', 'startup', 'gateway-repair', 'route-repair', 'cleanup'), 'Unknown resource phase')
     lock = Path(meta).resolve() / '.locks/heavy-run'
     require((Path(meta) / 'bin/start-task').is_file(), 'Managed meta root required')
     lock.parent.mkdir(exist_ok=True)
@@ -394,7 +457,10 @@ def heavy(meta, record, phase):
     marker = f"LHA {nonce} driver-pid={os.getpid()} session={record['session']}\n"
     try:
         private_write(owner, marker.encode())
-        if phase != 'cleanup':
+        if phase == 'route-repair':
+            # A reload admits no container or image workload, like resume-startup.
+            resume_capacity()
+        elif phase != 'cleanup':
             resource_gate(record['custody'], phase)
         yield
     finally:
@@ -548,6 +614,7 @@ def prepare(args):
               'status': 'PREPARED', 'images': {}}
     if selected_profile == 'tactical':
         record['profile'] = selected_profile
+        record['battleRouting'] = battle_route_binding(record)
     if selected_pause:
         record['startupPaused'] = True
     if map_record:
@@ -568,6 +635,8 @@ def prepare(args):
         topdown.copy_bundle(Path(args.topdown_bundle), directory, map_record)
     (directory / 'certs').mkdir(mode=0o700)
     (directory / 'battle-ws').mkdir(mode=0o700)
+    if selected_profile == 'tactical':
+        private_write(directory / 'battle-ws' / ROUTE_FILE, battle_route_bytes(record))
     private_write(directory / 'nginx.conf', nginx)
     # Only keys generated here are read, never an existing env/key/certificate.
     key = directory / 'issuer.pem'
@@ -598,7 +667,7 @@ def prepare(args):
     print(str(directory))
 
 
-def verify_custody_files(directory, record):
+def verify_custody_files(directory, record, *, legacy_route=False):
     require(sha(private_path(directory / 'nginx.conf').read_bytes()) == record['nginxSha256'] and
             sha(git(ROOT, 'show', record['dockerSha'] + ':infra/nginx/nginx.conf')) == record['nginxSha256'],
             'Canonical nginx mismatch')
@@ -615,16 +684,16 @@ def verify_custody_files(directory, record):
         topdown.validate(root / selected['bakeId'], selected['bakeId'], selected['manifestSha256'], pins, True)
     else:
         require(not (directory / 'topdown').exists(), 'Unselected topdown files')
-    require(tree_hash(directory / 'certs') == record['certsSha256'] and not list((directory / 'battle-ws').iterdir()),
-            'TLS or battle routing changed')
+    require(tree_hash(directory / 'certs') == record['certsSha256'], 'TLS changed')
+    verify_battle_route(directory, record, legacy=legacy_route)
     require(sha(private_path(directory / 'compose.json').read_bytes()) == record['configSha256'], 'Compose changed')
     fixtures = json.loads(private_path(directory / 'runtime.json').read_bytes())
     model = json.loads((directory / 'compose.json').read_bytes())
     return fixtures, model
 
 
-def verify_files(directory, record):
-    fixtures, model = verify_custody_files(directory, record)
+def verify_files(directory, record, *, legacy_route=False):
+    fixtures, model = verify_custody_files(directory, record, legacy_route=legacy_route)
     require(model == model_for(record, fixtures), 'Compose differs from owned inputs')
     return model
 
@@ -767,6 +836,24 @@ def verify_running(record, resources, model):
         require(row.get('Driver') == 'bridge', 'Foreign runtime network driver')
         own_ids = {r['Id'] for r in resources['container']}
         require(set(row.get('Containers', {})) <= own_ids, 'Foreign network member; preserved')
+    verify_battle_route_runtime(record, resources)
+
+
+def verify_battle_route_runtime(record, resources):
+    if profile(record) != 'tactical':
+        return
+    alias = 's' + record['serverId'] + '-game-api'
+    found = 0
+    for row in resources['container']:
+        service = row['Config']['Labels'].get('com.docker.compose.service')
+        aliases = row['NetworkSettings']['Networks'][record['project'] + '_local'].get('Aliases') or []
+        if service == 'game-api':
+            found += 1
+            require(len(aliases) == 3 and set(aliases) == {row['Name'].lstrip('/'), 'game-api', alias},
+                    'Owned game API runtime aliases differ')
+        else:
+            require(alias not in aliases, 'Owned game API alias belongs to another endpoint')
+    require(found == 1, 'Unique owned game API endpoint required')
 
 
 def registry_repair_model(record, fixtures, model):
@@ -924,6 +1011,97 @@ def resume_startup(args):
     smoke(args)
 
 
+def route_resource_ids(resources):
+    return {'containers': sorted((row['Id'], row['Image']) for row in resources['container']),
+            'networks': sorted(row['Id'] for row in resources['network']),
+            'volumes': sorted(row['Name'] for row in resources['volume'])}
+
+
+def wait_tactical_route(directory, record):
+    context = ssl.create_default_context(cafile=str(directory / 'certs/opensamguk.crt'))
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context))
+    deadline = time.monotonic() + 30
+    while True:
+        statuses = []
+        for sid in (record['serverId'], 'foreign'):
+            try:
+                with opener.open(ORIGIN + '/api/battle-ws/' + sid + '/160/probe', timeout=3) as response:
+                    statuses.append(response.status)
+            except urllib.error.HTTPError as error:
+                statuses.append(error.code)
+        require(statuses[1] == 404 and statuses[0] in (403, 404), 'Unexpected reloaded route boundary')
+        if statuses == [403, 404]:
+            return
+        require(time.monotonic() < deadline, 'Tactical route reload did not become ready')
+        time.sleep(1)
+
+
+def repair_tactical_route(args):
+    directory, record = load(args.custody)
+    require(args.authorize_project == record['project'], 'Explicit owned route repair approval required')
+    require(record['status'] == 'RUNNING' and record['dockerSha'] == LEGACY_TACTICAL_DOCKER and
+            profile(record) == 'tactical' and 'battleRouting' not in record and
+            not any(key.startswith('runtimeVerifier') for key in record), 'Only original unpassed d35 tactical route repair is allowed')
+    verifier = route_verifier_identity(args.verifier_sha)
+    for path in ('infra/nginx/nginx.conf', 'docker-compose.localhost-acceptance.yml'):
+        require(git(ROOT, 'show', record['dockerSha'] + ':' + path) ==
+                git(ROOT, 'show', args.verifier_sha + ':' + path), 'Route repair cannot change nginx or Compose')
+    failure = json.loads(private_path(directory / 'h-execution.json').read_bytes())
+    require(failure.get('status') == 'FAILED_OR_REFUSED' and failure.get('exceptionType') == 'Refused' and
+            failure.get('fixedFailureCode') == 'Boundary smoke failed at /api/battle-ws/' + record['serverId'] + '/160/probe',
+            'Original tactical boundary failure is required')
+    attempt = directory / 'tactical-route-execution.json'
+    require(not any(path.exists() or path.is_symlink() for path in
+                    (attempt, directory / ROUTE_ORIGINAL, directory / ROUTE_PROOF)),
+            'Route repair already attempted; original state preserved')
+    with heavy(args.meta, record, 'route-repair'):
+        require(not (Path(args.meta) / '.locks/gui-run').exists(), 'GUI operation active')
+        model = verify_files(directory, record, legacy_route=True)
+        verify_images(record)
+        resources = inventory(record)
+        verify_running(record, resources, model)
+        runtime_caps(model, resources)
+        before = route_resource_ids(resources)
+        original = private_path(directory / 'contract.json').read_bytes()
+        require(json.loads(original) == record, 'Contract changed during route repair admission')
+        audit = {'status': 'APPLYING', 'buildDockerSha': record['dockerSha'], **verifier,
+                 'originalContractFile': ROUTE_ORIGINAL, 'originalContractSha256': sha(original),
+                 'resourceIdsBefore': before}
+        write_json(attempt, audit)
+        try:
+            private_write(directory / ROUTE_ORIGINAL, original)
+            record.update(verifier)
+            record['battleRouting'] = battle_route_binding(record)
+            write_json(directory / ROUTE_PROOF, {'schema': 1, 'originalContractSha256': sha(original),
+                       **verifier, 'battleRouting': record['battleRouting']})
+            private_write(directory / 'battle-ws' / ROUTE_FILE, battle_route_bytes(record))
+            write_json(directory / 'contract.json', record, replace=True)
+            verify_files(directory, record)
+            compose(directory, record, 'exec', '-T', 'nginx', 'nginx', '-t',
+                    log_path=directory / 'tactical-route-nginx-test.log')
+            compose(directory, record, 'exec', '-T', 'nginx', 'nginx', '-s', 'reload',
+                    log_path=directory / 'tactical-route-nginx-reload.log')
+            wait_tactical_route(directory, record)
+            current = inventory(record)
+            verify_running(record, current, model)
+            require(route_resource_ids(current) == before, 'Route repair changed resource identities')
+            audit['status'] = 'RELOADED'
+            write_json(attempt, audit, replace=True)
+            smoke(args, finalize=False)
+            current = inventory(record)
+            verify_running(record, current, model)
+            require(route_resource_ids(current) == before, 'Post-smoke resource identities changed')
+            record['status'] = 'SMOKE_PASSED'
+            write_json(directory / 'contract.json', record, replace=True)
+            audit['status'] = 'SMOKE_PASSED'
+            write_json(attempt, audit, replace=True)
+        except BaseException:
+            audit['status'] = 'FAILED_OR_REFUSED'
+            write_json(attempt, audit, replace=True)
+            raise
+    print('Owned tactical route repaired; original failure and six build image pins retained; USER remains separate')
+
+
 def sql(directory, record, service, query):
     db = 'game' if service == 'game-postgres' else 'gateway'
     return compose(directory, record, 'exec', '-T', service, 'psql', '-X', '-q', '-A', '-t', '-v', 'ON_ERROR_STOP=1',
@@ -1012,7 +1190,7 @@ def startup_pause_smoke(directory, record):
     validate_startup_pause_status(payload, record)
 
 
-def smoke(args):
+def smoke(args, *, finalize=True):
     directory, record = load(args.custody)
     model = verify_files(directory, record)
     verify_images(record)
@@ -1024,6 +1202,7 @@ def smoke(args):
     checks = [('/health', {200}), ('/api/gateway/auth/me', {401}),
               ('/api/battle-ws/' + record['serverId'] + '/160/probe',
                {403 if profile(record) == 'tactical' else 404}),
+              ('/api/battle-ws/foreign/160/probe', {404}),
               ('/d_pic/.ops/private', {404}), ('/game/', {404}), ('/', {200})]
     for path, expected in checks:
         try:
@@ -1045,8 +1224,9 @@ def smoke(args):
         'curl', '-fsS', '--max-time', '15', 'http://localhost:8081' + path))
     startup_pause_smoke(directory, record)
     startup_disk_check(directory, 'beforeSmokePassedFreeBytes')
-    record['status'] = 'SMOKE_PASSED'
-    write_json(directory / 'contract.json', record, replace=True)
+    if finalize:
+        record['status'] = 'SMOKE_PASSED'
+        write_json(directory / 'contract.json', record, replace=True)
     print('nginx, healthy services, seed identity and unauthenticated boundaries passed; USER stories remain separate')
 
 
@@ -1144,11 +1324,14 @@ def main():
     p.add_argument('--custody', required=True, type=Path)
     p.add_argument('--general-id', required=True)
     p.add_argument('--request-id')
-    for command in ('build', 'up', 'smoke', 'resume-startup', 'validate', 'down', 'repair-registry'):
+    for command in ('build', 'up', 'smoke', 'resume-startup', 'validate', 'down', 'repair-registry', 'repair-tactical-route'):
         p = sub.add_parser(command)
         p.add_argument('--custody', required=True, type=Path)
-        if command in ('build', 'up', 'down', 'repair-registry'):
+        if command in ('build', 'up', 'down', 'repair-registry', 'repair-tactical-route'):
             p.add_argument('--meta', required=True, type=Path)
+        if command == 'repair-tactical-route':
+            p.add_argument('--verifier-sha', required=True, help='Exact separately reviewed clean verifier revision')
+            p.add_argument('--authorize-project', required=True, help='Exact owned project, after explicit operation approval')
     args = parser.parse_args()
     try:
         if args.command == 'validate':
