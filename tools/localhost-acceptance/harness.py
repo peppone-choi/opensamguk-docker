@@ -15,6 +15,7 @@ import shutil
 import socket
 import stat
 import subprocess
+import sys
 import tarfile
 import time
 import urllib.error
@@ -588,6 +589,35 @@ def compose(directory, record, *args, timeout=60, log_path=None):
                 '--project-directory', str(directory), '-f', str(directory / 'compose.json'), *args], timeout=timeout, log_path=log_path)
 
 
+def verify_mounts(actual, service, model):
+    expected = []
+    for mount in service.get('volumes', []):
+        kind = mount['type']
+        require(kind in ('bind', 'volume'), 'Unexpected declared mount type')
+        source = mount['source'] if kind == 'bind' else model['volumes'][mount['source']]['name']
+        expected.append((kind, source, mount['target'], not mount.get('read_only', False)))
+    require(len(expected) == len(set(expected)), 'Duplicate declared mount')
+    aliases = {'/host_mnt' + source: source for kind, source, _, _ in expected if kind == 'bind'}
+    if any(m.get('Type') == 'bind' and m.get('Source') in aliases for m in actual):
+        require(sys.platform == 'darwin', 'Desktop mount alias requires macOS')
+        # run() independently proves the active endpoint is a local Unix socket.
+        daemon = json.loads(run(['docker', 'info', '--format',
+            '{"OperatingSystem":{{json .OperatingSystem}},"OSType":{{json .OSType}},"ID":{{json .ID}}}']))
+        require(daemon.get('OperatingSystem') == 'Docker Desktop' and daemon.get('OSType') == 'linux'
+                and bool(daemon.get('ID')), 'Desktop mount alias requires current local Desktop daemon')
+    observed = []
+    for mount in actual:
+        kind = mount.get('Type')
+        require(kind in ('bind', 'volume') and type(mount.get('RW')) is bool,
+                'Invalid runtime mount')
+        source = mount.get('Source') if kind == 'bind' else mount.get('Name')
+        if kind == 'bind':
+            source = aliases.get(source, source)
+        observed.append((kind, source, mount.get('Destination'), mount['RW']))
+    require(len(observed) == len(expected) and len(set(observed)) == len(observed)
+            and set(observed) == set(expected), 'Runtime mounts differ from declared model')
+
+
 def verify_running(record, resources, model):
     assert_owned(record, resources)
     require(len(resources['container']) == len(model['services']), 'Incomplete stack')
@@ -606,13 +636,7 @@ def verify_running(record, resources, model):
         ports = row['HostConfig'].get('PortBindings') or {}
         require(ports == ({'443/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '443'}]} if svc == 'nginx' else {}),
                 'Runtime port binding differs')
-        for mount in row.get('Mounts', []):
-            if mount['Type'] == 'volume':
-                require(mount.get('Name') in {v['name'] for v in model['volumes'].values()}, 'Foreign runtime volume')
-            else:
-                require(mount['Type'] == 'bind' and svc == 'nginx' and not mount['RW'] and
-                        mount['Source'] in {record['custody'] + '/' + n for n in ('certs', 'nginx.conf', 'battle-ws')},
-                        'Foreign runtime bind')
+        verify_mounts(row.get('Mounts', []), model['services'][svc], model)
     for row in resources['network']:
         require(row.get('Driver') == 'bridge', 'Foreign runtime network driver')
         own_ids = {r['Id'] for r in resources['container']}
@@ -745,6 +769,35 @@ def up(args):
     smoke(args)
 
 
+def resume_capacity():
+    # No new workload is admitted: retain VM capacity/load checks without reserving startup memory twice.
+    info = json.loads(run(['docker', 'info', '--format',
+        '{"NCPU":{{json .NCPU}},"MemTotal":{{json .MemTotal}}}'], timeout=30))
+    require(info['NCPU'] >= 2 and info['MemTotal'] >= 6 * GIB, 'Docker needs 2 CPUs and 6 GiB memory')
+    require(os.getloadavg()[1] <= 400, 'Host load5 exceeds the managed QA limit of 400')
+
+
+def resume_startup(args):
+    directory, record = load(args.custody)
+    require(record['status'] in ('STARTING', 'RUNNING'), 'Resume requires an unpassed started stack')
+    model = verify_files(directory, record)
+    verify_images(record)
+    resources = inventory(record)
+    verify_running(record, resources, model)
+    runtime_caps(model, resources)
+    resume_capacity()
+    verifier_head = git(ROOT, 'rev-parse', 'HEAD').decode().strip()
+    require(re.fullmatch('[a-f0-9]{40}', verifier_head), 'Invalid runtime verifier head')
+    require(not git(ROOT, 'status', '--porcelain', '--untracked-files=all').strip(), 'Runtime verifier must be clean')
+    # Retain the failed start contract before the first recovery transition.
+    write_json(directory / ('pre-resume-' + secrets.token_hex(8) + '.json'), record)
+    record['runtimeVerifierHead'] = verifier_head
+    record['runtimeVerifierPath'] = str(ROOT)
+    record['status'] = 'RUNNING'
+    write_json(directory / 'contract.json', record, replace=True)
+    smoke(args)
+
+
 def sql(directory, record, service, query):
     db = 'game' if service == 'game-postgres' else 'gateway'
     return compose(directory, record, 'exec', '-T', service, 'psql', '-X', '-q', '-A', '-t', '-v', 'ON_ERROR_STOP=1',
@@ -870,7 +923,7 @@ def main():
     p.add_argument('--custody', required=True, type=Path)
     p.add_argument('--general-id', required=True)
     p.add_argument('--request-id')
-    for command in ('build', 'up', 'smoke', 'validate', 'down', 'repair-registry'):
+    for command in ('build', 'up', 'smoke', 'resume-startup', 'validate', 'down', 'repair-registry'):
         p = sub.add_parser(command)
         p.add_argument('--custody', required=True, type=Path)
         if command in ('build', 'up', 'down', 'repair-registry'):

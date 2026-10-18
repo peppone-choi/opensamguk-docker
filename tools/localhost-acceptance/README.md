@@ -17,6 +17,7 @@ python3 tools/localhost-acceptance/harness.py build --custody <directory> --meta
 python3 tools/localhost-acceptance/harness.py validate --custody <directory>
 python3 tools/localhost-acceptance/harness.py up --custody <directory> --meta <metarepo>
 python3 tools/localhost-acceptance/harness.py smoke --custody <directory>
+python3 tools/localhost-acceptance/harness.py resume-startup --custody <directory>
 python3 tools/localhost-acceptance/harness.py snapshot --custody <directory> --general-id <positive-id>
 python3 tools/localhost-acceptance/harness.py snapshot --custody <directory> --general-id <positive-id> --request-id <uuid>
 python3 tools/localhost-acceptance/harness.py down --custody <directory> --meta <metarepo>
@@ -33,6 +34,8 @@ Inventory/image inspect uses explicit projections that exclude environment, comm
 `smoke` does not claim a successful USER journey. The app's separate runner owns normal ADMIN login/me, enabling/readback of allow_join and allow_login, normal USER register/login/join, and all original US-WAND-01/02 assertions. Only the new throwaway DB's AdminSeeder fixture is authorized. No SQL account promotion exists. `RESET_TURNTERM=2` means **two minutes / tickSeconds120**, not two seconds.
 
 ## Private handoff and logs
+
+`resume-startup` revalidates an existing STARTING or unpassed RUNNING stack without building, restarting, or changing Compose/fixtures/databases. It requires a clean verifier checkout, unchanged source/config/image receipts, eleven healthy owned services, exact model/runtime mount pairs, port/network boundaries, 6016MiB service caps, VM capacity and host load. Only then does it save the original contract, record the separate `runtimeVerifierHead` and `runtimeVerifierPath` without changing the build `dockerSha`, transition to RUNNING, and execute the normal strict smoke. A validation failure leaves the contract unchanged; a smoke failure cannot mark SMOKE_PASSED. Runtime mount matching permits an exact `/host_mnt` + declared host path alias only on macOS with a current local Unix Docker Desktop daemon. Missing, extra, duplicate or mismatched type/source/destination/write-mode mounts are refused, including named volumes.
 
 Custody is owned by the current OS user, mode0700; JSON/log/key files are mode0600. `contract.json` is safe to summarize but remains private. It supplies project, nonce, dynamic `serverId=lha<nonce>`, world160/gen0, exact origin/source and image identities. `fixture.json` is only `{admin:{username,password}, user:{username,password,name}}`; the USER runner consumes it internally. DB/JWT/internal credentials live in separate `runtime.json` and `compose.json`. Never print or commit these files, run `compose config` to the terminal, dump container inspect/env/logs, or record raw auth/cookie bodies.
 
