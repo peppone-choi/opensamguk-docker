@@ -82,6 +82,17 @@ def images(record, model):
             record['supportImages'][spec['image']] for svc, spec in model['services'].items()}
 
 
+def same_profile(record, source, code):
+    need(fresh.profile(record) == fresh.profile(source) and
+         fresh.startup_paused(record) == fresh.startup_paused(source), code)
+
+
+def profile_smoke(directory, record):
+    if fresh.profile(record) == 'tactical':
+        fresh.tactical_smoke(directory, record)
+    fresh.startup_pause_smoke(directory, record)
+
+
 def selected_tree(directory, record, public=False):
     root = Path(directory) / 'topdown'
     selected = record.get('topdown')
@@ -171,6 +182,7 @@ class Recovery:
         t = read(path / 'target.json')
         m = self.bundle(t['bundle'])
         rec = t['record']
+        same_profile(rec, m['source'], 'TARGET_PROFILE_BINDING')
         need(rec.get('topdown') == m['source'].get('topdown'), 'TARGET_TOPDOWN_BINDING')
         selected_tree(path / 'runtime', rec, True)
         need(re.fullmatch('[a-f0-9]{16}', rec.get('nonce', '')) and rec['nonce'] != m['source']['nonce'] and
@@ -431,6 +443,7 @@ class Recovery:
             need(candidate_pins == selected['sourcePins'], 'VERSION_TOPDOWN_SOURCE')
         version_record = {'schema': 1, 'appSha': app_sha, 'images': pins,
                        'identity': m['identity'], 'sourceTreeSha256': next(iter(source_tree)), 'dockerfiles': dockerfiles}
+        version_record.update({key: m['source'][key] for key in ('profile', 'startupPaused') if key in m['source']})
         if selected is not None:
             version_record['topdown'] = selected
         write(output, version_record)
@@ -448,6 +461,7 @@ class Recovery:
         app_sha = source['appSha']
         if version:
             v = read(version)
+            same_profile(v, source, 'VERSION_PROFILE_BINDING')
             need(v.get('topdown') == source.get('topdown'), 'VERSION_TOPDOWN_BINDING')
             need(v.get('schema') == 1 and v.get('identity') == m['identity'] and
                  v.get('appSha') != app_sha and SHA.fullmatch(v.get('appSha', '')), 'VERSION_INPUT')
@@ -511,6 +525,7 @@ class Recovery:
             '--project-directory', str(target), '-f', str(target / 'compose.json'), 'up', '-d',
             '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '600'], timeout=660)
         self.verify(rec, transformed, healthy=True)
+        profile_smoke(target, rec)
         t['phase'] = 'RUNNING_NOT_ACCEPTED'
         write(target / 'target.json', t, replace=True)
         return {'phase': t['phase'], 'appSha': app_sha, 'resourceNonce': nonce}
@@ -529,6 +544,7 @@ class Recovery:
             "BEGIN READ ONLY; SELECT count(*) FROM game_server s JOIN game_server_publication p USING(server_id) "
             f"WHERE s.server_id='{sid}' AND s.generation=0 AND p.state='PUBLIC' AND p.revision=1; COMMIT;")
         need(world == '160' and registry == '1', 'STRICT_SMOKE_IDENTITY')
+        profile_smoke(target, t['record'])
         fresh.topdown.smoke(t['record'], lambda path: self.io.run([
             'docker', 'exec', rows['game-api']['Id'], 'curl', '-fsS', '--max-time', '15',
             'http://localhost:8081' + path]))

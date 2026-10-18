@@ -1,5 +1,6 @@
 """Contract tests using a stateful fake Docker CLI. Never contacts a Docker daemon."""
 import copy
+from datetime import datetime, timezone
 import hashlib
 import io
 import json
@@ -44,6 +45,8 @@ class FakeCLI:
         self.fail_start = False
         self.corrupt_restore = False
         self.probe_ok = True
+        self.startup_pause_ok = True
+        self.tactical_ready = True
         self.nonempty = False
         self.cp = {'generalId': 2, 'userId': '7', 'nationId': 1, 'requestId': RID, 'appliedCount': 1,
                    'terminalVersion': 40, 'logCount': 1}
@@ -151,6 +154,18 @@ class FakeCLI:
             path = Path(a[a.index('-f')+1]); model = read(path)
             if 'exec' in a:
                 query = a[-1]
+                if query.endswith('/admin/turn-daemon/status'):
+                    paused = self.startup_pause_ok
+                    payload = dict(state='paused' if paused else 'running', running=not paused, paused=paused,
+                        loopAlive=True, serviceMaterialized=True, recoveryReady=True, recoveryMode='READY',
+                        autoStartEnabled=True, clock={'worldId':160}, lastTickStartedAt=None, lastTickCompletedAt=None)
+                    return json.dumps(payload).encode() + b'\nSTATUS:200'
+                if '/internal/battles/pipeline-readiness?' in query:
+                    payload = dict(schemaVersion=1, worldId=160, status='READY' if self.tactical_ready else 'BLOCKED',
+                        moraleEncoding='CAMPAIGN_NATIVE_D177_V1', checkedAt=datetime.now(timezone.utc).isoformat(), reasons=[])
+                    payload.update({key:'a' * 64 for key in ('dbFingerprint','nativeFenceSha256','ruleSha256',
+                        'catalogSha256','combatSha256','spaceSha256')})
+                    return json.dumps(payload).encode() + b'\nSTATUS:200'
                 if 'json_build_object' in query:
                     # All application writers must already be stopped at backup cut.
                     return json.dumps(self.cp).encode()
