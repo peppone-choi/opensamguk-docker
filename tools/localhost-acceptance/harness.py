@@ -38,6 +38,7 @@ SUPPORT_IMAGES = ('postgres:16-alpine', 'redis:7-alpine', 'nginx:1.30.5-alpine')
 GIB = 1024 ** 3
 ORIGIN = 'https://localhost'
 TACTICAL_KEY = 'BATTLE_JOIN_TICKET_KEY_BASE64'
+STARTUP_PAUSE_ENV = 'OPENSAMGUK_DAEMON_STARTUP_PAUSED'
 TACTICAL_API = {'BATTLE_SESSION_ENABLED': 'true', 'BATTLE_JOIN_TICKET_ENABLED': 'true',
                 'BATTLE_V3_COMMAND_INGRESS_ENABLED': 'true', 'BATTLE_V3_PROJECTION_ENABLED': 'true',
                 'BATTLE_WS_ALLOWED_ORIGINS': ORIGIN}
@@ -119,6 +120,7 @@ def private_path(path, directory=False):
 
 def identity(record, read_only=False):
     profile(record)
+    startup_paused(record)
     nonce = record.get('nonce', '')
     require(re.fullmatch('[a-f0-9]{16}', nonce), 'Invalid nonce')
     require(record.get('project') == 'osglha' + nonce and record.get('serverId') == 'lha' + nonce,
@@ -164,6 +166,18 @@ def tactical_key(value):
     return value
 
 
+def startup_pause_key(name):
+    return 'startuppaus' in re.sub(r'[^a-z0-9]', '', name.lower())
+
+
+def startup_paused(record):
+    require({key for key in record if startup_pause_key(key)} <= {'startupPaused'},
+            'Unknown startup pause contract key')
+    value = record.get('startupPaused', False)
+    require(type(value) is bool, 'Startup pause contract must be boolean')
+    return value
+
+
 def profile_fixtures(record, fixtures):
     if profile(record) == 'standard':
         return fixtures
@@ -201,6 +215,7 @@ def substitute(value, values):
 
 
 def model_for(record, fixtures):
+    paused = startup_paused(record)
     values = dict(fixtures)
     values.update(CUSTODY=record['custody'], PROJECT=record['project'], NONCE=record['nonce'],
                   SESSION=record['session'], SERVER_ID=record['serverId'],
@@ -217,6 +232,8 @@ def model_for(record, fixtures):
     model['services']['game-api']['environment'].update(map_env)
     if map_mounts:
         model['services']['game-api']['volumes'] = map_mounts
+    if paused:
+        model['services']['game-engine']['environment'][STARTUP_PAUSE_ENV] = 'true'
     validate_model(model, record)
     return model
 
@@ -239,6 +256,9 @@ def validate_model(model, record):
     map_env, map_mounts = topdown.settings(record)
     require(model['services']['game-api'].get('volumes', []) == map_mounts, 'Topdown mount differs from explicit pin')
     for name, svc in model['services'].items():
+        pause_env = {key: value for key, value in svc.get('environment', {}).items() if startup_pause_key(key)}
+        require(pause_env == ({STARTUP_PAUSE_ENV: 'true'} if name == 'game-engine' and startup_paused(record) else {}),
+                'Startup pause environment differs from its contract or service')
         require({k: v for k, v in svc.get('environment', {}).items() if k.startswith('TOPDOWN_')} ==
                 (map_env if name == 'game-api' else {}), 'Topdown environment differs from explicit pin')
         require(not set(svc) & {'build', 'container_name', 'privileged', 'network_mode', 'pid', 'ipc', 'devices',
@@ -499,6 +519,7 @@ def tree_hash(directory):
 def prepare(args):
     selected_profile = getattr(args, 'profile', 'standard')
     require(selected_profile in ('standard', 'tactical'), 'Unknown local fixture profile')
+    selected_pause = startup_paused({'startupPaused': getattr(args, 'startup_paused', False)})
     session = os.environ.get('OPENSAMGUK_TASK_OWNER_SESSION', '')
     require(re.fullmatch('[a-f0-9-]{36}', session), 'Set writer session before prepare')
     require(re.fullmatch('[a-f0-9]{40}', args.docker_sha), 'Exact Docker SHA required')
@@ -527,6 +548,8 @@ def prepare(args):
               'status': 'PREPARED', 'images': {}}
     if selected_profile == 'tactical':
         record['profile'] = selected_profile
+    if selected_pause:
+        record['startupPaused'] = True
     if map_record:
         record['topdown'] = map_record
     write_json(directory / 'contract.json', record)
@@ -948,6 +971,47 @@ def tactical_smoke(directory, record):
     validate_tactical_readiness(payload, record)
 
 
+def validate_startup_pause_status(payload, record):
+    require(isinstance(payload, dict) and payload.get('state') == 'paused' and
+            payload.get('running') is False and all(payload.get(key) is True for key in
+            ('paused', 'loopAlive', 'serviceMaterialized', 'recoveryReady', 'autoStartEnabled')) and
+            payload.get('recoveryMode') == 'READY', 'Engine startup pause is not ready')
+    clock = payload.get('clock')
+    require(isinstance(clock, dict) and type(clock.get('worldId')) is int and
+            clock['worldId'] == record['worldId'], 'Startup pause world differs')
+    started, completed = payload.get('lastTickStartedAt'), payload.get('lastTickCompletedAt')
+    if started is None and completed is None:
+        return
+    try:
+        start = datetime.datetime.fromisoformat(started.replace('Z', '+00:00'))
+        end = datetime.datetime.fromisoformat(completed.replace('Z', '+00:00'))
+        require(start.tzinfo is not None and end.tzinfo is not None and end >= start,
+                'Startup pause has an unfinished tick')
+    except (AttributeError, TypeError, ValueError):
+        raise Refused('Startup pause tick observation is invalid') from None
+
+
+def startup_pause_smoke(directory, record):
+    if not startup_paused(record):
+        return
+    raw = compose(directory, record, 'exec', '-T', 'game-engine', 'curl', '--silent', '--show-error',
+                  '--max-time', '3', '--noproxy', '*', '--write-out', '\nSTATUS:%{http_code}',
+                  'http://127.0.0.1:8082/admin/turn-daemon/status')
+    body, separator, status = raw.rpartition(b'\nSTATUS:')
+    require(separator and status == b'200' and len(body) <= 16384, 'Startup pause HTTP probe failed')
+    def unique_fields(pairs):
+        result = {}
+        for key, value in pairs:
+            require(key not in result, 'Startup pause status has duplicate fields')
+            result[key] = value
+        return result
+    try:
+        payload = json.loads(body, object_pairs_hook=unique_fields)
+    except (ValueError, UnicodeDecodeError):
+        raise Refused('Startup pause status is invalid') from None
+    validate_startup_pause_status(payload, record)
+
+
 def smoke(args):
     directory, record = load(args.custody)
     model = verify_files(directory, record)
@@ -979,6 +1043,7 @@ def smoke(args):
         tactical_smoke(directory, record)
     topdown.smoke(record, lambda path: compose(directory, record, 'exec', '-T', 'game-api',
         'curl', '-fsS', '--max-time', '15', 'http://localhost:8081' + path))
+    startup_pause_smoke(directory, record)
     startup_disk_check(directory, 'beforeSmokePassedFreeBytes')
     record['status'] = 'SMOKE_PASSED'
     write_json(directory / 'contract.json', record, replace=True)
@@ -1061,13 +1126,15 @@ def down(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
-    p = sub.add_parser('prepare')
+    p = sub.add_parser('prepare', allow_abbrev=False)
     p.add_argument('--source', required=True, type=Path)
     p.add_argument('--app-sha', required=True)
     p.add_argument('--docker-sha', required=True)
     p.add_argument('--custody', required=True, type=Path)
     p.add_argument('--profile', choices=('standard', 'tactical'), default='standard',
                    help='Explicit opt-in for a new fixture; never modifies an existing custody')
+    p.add_argument('--startup-paused', action='store_true',
+                   help='Hold scheduled ticks from engine startup; normal resume releases the hold')
     p.add_argument('--clone-source-custody', type=Path,
                    help='Optional owned prior custody; clone public source only after exact Git archive comparison')
     p.add_argument('--topdown-bundle', type=Path, help='Existing approved full bake directory; new custody only')
