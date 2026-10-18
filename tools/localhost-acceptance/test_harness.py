@@ -173,6 +173,40 @@ class HarnessTests(unittest.TestCase):
                 with self.assertRaises(h.Refused):
                     h.tactical_smoke(self.directory, self.record)
 
+    def test_smoke_requires_403_for_tactical_and_refuses_its_disabled_404(self):
+        from unittest.mock import MagicMock
+        for mode, websocket_status, accepted in [('standard', 404, True), ('tactical', 403, True),
+                                                  ('tactical', 404, False)]:
+            with self.subTest(mode=mode, websocket_status=websocket_status):
+                record = {**self.record, 'profile': mode, 'status': 'RUNNING'}
+                opener = MagicMock()
+                def response(url, **kwargs):
+                    status = websocket_status if '/api/battle-ws/' in url else 401 if '/auth/me' in url else (
+                        404 if '/d_pic/' in url or url.endswith('/game/') else 200)
+                    result = MagicMock()
+                    result.__enter__.return_value.status = status
+                    return result
+                opener.open.side_effect = response
+                with patch.object(h, 'load', return_value=(self.directory, record)), \
+                     patch.object(h, 'verify_files', return_value=self.model), \
+                     patch.object(h, 'verify_images'), patch.object(h, 'verify_running'), \
+                     patch.object(h, 'inventory', return_value={}), patch.object(h, 'compose'), \
+                     patch.object(h.ssl, 'create_default_context'), \
+                     patch.object(h.urllib.request, 'build_opener', return_value=opener), \
+                     patch.object(h, 'sql', side_effect=['160', '1']), \
+                     patch.object(h, 'startup_disk_check'), patch.object(h, 'write_json') as written, \
+                     patch.object(h, 'tactical_smoke') as readiness:
+                    if accepted:
+                        h.smoke(type('Args', (), {'custody': self.directory})())
+                        self.assertEqual('SMOKE_PASSED', record['status'])
+                        self.assertEqual(int(mode == 'tactical'), readiness.call_count)
+                    else:
+                        with self.assertRaises(h.Refused):
+                            h.smoke(type('Args', (), {'custody': self.directory})())
+                        self.assertEqual('RUNNING', record['status'])
+                        readiness.assert_not_called()
+                        written.assert_not_called()
+
     def test_privileged_port_probe_handles_mac_denial_without_ignoring_listener(self):
         from unittest.mock import MagicMock
         import errno
