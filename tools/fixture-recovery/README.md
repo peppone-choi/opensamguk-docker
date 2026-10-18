@@ -97,9 +97,13 @@ restored content root must equal A's. No data-service version change is allowed.
 An actual B image bundle is mandatory. The tool does not build B or reinterpret a tag as a
 version. The Docker owner must first supply six built B image IDs and its clean exact-source
 checkout. B must have a different app SHA and different IDs for all six app images. Its image
-labels, exported tracked-source hash and Dockerfile hashes must match that B source. Public
-build arguments must still match **A's app identity**, notably the gateway's game URL. Fresh
-images built for a different serverId are refused; retagging cannot repair that discrepancy.
+labels, exported tracked-source hash and Dockerfile hashes must match that B source.
+Backend `IMAGE_TAG` must be **B's app SHA**, including its build-args hash, so embedded
+release metadata reports B. Public build arguments still match **A's app identity**, notably
+the gateway's game URL. These same checks run at pinning, restore and target observation.
+A standard B backend image can be reused if all pins match; the web-game arguments do not
+contain serverId. A gateway image built for another serverId is refused; retagging cannot
+repair its compiled URL or labels.
 The owner arranges any B build in a separate approved build window before maintenance.
 
 ```sh

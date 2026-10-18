@@ -71,6 +71,11 @@ def identity(record):
     return {key: record[key] for key in ('serverId', 'worldId', 'generation', 'origin')}
 
 
+def version_args(source, app_sha, service):
+    """Keep A's app identity while requiring the actual release SHA in backend build metadata."""
+    return fresh.build_args(dict(source, appSha=app_sha), service)
+
+
 def images(record, model):
     return {svc: record['images'][svc]['imageId'] if svc in fresh.SERVICES else
             record['supportImages'][spec['image']] for svc, spec in model['services'].items()}
@@ -150,7 +155,7 @@ class Recovery:
                      labels.get('org.opencontainers.image.revision') == rec['appSha'] and
                      labels.get('org.opensamguk.local.source-tree') == rec['sourceTreeSha256'] and
                      labels.get('org.opensamguk.local.build-args') == hashlib.sha256(json.dumps(
-                         fresh.build_args(m['source'], svc), sort_keys=True).encode()).hexdigest(), 'TARGET_B_IMAGES')
+                         version_args(m['source'], rec['appSha'], svc), sort_keys=True).encode()).hexdigest(), 'TARGET_B_IMAGES')
         return t, model
 
     def source(self, path):
@@ -370,7 +375,7 @@ class Recovery:
             actual = fresh.inspect_image(image)
             labels = actual.get('Config', {}).get('Labels', {})
             need(actual['Id'] == image and labels.get('org.opencontainers.image.revision') == app_sha, 'VERSION_IMAGE_SOURCE')
-            expected = hashlib.sha256(json.dumps(fresh.build_args(m['source'], svc), sort_keys=True).encode()).hexdigest()
+            expected = hashlib.sha256(json.dumps(version_args(m['source'], app_sha, svc), sort_keys=True).encode()).hexdigest()
             need(labels.get('org.opensamguk.local.build-args') == expected, 'VERSION_APP_IDENTITY')
             need(re.fullmatch('[a-f0-9]{64}', labels.get('org.opensamguk.local.dockerfile', '')), 'VERSION_DOCKERFILE')
             dockerfiles[svc] = hashlib.sha256(fresh.git(source_path, 'show', app_sha + ':docker/' + svc + '.Dockerfile')).hexdigest()
@@ -406,7 +411,7 @@ class Recovery:
                      labels.get('org.opensamguk.local.source-tree') == v['sourceTreeSha256'] and
                      labels.get('org.opensamguk.local.dockerfile') == v['dockerfiles'][svc] and
                      labels.get('org.opensamguk.local.build-args') == hashlib.sha256(json.dumps(
-                         fresh.build_args(source, svc), sort_keys=True).encode()).hexdigest(), 'VERSION_IMAGE_CHANGED')
+                         version_args(source, v['appSha'], svc), sort_keys=True).encode()).hexdigest(), 'VERSION_IMAGE_CHANGED')
             pins.update(v['images'])
             app_sha = v['appSha']
         else:

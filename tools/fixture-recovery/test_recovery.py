@@ -219,9 +219,7 @@ class RecoveryTests(unittest.TestCase):
     def version(self):
         pins={s:image_id('B-'+s) for s in r.fresh.SERVICES}
         for svc,iid in pins.items():
-            labels=r.fresh.image_metadata(self.record,svc,{})
-            labels['org.opencontainers.image.revision']='b'*40
-            labels['org.opensamguk.local.source-tree']='f'*64
+            labels=r.fresh.image_metadata(dict(self.record,appSha='b'*40,sourceTreeSha256='f'*64),svc,{})
             self.io.image_data[iid]={'Id':iid,'RepoTags':[], 'Config':{'Labels':labels}}
         out=self.root/'B.json'
         with patch.object(r.fresh,'source_archive',return_value=b'fake public archive'), patch.object(r.fresh,'archive_tree_hash',return_value='f'*64), patch.object(r.fresh,'git',return_value=b'FROM fixture'):
