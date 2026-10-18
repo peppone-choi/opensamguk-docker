@@ -1,4 +1,6 @@
 import copy
+import base64
+import datetime
 import importlib.util
 import io
 import json
@@ -38,6 +40,138 @@ class HarnessTests(unittest.TestCase):
         change(model)
         with self.assertRaises(h.Refused):
             h.validate_model(model, self.record)
+
+    def tactical(self):
+        record = {**self.record, 'profile': 'tactical'}
+        fixture = h.profile_fixtures(record, self.fixture)
+        return record, fixture, h.model_for(record, fixture)
+
+    def test_standard_profile_keeps_existing_model_and_does_not_generate_a_key(self):
+        with patch.object(h.secrets, 'token_bytes', side_effect=AssertionError('unexpected generation')):
+            self.assertIs(self.fixture, h.profile_fixtures(self.record, self.fixture))
+            self.assertEqual(self.model, h.model_for({**self.record, 'profile': 'standard'}, self.fixture))
+        self.assertNotIn(h.TACTICAL_KEY, self.fixture)
+        self.rejects(lambda m: m['services']['game-api']['environment'].update(BATTLE_SESSION_ENABLED='true'))
+
+    def test_tactical_profile_changes_only_exact_api_and_engine_environment_keys(self):
+        record, fixture, model = self.tactical()
+        api, engine = (model['services'][service]['environment'] for service in ('game-api', 'game-engine'))
+        self.assertEqual(h.TACTICAL_API, {key: api[key] for key in h.TACTICAL_API})
+        self.assertEqual(h.TACTICAL_ENGINE, {key: engine[key] for key in h.TACTICAL_ENGINE})
+        self.assertEqual(record['serverId'], api['SERVER_ID'])
+        self.assertEqual('160', api['OPENSAMGUK_WORLD_ID'])
+        self.assertEqual(fixture[h.TACTICAL_KEY], api[h.TACTICAL_KEY])
+        stripped = copy.deepcopy(model)
+        for key in {*h.TACTICAL_API, h.TACTICAL_KEY}:
+            del stripped['services']['game-api']['environment'][key]
+        for key in h.TACTICAL_ENGINE:
+            del stripped['services']['game-engine']['environment'][key]
+        self.assertEqual(self.model, stripped)
+
+    def test_tactical_signing_keys_are_fresh_canonical_private_fixture_values(self):
+        record = {**self.record, 'profile': 'tactical'}
+        first, second = (h.profile_fixtures(record, self.fixture) for _ in range(2))
+        self.assertNotEqual(first[h.TACTICAL_KEY], second[h.TACTICAL_KEY])
+        self.assertNotIn(h.TACTICAL_KEY, self.fixture)
+        self.assertEqual(32, len(base64.b64decode(first[h.TACTICAL_KEY], validate=True)))
+        path = self.directory / 'private-profile-fixture.json'
+        h.write_json(path, first)
+        self.assertEqual(0o600, path.stat().st_mode & 0o777)
+        with self.assertRaises(h.Refused):
+            h.profile_fixtures(record, first)
+
+    def test_tactical_missing_or_invalid_key_fails_without_echoing_it(self):
+        record = {**self.record, 'profile': 'tactical'}
+        invalid = [None, '', 'not-a-private-key!', base64.b64encode(b'x' * 16).decode(),
+                   base64.b64encode(b'x' * 33).decode()]
+        for key in invalid:
+            with self.subTest(kind=type(key).__name__):
+                fixture = dict(self.fixture)
+                if key is not None:
+                    fixture[h.TACTICAL_KEY] = key
+                with self.assertRaises(h.Refused) as caught:
+                    h.model_for(record, fixture)
+                if key:
+                    self.assertNotIn(key, str(caught.exception))
+
+    def test_tactical_key_cannot_reuse_or_escape_to_other_service_secrets(self):
+        record, fixture, model = self.tactical()
+        reused = {**fixture, 'DB_PASSWORD': fixture[h.TACTICAL_KEY]}
+        with self.assertRaises(h.Refused):
+            h.model_for(record, reused)
+        for service in h.SERVICES:
+            if service == 'game-api':
+                continue
+            changed = copy.deepcopy(model)
+            changed['services'][service]['environment'][h.TACTICAL_KEY] = fixture[h.TACTICAL_KEY]
+            with self.assertRaises(h.Refused):
+                h.validate_model(changed, record)
+
+    def test_tactical_flags_origin_server_world_and_internal_url_are_exact(self):
+        record, _, model = self.tactical()
+        changes = [('game-api', key, 'false') for key in h.TACTICAL_API]
+        changes += [('game-api', 'SERVER_ID', 'foreign'), ('game-api', 'OPENSAMGUK_WORLD_ID', '1'),
+                    ('game-engine', 'OPENSAMGUK_WORLD_ID', '1'),
+                    ('game-engine', 'BATTLE_PIPELINE_ENABLED', 'false'),
+                    ('game-engine', 'BATTLE_PIPELINE_API_BASE_URL', 'http://external.invalid:8081')]
+        for service, key, value in changes:
+            with self.subTest(service=service, key=key):
+                changed = copy.deepcopy(model)
+                changed['services'][service]['environment'][key] = value
+                with self.assertRaises(h.Refused):
+                    h.validate_model(changed, record)
+
+    def test_unknown_profile_is_refused_before_prepare_dependencies_or_writes(self):
+        from types import SimpleNamespace
+        for value in ('other', None, False, 1):
+            with self.subTest(kind=type(value).__name__):
+                with self.assertRaises(h.Refused):
+                    h.model_for({**self.record, 'profile': value}, self.fixture)
+        with patch.object(h, 'git', side_effect=AssertionError('unexpected dependency')):
+            with self.assertRaises(h.Refused):
+                h.prepare(SimpleNamespace(profile='other'))
+
+    def ready_payload(self):
+        payload = {key: 'a' * 64 for key in ('dbFingerprint', 'nativeFenceSha256', 'ruleSha256',
+                                           'catalogSha256', 'combatSha256', 'spaceSha256')}
+        payload.update(schemaVersion=1, status='READY', worldId=160, reasons=[],
+                       moraleEncoding='CAMPAIGN_NATIVE_D177_V1', checkedAt='2026-10-18T00:00:00Z')
+        now = datetime.datetime(2026, 10, 18, tzinfo=datetime.timezone.utc).timestamp()
+        return payload, now
+
+    def test_tactical_readiness_requires_current_exact_contract_not_just_http200(self):
+        payload, now = self.ready_payload()
+        h.validate_tactical_readiness(payload, self.record, now=now)
+        h.validate_tactical_readiness(payload, self.record, now=now + 5)
+        for key, value in [('schemaVersion', True), ('worldId', True), ('worldId', 1), ('status', 'NOT_READY'),
+                           ('reasons', ['SCANNER_STALE']), ('moraleEncoding', 'SOLDIER_RAW_0_200'),
+                           ('dbFingerprint', None), ('ruleSha256', 'A' * 64), ('checkedAt', 'invalid'),
+                           ('checkedAt', '2026-10-18T09:00:00+09:00')]:
+            with self.subTest(key=key):
+                with self.assertRaises(h.Refused):
+                    h.validate_tactical_readiness({**payload, key: value}, self.record, now=now)
+        for observed in (now - 0.01, now + 5.01):
+            with self.assertRaises(h.Refused):
+                h.validate_tactical_readiness(payload, self.record, now=observed)
+        with self.assertRaises(h.Refused):
+            h.validate_tactical_readiness({**payload, 'unexpected': True}, self.record, now=now)
+
+    def test_tactical_smoke_uses_owned_api_and_rejects_unexposed_redirect_or_oversized_response(self):
+        payload, now = self.ready_payload()
+        calls = []
+        def compose(*args, **kwargs):
+            calls.append(args)
+            return json.dumps(payload).encode() + b'\nSTATUS:200'
+        with patch.object(h, 'compose', side_effect=compose), patch.object(h.time, 'time', return_value=now):
+            h.tactical_smoke(self.directory, self.record)
+        self.assertIn('game-api', calls[0])
+        self.assertIn('http://127.0.0.1:8081/internal/battles/pipeline-readiness?worldId=160', calls[0])
+        self.assertNotIn('-L', calls[0])
+        for raw in (b'not-json\nSTATUS:200', b'{}\nSTATUS:404', b'{}\nSTATUS:302',
+                    b'x' * 16385 + b'\nSTATUS:200'):
+            with patch.object(h, 'compose', return_value=raw):
+                with self.assertRaises(h.Refused):
+                    h.tactical_smoke(self.directory, self.record)
 
     def test_privileged_port_probe_handles_mac_denial_without_ignoring_listener(self):
         from unittest.mock import MagicMock
