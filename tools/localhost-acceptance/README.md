@@ -81,6 +81,79 @@ assigned integration execution; pure tests are not evidence of an actual stack r
 Startup tests execute the real disk stage validation/reporting with synthetic free
 space: bootstrap and full startup retain the 3 GiB floor, and unknown stages refuse.
 
+### Native writer, fresh custody only (requires app PR1748)
+
+Add `--native-writer` only to a **new** `prepare` invocation. The default omits its
+contract field, configuration file/mount/environment, source requirements and all
+native SQL. Older OFF/non-enrolled worlds, including databases without native
+tables, receive no native inspection from this harness. This does not assert that
+the PR1748 binary itself supports a pre-V86 database: its product migration/boot
+requirements belong to that prerequisite and must be verified separately.
+
+The option composes with `--engine-observation`, `--startup-paused`, tactical and
+approved map inputs. For example, append `--native-writer --engine-observation
+--startup-paused` to the pinned prepare command, then use the existing build/up
+commands. It introduces no new service, port, volume, grant/enrollment API or
+account provisioning. Actual pins and execution still require C0's separate window.
+
+The sole added engine property is exactly:
+
+```properties
+opensamguk.native-writer.enabled=true
+```
+
+The harness owns `native-writer.properties` inside the private custody, mode0644
+so engine UID10001 can read it, with a read-only single-file bind at
+`/app/native-writer.properties` and `create_host_path=false`. Its parent custody
+remains0700. Only game-engine gets
+`SPRING_CONFIG_ADDITIONAL_LOCATION=file:/app/native-writer.properties`. This adds
+to the normal packaged configuration; it does not replace it. No native property
+is added to game-api, board or gateway, and engine gets no SPRING_APPLICATION_JSON.
+Aliases, additional config properties, foreign/writable/missing mounts and config
+byte/mode/owner/link changes are refused.
+
+The `nativeWriter` contract contains schema1, the complete hashes of ten product
+source files, the canonical native helper hash from the recorded Docker revision,
+the one-property file hash, and an initially null `proof`. Old app sources and old
+Docker revisions without this helper are refused before runtime actions. Source
+drift is rejected even when the required markers remain. A previous custody cannot
+be selected through prepare or a later command; no conversion/repair command is
+provided, and an old nonce cannot acquire support by adding a field/config file
+while retaining its original Docker pin. Never edit an existing contract to opt in.
+
+`up` starts only the existing DB/Redis/engine bootstrap set first, with the same
+images, ownership, readiness, resource and real disk stage guards. V86 and the
+product engine perform seed → dedicated lease/grant → snapshot; this harness never
+acquires an advisory lock, issues a grant, enrolls via SQL or adjusts an epoch.
+Before starting APIs it reads only world160's current grant/history, world epoch,
+the earliest adjacent handover origin and the existing stable functions
+`native_writer_lease_alive` / `native_writer_binding_valid` inside BEGIN READ ONLY.
+The proof requires one world, matching integer world/epochs, canonical matching
+grant/request UUIDs, previous+1=current=world epoch, and true live-lease/full-chain
+predicates. Missing tables/rows, a competing/stale/lost lease, false/missing chain,
+wrong world or changed grant fail closed.
+
+The private proof fields are `worldCount`, `worldId`, `writerEpoch`, `grantEpoch`,
+`previousEpoch`, `originEpoch`, `grantId`, `requestId`, `leaseAlive`, `handoverValid`.
+They are checked again after full startup and in strict smoke. A different grant
+is not silently adopted, even if its handover is otherwise valid. Failure retains
+custody, original proof, resources and logs; it does not repair or retry ownership.
+Turning the process flag OFF does not unenroll a world: the product's durable
+enrollment and database guard continue rejecting legacy/unfenced writes.
+
+Collector binding remains exactly publicServerId/nativeServerId/worldId/tickSeconds;
+CURRENT/RUNNING is not native lease evidence. Native proof is a separate private
+contract, not a public DTO extension. With startupPaused=true, strict smoke still
+requires PAUSED after an official daemon resume; `resume-startup` does not resume
+the daemon. Preserve PAUSED acceptance and check post-resume RUNNING separately
+through normal status/public reads. No sixteen-user fixture is required for the
+native bootstrap/observation proof alone.
+
+`python3 -B tools/localhost-acceptance/test_native_writer.py -q` uses synthetic
+source/config/proofs, temporary files and mocked runtime only. Source/pure success
+does not establish Spring file loading, V86 migration, the prerequisite's JVM/PG
+tests, a real lease/handover, or a new stack acceptance result.
+
 `build` runs the four JVM and two web Dockerfiles sequentially under the metarepo's atomic `.locks/heavy-run` lock. It waits for another owner and never removes that lock. Source-build disk must be at least **12 GiB**, Docker VM allocation at least **2 CPUs / 6 GiB**, available Docker memory at least **6 GiB**, and host five-minute load at most **400**, with the load bound matching app main `tools/qa/local-stack.py:46–51`. Gates rerun before each image. Compilation uses the source Dockerfiles as written, including real packaged map/curated inputs. No RTK14 credential enrichment or toy source is injected. Original private build, startup and nginx-test output is retained even on failure. Full Gradle test suites are not run here.
 
 Receipt fields in `contract.json` bind the exact app SHA, source bytes/modes digest, nginx digest from Docker main, Dockerfile digests, explicit public build arguments, nonce/session labels and image IDs. `up` checks these again and never rebuilds or pulls app images. `build` prepares missing public postgres/Redis/nginx support images under the same lock and records their IDs, preserving existing shared images. `up --pull never` checks their IDs too. Normal source Docker builds may download their public base images/dependencies.

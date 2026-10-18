@@ -31,6 +31,9 @@ _topdown_spec.loader.exec_module(topdown)
 _observation_spec = importlib.util.spec_from_file_location('localhost_engine_observation', Path(__file__).with_name('engine_observation.py'))
 observation = importlib.util.module_from_spec(_observation_spec)
 _observation_spec.loader.exec_module(observation)
+_native_spec = importlib.util.spec_from_file_location('localhost_native_writer', Path(__file__).with_name('native_writer.py'))
+native_writer = importlib.util.module_from_spec(_native_spec)
+_native_spec.loader.exec_module(native_writer)
 
 ROOT = Path(__file__).resolve().parents[2]
 SERVICES = ('gateway-api', 'board-api', 'game-api', 'game-engine', 'web-gateway', 'web-game')
@@ -135,6 +138,7 @@ def identity(record, read_only=False):
     profile(record)
     startup_paused(record)
     observation.selected(record)
+    native_writer.selected(record)
     nonce = record.get('nonce', '')
     require(re.fullmatch('[a-f0-9]{16}', nonce), 'Invalid nonce')
     require(record.get('project') == 'osglha' + nonce and record.get('serverId') == 'lha' + nonce,
@@ -348,6 +352,10 @@ def model_for(record, fixtures):
     if paused:
         model['services']['game-engine']['environment'][STARTUP_PAUSE_ENV] = 'true'
     model['services']['game-api']['environment'].update(observation.environment(record))
+    native_env, native_mounts = native_writer.settings(record)
+    model['services']['game-engine']['environment'].update(native_env)
+    if native_mounts:
+        model['services']['game-engine']['volumes'] = native_mounts
     validate_model(model, record)
     return model
 
@@ -368,6 +376,7 @@ def validate_model(model, record):
                     ('bridge' if kind == 'networks' else 'local'), 'Foreign resource driver')
     allowed_binds = {'/etc/nginx/nginx.conf': 'nginx.conf', '/etc/nginx/certs': 'certs', '/etc/nginx/battle-ws': 'battle-ws'}
     map_env, map_mounts = topdown.settings(record)
+    _, native_mounts = native_writer.settings(record)
     require(model['services']['game-api'].get('volumes', []) == map_mounts, 'Topdown mount differs from explicit pin')
     require(model['services']['game-api'].get('networks', {}).get('local', {}).get('aliases') ==
             ['s' + record['serverId'] + '-game-api'], 'Owned game API alias differs')
@@ -392,13 +401,15 @@ def validate_model(model, record):
                 target = mount.get('target')
                 require((name == 'nginx' and target in allowed_binds and mount.get('read_only') is True and
                          mount['source'] == record['custody'] + '/' + allowed_binds[target]) or
-                        (name == 'game-api' and map_mounts and mount == map_mounts[0]), 'Foreign host bind')
+                        (name == 'game-api' and map_mounts and mount == map_mounts[0]) or
+                        (name == 'game-engine' and native_mounts and mount == native_mounts[0]), 'Foreign host bind')
             else:
                 require(mount['type'] == 'volume' and mount['source'] in model['volumes'], 'Foreign volume mount')
     require('JWT_PRIVATE_KEY' not in model['services']['game-api']['environment'] and
             'JWT_PRIVATE_KEY' not in model['services']['board-api']['environment'], 'Private key escaped issuer')
     validate_profile_model(model, record)
     observation.validate_model(model, record)
+    native_writer.validate_model(model, record)
 
 
 def validate_profile_model(model, record):
@@ -642,6 +653,8 @@ def prepare(args):
     selected_pause = startup_paused({'startupPaused': getattr(args, 'startup_paused', False)})
     selected_observation = getattr(args, 'engine_observation', False)
     require(type(selected_observation) is bool, 'Engine observation requires an explicit boolean selection')
+    selected_native = getattr(args, 'native_writer', False)
+    require(type(selected_native) is bool, 'Native writer requires an explicit boolean selection')
     session = os.environ.get('OPENSAMGUK_TASK_OWNER_SESSION', '')
     require(re.fullmatch('[a-f0-9-]{36}', session), 'Set writer session before prepare')
     require(re.fullmatch('[a-f0-9]{40}', args.docker_sha), 'Exact Docker SHA required')
@@ -652,6 +665,8 @@ def prepare(args):
     archive = source_archive(args.source, args.app_sha)
     observation_pins = (observation.source_pins(lambda path: git(args.source, 'show', args.app_sha + ':' + path))
                         if selected_observation else None)
+    native_option = (native_writer.selection(lambda path: git(args.source, 'show', args.app_sha + ':' + path),
+                     lambda path: git(ROOT, 'show', args.docker_sha + ':' + path)) if selected_native else None)
     nginx = git(ROOT, 'show', args.docker_sha + ':infra/nginx/nginx.conf')
     directory = Path(args.custody).absolute()
     map_args = [getattr(args, key, None) for key in ('topdown_bundle', 'topdown_bake_id', 'topdown_manifest_sha256')]
@@ -677,6 +692,8 @@ def prepare(args):
         record['startupPaused'] = True
     if selected_observation:
         record['engineObservation'] = {'schema': 1, 'sourcePins': observation_pins, 'binding': None}
+    if selected_native:
+        record['nativeWriter'] = native_option
     if map_record:
         record['topdown'] = map_record
     write_json(directory / 'contract.json', record)
@@ -691,6 +708,10 @@ def prepare(args):
         unpack_archive(archive, directory / 'source')
         record['sourceExport'] = 'git-archive'
     record['sourceTreeSha256'] = tree_hash(directory / 'source')
+    if selected_native:
+        private_write(directory / native_writer.FILE, native_writer.CONFIG)
+        # This one-property public file must be readable by the engine's UID10001 through its read-only bind.
+        (directory / native_writer.FILE).chmod(0o644)
     if map_record:
         topdown.copy_bundle(Path(args.topdown_bundle), directory, map_record)
     (directory / 'certs').mkdir(mode=0o700)
@@ -737,6 +758,8 @@ def verify_custody_files(directory, record, *, legacy_route=False):
     require(sha((ROOT / 'docker-compose.localhost-acceptance.yml').read_bytes()) == record['templateSha256'],
             'Harness template changed; prepare a fresh stack')
     require(tree_hash(directory / 'source') == record['sourceTreeSha256'], 'Source bytes/modes changed')
+    native_writer.verify_custody(directory, record, lambda path: topdown.read_file(directory / 'source' / path),
+                                 lambda path: git(ROOT, 'show', record['dockerSha'] + ':' + path))
     option = observation.selected(record)
     if option is not None:
         require(option['sourcePins'] == observation.source_pins(lambda path: topdown.read_file(directory / 'source' / path)),
@@ -883,7 +906,8 @@ def verify_mounts(actual, service, model):
 def verify_running(record, resources, model, *, bootstrap=False):
     assert_owned(record, resources)
     expected = set(observation.BOOTSTRAP) if bootstrap else set(model['services'])
-    require(not bootstrap or observation.selected(record) is not None, 'Unselected bootstrap refused')
+    require(not bootstrap or observation.selected(record) is not None or native_writer.selected(record) is not None,
+            'Unselected bootstrap refused')
     require(len(resources['container']) == len(expected), 'Incomplete stack')
     seen = set()
     for row in resources['container']:
@@ -907,7 +931,7 @@ def verify_running(record, resources, model, *, bootstrap=False):
         require(set(row.get('Containers', {})) <= own_ids, 'Foreign network member; preserved')
     if not bootstrap:
         verify_battle_route_runtime(record, resources)
-    if observation.selected(record) is not None:
+    if observation.selected(record) is not None or native_writer.selected(record) is not None:
         verify_observation_network(record, resources)
 
 
@@ -1066,22 +1090,32 @@ def up(args):
         record['status'] = 'STARTING'
         write_json(directory / 'contract.json', record, replace=True)
         bootstrap_ids = None
-        if observation.selected(record) is not None:
-            require(record['engineObservation']['binding'] is None, 'Fresh observation bootstrap is already bound')
+        has_observation = observation.selected(record) is not None
+        has_native = native_writer.selected(record) is not None
+        if has_observation or has_native:
+            require(not has_observation or record['engineObservation']['binding'] is None,
+                    'Fresh observation bootstrap is already bound')
+            require(not has_native or record['nativeWriter']['proof'] is None, 'Fresh native bootstrap is already bound')
             compose(directory, record, 'up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '600',
                     *observation.BOOTSTRAP, timeout=660, log_path=directory / 'observation-bootstrap.log')
             startup_disk_check(directory, 'afterObservationBootstrapFreeBytes', initial_free)
             resources = inventory(record)
             verify_running(record, resources, model, bootstrap=True)
             bootstrap_ids = observation_resource_ids(resources)
-            world = observation_metadata(directory, record)
-            status = observation_status(directory, record, 'game-engine', 'http://127.0.0.1:8082')
-            option = observation.bind(record, world, status, time.time(), observation.seed_tick(model))
+            if has_observation:
+                world = observation_metadata(directory, record)
+                status = observation_status(directory, record, 'game-engine', 'http://127.0.0.1:8082')
+                option = observation.bind(record, world, status, time.time(), observation.seed_tick(model))
+            if has_native:
+                proof = native_writer.verify_proof(native_writer_proof(directory, record), record, initial=True)
             verify_files(directory, record)
             current = inventory(record)
             verify_running(record, current, model, bootstrap=True)
             require(observation_resource_ids(current) == bootstrap_ids, 'Bootstrap resources changed before binding')
-            record['engineObservation'] = option
+            if has_observation:
+                record['engineObservation'] = option
+            if has_native:
+                record['nativeWriter']['proof'] = proof
             fixtures = json.loads(private_path(directory / 'runtime.json').read_bytes())
             model = model_for(record, fixtures)
             write_json(directory / 'compose.json', model, replace=True)
@@ -1095,6 +1129,8 @@ def up(args):
         if bootstrap_ids is not None:
             require(observation_resource_ids(resources, bootstrap_only=True) == bootstrap_ids,
                     'Bootstrap resources changed during full startup')
+        if has_native:
+            native_writer_smoke(directory, record)
         record['status'] = 'RUNNING'
         write_json(directory / 'contract.json', record, replace=True)
     smoke(args)
@@ -1293,6 +1329,16 @@ def observation_resource_ids(resources, *, bootstrap_only=False):
                              r['Name'].endswith(('_game-pgdata', '_game-redisdata')))}
 
 
+def native_writer_proof(directory, record):
+    return native_writer.decode(sql(directory, record, 'game-postgres', native_writer.query(record)))
+
+
+def native_writer_smoke(directory, record):
+    if native_writer.selected(record) is None:
+        return
+    native_writer.verify_proof(native_writer_proof(directory, record), record)
+
+
 def observation_metadata(directory, record):
     require(type(record['worldId']) is int, 'Observation world must be an integer')
     # Only identity/timing metadata is projected, never the complete meta/env or account tables.
@@ -1451,6 +1497,7 @@ def smoke(args, *, finalize=True):
     topdown.smoke(record, lambda path: compose(directory, record, 'exec', '-T', 'game-api',
         'curl', '-fsS', '--max-time', '15', 'http://localhost:8081' + path))
     startup_pause_smoke(directory, record)
+    native_writer_smoke(directory, record)
     observation_smoke(directory, record, model, opener)
     startup_disk_check(directory, 'beforeSmokePassedFreeBytes')
     if finalize:
@@ -1546,6 +1593,8 @@ def main():
                    help='Hold scheduled ticks from engine startup; normal resume releases the hold')
     p.add_argument('--engine-observation', action='store_true',
                    help='New stack only: bind the API collector to generated engine metadata before starting API')
+    p.add_argument('--native-writer', action='store_true',
+                   help='New custody only: engine property file and read-only live grant proof; requires app PR1748')
     p.add_argument('--clone-source-custody', type=Path,
                    help='Optional owned prior custody; clone public source only after exact Git archive comparison')
     p.add_argument('--topdown-bundle', type=Path, help='Existing approved full bake directory; new custody only')
@@ -1574,7 +1623,7 @@ def main():
             globals()[args.command.replace('-', '_')](args)
     except (Refused, OSError, ValueError, KeyError, TypeError, EOFError) as e:
         # Never print child exceptions, config values, tokens or arbitrary untrusted filenames.
-        print('REFUSED: ' + str(e) if isinstance(e, (Refused, topdown.Refused, observation.Refused)) else 'REFUSED: invalid input or unavailable dependency; custody preserved')
+        print('REFUSED: ' + str(e) if isinstance(e, (Refused, topdown.Refused, observation.Refused, native_writer.Refused)) else 'REFUSED: invalid input or unavailable dependency; custody preserved')
         return 1
     return 0
 
