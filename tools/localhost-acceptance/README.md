@@ -43,6 +43,24 @@ All child process stdout/stderr is captured. Errors returned to chat are fixed m
 
 `down` does not require healthy services or spare build memory/disk. It takes the shared lock, inventories all name/label matches, verifies nonce + writing session + compose project on every resource, checks no foreign network members or volume consumers, then removes only inspected owned container IDs, network IDs, volume names and validated app image tags. It does not prune Docker caches, remove shared base images, touch other stacks, remove the private custody or erase failure records. If any ownership check fails, it performs no deletion.
 
+## 전술 실행 opt-in profile
+
+새 fixture를 준비할 때만 `prepare ... --profile tactical`을 지정할 수 있다. 생략한 기본
+profile의 구성은 유지되며, 준비된 custody나 기존 스택을 이 옵션으로 변경하지 않는다.
+실제 전술 runtime/readiness를 포함한 앱 main이 선행해야 한다.
+
+이 profile은 fixture 전용 32바이트 join-ticket 키를 private `runtime.json`에 생성하고,
+game-api에 기존 네 전술 flag·serverId·정확한 `https://localhost` WS origin을 결속한다.
+engine에는 `BATTLE_PIPELINE_ENABLED=true`와
+`BATTLE_PIPELINE_API_BASE_URL=http://game-api:8081`을 지정한다. 키는 game-api만 받으며
+JWT·DB·internal-service 비밀을 재사용하지 않는다. 공개 gateway/nginx 경로는 추가하지 않는다.
+
+전술 profile의 무인증 WS 경계 기대값은 **403**이다. 기본 profile의 미노출 **404**를
+전술 기능 성공으로 인정하지 않는다. 추가 smoke는 owned game-api 내부의 읽기 전용
+readiness를 호출해 정확한 world·D177 encoding·여섯 hash·5초 이내 UTC 시각·빈 reasons와
+READY를 확인한다. HTTP 200 하나나 일반 health를 readiness 대신 사용하지 않는다.
+이 검사는 실제 조우·한 판 종료·캠페인 정산·성능 인수를 대신하지 않는다.
+
 ## Regression
 
 ```sh
