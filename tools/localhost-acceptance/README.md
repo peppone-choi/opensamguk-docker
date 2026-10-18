@@ -78,6 +78,8 @@ UNKNOWN/fail-closed behavior, and opt-in smoke cannot publish SMOKE_PASSED for t
 synthetic source/metadata, mocked startup and public reads only. Actual startup,
 Spring property binding and end-to-end collector behavior require the separately
 assigned integration execution; pure tests are not evidence of an actual stack run.
+Startup tests execute the real disk stage validation/reporting with synthetic free
+space: bootstrap and full startup retain the 3 GiB floor, and unknown stages refuse.
 
 `build` runs the four JVM and two web Dockerfiles sequentially under the metarepo's atomic `.locks/heavy-run` lock. It waits for another owner and never removes that lock. Source-build disk must be at least **12 GiB**, Docker VM allocation at least **2 CPUs / 6 GiB**, available Docker memory at least **6 GiB**, and host five-minute load at most **400**, with the load bound matching app main `tools/qa/local-stack.py:46–51`. Gates rerun before each image. Compilation uses the source Dockerfiles as written, including real packaged map/curated inputs. No RTK14 credential enrichment or toy source is injected. Original private build, startup and nginx-test output is retained even on failure. Full Gradle test suites are not run here.
 

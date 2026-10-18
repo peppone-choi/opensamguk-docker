@@ -1038,7 +1038,8 @@ def repair_registry(args):
 
 
 def startup_disk_check(directory, stage, initial_free=None):
-    require(stage in ('afterStartupFreeBytes', 'beforeSmokePassedFreeBytes'), 'Unknown disk observation')
+    require(stage in ('afterObservationBootstrapFreeBytes', 'afterStartupFreeBytes', 'beforeSmokePassedFreeBytes'),
+            'Unknown disk observation')
     path = directory / 'startup-disk.json'
     report = ({'startupFreeBytes': initial_free} if initial_free is not None else
               json.loads(private_path(path).read_bytes()))

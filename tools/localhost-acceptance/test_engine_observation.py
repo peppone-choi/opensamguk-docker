@@ -222,7 +222,7 @@ class EngineObservationTests(unittest.TestCase):
                 with self.subTest(endpoint=endpoint, wrong=wrong), self.assertRaises(h.Refused):
                     h.verify_observation_network(self.record, bad)
 
-    def startup(self, invalid=False, changed_resources=False):
+    def startup(self, invalid=False, changed_resources=False, disk_free=None):
         model = h.model_for(self.record, self.fixtures)
         bootstrap = self.resources(o.BOOTSTRAP)
         full = self.resources((*o.BOOTSTRAP, 'game-api', 'gateway-api'))
@@ -240,17 +240,27 @@ class EngineObservationTests(unittest.TestCase):
             'load': {'return_value': (self.directory, self.record)}, 'verify_files': {'return_value': model},
             'verify_images': {}, 'heavy': {'return_value': nullcontext()},
             'inventory': {'side_effect': [{'container': [], 'network': [], 'volume': []}, bootstrap, bootstrap, full]},
-            'port_free': {}, 'verify_running': {}, 'smoke': {}, 'startup_disk_check': {},
+            'port_free': {}, 'verify_running': {}, 'smoke': {},
             'observation_metadata': {'return_value': self.world},
             'observation_status': {'return_value': {**self.status, 'clock': None} if invalid else self.status},
             'compose': {'side_effect': compose},
         }.items(): stack.enter_context(patch.object(h, name, **kwargs))
+        # Keep the real stage allowlist, reserve check and report writes in every startup test.
+        free = disk_free if disk_free is not None else [8 * h.GIB, 7 * h.GIB, 6 * h.GIB]
+        stack.enter_context(patch.object(h.shutil, 'disk_usage', side_effect=[SimpleNamespace(free=n) for n in free]))
         stack.enter_context(patch.object(h.time, 'time', return_value=self.now))
         return args, calls
 
     def test_startup_binds_before_any_api_start_and_preserves_bootstrap_ids(self):
         args, calls = self.startup()
-        h.up(args)
+        with patch.object(h, 'startup_disk_check', wraps=h.startup_disk_check) as check:
+            h.up(args)
+        self.assertEqual(['afterObservationBootstrapFreeBytes', 'afterStartupFreeBytes'],
+                         [call.args[1] for call in check.call_args_list])
+        report = json.loads((self.directory / 'startup-disk.json').read_bytes())
+        self.assertEqual(8 * h.GIB, report['startupFreeBytes'])
+        self.assertEqual(6 * h.GIB, report['afterStartupFreeBytes'])
+        self.assertEqual(2 * h.GIB, report['consumedBytes'])
         self.assertEqual(3, len(calls))
         self.assertEqual(o.BOOTSTRAP, calls[1][0][-3:])
         self.assertIsNone(calls[1][1]['engineObservation']['binding'])
@@ -264,6 +274,39 @@ class EngineObservationTests(unittest.TestCase):
         self.assertEqual(h.sha((self.directory / 'compose.json').read_bytes()), self.record['configSha256'])
         self.assertEqual('RUNNING', self.record['status'])
         self.assertEqual(0o600, (self.directory / 'compose.json').stat().st_mode & 0o777)
+
+    def test_bootstrap_disk_below_3gib_preserves_failure_and_never_reads_metadata_or_starts_api(self):
+        args, calls = self.startup(disk_free=[8 * h.GIB, 3 * h.GIB - 1])
+        with self.assertRaisesRegex(h.Refused, 'Startup reserve below 3 GiB'): h.up(args)
+        self.assertEqual(2, len(calls))
+        self.assertEqual(o.BOOTSTRAP, calls[1][0][-3:])
+        self.assertEqual('STARTING', self.record['status'])
+        self.assertIsNone(self.record['engineObservation']['binding'])
+        h.observation_metadata.assert_not_called()
+        h.observation_status.assert_not_called()
+        h.smoke.assert_not_called()
+        self.assertFalse((self.directory / 'compose.json').exists())
+        report = json.loads((self.directory / 'startup-disk.json').read_bytes())
+        self.assertEqual(3 * h.GIB - 1, report['afterObservationBootstrapFreeBytes'])
+        self.assertEqual(5 * h.GIB + 1, report['consumedBytes'])
+        self.assertEqual(0o600, (self.directory / 'startup-disk.json').stat().st_mode & 0o777)
+
+    def test_bootstrap_and_full_startup_accept_exact_3gib_reserve(self):
+        args, calls = self.startup(disk_free=[8 * h.GIB, 3 * h.GIB, 3 * h.GIB])
+        h.up(args)
+        self.assertEqual(3, len(calls))
+        self.assertEqual('RUNNING', self.record['status'])
+
+    def test_unknown_disk_stage_refuses_before_measurement_or_report_mutation(self):
+        path = self.directory / 'startup-disk.json'
+        h.write_json(path, {'startupFreeBytes': 8 * h.GIB})
+        original = path.read_bytes()
+        for stage in ('afterObservationBootstrap', 'afterStartupFreeByte', '', None):
+            with self.subTest(stage=stage), patch.object(h.shutil, 'disk_usage') as disk:
+                with self.assertRaisesRegex(h.Refused, 'Unknown disk observation'):
+                    h.startup_disk_check(self.directory, stage, 8 * h.GIB)
+                disk.assert_not_called()
+                self.assertEqual(original, path.read_bytes())
 
     def test_invalid_bootstrap_never_starts_api_or_publishes_running(self):
         args, calls = self.startup(invalid=True)
