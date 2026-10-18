@@ -17,6 +17,7 @@ python3 tools/localhost-acceptance/harness.py build --custody <directory> --meta
 python3 tools/localhost-acceptance/harness.py validate --custody <directory>
 python3 tools/localhost-acceptance/harness.py up --custody <directory> --meta <metarepo>
 python3 tools/localhost-acceptance/harness.py smoke --custody <directory>
+python3 tools/localhost-acceptance/harness.py resume-startup --custody <directory>
 python3 tools/localhost-acceptance/harness.py snapshot --custody <directory> --general-id <positive-id>
 python3 tools/localhost-acceptance/harness.py snapshot --custody <directory> --general-id <positive-id> --request-id <uuid>
 python3 tools/localhost-acceptance/harness.py down --custody <directory> --meta <metarepo>
@@ -33,6 +34,8 @@ Inventory/image inspect uses explicit projections that exclude environment, comm
 `smoke` does not claim a successful USER journey. The app's separate runner owns normal ADMIN login/me, enabling/readback of allow_join and allow_login, normal USER register/login/join, and all original US-WAND-01/02 assertions. Only the new throwaway DB's AdminSeeder fixture is authorized. No SQL account promotion exists. `RESET_TURNTERM=2` means **two minutes / tickSeconds120**, not two seconds.
 
 ## Private handoff and logs
+
+`resume-startup` revalidates an existing STARTING or unpassed RUNNING stack without building, restarting, or changing Compose/fixtures/databases. It requires a clean verifier checkout, unchanged source/config/image receipts, eleven healthy owned services, exact model/runtime mount pairs, port/network boundaries, 6016MiB service caps, VM capacity and host load. Only then does it save the original contract, record the separate `runtimeVerifierHead` and `runtimeVerifierPath` without changing the build `dockerSha`, transition to RUNNING, and execute the normal strict smoke. A validation failure leaves the contract unchanged; a smoke failure cannot mark SMOKE_PASSED. Runtime mount matching permits an exact `/host_mnt` + declared host path alias only on macOS with a current local Unix Docker Desktop daemon. Missing, extra, duplicate or mismatched type/source/destination/write-mode mounts are refused, including named volumes.
 
 Custody is owned by the current OS user, mode0700; JSON/log/key files are mode0600. `contract.json` is safe to summarize but remains private. It supplies project, nonce, dynamic `serverId=lha<nonce>`, world160/gen0, exact origin/source and image identities. `fixture.json` is only `{admin:{username,password}, user:{username,password,name}}`; the USER runner consumes it internally. DB/JWT/internal credentials live in separate `runtime.json` and `compose.json`. Never print or commit these files, run `compose config` to the terminal, dump container inspect/env/logs, or record raw auth/cookie bodies.
 
@@ -66,6 +69,29 @@ python3 -B scripts/test_nginx_campaign_routes.py
 ```
 
 The unit suite includes real Compose CLI normalization and negative ownership/port/mount/image/source/redaction/cleanup checks. The existing synthetic nginx runtime suite remains separate from real app acceptance. CI is retired; no definition/dispatch is restored and no skipped/canceled job is labeled PASS. Current-head independent review is required before integration.
+
+## Explicit topdown supply for a new custody
+
+The standard profile supplies no map bake. For a separately approved **new** localhost custody, `prepare` accepts all three public inputs together:
+
+```sh
+python3 -B tools/localhost-acceptance/harness.py prepare \
+  --source '<clean app checkout>' --app-sha '<exact fetched app main SHA>' \
+  --docker-sha '<exact fetched Docker main SHA>' --custody '<new absolute custody>' \
+  --topdown-bundle '<approved full bundle directory ending in its bake ID>' \
+  --topdown-bake-id '<approved 64-hex ID>' \
+  --topdown-manifest-sha256 '<approved manifest byte SHA256>'
+```
+
+This copies existing public bytes and never generates art, bakes a map, or rebuilds images. It checks full/nonpartial identity, complete chunk/file inventory, transport/raw hashes, the fresh scenario_3190 province-world catalog and its tiles/world/roads, and the app's approved kit export and both web mirrors. An absent or mismatched bundle fails before custody/runtime/key preparation. Existing custody, source bundle and other stacks are not modified. Partial regions, path traversal, symlinks, hardlinks and source/output overlap are refused.
+
+Only the validated bundle is copied under `<custody>/topdown/<bakeId>` with public directories0755/files0644; the custody remains0700. The contract records the explicit selection and source pins. Every normal source/config verification rechecks the copied bytes, file inventory and public modes. Only game-api receives the fixed `TOPDOWN_MAP_ROOT=/app/data/map/topdown`, exact bake ID and `<custody>/topdown` read-only bind with `create_host_path:false`. Missing/extra/foreign/RW runtime mounts still fail the exact mount guard. Conditional smoke also requires the actual preview's bake ID and served manifest hash before `SMOKE_PASSED`; it does not prove browser rendering or gameplay.
+
+The approved existing candidate is artifact11486607528 from app run37632390499, bake `dc7b0ad33600721cd9c10db2fa31b08d3d13d24a120c4fc25d8cb162bd2d36e1`, manifest SHA `3c6e5a2fb672cd7a6867c82a92ec6d5bad348b60d04df000282c9f45b2d7ea28`. These are explicit operator inputs, not fallback defaults. Recheck source compatibility for every new custody; a later source drift is a refusal, never a reason to reuse an old pin blindly.
+
+This profile cannot be added to G by editing its existing contract/Compose/environment. Existing role bootstrap1723 and full-recovery83 have separate strict mount assumptions: their current versions must not be treated as accepting this additional bind. C0 coordinates their compatibility and the frozen tactical profile82 separately before a combined acceptance run. Actual new H startup, image reuse/build approval, USER/GUI acceptance and runtime rollback remain separate.
+
+The new pure suite is `python3 -B tools/localhost-acceptance/test_topdown_bundle.py`. It uses temporary public fixtures and mocked runtime/key operations only. The existing suite's real Docker image-inspect and Compose-normalization cases still require a separately allowed Docker window.
 
 Startup uses an explicit separate phase: **8 GiB** free disk, with the same **2 CPUs / 6 GiB allocated and available Docker memory / load5 ≤400** checks. Unknown phases are refused. All six app images and three support images are already verified, and startup retains `--no-build --pull never`; new writes are the five nonce volumes, eleven container writable layers and bounded logs (11 × 20MiB). Service memory ceilings total 6016MiB. This separates source compilation storage from runtime admission. `startup-disk.json` records initial and observed disk consumption. After startup and immediately before `SMOKE_PASSED`, free disk must remain **at least 3 GiB**; failure preserves resources and cannot pass smoke. DB/WAL growth is not hard-capped, so these observations remain required. Original resource refusals remain in custody.
 
