@@ -710,8 +710,10 @@ class HarnessTests(unittest.TestCase):
                  'HostConfig':{'PortBindings':({'443/tcp':[{'HostIp':'127.0.0.1','HostPort':'443'}]} if svc=='nginx' else {})},
                  'Mounts':[]}
             for mount in model.get('volumes',[]):
-                if mount['type']=='bind': row['Mounts'].append({'Type':'bind','Source':mount['source'],'RW':False})
-                else: row['Mounts'].append({'Type':'volume','Name':self.model['volumes'][mount['source']]['name']})
+                runtime={'Type':mount['type'],'Destination':mount['target'],'RW':not mount.get('read_only',False)}
+                if mount['type']=='bind': runtime['Source']=mount['source']
+                else: runtime['Name']=self.model['volumes'][mount['source']]['name']
+                row['Mounts'].append(runtime)
             rows.append(row)
         network=self.resource('network',Driver='bridge',Containers={r['Id']:{} for r in rows})
         return {'container':rows,'network':[network],'volume':[]}
@@ -728,6 +730,97 @@ class HarnessTests(unittest.TestCase):
             bad=copy.deepcopy(resources)
             mutate(bad)
             with self.assertRaises(h.Refused):h.verify_running(self.record,bad,self.model)
+
+    def desktop_resources(self):
+        resources=self.running_resources()
+        nginx=next(r for r in resources['container'] if r['Config']['Labels']['com.docker.compose.service']=='nginx')
+        self.assertEqual(3,sum(m['Type']=='bind' for m in nginx['Mounts']))
+        for mount in nginx['Mounts']:
+            if mount['Type']=='bind': mount['Source']='/host_mnt'+mount['Source']
+        return resources,nginx
+
+    def test_desktop_exact_alias_accepts_only_current_local_desktop_on_mac(self):
+        resources,_=self.desktop_resources()
+        daemon={'OperatingSystem':'Docker Desktop','OSType':'linux','ID':'current-daemon'}
+        with patch.object(h.sys,'platform','darwin'), patch.object(h,'run',return_value=json.dumps(daemon).encode()) as run:
+            h.verify_running(self.record,resources,self.model)
+            self.assertEqual(['docker','info','--format'],run.call_args.args[0][:3])
+        for platform,proof in [('linux',daemon),('darwin',{**daemon,'OperatingSystem':'Other'}),
+                               ('darwin',{**daemon,'OSType':'windows'}),('darwin',{**daemon,'ID':''})]:
+            with self.subTest(platform=platform,proof=proof), patch.object(h.sys,'platform',platform), \
+                 patch.object(h,'run',return_value=json.dumps(proof).encode()):
+                with self.assertRaises(h.Refused): h.verify_running(self.record,resources,self.model)
+        with patch.object(h.sys,'platform','darwin'), patch.object(h,'run',side_effect=h.Refused('remote refused')):
+            with self.assertRaises(h.Refused): h.verify_running(self.record,resources,self.model)
+
+    def test_bind_bijection_rejects_missing_extra_duplicate_wrong_source_target_and_rw(self):
+        for mutation in [lambda m:m.pop(),lambda m:m.append(copy.deepcopy(m[0])),
+                         lambda m:m[0].update(Source='/host_mnt/foreign/certs'),
+                         lambda m:m[0].update(Source='/host_mnt'+m[0]['Source']),
+                         lambda m:m[0].update(Source=m[0]['Source']+'/../certs'),
+                         lambda m:m[0].update(Destination=m[1]['Destination']),
+                         lambda m:m[0].update(RW=True),lambda m:m[0].update(Type='tmpfs'),
+                         lambda m:m[0].pop('RW')]:
+            resources,nginx=self.desktop_resources()
+            mutation(nginx['Mounts'])
+            with patch.object(h.sys,'platform','darwin'), patch.object(h,'run',return_value=b'{"OperatingSystem":"Docker Desktop","OSType":"linux","ID":"current"}'):
+                with self.assertRaises(h.Refused): h.verify_running(self.record,resources,self.model)
+
+    def test_named_volume_bijection_rejects_missing_extra_wrong_name_target_and_rw(self):
+        for mutation in [lambda m:m.clear(),lambda m:m.append(copy.deepcopy(m[0])),
+                         lambda m:m[0].update(Name='foreign'),lambda m:m[0].update(Destination='/other'),
+                         lambda m:m[0].update(RW=False)]:
+            resources=self.running_resources()
+            row=next(r for r in resources['container'] if any(m['Type']=='volume' for m in r['Mounts']))
+            mutation(row['Mounts'])
+            with self.assertRaises(h.Refused): h.verify_running(self.record,resources,self.model)
+
+    def test_resume_revalidates_before_transition_and_smoke_without_restarting(self):
+        self.record['status']='STARTING'
+        original=copy.deepcopy(self.record)
+        events=[]
+        writes=[]
+        def write(path,record,**kwargs):
+            events.append('write')
+            writes.append((path,copy.deepcopy(record)))
+        with patch.object(h,'load',return_value=(self.directory,self.record)), \
+             patch.object(h,'verify_files',side_effect=lambda *a:events.append('files') or self.model), \
+             patch.object(h,'verify_images',side_effect=lambda *a:events.append('images')), \
+             patch.object(h,'inventory',return_value={}), \
+             patch.object(h,'verify_running',side_effect=lambda *a:events.append('runtime')), \
+             patch.object(h,'runtime_caps',side_effect=lambda *a:events.append('caps')), \
+             patch.object(h,'resume_capacity',side_effect=lambda:events.append('capacity')), \
+             patch.object(h,'git',side_effect=[b'd'*40,b'']), patch.object(h,'write_json',side_effect=write), \
+             patch.object(h,'smoke',side_effect=lambda *a:events.append('smoke')), patch.object(h,'compose') as compose:
+            h.resume_startup(type('Args',(),{'custody':self.directory})())
+        self.assertEqual(['files','images','runtime','caps','capacity','write','write','smoke'],events)
+        self.assertEqual(original,writes[0][1])
+        self.assertEqual('RUNNING',writes[1][1]['status'])
+        self.assertEqual(original['dockerSha'],writes[1][1]['dockerSha'])
+        self.assertEqual('d'*40,writes[1][1]['runtimeVerifierHead'])
+        compose.assert_not_called()
+
+    def test_resume_failure_never_transitions_or_runs_smoke(self):
+        self.record['status']='STARTING'
+        for failure in ('verify_files','verify_images','verify_running','runtime_caps','resume_capacity','git'):
+            with self.subTest(failure=failure), patch.object(h,'load',return_value=(self.directory,self.record)), \
+                 patch.object(h,'verify_files',return_value=self.model), patch.object(h,'verify_images'), \
+                 patch.object(h,'inventory',return_value={}), patch.object(h,'verify_running'), \
+                 patch.object(h,'runtime_caps'), patch.object(h,'resume_capacity'), patch.object(h,'git',side_effect=[b'd'*40,b'']), \
+                 patch.object(h,failure,side_effect=h.Refused('validation failed')), \
+                 patch.object(h,'write_json') as write, patch.object(h,'smoke') as smoke, patch.object(h,'compose') as compose:
+                with self.assertRaises(h.Refused): h.resume_startup(type('Args',(),{'custody':self.directory})())
+                write.assert_not_called();smoke.assert_not_called();compose.assert_not_called()
+                self.assertEqual('STARTING',self.record['status'])
+
+    def test_resume_capacity_keeps_cpu_vm_memory_and_load_limits(self):
+        for cpus,memory,load,valid in [(2,6*h.GIB,400,True),(1,6*h.GIB,1,False),
+                                      (2,6*h.GIB-1,1,False),(2,6*h.GIB,401,False)]:
+            with patch.object(h,'run',return_value=json.dumps({'NCPU':cpus,'MemTotal':memory}).encode()), \
+                 patch.object(h.os,'getloadavg',return_value=(0,load,0)):
+                if valid: h.resume_capacity()
+                else:
+                    with self.assertRaises(h.Refused): h.resume_capacity()
 
     def test_source_requires_clean_head_and_rejects_ignored_data_without_reading_it(self):
         with patch.object(h, 'git', side_effect=[('a'*40+'\n').encode(),b'',b'.env\n']) as git:
