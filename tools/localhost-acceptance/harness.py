@@ -846,8 +846,14 @@ def tactical_smoke(directory, record):
                   f'http://127.0.0.1:8081/internal/battles/pipeline-readiness?worldId={record["worldId"]}')
     body, separator, status = raw.rpartition(b'\nSTATUS:')
     require(separator and status == b'200' and len(body) <= 16384, 'Tactical readiness HTTP probe failed')
+    def unique_fields(pairs):
+        result = {}
+        for key, value in pairs:
+            require(key not in result, 'Tactical readiness response has duplicate fields')
+            result[key] = value
+        return result
     try:
-        payload = json.loads(body)
+        payload = json.loads(body, object_pairs_hook=unique_fields)
     except (ValueError, UnicodeDecodeError):
         raise Refused('Tactical readiness response is invalid') from None
     validate_tactical_readiness(payload, record)

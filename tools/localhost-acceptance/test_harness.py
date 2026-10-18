@@ -174,6 +174,20 @@ class HarnessTests(unittest.TestCase):
                 with self.assertRaises(h.Refused):
                     h.tactical_smoke(self.directory, self.record)
 
+    def test_tactical_smoke_rejects_duplicate_readiness_fields_before_validation(self):
+        payload, now = self.ready_payload()
+        original = json.dumps(payload).encode()
+        for extra in (b'"status":"NOT_READY",', b'"worldId":1,', b'"reasons":["SCANNER_STALE"],'):
+            # A normal JSON decoder keeps the later READY value and hides the contradiction.
+            body = b'{' + extra + original[1:]
+            self.assertEqual(payload, json.loads(body))
+            with self.subTest(field=extra), patch.object(h, 'compose', return_value=body + b'\nSTATUS:200'), \
+                 patch.object(h.time, 'time', return_value=now), \
+                 patch.object(h, 'validate_tactical_readiness') as validate:
+                with self.assertRaisesRegex(h.Refused, 'duplicate fields'):
+                    h.tactical_smoke(self.directory, self.record)
+                validate.assert_not_called()
+
     def test_smoke_requires_403_for_tactical_and_refuses_its_disabled_404(self):
         from unittest.mock import MagicMock
         for mode, websocket_status, accepted in [('standard', 404, True), ('tactical', 403, True),
