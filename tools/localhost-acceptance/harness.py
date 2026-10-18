@@ -15,11 +15,18 @@ import shutil
 import socket
 import stat
 import subprocess
+import sys
 import tarfile
 import time
 import urllib.error
 import urllib.request
 import ssl
+import importlib.util
+
+# Recovery callers load this harness by file path; resolve its own helper, never another checkout's module.
+_topdown_spec = importlib.util.spec_from_file_location('localhost_topdown', Path(__file__).with_name('topdown_bundle.py'))
+topdown = importlib.util.module_from_spec(_topdown_spec)
+_topdown_spec.loader.exec_module(topdown)
 
 ROOT = Path(__file__).resolve().parents[2]
 SERVICES = ('gateway-api', 'board-api', 'game-api', 'game-engine', 'web-gateway', 'web-game')
@@ -169,6 +176,10 @@ def model_for(record, fixtures):
                   REGISTRY=json.dumps(registry(record), separators=(',', ':')))
     values.update({'IMAGE_' + s: image_ref(record, s) for s in SERVICES})
     model = substitute(json.loads((ROOT / 'docker-compose.localhost-acceptance.yml').read_bytes()), values)
+    map_env, map_mounts = topdown.settings(record)
+    model['services']['game-api']['environment'].update(map_env)
+    if map_mounts:
+        model['services']['game-api']['volumes'] = map_mounts
     validate_model(model, record)
     return model
 
@@ -188,7 +199,11 @@ def validate_model(model, record):
             require(spec.get('driver', 'bridge' if kind == 'networks' else 'local') ==
                     ('bridge' if kind == 'networks' else 'local'), 'Foreign resource driver')
     allowed_binds = {'/etc/nginx/nginx.conf': 'nginx.conf', '/etc/nginx/certs': 'certs', '/etc/nginx/battle-ws': 'battle-ws'}
+    map_env, map_mounts = topdown.settings(record)
+    require(model['services']['game-api'].get('volumes', []) == map_mounts, 'Topdown mount differs from explicit pin')
     for name, svc in model['services'].items():
+        require({k: v for k, v in svc.get('environment', {}).items() if k.startswith('TOPDOWN_')} ==
+                (map_env if name == 'game-api' else {}), 'Topdown environment differs from explicit pin')
         require(not set(svc) & {'build', 'container_name', 'privileged', 'network_mode', 'pid', 'ipc', 'devices',
                                 'volumes_from', 'env_file', 'cap_add', 'extends', 'configs', 'secrets', 'external_links'},
                 'Unsafe service option')
@@ -202,8 +217,9 @@ def validate_model(model, record):
         for mount in svc.get('volumes', []):
             if mount['type'] == 'bind':
                 target = mount.get('target')
-                require(name == 'nginx' and target in allowed_binds and mount.get('read_only') is True and
-                        mount['source'] == record['custody'] + '/' + allowed_binds[target], 'Foreign host bind')
+                require((name == 'nginx' and target in allowed_binds and mount.get('read_only') is True and
+                         mount['source'] == record['custody'] + '/' + allowed_binds[target]) or
+                        (name == 'game-api' and map_mounts and mount == map_mounts[0]), 'Foreign host bind')
             else:
                 require(mount['type'] == 'volume' and mount['source'] in model['volumes'], 'Foreign volume mount')
     require('JWT_PRIVATE_KEY' not in model['services']['game-api']['environment'] and
@@ -339,20 +355,72 @@ def archive_tree_hash(archive):
     return digest.hexdigest()
 
 
+def export_path(directory):
+    directory = Path(directory)
+    require('..' not in directory.parts, 'Source export traversal refused')
+    directory = directory.absolute()
+    require(not any(p.is_symlink() for p in (directory, *directory.parents)),
+            'Source export symlink refused')
+    private_path(directory.parent, True)
+    return directory
+
+
+def export_directories(directory):
+    directory = export_path(directory)
+    root = directory.lstat()
+    require(stat.S_ISDIR(root.st_mode) and root.st_uid == os.getuid(), 'Foreign source export root')
+    directories = [(directory, root)]
+
+    def inaccessible(_error):
+        raise Refused('Source export cannot be inspected')
+
+    for parent, names, files in os.walk(directory, followlinks=False, onerror=inaccessible):
+        for name in names + files:
+            path = Path(parent) / name
+            info = path.lstat()
+            require(info.st_uid == os.getuid() and
+                    (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)),
+                    'Source export link, special file or foreign owner refused')
+            if stat.S_ISDIR(info.st_mode):
+                directories.append((path, info))
+    return directories
+
+
+def normalize_export_directories(directory):
+    # Validate the whole public tree before chmod; custody and tracked files stay private/unchanged.
+    for path, before in export_directories(directory):
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            current = os.fstat(fd)
+            require((current.st_dev, current.st_ino) == (before.st_dev, before.st_ino),
+                    'Source export directory changed during normalization')
+            os.fchmod(fd, 0o755)
+        finally:
+            os.close(fd)
+
+
 def unpack_archive(archive, destination):
-    destination.mkdir(mode=0o700)
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         checked_members(tar)
+        destination = export_path(destination)
+        destination.mkdir(mode=0o700)
         tar.extractall(destination, filter='data')
+    normalize_export_directories(destination)
 
 
 def clone_export(archive, source, destination):
     expected = archive_tree_hash(archive)
+    source = export_path(source)
+    export_directories(source)
+    destination = export_path(destination)
+    require(not destination.is_relative_to(source), 'Clone destination overlaps source')
     require(tree_hash(source) == expected, 'Clone source differs from clean Git archive')
     require(not destination.exists(), 'Clone destination already exists')
     # APFS copies share storage while later writes remain independent. Never copy runtime fixtures.
     run(['/bin/cp', '-cRp', str(source), str(destination)], timeout=300)
+    export_directories(destination)
     require(tree_hash(destination) == expected, 'APFS clone bytes/modes differ from Git archive')
+    normalize_export_directories(destination)
 
 
 def tree_hash(directory):
@@ -377,6 +445,13 @@ def prepare(args):
     archive = source_archive(args.source, args.app_sha)
     nginx = git(ROOT, 'show', args.docker_sha + ':infra/nginx/nginx.conf')
     directory = Path(args.custody).absolute()
+    map_args = [getattr(args, key, None) for key in ('topdown_bundle', 'topdown_bake_id', 'topdown_manifest_sha256')]
+    map_record = None
+    if any(value is not None for value in map_args):
+        require(all(value is not None for value in map_args), 'All three explicit topdown inputs are required')
+        require(not topdown.overlap(Path(map_args[0]), directory), 'Topdown source overlaps custody')
+        pins = topdown.source_pins(lambda path: git(args.source, 'show', args.app_sha + ':' + path))
+        map_record = topdown.validate(*map_args, pins)
     require(not directory.exists() and not directory.is_symlink(), 'Custody already exists')
     require(not any(p.is_symlink() for p in directory.parents), 'Symlink parent refused')
     directory.mkdir(mode=0o700)
@@ -386,6 +461,8 @@ def prepare(args):
               'appSha': args.app_sha, 'dockerSha': args.docker_sha, 'nginxSha256': sha(nginx),
               'templateSha256': sha((ROOT / 'docker-compose.localhost-acceptance.yml').read_bytes()),
               'status': 'PREPARED', 'images': {}}
+    if map_record:
+        record['topdown'] = map_record
     write_json(directory / 'contract.json', record)
     assert_owned(record, inventory(record), empty=True)
     port_free()
@@ -398,6 +475,8 @@ def prepare(args):
         unpack_archive(archive, directory / 'source')
         record['sourceExport'] = 'git-archive'
     record['sourceTreeSha256'] = tree_hash(directory / 'source')
+    if map_record:
+        topdown.copy_bundle(Path(args.topdown_bundle), directory, map_record)
     (directory / 'certs').mkdir(mode=0o700)
     (directory / 'battle-ws').mkdir(mode=0o700)
     private_write(directory / 'nginx.conf', nginx)
@@ -436,6 +515,16 @@ def verify_custody_files(directory, record):
     require(sha((ROOT / 'docker-compose.localhost-acceptance.yml').read_bytes()) == record['templateSha256'],
             'Harness template changed; prepare a fresh stack')
     require(tree_hash(directory / 'source') == record['sourceTreeSha256'], 'Source bytes/modes changed')
+    if record.get('topdown'):
+        selected = record['topdown']
+        pins = topdown.source_pins(lambda path: topdown.read_file(directory / 'source' / path))
+        require(selected['sourcePins'] == pins, 'Topdown source pins changed')
+        root = directory / 'topdown'
+        require(stat.S_IMODE(topdown.path_checked(root, True).stat().st_mode) == 0o755 and
+                {p.name for p in root.iterdir()} == {selected['bakeId']}, 'Topdown root changed')
+        topdown.validate(root / selected['bakeId'], selected['bakeId'], selected['manifestSha256'], pins, True)
+    else:
+        require(not (directory / 'topdown').exists(), 'Unselected topdown files')
     require(tree_hash(directory / 'certs') == record['certsSha256'] and not list((directory / 'battle-ws').iterdir()),
             'TLS or battle routing changed')
     require(sha(private_path(directory / 'compose.json').read_bytes()) == record['configSha256'], 'Compose changed')
@@ -536,6 +625,35 @@ def compose(directory, record, *args, timeout=60, log_path=None):
                 '--project-directory', str(directory), '-f', str(directory / 'compose.json'), *args], timeout=timeout, log_path=log_path)
 
 
+def verify_mounts(actual, service, model):
+    expected = []
+    for mount in service.get('volumes', []):
+        kind = mount['type']
+        require(kind in ('bind', 'volume'), 'Unexpected declared mount type')
+        source = mount['source'] if kind == 'bind' else model['volumes'][mount['source']]['name']
+        expected.append((kind, source, mount['target'], not mount.get('read_only', False)))
+    require(len(expected) == len(set(expected)), 'Duplicate declared mount')
+    aliases = {'/host_mnt' + source: source for kind, source, _, _ in expected if kind == 'bind'}
+    if any(m.get('Type') == 'bind' and m.get('Source') in aliases for m in actual):
+        require(sys.platform == 'darwin', 'Desktop mount alias requires macOS')
+        # run() independently proves the active endpoint is a local Unix socket.
+        daemon = json.loads(run(['docker', 'info', '--format',
+            '{"OperatingSystem":{{json .OperatingSystem}},"OSType":{{json .OSType}},"ID":{{json .ID}}}']))
+        require(daemon.get('OperatingSystem') == 'Docker Desktop' and daemon.get('OSType') == 'linux'
+                and bool(daemon.get('ID')), 'Desktop mount alias requires current local Desktop daemon')
+    observed = []
+    for mount in actual:
+        kind = mount.get('Type')
+        require(kind in ('bind', 'volume') and type(mount.get('RW')) is bool,
+                'Invalid runtime mount')
+        source = mount.get('Source') if kind == 'bind' else mount.get('Name')
+        if kind == 'bind':
+            source = aliases.get(source, source)
+        observed.append((kind, source, mount.get('Destination'), mount['RW']))
+    require(len(observed) == len(expected) and len(set(observed)) == len(observed)
+            and set(observed) == set(expected), 'Runtime mounts differ from declared model')
+
+
 def verify_running(record, resources, model):
     assert_owned(record, resources)
     require(len(resources['container']) == len(model['services']), 'Incomplete stack')
@@ -554,13 +672,7 @@ def verify_running(record, resources, model):
         ports = row['HostConfig'].get('PortBindings') or {}
         require(ports == ({'443/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '443'}]} if svc == 'nginx' else {}),
                 'Runtime port binding differs')
-        for mount in row.get('Mounts', []):
-            if mount['Type'] == 'volume':
-                require(mount.get('Name') in {v['name'] for v in model['volumes'].values()}, 'Foreign runtime volume')
-            else:
-                require(mount['Type'] == 'bind' and svc == 'nginx' and not mount['RW'] and
-                        mount['Source'] in {record['custody'] + '/' + n for n in ('certs', 'nginx.conf', 'battle-ws')},
-                        'Foreign runtime bind')
+        verify_mounts(row.get('Mounts', []), model['services'][svc], model)
     for row in resources['network']:
         require(row.get('Driver') == 'bridge', 'Foreign runtime network driver')
         own_ids = {r['Id'] for r in resources['container']}
@@ -693,6 +805,35 @@ def up(args):
     smoke(args)
 
 
+def resume_capacity():
+    # No new workload is admitted: retain VM capacity/load checks without reserving startup memory twice.
+    info = json.loads(run(['docker', 'info', '--format',
+        '{"NCPU":{{json .NCPU}},"MemTotal":{{json .MemTotal}}}'], timeout=30))
+    require(info['NCPU'] >= 2 and info['MemTotal'] >= 6 * GIB, 'Docker needs 2 CPUs and 6 GiB memory')
+    require(os.getloadavg()[1] <= 400, 'Host load5 exceeds the managed QA limit of 400')
+
+
+def resume_startup(args):
+    directory, record = load(args.custody)
+    require(record['status'] in ('STARTING', 'RUNNING'), 'Resume requires an unpassed started stack')
+    model = verify_files(directory, record)
+    verify_images(record)
+    resources = inventory(record)
+    verify_running(record, resources, model)
+    runtime_caps(model, resources)
+    resume_capacity()
+    verifier_head = git(ROOT, 'rev-parse', 'HEAD').decode().strip()
+    require(re.fullmatch('[a-f0-9]{40}', verifier_head), 'Invalid runtime verifier head')
+    require(not git(ROOT, 'status', '--porcelain', '--untracked-files=all').strip(), 'Runtime verifier must be clean')
+    # Retain the failed start contract before the first recovery transition.
+    write_json(directory / ('pre-resume-' + secrets.token_hex(8) + '.json'), record)
+    record['runtimeVerifierHead'] = verifier_head
+    record['runtimeVerifierPath'] = str(ROOT)
+    record['status'] = 'RUNNING'
+    write_json(directory / 'contract.json', record, replace=True)
+    smoke(args)
+
+
 def sql(directory, record, service, query):
     db = 'game' if service == 'game-postgres' else 'gateway'
     return compose(directory, record, 'exec', '-T', service, 'psql', '-X', '-q', '-A', '-t', '-v', 'ON_ERROR_STOP=1',
@@ -725,6 +866,8 @@ def smoke(args):
     actual = sql(directory, record, 'gateway-postgres',
                  f"SELECT count(*) FROM game_server s JOIN game_server_publication p USING(server_id) WHERE s.server_id='{sid}' AND s.generation=0 AND p.state='PUBLIC' AND p.revision=1;")
     require(actual == '1', 'Registry identity mismatch')
+    topdown.smoke(record, lambda path: compose(directory, record, 'exec', '-T', 'game-api',
+        'curl', '-fsS', '--max-time', '15', 'http://localhost:8081' + path))
     startup_disk_check(directory, 'beforeSmokePassedFreeBytes')
     record['status'] = 'SMOKE_PASSED'
     write_json(directory / 'contract.json', record, replace=True)
@@ -814,11 +957,14 @@ def main():
     p.add_argument('--custody', required=True, type=Path)
     p.add_argument('--clone-source-custody', type=Path,
                    help='Optional owned prior custody; clone public source only after exact Git archive comparison')
+    p.add_argument('--topdown-bundle', type=Path, help='Existing approved full bake directory; new custody only')
+    p.add_argument('--topdown-bake-id', help='Explicit approved 64-hex bake identity')
+    p.add_argument('--topdown-manifest-sha256', help='Explicit approved manifest byte SHA256')
     p = sub.add_parser('snapshot')
     p.add_argument('--custody', required=True, type=Path)
     p.add_argument('--general-id', required=True)
     p.add_argument('--request-id')
-    for command in ('build', 'up', 'smoke', 'validate', 'down', 'repair-registry'):
+    for command in ('build', 'up', 'smoke', 'resume-startup', 'validate', 'down', 'repair-registry'):
         p = sub.add_parser(command)
         p.add_argument('--custody', required=True, type=Path)
         if command in ('build', 'up', 'down', 'repair-registry'):
@@ -832,9 +978,9 @@ def main():
             print('Owned source/config validated')
         else:
             globals()[args.command.replace('-', '_')](args)
-    except (Refused, OSError, ValueError, KeyError) as e:
+    except (Refused, OSError, ValueError, KeyError, TypeError, EOFError) as e:
         # Never print child exceptions, config values, tokens or arbitrary untrusted filenames.
-        print('REFUSED: ' + str(e) if isinstance(e, Refused) else 'REFUSED: invalid input or unavailable dependency; custody preserved')
+        print('REFUSED: ' + str(e) if isinstance(e, (Refused, topdown.Refused)) else 'REFUSED: invalid input or unavailable dependency; custody preserved')
         return 1
     return 0
 

@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -169,15 +170,183 @@ class HarnessTests(unittest.TestCase):
 
     def test_archive_refuses_path_traversal_symlink_and_tracked_key(self):
         for name, kind in [('../escape', tarfile.REGTYPE), ('key.pem', tarfile.REGTYPE),
-                           ('.env',tarfile.REGTYPE), ('link',tarfile.SYMTYPE)]:
+                           ('.env',tarfile.REGTYPE), ('link',tarfile.SYMTYPE),
+                           ('hardlink', tarfile.LNKTYPE), ('pipe', tarfile.FIFOTYPE),
+                           ('device', tarfile.CHRTYPE), ('/outside', tarfile.REGTYPE)]:
             data = io.BytesIO()
             with tarfile.open(fileobj=data, mode='w') as tar:
                 member = tarfile.TarInfo(name)
                 member.type = kind
                 member.linkname = '/etc/passwd' if kind == tarfile.SYMTYPE else ''
                 tar.addfile(member)
+            destination = self.directory / ('bad' + str(len(list(self.directory.iterdir()))))
             with self.assertRaises(h.Refused):
-                h.unpack_archive(data.getvalue(), self.directory / ('bad' + str(len(list(self.directory.iterdir())))))
+                h.unpack_archive(data.getvalue(), destination)
+            self.assertFalse(destination.exists())
+
+    def public_archive(self):
+        data = io.BytesIO()
+        files = {'public/battle/asset.json': (b'{"public":true}', 0o644),
+                 'bin/start': (b'#!/bin/sh\nexit 0\n', 0o755)}
+        with tarfile.open(fileobj=data, mode='w') as tar:
+            for name in ('public', 'public/battle', 'bin'):
+                member = tarfile.TarInfo(name)
+                member.type = tarfile.DIRTYPE
+                member.mode = 0o755
+                tar.addfile(member)
+            for name, (body, mode) in files.items():
+                member = tarfile.TarInfo(name)
+                member.mode, member.size = mode, len(body)
+                tar.addfile(member, io.BytesIO(body))
+        return data.getvalue(), files
+
+    def assert_public_export(self, destination, archive, files):
+        for directory in (destination, destination/'public', destination/'public/battle', destination/'bin'):
+            self.assertEqual(0o755, directory.stat().st_mode & 0o777)
+        for name, (body, mode) in files.items():
+            self.assertEqual(body, (destination/name).read_bytes())
+            self.assertEqual(mode, (destination/name).stat().st_mode & 0o777)
+        self.assertEqual(h.archive_tree_hash(archive), h.tree_hash(destination))
+
+    def test_archive_export_under_private_umask_preserves_files_and_private_boundary(self):
+        archive, files = self.public_archive()
+        private = self.directory/'private'
+        private.mkdir(mode=0o700)
+        key = private/'test-fixture.key'
+        h.private_write(key, b'new-test-fixture')
+        destination = self.directory/'public-export'
+        before = os.umask(0o077)
+        try:
+            h.unpack_archive(archive, destination)
+        finally:
+            os.umask(before)
+        self.assert_public_export(destination, archive, files)
+        self.assertEqual(0o700, self.directory.stat().st_mode & 0o777)
+        self.assertEqual(0o700, private.stat().st_mode & 0o777)
+        self.assertEqual(0o600, key.stat().st_mode & 0o777)
+        self.assertEqual(b'new-test-fixture', key.read_bytes())
+
+    def test_clone_normalizes_only_destination_under_private_umask(self):
+        archive, files = self.public_archive()
+        source, destination = self.directory/'original-public', self.directory/'cloned-public'
+        h.unpack_archive(archive, source)
+        private = self.directory/'clone-private-fixture.json'
+        h.private_write(private, b'private-clone-test-fixture')
+        original_directories = [source, *[p for p in source.rglob('*') if p.is_dir()]]
+        for directory in original_directories:
+            directory.chmod(0o700)
+        source_hash = h.tree_hash(source)
+
+        def clone(args, **kwargs):
+            self.assertEqual(['/bin/cp', '-cRp', str(source), str(destination)], args)
+            shutil.copytree(source, destination)
+
+        before = os.umask(0o077)
+        try:
+            with patch.object(h, 'run', side_effect=clone):
+                h.clone_export(archive, source, destination)
+        finally:
+            os.umask(before)
+        self.assert_public_export(destination, archive, files)
+        self.assertEqual(source_hash, h.tree_hash(source))
+        for directory in original_directories:
+            self.assertEqual(0o700, directory.stat().st_mode & 0o777)
+        for name, (body, mode) in files.items():
+            self.assertEqual(body, (source/name).read_bytes())
+            self.assertEqual(mode, (source/name).stat().st_mode & 0o777)
+        self.assertEqual(0o700, self.directory.stat().st_mode & 0o777)
+        self.assertEqual(0o600, private.stat().st_mode & 0o777)
+        self.assertEqual(b'private-clone-test-fixture', private.read_bytes())
+        self.assertFalse((destination/private.name).exists())
+
+    def test_normalization_refuses_links_and_special_files_before_any_chmod(self):
+        outside = self.directory/'outside-private'
+        outside.mkdir(mode=0o700)
+        marker = outside/'marker'
+        h.private_write(marker, b'untouched')
+        for kind in ('symlink', 'fifo'):
+            with self.subTest(kind=kind):
+                root = self.directory/kind
+                nested = root/'public'
+                nested.mkdir(parents=True, mode=0o700)
+                root.chmod(0o700)
+                if kind == 'symlink':
+                    (nested/'unsafe').symlink_to(outside, target_is_directory=True)
+                else:
+                    os.mkfifo(nested/'unsafe')
+                with patch.object(h.os, 'fchmod', wraps=os.fchmod) as chmod:
+                    with self.assertRaises(h.Refused):
+                        h.normalize_export_directories(root)
+                    chmod.assert_not_called()
+                self.assertEqual(0o700, root.stat().st_mode & 0o777)
+                self.assertEqual(0o700, nested.stat().st_mode & 0o777)
+        self.assertEqual(0o700, outside.stat().st_mode & 0o777)
+        self.assertEqual(0o600, marker.stat().st_mode & 0o777)
+        self.assertEqual(b'untouched', marker.read_bytes())
+
+    def test_export_refuses_symlink_parents_and_traversal_before_outside_changes(self):
+        archive, _ = self.public_archive()
+        outside = self.directory/'outside'
+        outside.mkdir(mode=0o700)
+        alias = self.directory/'alias'
+        alias.symlink_to(outside, target_is_directory=True)
+        for target in (alias/'export', self.directory/'missing/../escape'):
+            with self.subTest(target=str(target)), self.assertRaises(h.Refused):
+                h.unpack_archive(archive, target)
+        self.assertEqual([], list(outside.iterdir()))
+        self.assertEqual(0o700, outside.stat().st_mode & 0o777)
+
+    def test_clone_rejects_unsafe_source_before_hash_or_copy(self):
+        archive, _ = self.public_archive()
+        for kind in ('symlink-root', 'symlink-child', 'fifo'):
+            with self.subTest(kind=kind):
+                source = self.directory/kind
+                if kind == 'symlink-root':
+                    source.symlink_to(self.directory/'source', target_is_directory=True)
+                else:
+                    h.unpack_archive(archive, source)
+                    if kind == 'symlink-child':
+                        (source/'unsafe').symlink_to(self.directory/'source', target_is_directory=True)
+                    else:
+                        os.mkfifo(source/'unsafe')
+                destination = self.directory/('clone-'+kind)
+                with patch.object(h, 'tree_hash') as digest, patch.object(h, 'run') as clone:
+                    with self.assertRaises(h.Refused):
+                        h.clone_export(archive, source, destination)
+                    digest.assert_not_called()
+                    clone.assert_not_called()
+                self.assertFalse(destination.exists())
+
+    def test_clone_refuses_destination_inside_source(self):
+        archive, _ = self.public_archive()
+        source = self.directory/'original-public'
+        h.unpack_archive(archive, source)
+        source.chmod(0o700)
+        with patch.object(h, 'run') as clone:
+            with self.assertRaises(h.Refused):
+                h.clone_export(archive, source, source/'recursive-copy')
+            clone.assert_not_called()
+
+    def test_clone_refuses_unsafe_copy_result_before_hash_or_chmod(self):
+        archive, _ = self.public_archive()
+        source, destination = self.directory/'original-public', self.directory/'cloned-public'
+        h.unpack_archive(archive, source)
+        digest = h.tree_hash
+
+        def hash_source_only(path):
+            self.assertEqual(source, path)
+            return digest(path)
+
+        def unsafe_copy(*args, **kwargs):
+            shutil.copytree(source, destination)
+            (destination/'unsafe').symlink_to(self.directory/'source', target_is_directory=True)
+
+        with patch.object(h, 'run', side_effect=unsafe_copy), \
+                patch.object(h, 'tree_hash', side_effect=hash_source_only), \
+                patch.object(h.os, 'fchmod', wraps=os.fchmod) as chmod:
+            with self.assertRaises(h.Refused):
+                h.clone_export(archive, source, destination)
+            chmod.assert_not_called()
 
     def test_apfs_clone_matches_archive_and_preserves_original_on_later_write(self):
         if sys.platform!='darwin':self.skipTest('APFS clone is macOS-only')
@@ -189,8 +358,13 @@ class HarnessTests(unittest.TestCase):
         source=self.directory/'original-export'
         h.unpack_archive(archive,source)
         self.assertEqual(h.archive_tree_hash(archive),h.tree_hash(source))
+        source.chmod(0o700)
         destination=self.directory/'clone-export'
-        h.clone_export(archive,source,destination)
+        before=os.umask(0o077)
+        try:h.clone_export(archive,source,destination)
+        finally:os.umask(before)
+        self.assertEqual(0o755,destination.stat().st_mode & 0o777)
+        self.assertEqual(0o700,source.stat().st_mode & 0o777)
         (destination/'file').write_text('changed')
         self.assertEqual('original',(source/'file').read_text())
         (source/'file').write_text('wrong')
@@ -536,8 +710,10 @@ class HarnessTests(unittest.TestCase):
                  'HostConfig':{'PortBindings':({'443/tcp':[{'HostIp':'127.0.0.1','HostPort':'443'}]} if svc=='nginx' else {})},
                  'Mounts':[]}
             for mount in model.get('volumes',[]):
-                if mount['type']=='bind': row['Mounts'].append({'Type':'bind','Source':mount['source'],'RW':False})
-                else: row['Mounts'].append({'Type':'volume','Name':self.model['volumes'][mount['source']]['name']})
+                runtime={'Type':mount['type'],'Destination':mount['target'],'RW':not mount.get('read_only',False)}
+                if mount['type']=='bind': runtime['Source']=mount['source']
+                else: runtime['Name']=self.model['volumes'][mount['source']]['name']
+                row['Mounts'].append(runtime)
             rows.append(row)
         network=self.resource('network',Driver='bridge',Containers={r['Id']:{} for r in rows})
         return {'container':rows,'network':[network],'volume':[]}
@@ -554,6 +730,97 @@ class HarnessTests(unittest.TestCase):
             bad=copy.deepcopy(resources)
             mutate(bad)
             with self.assertRaises(h.Refused):h.verify_running(self.record,bad,self.model)
+
+    def desktop_resources(self):
+        resources=self.running_resources()
+        nginx=next(r for r in resources['container'] if r['Config']['Labels']['com.docker.compose.service']=='nginx')
+        self.assertEqual(3,sum(m['Type']=='bind' for m in nginx['Mounts']))
+        for mount in nginx['Mounts']:
+            if mount['Type']=='bind': mount['Source']='/host_mnt'+mount['Source']
+        return resources,nginx
+
+    def test_desktop_exact_alias_accepts_only_current_local_desktop_on_mac(self):
+        resources,_=self.desktop_resources()
+        daemon={'OperatingSystem':'Docker Desktop','OSType':'linux','ID':'current-daemon'}
+        with patch.object(h.sys,'platform','darwin'), patch.object(h,'run',return_value=json.dumps(daemon).encode()) as run:
+            h.verify_running(self.record,resources,self.model)
+            self.assertEqual(['docker','info','--format'],run.call_args.args[0][:3])
+        for platform,proof in [('linux',daemon),('darwin',{**daemon,'OperatingSystem':'Other'}),
+                               ('darwin',{**daemon,'OSType':'windows'}),('darwin',{**daemon,'ID':''})]:
+            with self.subTest(platform=platform,proof=proof), patch.object(h.sys,'platform',platform), \
+                 patch.object(h,'run',return_value=json.dumps(proof).encode()):
+                with self.assertRaises(h.Refused): h.verify_running(self.record,resources,self.model)
+        with patch.object(h.sys,'platform','darwin'), patch.object(h,'run',side_effect=h.Refused('remote refused')):
+            with self.assertRaises(h.Refused): h.verify_running(self.record,resources,self.model)
+
+    def test_bind_bijection_rejects_missing_extra_duplicate_wrong_source_target_and_rw(self):
+        for mutation in [lambda m:m.pop(),lambda m:m.append(copy.deepcopy(m[0])),
+                         lambda m:m[0].update(Source='/host_mnt/foreign/certs'),
+                         lambda m:m[0].update(Source='/host_mnt'+m[0]['Source']),
+                         lambda m:m[0].update(Source=m[0]['Source']+'/../certs'),
+                         lambda m:m[0].update(Destination=m[1]['Destination']),
+                         lambda m:m[0].update(RW=True),lambda m:m[0].update(Type='tmpfs'),
+                         lambda m:m[0].pop('RW')]:
+            resources,nginx=self.desktop_resources()
+            mutation(nginx['Mounts'])
+            with patch.object(h.sys,'platform','darwin'), patch.object(h,'run',return_value=b'{"OperatingSystem":"Docker Desktop","OSType":"linux","ID":"current"}'):
+                with self.assertRaises(h.Refused): h.verify_running(self.record,resources,self.model)
+
+    def test_named_volume_bijection_rejects_missing_extra_wrong_name_target_and_rw(self):
+        for mutation in [lambda m:m.clear(),lambda m:m.append(copy.deepcopy(m[0])),
+                         lambda m:m[0].update(Name='foreign'),lambda m:m[0].update(Destination='/other'),
+                         lambda m:m[0].update(RW=False)]:
+            resources=self.running_resources()
+            row=next(r for r in resources['container'] if any(m['Type']=='volume' for m in r['Mounts']))
+            mutation(row['Mounts'])
+            with self.assertRaises(h.Refused): h.verify_running(self.record,resources,self.model)
+
+    def test_resume_revalidates_before_transition_and_smoke_without_restarting(self):
+        self.record['status']='STARTING'
+        original=copy.deepcopy(self.record)
+        events=[]
+        writes=[]
+        def write(path,record,**kwargs):
+            events.append('write')
+            writes.append((path,copy.deepcopy(record)))
+        with patch.object(h,'load',return_value=(self.directory,self.record)), \
+             patch.object(h,'verify_files',side_effect=lambda *a:events.append('files') or self.model), \
+             patch.object(h,'verify_images',side_effect=lambda *a:events.append('images')), \
+             patch.object(h,'inventory',return_value={}), \
+             patch.object(h,'verify_running',side_effect=lambda *a:events.append('runtime')), \
+             patch.object(h,'runtime_caps',side_effect=lambda *a:events.append('caps')), \
+             patch.object(h,'resume_capacity',side_effect=lambda:events.append('capacity')), \
+             patch.object(h,'git',side_effect=[b'd'*40,b'']), patch.object(h,'write_json',side_effect=write), \
+             patch.object(h,'smoke',side_effect=lambda *a:events.append('smoke')), patch.object(h,'compose') as compose:
+            h.resume_startup(type('Args',(),{'custody':self.directory})())
+        self.assertEqual(['files','images','runtime','caps','capacity','write','write','smoke'],events)
+        self.assertEqual(original,writes[0][1])
+        self.assertEqual('RUNNING',writes[1][1]['status'])
+        self.assertEqual(original['dockerSha'],writes[1][1]['dockerSha'])
+        self.assertEqual('d'*40,writes[1][1]['runtimeVerifierHead'])
+        compose.assert_not_called()
+
+    def test_resume_failure_never_transitions_or_runs_smoke(self):
+        self.record['status']='STARTING'
+        for failure in ('verify_files','verify_images','verify_running','runtime_caps','resume_capacity','git'):
+            with self.subTest(failure=failure), patch.object(h,'load',return_value=(self.directory,self.record)), \
+                 patch.object(h,'verify_files',return_value=self.model), patch.object(h,'verify_images'), \
+                 patch.object(h,'inventory',return_value={}), patch.object(h,'verify_running'), \
+                 patch.object(h,'runtime_caps'), patch.object(h,'resume_capacity'), patch.object(h,'git',side_effect=[b'd'*40,b'']), \
+                 patch.object(h,failure,side_effect=h.Refused('validation failed')), \
+                 patch.object(h,'write_json') as write, patch.object(h,'smoke') as smoke, patch.object(h,'compose') as compose:
+                with self.assertRaises(h.Refused): h.resume_startup(type('Args',(),{'custody':self.directory})())
+                write.assert_not_called();smoke.assert_not_called();compose.assert_not_called()
+                self.assertEqual('STARTING',self.record['status'])
+
+    def test_resume_capacity_keeps_cpu_vm_memory_and_load_limits(self):
+        for cpus,memory,load,valid in [(2,6*h.GIB,400,True),(1,6*h.GIB,1,False),
+                                      (2,6*h.GIB-1,1,False),(2,6*h.GIB,401,False)]:
+            with patch.object(h,'run',return_value=json.dumps({'NCPU':cpus,'MemTotal':memory}).encode()), \
+                 patch.object(h.os,'getloadavg',return_value=(0,load,0)):
+                if valid: h.resume_capacity()
+                else:
+                    with self.assertRaises(h.Refused): h.resume_capacity()
 
     def test_source_requires_clean_head_and_rejects_ignored_data_without_reading_it(self):
         with patch.object(h, 'git', side_effect=[('a'*40+'\n').encode(),b'',b'.env\n']) as git:
