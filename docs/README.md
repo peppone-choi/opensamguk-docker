@@ -8,6 +8,7 @@
 |---|---|
 | [설치와 배포](installation-and-deployment.md) | Linux 호스트에 공유 스택과 게임 월드를 새로 설치·업그레이드·백업할 때 |
 | [localhost 격리 스택](localhost.md) | 개발 기기에서 정확한 앱 SHA를 정본 nginx 뒤에 띄워 확인할 때 |
+| [로컬 fixture 복구](local-fixture-recovery.md) | C0가 인계한 새 F에서 백업·새 nonce 복원·다른 버전 롤백·관측을 실행할 때 |
 | [환경 변수](environment-variables.md) | `.env`·`servers/*.env`의 각 변수가 무엇이고 어느 서비스가 읽는지 |
 | [문제 해결](troubleshooting.md) | 503, nginx 설정 미반영, 443 점유, 자원 관문 거절, 로그인 쿠키 문제 |
 | [운영 주의](operations-cautions.md) | 되돌리기 어려운 명령과 비밀값 취급 |
