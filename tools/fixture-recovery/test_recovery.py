@@ -430,6 +430,12 @@ class RecoveryTests(unittest.TestCase):
             self.engine.restore(self.bundle,self.root/'target')
         self.assertFalse(any(c[1:3]==['image','load'] for c in self.io.calls))
 
+    def test_bad_source_USER_is_rejected_before_quiesce(self):
+        self.io.probe_ok=False
+        with self.assertRaisesRegex(Refused,'SOURCE_USER_PROBE'):self.backup()
+        self.assertFalse(self.bundle.exists())
+        self.assertFalse(any(c[1:2]==['kill'] for c in self.io.calls))
+
 
 def re_find(text):
     import re

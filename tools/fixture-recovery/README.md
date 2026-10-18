@@ -56,7 +56,8 @@ python3 -B "$R" --handoff "$P" --source-custody "$F" --meta "$M" --logs "$L1" \
   backup --bundle "$A" --general-id "$GID" --request-id "$RID"
 ```
 
-Backup normally stops ingress, APIs and engine, captures the committed USER checkpoint while
+Backup first checks normal USER login/readback before stopping anything. It then normally
+stops ingress, APIs and engine, captures the committed USER checkpoint while
 PG is still online, then normally stops both PostgreSQL and both Redis instances. Data service
 exit must be clean (exit0, not OOM); no SIGKILL fallback exists. Only then does it read-only
 archive all five volumes, including **all** Redis AOF segments/manifest and profile icons.

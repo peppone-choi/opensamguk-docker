@@ -300,6 +300,9 @@ class Recovery:
     def backup(self, source_path, output, general_id, request_id):
         directory, record, model = self.source(source_path)
         rows = self.verify(record, model, healthy=True)
+        probe = self.io.user_probe(directory, identity(record), general_id, request_id)
+        need(probe.get('login') is True and probe.get('resolved') is True and
+             probe.get('generalId') == general_id and probe.get('requestId') == request_id, 'SOURCE_USER_PROBE')
         output = newdir(output)
         copy_private(directory, output / 'custody')
         newdir(output / 'data')
