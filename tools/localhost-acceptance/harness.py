@@ -46,6 +46,7 @@ TACTICAL_ENGINE = {'BATTLE_PIPELINE_ENABLED': 'true', 'BATTLE_PIPELINE_API_BASE_
 LEGACY_TACTICAL_DOCKER = 'd35b3815e4f3edea119c4eff3b9678766be756b7'
 ROUTE_FILE = 'localhost-allowlist.map'
 ROUTE_ORIGINAL = 'tactical-route-original-contract.json'
+ROUTE_ORIGINAL_NGINX = 'tactical-route-original-nginx.conf'
 ROUTE_PROOF = 'tactical-route-recovery.json'
 # Inspect projections exclude Env, command arguments, health logs and volume driver options.
 IMAGE_FORMAT = '{"Id":{{json .Id}},"RepoTags":{{json .RepoTags}},"Config":{"Labels":{{json (index .Config "Labels")}}}}'
@@ -200,6 +201,43 @@ def route_verifier_identity(expected_head):
             'runtimeVerifierHarnessSha256': sha(source)}
 
 
+def route_nginx_transition(record, revision):
+    original = git(ROOT, 'show', record['dockerSha'] + ':infra/nginx/nginx.conf')
+    pattern = b'location ~ "^/api/battle-ws/'
+    block = b'        location /api/battle-ws/ {\n            access_log off;\n            return 404;\n        }\n'
+    alias = b'        location = /ws/battles {\n            access_log off;\n            return 404;\n        }\n        location /ws/battles/ {\n            access_log off;\n            return 404;\n        }\n'
+    require(original.count(pattern) == 2 and original.count(block) == 2, 'Original nginx route shape differs')
+    expected = original.replace(pattern, b'location ~ "^/(?:api/battle-ws|ws/battles)/').replace(block, block + alias)
+    current = git(ROOT, 'show', revision + ':infra/nginx/nginx.conf')
+    require(current == expected and sha(original) == record['nginxSha256'],
+            'Only the exact canonical two-block battle alias transition is allowed')
+    return original, current
+
+
+def nginx_file_identity(path):
+    mode = private_path(path).stat()
+    require(mode.st_nlink == 1 and stat.S_IMODE(mode.st_mode) == 0o600, 'Private single-link nginx file required')
+    return {'device': mode.st_dev, 'inode': mode.st_ino}
+
+
+def write_bound_nginx(path, expected, replacement, identity):
+    require(nginx_file_identity(path) == identity, 'Bound nginx inode changed')
+    fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'r+b') as stream:
+        mode = os.fstat(stream.fileno())
+        require({'device': mode.st_dev, 'inode': mode.st_ino} == identity and mode.st_uid == os.getuid() and
+                stat.S_ISREG(mode.st_mode) and stat.S_IMODE(mode.st_mode) == 0o600 and mode.st_nlink == 1,
+                'Opened nginx file identity or ownership differs')
+        require(stream.read() == expected, 'Bound nginx bytes changed before write')
+        try:
+            stream.seek(0); stream.write(replacement); stream.truncate(); stream.flush(); os.fsync(stream.fileno())
+        except BaseException:
+            stream.seek(0); stream.write(expected); stream.truncate(); stream.flush(); os.fsync(stream.fileno())
+            raise
+    require(nginx_file_identity(path) == identity and path.read_bytes() == replacement,
+            'Bound nginx in-place write differs')
+
+
 def verify_route_recovery_binding(directory, record):
     proof = json.loads(private_path(directory / ROUTE_PROOF).read_bytes())
     original_bytes = private_path(directory / ROUTE_ORIGINAL).read_bytes()
@@ -209,11 +247,16 @@ def verify_route_recovery_binding(directory, record):
             'battleRouting' not in original and 'runtimeVerifierHarnessSha256' not in original,
             'Original tactical failure binding differs')
     verifier = route_verifier_identity(record.get('runtimeVerifierHead'))
-    expected = {**original, **verifier, 'battleRouting': battle_route_binding(original)}
+    old_nginx, new_nginx = route_nginx_transition(original, verifier['runtimeVerifierHead'])
+    require(private_path(directory / ROUTE_ORIGINAL_NGINX).read_bytes() == old_nginx,
+            'Original nginx failure config differs')
+    config = {'runtimeNginxSha256': sha(new_nginx),
+              'runtimeNginxFileIdentity': nginx_file_identity(directory / 'nginx.conf')}
+    expected = {**original, **verifier, **config, 'battleRouting': battle_route_binding(original)}
     require(record.get('status') in ('RUNNING', 'SMOKE_PASSED') and
             {**record, 'status': 'RUNNING'} == expected and
             proof == {'schema': 1, 'originalContractSha256': sha(original_bytes), **verifier,
-                      'battleRouting': expected['battleRouting']}, 'Recovered contract differs from original inputs')
+                      **config, 'battleRouting': expected['battleRouting']}, 'Recovered contract differs from original inputs')
 
 
 def tactical_key(value):
@@ -668,9 +711,12 @@ def prepare(args):
 
 
 def verify_custody_files(directory, record, *, legacy_route=False):
-    require(sha(private_path(directory / 'nginx.conf').read_bytes()) == record['nginxSha256'] and
+    nginx_file_identity(directory / 'nginx.conf')
+    require(sha(private_path(directory / 'nginx.conf').read_bytes()) == record.get('runtimeNginxSha256', record['nginxSha256']) and
             sha(git(ROOT, 'show', record['dockerSha'] + ':infra/nginx/nginx.conf')) == record['nginxSha256'],
             'Canonical nginx mismatch')
+    require(('runtimeNginxSha256' not in record and 'runtimeNginxFileIdentity' not in record) or
+            'runtimeVerifierHarnessSha256' in record, 'Unbound runtime nginx override')
     require(sha((ROOT / 'docker-compose.localhost-acceptance.yml').read_bytes()) == record['templateSha256'],
             'Harness template changed; prepare a fresh stack')
     require(tree_hash(directory / 'source') == record['sourceTreeSha256'], 'Source bytes/modes changed')
@@ -1023,17 +1069,63 @@ def wait_tactical_route(directory, record):
     deadline = time.monotonic() + 30
     while True:
         statuses = []
-        for sid in (record['serverId'], 'foreign'):
-            try:
-                with opener.open(ORIGIN + '/api/battle-ws/' + sid + '/160/probe', timeout=3) as response:
-                    statuses.append(response.status)
-            except urllib.error.HTTPError as error:
-                statuses.append(error.code)
-        require(statuses[1] == 404 and statuses[0] in (403, 404), 'Unexpected reloaded route boundary')
-        if statuses == [403, 404]:
+        for prefix in ('/api/battle-ws', '/ws/battles'):
+            for sid in (record['serverId'], 'foreign'):
+                try:
+                    with opener.open(ORIGIN + prefix + '/' + sid + '/160/probe', timeout=3) as response:
+                        statuses.append(response.status)
+                except urllib.error.HTTPError as error:
+                    statuses.append(error.code)
+        require(statuses[1::2] == [404, 404] and all(value in (403, 404) for value in statuses[::2]),
+                'Unexpected reloaded route boundary')
+        if statuses == [403, 404, 403, 404]:
             return
         require(time.monotonic() < deadline, 'Tactical route reload did not become ready')
         time.sleep(1)
+
+
+def restore_route_failure(directory, record, model, before, original, old_nginx, new_nginx, inode, reload_attempted):
+    resources = inventory(record)
+    verify_running(record, resources, model)
+    require(route_resource_ids(resources) == before, 'Changed resources prevent original route restoration')
+    require(private_path(directory / ROUTE_ORIGINAL).read_bytes() == original and
+            private_path(directory / ROUTE_ORIGINAL_NGINX).read_bytes() == old_nginx,
+            'Original route backup changed; restoration refused')
+    current = private_path(directory / 'nginx.conf').read_bytes()
+    require(current in (old_nginx, new_nginx), 'Foreign nginx bytes prevent restoration')
+    route = private_path(directory / 'battle-ws', True)
+    files = list(route.iterdir())
+    require(not files or {path.name for path in files} == {ROUTE_FILE}, 'Foreign route files prevent restoration')
+    if files:
+        path = private_path(route / ROUTE_FILE)
+        require(path.stat().st_nlink == 1 and path.read_bytes() == battle_route_bytes(record),
+                'Foreign route bytes prevent restoration')
+    current_contract = json.loads(private_path(directory / 'contract.json').read_bytes())
+    require(current_contract in (json.loads(original), record), 'Changed contract prevents restoration')
+    write_bound_nginx(directory / 'nginx.conf', current, old_nginx, inode)
+    if files:
+        (route / ROUTE_FILE).unlink()
+    private_write(directory / 'contract.json', original, replace=True)
+    if reload_attempted:
+        original_record = json.loads(original)
+        compose(directory, original_record, 'exec', '-T', 'nginx', 'nginx', '-t',
+                log_path=directory / 'tactical-route-restore-nginx-test.log')
+        compose(directory, original_record, 'exec', '-T', 'nginx', 'nginx', '-s', 'reload',
+                log_path=directory / 'tactical-route-restore-nginx-reload.log')
+    current = inventory(record)
+    verify_running(record, current, model)
+    require(route_resource_ids(current) == before, 'Restored route resource identities changed')
+
+
+def battle_boundary_checks(record):
+    checks = []
+    for prefix in ('/api/battle-ws', '/ws/battles'):
+        checks.extend([(prefix + '/' + record['serverId'] + '/160/probe',
+                        {403 if profile(record) == 'tactical' else 404}),
+                       (prefix + '/foreign/160/probe', {404}),
+                       (prefix + '/' + record['serverId'] + '/0/probe', {404}),
+                       (prefix + '/' + record['serverId'] + '/160/bad.dot', {404})])
+    return checks
 
 
 def repair_tactical_route(args):
@@ -1043,16 +1135,17 @@ def repair_tactical_route(args):
             profile(record) == 'tactical' and 'battleRouting' not in record and
             not any(key.startswith('runtimeVerifier') for key in record), 'Only original unpassed d35 tactical route repair is allowed')
     verifier = route_verifier_identity(args.verifier_sha)
-    for path in ('infra/nginx/nginx.conf', 'docker-compose.localhost-acceptance.yml'):
+    for path in ('docker-compose.localhost-acceptance.yml',):
         require(git(ROOT, 'show', record['dockerSha'] + ':' + path) ==
-                git(ROOT, 'show', args.verifier_sha + ':' + path), 'Route repair cannot change nginx or Compose')
+                git(ROOT, 'show', args.verifier_sha + ':' + path), 'Route repair cannot change Compose')
+    old_nginx, new_nginx = route_nginx_transition(record, args.verifier_sha)
     failure = json.loads(private_path(directory / 'h-execution.json').read_bytes())
     require(failure.get('status') == 'FAILED_OR_REFUSED' and failure.get('exceptionType') == 'Refused' and
             failure.get('fixedFailureCode') == 'Boundary smoke failed at /api/battle-ws/' + record['serverId'] + '/160/probe',
             'Original tactical boundary failure is required')
     attempt = directory / 'tactical-route-execution.json'
     require(not any(path.exists() or path.is_symlink() for path in
-                    (attempt, directory / ROUTE_ORIGINAL, directory / ROUTE_PROOF)),
+                    (attempt, directory / ROUTE_ORIGINAL, directory / ROUTE_ORIGINAL_NGINX, directory / ROUTE_PROOF)),
             'Route repair already attempted; original state preserved')
     with heavy(args.meta, record, 'route-repair'):
         require(not (Path(args.meta) / '.locks/gui-run').exists(), 'GUI operation active')
@@ -1064,21 +1157,27 @@ def repair_tactical_route(args):
         before = route_resource_ids(resources)
         original = private_path(directory / 'contract.json').read_bytes()
         require(json.loads(original) == record, 'Contract changed during route repair admission')
+        inode = nginx_file_identity(directory / 'nginx.conf')
+        config = {'runtimeNginxSha256': sha(new_nginx), 'runtimeNginxFileIdentity': inode}
         audit = {'status': 'APPLYING', 'buildDockerSha': record['dockerSha'], **verifier,
                  'originalContractFile': ROUTE_ORIGINAL, 'originalContractSha256': sha(original),
                  'resourceIdsBefore': before}
         write_json(attempt, audit)
+        reload_attempted = False
         try:
             private_write(directory / ROUTE_ORIGINAL, original)
-            record.update(verifier)
+            private_write(directory / ROUTE_ORIGINAL_NGINX, old_nginx)
+            record.update({**verifier, **config})
             record['battleRouting'] = battle_route_binding(record)
             write_json(directory / ROUTE_PROOF, {'schema': 1, 'originalContractSha256': sha(original),
-                       **verifier, 'battleRouting': record['battleRouting']})
+                       **verifier, **config, 'battleRouting': record['battleRouting']})
             private_write(directory / 'battle-ws' / ROUTE_FILE, battle_route_bytes(record))
+            write_bound_nginx(directory / 'nginx.conf', old_nginx, new_nginx, inode)
             write_json(directory / 'contract.json', record, replace=True)
             verify_files(directory, record)
             compose(directory, record, 'exec', '-T', 'nginx', 'nginx', '-t',
                     log_path=directory / 'tactical-route-nginx-test.log')
+            reload_attempted = True
             compose(directory, record, 'exec', '-T', 'nginx', 'nginx', '-s', 'reload',
                     log_path=directory / 'tactical-route-nginx-reload.log')
             wait_tactical_route(directory, record)
@@ -1097,6 +1196,11 @@ def repair_tactical_route(args):
             write_json(attempt, audit, replace=True)
         except BaseException:
             audit['status'] = 'FAILED_OR_REFUSED'
+            try:
+                restore_route_failure(directory, record, model, before, original, old_nginx, new_nginx, inode, reload_attempted)
+                audit['restoration'] = 'ORIGINAL_FAILURE_CONFIG_RESTORED'
+            except BaseException:
+                audit['restoration'] = 'REFUSED_OR_FAILED_REQUIRES_OPERATOR'
             write_json(attempt, audit, replace=True)
             raise
     print('Owned tactical route repaired; original failure and six build image pins retained; USER remains separate')
@@ -1199,10 +1303,7 @@ def smoke(args, *, finalize=True):
             log_path=directory / ('nginx-test-' + secrets.token_hex(4) + '.log'))
     context = ssl.create_default_context(cafile=str(directory / 'certs/opensamguk.crt'))
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context))
-    checks = [('/health', {200}), ('/api/gateway/auth/me', {401}),
-              ('/api/battle-ws/' + record['serverId'] + '/160/probe',
-               {403 if profile(record) == 'tactical' else 404}),
-              ('/api/battle-ws/foreign/160/probe', {404}),
+    checks = [('/health', {200}), ('/api/gateway/auth/me', {401}), *battle_boundary_checks(record),
               ('/d_pic/.ops/private', {404}), ('/game/', {404}), ('/', {200})]
     for path, expected in checks:
         try:

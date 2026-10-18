@@ -57,7 +57,7 @@ profile의 구성은 유지되며, 준비된 custody나 기존 스택을 이 옵
 game-api에 기존 네 전술 flag·serverId·정확한 `https://localhost` WS origin을 결속한다.
 engine에는 `BATTLE_PIPELINE_ENABLED=true`와
 `BATTLE_PIPELINE_API_BASE_URL=http://game-api:8081`을 지정한다. 키는 game-api만 받으며
-JWT·DB·internal-service 비밀을 재사용하지 않는다. 공개 gateway/nginx 경로는 추가하지 않는다.
+JWT·DB·internal-service 비밀을 재사용하지 않는다. nginx는 아래 계약의 두 WS alias만 연결한다.
 
 전술 profile의 무인증 WS 경계 기대값은 **403**이다. 기본 profile의 미노출 **404**를
 전술 기능 성공으로 인정하지 않는다. 추가 smoke는 owned game-api 내부의 읽기 전용
@@ -67,15 +67,20 @@ READY를 확인한다. HTTP 200 하나나 일반 health를 readiness 대신 사�
 
 Tactical prepare writes exactly one private `battle-ws/localhost-allowlist.map` entry:
 the contract's exact server ID to `http://s<serverId>-game-api:8081`. The canonical nginx
-already includes this directory; nginx, Compose and Dockerfiles are unchanged. Standard
+already includes this directory; prepare copies canonical nginx as-is, and Compose/Dockerfiles remain unchanged. Standard
 prepare keeps the directory empty. The contract binds canonical map bytes and SHA256;
 verification rejects extra files, arbitrary targets, changed receipts, symlinks/hardlinks,
 public or foreign-owned files, and changed model/runtime aliases. Only the owned game-api
-endpoint may carry that alias. Strict smoke requires own SID **403** and foreign SID **404**.
+endpoint may carry that alias. Canonical HTTP and HTTPS locations accept the actual browser
+contract `/ws/battles/...` and the compatibility `/api/battle-ws/...` through the same strict
+SID/world/battle ID expression, short-ticket/Origin handling and stripped cookie/auth headers.
+No general `/ws` proxy exists. Strict smoke requires own SID **403**, foreign SID **404** and
+malformed world/battle paths **404** on both aliases.
 
 ### Existing d35 tactical boundary failure
 
-The d35 build created an empty map while expecting tactical 403. The existing H's six
+The d35 build created an empty map while expecting tactical 403, and lacked the browser's
+`/ws/battles` public path. The existing H's six
 images and eleven healthy containers can be retained through a separately approved,
 single-attempt `repair-tactical-route`. Source review alone does not authorize this operation.
 Use a **separately registered stable verifier worktree**, for example
@@ -98,21 +103,36 @@ The reload adds no container workload, so it retains resume-startup's 2CPU/6GiB 
 checks rather than reserving another six GiB. Any separately authorized D174 disk-floor
 override remains an operator concern; this command does not disable source smoke checks.
 
-The operation preserves the original contract bytes in
-`tactical-route-original-contract.json` inside the same private custody. It leaves
+The operation preserves the original contract bytes in `tactical-route-original-contract.json`
+and public nginx bytes in `tactical-route-original-nginx.conf` inside the same private custody. It leaves
 `h-execution.json` and all original failure/diagnosis logs untouched, makes no copies of
 auth/runtime/certificates, and records the separate verifier SHA/path/harness SHA256 in the
-current contract and `tactical-route-recovery.json`. Build `dockerSha` remains d35, and all
-other original contract fields must match, except status and the explicit routing/verifier
-binding. Normal validation and snapshot recheck that binding against the preserved original.
+current contract and `tactical-route-recovery.json`. Build `dockerSha` and `nginxSha256` remain
+d35's original pins. Separate `runtimeNginxSha256` and `runtimeNginxFileIdentity` bind the new
+canonical config to that reviewed verifier revision and the original host device/inode.
+Only the exact two-location alias/fallback addition is allowed; an unrelated nginx change
+is refused. All other original contract fields must match, except status and these explicit
+routing/config/verifier bindings. Normal validation and snapshot recheck them against the
+preserved originals and exact Git bytes. Compose and Dockerfiles remain unchanged.
 
-Only then does it write the canonical map, run `nginx -t`, and send **one normal nginx reload**.
-It waits for own403/foreign404 with a 30-second observation deadline, runs the complete
+Only then does it write the canonical map and new canonical nginx bytes. The nginx file is
+a file-level bind: an atomic rename would leave the container on the old inode. The writer
+opens the original with O_NOFOLLOW, checks fstat device/inode/owner/private mode/single-link
+and old bytes, writes in place, fsyncs, and rechecks the inode and bytes. A write exception
+attempts to restore the old bytes through the same FD. It then runs `nginx -t` and sends
+**one normal nginx reload**. It waits for own403/foreign404 on both aliases with a 30-second
+observation deadline, runs the complete
 tactical/map/startup-pause smoke, and verifies unchanged container/image/network/volume IDs
 before publishing `SMOKE_PASSED`. No image build/pull, Compose up/recreate, engine restart,
 SQL, policy/account/role mutation or resume occurs. `tactical-route-execution.json` records
-the attempt. A refusal or partial failure preserves the map/current binding and original
-failure for diagnosis and refuses automatic retries; it does not claim a rollback or USER pass.
+the attempt. On failure, restoration first rechecks the same healthy resource IDs, original
+backups, exact known current contract/map/config bytes and original inode. If they match,
+it restores the old config in place, removes only its canonical map file, and restores the
+original FAIL-state contract bytes. If a reload was attempted, restoration runs `nginx -t`
+and at most **one additional normal reload** for the old config. This is restoration of the
+original failing configuration, not a USER pass. Foreign edits, changed IDs or failed restore
+checks prevent overwrites and are recorded as requiring operator action. Both failure records
+and originals remain; no automatic repair retry is allowed.
 
 ## Regression
 

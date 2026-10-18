@@ -2,6 +2,8 @@ import copy
 import importlib.util
 import json
 import os
+import re
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -139,6 +141,9 @@ class TacticalRouteTests(unittest.TestCase):
                 h.route_verifier_identity('d' * 40)
 
     def setup_repair(self):
+        self.old_nginx, self.new_nginx = b'original nginx config\n', b'reviewed new nginx config\n'
+        self.record['nginxSha256'] = h.sha(self.old_nginx)
+        h.private_write(self.directory / 'nginx.conf', self.old_nginx)
         h.write_json(self.directory / 'contract.json', self.record)
         h.write_json(self.directory / 'h-execution.json', {'status': 'FAILED_OR_REFUSED',
             'exceptionType': 'Refused', 'fixedFailureCode':
@@ -156,6 +161,7 @@ class TacticalRouteTests(unittest.TestCase):
             'runtime_caps': lambda *a: None,
             'inventory': lambda *a: self.resources,
             'wait_tactical_route': lambda *a: None,
+            'route_nginx_transition': lambda *a: (self.old_nginx, self.new_nginx),
         }
         for name, fn in patches.items():
             stack.enter_context(patch.object(h, name, side_effect=fn))
@@ -204,6 +210,7 @@ class TacticalRouteTests(unittest.TestCase):
                 # Each subcase has its own patched admission, but reuses only untouched private files.
                 (self.directory / 'contract.json').unlink()
                 (self.directory / 'h-execution.json').unlink()
+                (self.directory / 'nginx.conf').unlink()
 
     def test_reload_failure_preserves_failure_original_and_refuses_retry(self):
         self.setup_repair()
@@ -216,6 +223,35 @@ class TacticalRouteTests(unittest.TestCase):
         with self.assertRaises(h.Refused):
             h.repair_tactical_route(self.args)
 
+    def test_failed_reloaded_boundary_restores_original_inode_bytes_contract_and_empty_map(self):
+        self.setup_repair()
+        inode = h.nginx_file_identity(self.directory / 'nginx.conf')
+        with patch.object(h, 'wait_tactical_route', side_effect=h.Refused('boundary failure')):
+            with self.assertRaises(h.Refused):
+                h.repair_tactical_route(self.args)
+        self.assertEqual(self.old_nginx, (self.directory / 'nginx.conf').read_bytes())
+        self.assertEqual(inode, h.nginx_file_identity(self.directory / 'nginx.conf'))
+        self.assertEqual(self.original, (self.directory / 'contract.json').read_bytes())
+        self.assertEqual([], list((self.directory / 'battle-ws').iterdir()))
+        audit = json.loads((self.directory / 'tactical-route-execution.json').read_bytes())
+        self.assertEqual('FAILED_OR_REFUSED', audit['status'])
+        self.assertEqual('ORIGINAL_FAILURE_CONFIG_RESTORED', audit['restoration'])
+        self.assertEqual(2, sum(command[-2:] == ('-s', 'reload') for command in self.commands))
+        self.assertEqual('FAILED_OR_REFUSED', json.loads((self.directory / 'h-execution.json').read_bytes())['status'])
+
+    def test_restoration_refuses_foreign_config_instead_of_overwriting_it(self):
+        self.setup_repair()
+        def changed(*args):
+            (self.directory / 'nginx.conf').write_bytes(b'foreign configuration')
+            raise h.Refused('foreign config')
+        with patch.object(h, 'wait_tactical_route', side_effect=changed):
+            with self.assertRaises(h.Refused):
+                h.repair_tactical_route(self.args)
+        self.assertEqual(b'foreign configuration', (self.directory / 'nginx.conf').read_bytes())
+        audit = json.loads((self.directory / 'tactical-route-execution.json').read_bytes())
+        self.assertEqual('REFUSED_OR_FAILED_REQUIRES_OPERATOR', audit['restoration'])
+        self.assertEqual(1, sum(command[-2:] == ('-s', 'reload') for command in self.commands))
+
     def test_post_smoke_identity_failure_cannot_publish_pass(self):
         self.setup_repair()
         different = copy.deepcopy(self.resources)
@@ -227,8 +263,9 @@ class TacticalRouteTests(unittest.TestCase):
         self.assertEqual(self.original, (self.directory / h.ROUTE_ORIGINAL).read_bytes())
 
     def test_reload_wait_only_accepts_own_403_foreign_404(self):
-        for statuses, accepted in [([404, 404, 403, 404], True), ([403, 403], False),
-                                   ([200, 404], False), ([404, 404], False)]:
+        for statuses, accepted in [([404, 404, 404, 404, 403, 404, 403, 404], True),
+                                   ([403, 403, 403, 404], False),
+                                   ([200, 404, 403, 404], False), ([404, 404, 404, 404], False)]:
             opener = MagicMock()
             responses = [nullcontext(type('Response', (), {'status': value})()) for value in statuses]
             opener.open.side_effect = responses
@@ -242,6 +279,59 @@ class TacticalRouteTests(unittest.TestCase):
                 else:
                     with self.assertRaises(h.Refused):
                         h.wait_tactical_route(self.directory, self.record)
+
+    def test_file_bind_write_preserves_inode_and_rejects_changed_inode_or_bytes(self):
+        path = self.directory / 'nginx.conf'
+        h.private_write(path, b'original')
+        inode = h.nginx_file_identity(path)
+        h.write_bound_nginx(path, b'original', b'new reviewed bytes', inode)
+        self.assertEqual(inode, h.nginx_file_identity(path))
+        h.write_bound_nginx(path, b'new reviewed bytes', b'original', inode)
+        self.assertEqual(b'original', path.read_bytes())
+        with patch.object(h.os, 'getuid', return_value=os.getuid()+1), self.assertRaises(h.Refused):
+            h.write_bound_nginx(path, b'original', b'other', inode)
+        for current, identity in [(b'foreign', inode), (b'original', {**inode, 'inode': -1})]:
+            with self.assertRaises(h.Refused):
+                h.write_bound_nginx(path, current, b'other', identity)
+        self.assertEqual(b'original', path.read_bytes())
+
+    def test_canonical_http_and_https_aliases_share_strict_path_and_header_guards(self):
+        source = (h.ROOT / 'infra/nginx/nginx.conf').read_text()
+        blocks = re.findall(r'location ~ "(\^/\(\?:api/battle-ws\|ws/battles\)/[^"\n]+)" \{(.*?)\n        \}', source, re.S)
+        self.assertEqual(2, len(blocks))
+        self.assertEqual(blocks[0], blocks[1])
+        for expression, body in blocks:
+            matcher = re.compile(expression.replace('(?<', '(?P<'))
+            for prefix in ('/api/battle-ws', '/ws/battles'):
+                for tail in ('pep/1/battle-1', 'lha0123456789abcdef/160/probe'):
+                    self.assertIsNotNone(matcher.fullmatch(prefix + '/' + tail))
+                for tail in ('pep/0/battle', 'pep/01/battle', 'PEP/1/battle',
+                             'pep/10000000000/battle', 'pep/1/bad.dot', 'pep/1/' + 'a'*129):
+                    self.assertIsNone(matcher.fullmatch(prefix + '/' + tail))
+                self.assertIn('location = ' + prefix + ' {', source)
+                self.assertIn('location ' + prefix + '/ {', source)
+            for header in ('Authorization', 'Proxy-Authorization', 'Cookie'):
+                self.assertIn('proxy_set_header ' + header + ' "";', body)
+            self.assertIn('if ($battle_ws_upstream = "") {\n                return 404;', body)
+            self.assertIn('$is_args$args;', body)
+            self.assertNotIn('location /ws/ {', source)
+
+    def test_only_the_exact_two_alias_source_transition_is_allowed(self):
+        old = subprocess.run(['git', '-C', str(h.ROOT), 'show',
+            h.LEGACY_TACTICAL_DOCKER + ':infra/nginx/nginx.conf'], check=True, capture_output=True).stdout
+        new = (h.ROOT / 'infra/nginx/nginx.conf').read_bytes()
+        record = {**self.record, 'nginxSha256': h.sha(old)}
+        for candidate, accepted in [(new, True), (old, False),
+                                    (new.replace(b'proxy_set_header Cookie "";', b''), False),
+                                    (new + b'\n# unreviewed config\n', False)]:
+            def git(repo, operation, target):
+                return old if target.startswith(h.LEGACY_TACTICAL_DOCKER + ':') else candidate
+            with self.subTest(accepted=accepted), patch.object(h, 'git', side_effect=git):
+                if accepted:
+                    self.assertEqual((old, new), h.route_nginx_transition(record, 'd'*40))
+                else:
+                    with self.assertRaises(h.Refused):
+                        h.route_nginx_transition(record, 'd'*40)
 
     def test_wrong_owner_or_project_never_opens_legacy_admission(self):
         with patch.dict(os.environ, {'OPENSAMGUK_TASK_OWNER_SESSION': 'other'}):

@@ -220,7 +220,9 @@ class HarnessTests(unittest.TestCase):
                 record = {**self.record, 'profile': mode, 'status': 'RUNNING'}
                 opener = MagicMock()
                 def response(url, **kwargs):
-                    status = 404 if '/api/battle-ws/foreign/' in url else websocket_status if '/api/battle-ws/' in url else 401 if '/auth/me' in url else (
+                    ws = '/api/battle-ws/' in url or '/ws/battles/' in url
+                    own = '/' + record['serverId'] + '/160/probe' in url
+                    status = (websocket_status if own else 404) if ws else 401 if '/auth/me' in url else (
                         404 if '/d_pic/' in url or url.endswith('/game/') else 200)
                     result = MagicMock()
                     result.__enter__.return_value.status = status

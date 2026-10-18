@@ -88,12 +88,14 @@ def probe(path, *, origin="https://game.example", ticket=token,
         assert "Sec-WebSocket-Protocol: battle.v1\r\n" in headers, headers
     return headers
 
-probe("/api/battle-ws/pep/1/battle-1?lastSeenEventSeq=19", expects_protocol=True)
-probe("/api/battle-ws/pep/1/battle-1", extra="Authorization: Bearer long\r\nCookie: sam_access=long\r\nProxy-Authorization: Basic long\r\n", expects_protocol=True)
-probe("/api/battle-ws/pep/1/battle-1", origin="https://other.example", expected="403")
-probe("/api/battle-ws/pep/1/battle-1", ticket="BTJ2.invalid." + "A" * 43, expected="403")
-probe("/api/battle-ws/test/1/battle-1", expected="404")
-probe("/api/battle-ws/pep/1/../battle-1", expected="404")
+for prefix in ("/api/battle-ws", "/ws/battles"):
+    probe(prefix + "/pep/1/battle-1?lastSeenEventSeq=19", expects_protocol=True)
+    probe(prefix + "/pep/1/battle-1", extra="Authorization: Bearer long\r\nCookie: sam_access=long\r\nProxy-Authorization: Basic long\r\n", expects_protocol=True)
+    probe(prefix + "/pep/1/battle-1", origin="https://other.example", expected="403")
+    probe(prefix + "/pep/1/battle-1", ticket="BTJ2.invalid." + "A" * 43, expected="403")
+    probe(prefix + "/test/1/battle-1", expected="404")
+    for tail in ("pep/1/../battle-1", "pep/0/battle-1", "pep/1/bad.dot", "pep/1/" + "a" * 129):
+        probe(prefix + "/" + tail, expected="404")
 print("battle WS proxy Upgrade/negative checks: PASS")
 PY
 

@@ -56,6 +56,13 @@ class ApiRateContract(unittest.TestCase):
     def test_only_approved_rate_directives_change_from_observed_canonical(self):
         original = self.source.replace(MAPS, '    limit_req_zone $binary_remote_addr zone=api_limit:10m rate=60r/m;')
         original = original.replace('            limit_req zone=api_read_limit burst=40 delay=8;\n', '')
+        # Undo only the separately checked browser WS alias, keeping the original rate baseline hash.
+        alias = ('        location = /ws/battles {\n            access_log off;\n            return 404;\n        }\n'
+                 '        location /ws/battles/ {\n            access_log off;\n            return 404;\n        }\n')
+        self.assertEqual(2, original.count(alias))
+        self.assertEqual(2, original.count('location ~ "^/(?:api/battle-ws|ws/battles)/'))
+        original = original.replace(alias, '').replace('location ~ "^/(?:api/battle-ws|ws/battles)/',
+                                                     'location ~ "^/api/battle-ws/')
         self.assertEqual('f0507d5a8bf0ea90cb6cc722b2dde99c2e049c1d517605adbfe764b39721b5e7',
                          hashlib.sha256(original.encode()).hexdigest())
 
