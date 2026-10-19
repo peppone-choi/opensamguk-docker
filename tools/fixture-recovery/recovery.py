@@ -150,7 +150,8 @@ def images(record, model):
 
 def same_profile(record, source, code):
     need(fresh.profile(record) == fresh.profile(source) and
-         fresh.startup_paused(record) == fresh.startup_paused(source), code)
+         fresh.startup_paused(record) == fresh.startup_paused(source) and
+         record.get('hostingerQA') == source.get('hostingerQA'), code)
 
 
 def profile_smoke(directory, record):
@@ -184,6 +185,8 @@ def copy_private(source, dest, public_topdown=False):
         for path in sorted(private(Path(source) / name, True).iterdir()):
             put(Path(dest) / name / path.name, private(path).read_bytes())
     record = read(Path(source) / 'contract.json')
+    if fresh.qa.selected(record):
+        put(Path(dest) / 'hostinger-qa.json', private(Path(source) / 'hostinger-qa.json').read_bytes())
     if route.active(record):
         route.snapshot(source, record, fresh)
         for name in route.PROOF_FILES:
@@ -208,7 +211,7 @@ def copy_private(source, dest, public_topdown=False):
 def target_model(model, source, target, nonce, pins):
     """The equality test makes every environment value, alias and app identity immutable."""
     out = copy.deepcopy(model)
-    project = 'osgfr' + nonce
+    project = fresh.qa.project(dict(source, nonce=nonce), recovery=True)
     out['name'] = project
     labels = {fresh.NONCE_LABEL: nonce, fresh.SESSION_LABEL: source['session']}
     for kind in ('volumes', 'networks'):
@@ -269,7 +272,7 @@ class Recovery:
         need(rec.get('topdown') == m['source'].get('topdown'), 'TARGET_TOPDOWN_BINDING')
         selected_tree(path / 'runtime', rec, True)
         need(re.fullmatch('[a-f0-9]{16}', rec.get('nonce', '')) and rec['nonce'] != m['source']['nonce'] and
-             rec['project'] == 'osgfr' + rec['nonce'] and rec['custody'] == str(path) and
+             rec['project'] == fresh.qa.project(rec, recovery=True) and rec['custody'] == str(path) and
              rec['session'] == m['source']['session'] and identity(rec) == m['identity'], 'TARGET_IDENTITY')
         need(set(t['pins']) == set(m['pins']) and
              all(t['pins'][s] == m['pins'][s] for s in m['pins'] if s not in fresh.SERVICES), 'TARGET_SUPPORT_IMAGES')
@@ -291,6 +294,8 @@ class Recovery:
 
     def source(self, path):
         directory, record = fresh.load(path)
+        # PR83 does not re-enroll/rebind PR95 native grants. Never silently copy an active grant.
+        need(not record.get('nativeWriter'), 'NATIVE_RECOVERY_REQUIRES_SEPARATE_GRANT_PROTOCOL')
         need(record.get('status') == 'SMOKE_PASSED', 'SOURCE_NOT_ACCEPTED')
         model = (route.live_model(directory, record, fresh) if route.active(record)
                  else fresh.verify_files(directory, record))
@@ -299,12 +304,13 @@ class Recovery:
         return directory, record, model
 
     def verify(self, record, model, healthy=False, partial=False):
+        is_target = record['project'] == fresh.qa.project(record, recovery=True)
         if route.active(record):
-            if record['project'].startswith('osgfr'):
+            if is_target:
                 self.target(record['custody'])
             else:
                 route.live_model(record['custody'], record, fresh)
-        selected_tree(Path(record['custody']) / ('runtime' if record['project'].startswith('osgfr') else ''), record, True)
+        selected_tree(Path(record['custody']) / ('runtime' if is_target else ''), record, True)
         inventory = fresh.inventory(record)
         fresh.assert_owned(record, inventory)
         if not partial:
@@ -344,7 +350,9 @@ class Recovery:
             need(row['Image'] == pins[svc], 'RUNTIME_IMAGE')
             need(set(row['NetworkSettings']['Networks']) == {record['project'] + '_local'}, 'RUNTIME_NETWORK')
             ports = row['HostConfig'].get('PortBindings') or {}
-            need(ports == ({'443/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '443'}]} if svc == 'nginx' else {}), 'RUNTIME_PORT')
+            need(ports == ({'443/tcp': [{'HostIp': '127.0.0.1', 'HostPort': str(fresh.qa.port(record))}]} if svc == 'nginx' else {}), 'RUNTIME_PORT')
+            if fresh.qa.selected(record):
+                fresh.qa.runtime_cap(row, svc)
             fresh.verify_mounts(row.get('Mounts', []), model['services'][svc], model)
         if healthy:
             need(all(c['State']['Running'] and c['State'].get('Health', {}).get('Status') == 'healthy'
@@ -488,7 +496,11 @@ class Recovery:
         # Check every original run before starting any dependency after an external change.
         for svc, cid in j.get('stopped', {}).items():
             original_state(svc, cid)
-        self.io.port_free()
+        if fresh.qa.selected(source):
+            fresh.port_free(source)
+            fresh.resource_gate(source['custody'], 'startup', source)
+        else:
+            self.io.port_free()
         for svc in START:
             cid = j.get('stopped', {}).get(svc)
             if cid and not original_state(svc, cid)['Running']:
@@ -526,7 +538,10 @@ class Recovery:
         args += ['tar', '-xpf' if incoming else '-cpf', '-', '-C', '/volume']
         if not incoming:
             args.append('.')
-        self.io.stream(args, path, incoming=incoming)
+        with fresh.qa.helper(record, self.io.run) as limits:
+            if limits:
+                args = args[:2] + limits + args[2:]
+            self.io.stream(args, path, incoming=incoming)
 
     def backup(self, source_path, output, general_id, request_id):
         output = isolated_output(output, [source_path])
@@ -617,7 +632,7 @@ class Recovery:
             need(candidate_pins == selected['sourcePins'], 'VERSION_TOPDOWN_SOURCE')
         version_record = {'schema': 1, 'appSha': app_sha, 'images': pins,
                        'identity': m['identity'], 'sourceTreeSha256': next(iter(source_tree)), 'dockerfiles': dockerfiles}
-        version_record.update({key: m['source'][key] for key in ('profile', 'startupPaused') if key in m['source']})
+        version_record.update({key: m['source'][key] for key in ('profile', 'startupPaused', 'hostingerQA') if key in m['source']})
         if selected is not None:
             version_record['topdown'] = selected
         write(output, version_record)
@@ -630,7 +645,11 @@ class Recovery:
         model = read(Path(bundle) / 'custody/compose.json')
         rows = self.verify(source, model)
         need(not any(self.state(c['Id'])['Running'] for c in rows.values()), 'ORIGINAL_MUST_BE_STOPPED')
-        self.io.port_free()
+        if fresh.qa.selected(source):
+            fresh.port_free(source)
+            fresh.resource_gate(source['custody'], 'startup', source)
+        else:
+            self.io.port_free()
         pins = dict(m['pins'])
         app_sha = source['appSha']
         if version:
@@ -664,7 +683,8 @@ class Recovery:
         target = newdir(target)
         copy_private(Path(bundle) / 'custody', target / 'runtime', public_topdown=True)
         nonce = secrets.token_hex(8)
-        rec = dict(source, nonce=nonce, project='osgfr' + nonce, custody=str(target), appSha=app_sha)
+        rec = dict(source, nonce=nonce, custody=str(target), appSha=app_sha)
+        rec['project'] = fresh.qa.project(rec, recovery=True)
         if version:
             rec['sourceTreeSha256'] = v['sourceTreeSha256']
         rec['images'] = {s: {'imageId': pins[s]} for s in fresh.SERVICES}
@@ -687,9 +707,10 @@ class Recovery:
             self.io.run(['docker', 'volume', 'create', '--label', fresh.NONCE_LABEL + '=' + nonce,
                          '--label', fresh.SESSION_LABEL + '=' + rec['session'], '--label',
                          fresh.PROJECT_LABEL + '=' + rec['project'], spec['name']])
-            empty = self.io.run(['docker', 'run', '--rm', '--pull', 'never', '--network', 'none', '--read-only',
-                '--mount', 'type=volume,source=' + spec['name'] + ',target=/volume,readonly',
-                source['supportImages']['postgres:16-alpine'], 'find', '/volume', '-mindepth', '1', '-print', '-quit'])
+            with fresh.qa.helper(rec, self.io.run) as limits:
+                empty = self.io.run(['docker', 'run', *limits, '--rm', '--pull', 'never', '--network', 'none', '--read-only',
+                    '--mount', 'type=volume,source=' + spec['name'] + ',target=/volume,readonly',
+                    source['supportImages']['postgres:16-alpine'], 'find', '/volume', '-mindepth', '1', '-print', '-quit'])
             need(not empty.strip(), 'TARGET_VOLUME_NOT_EMPTY')
             self.volume_command(rec, source['supportImages']['postgres:16-alpine'], spec['name'],
                                 'restore', Path(bundle) / 'data' / (name + '.tar'), incoming=True)
@@ -698,6 +719,8 @@ class Recovery:
             need(archive_root(path) == m['volumes'][name], 'RESTORE_CONTENT_MISMATCH')
         t['phase'] = 'DATA_VERIFIED'
         write(target / 'target.json', t, replace=True)
+        if fresh.qa.selected(rec):
+            fresh.qa.admission(rec, 'startup')
         self.io.run(['docker', 'compose', '--project-name', rec['project'], '--env-file', '/dev/null',
             '--project-directory', str(target), '-f', str(target / 'compose.json'), 'up', '-d',
             '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '600'], timeout=660)
@@ -839,9 +862,14 @@ def main():
         common = Path(fresh.git(ROOT, 'rev-parse', '--git-common-dir').decode().strip())
         if not common.is_absolute():
             common = ROOT / common
-        need(os.path.samefile(common, a.meta / 'projects/opensamguk-docker/.git'), 'META_REPOSITORY_MISMATCH')
+        _, source_record = fresh.load(a.source_custody)
+        hostinger = fresh.qa.selected(source_record)
+        if not hostinger:
+            need(os.path.samefile(common, a.meta / 'projects/opensamguk-docker/.git'), 'META_REPOSITORY_MISMATCH')
         io.local()
-        with heavy(a.meta, token['ownerSession'], datetime.fromisoformat(token['expiresAt'].replace('Z', '+00:00'))):
+        guard = (fresh.qa.lock('host-heavy.lock') if hostinger else
+                 heavy(a.meta, token['ownerSession'], datetime.fromisoformat(token['expiresAt'].replace('Z', '+00:00'))))
+        with guard, fresh.qa.lock('browser.lock') if hostinger else contextlib.nullcontext():
             r = Recovery(io)
             if a.action == 'backup':
                 result = r.backup(a.source_custody, a.bundle, a.general_id, a.request_id)

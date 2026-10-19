@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -31,6 +32,9 @@ _topdown_spec.loader.exec_module(topdown)
 _observation_spec = importlib.util.spec_from_file_location('localhost_engine_observation', Path(__file__).with_name('engine_observation.py'))
 observation = importlib.util.module_from_spec(_observation_spec)
 _observation_spec.loader.exec_module(observation)
+_qa_spec = importlib.util.spec_from_file_location('localhost_hostinger_qa', Path(__file__).with_name('hostinger_qa.py'))
+qa = importlib.util.module_from_spec(_qa_spec)
+_qa_spec.loader.exec_module(qa)
 
 ROOT = Path(__file__).resolve().parents[2]
 SERVICES = ('gateway-api', 'board-api', 'game-api', 'game-engine', 'web-gateway', 'web-game')
@@ -56,7 +60,8 @@ IMAGE_FORMAT = '{"Id":{{json .Id}},"RepoTags":{{json .RepoTags}},"Config":{"Labe
 CONTAINER_FORMAT = ('{"Id":{{json .Id}},"Name":{{json .Name}},"Image":{{json .Image}},'
     '"Config":{"Labels":{{json (index .Config "Labels")}}},"State":{"Running":{{json .State.Running}},'
     '"Health":{"Status":{{with index .State "Health"}}{{json .Status}}{{else}}null{{end}}}},'
-    '"HostConfig":{"PortBindings":{{json .HostConfig.PortBindings}}},"Mounts":{{json .Mounts}},'
+    '"HostConfig":{"PortBindings":{{json .HostConfig.PortBindings}},"CgroupParent":{{json .HostConfig.CgroupParent}},'
+    '"Memory":{{.HostConfig.Memory}},"MemorySwap":{{.HostConfig.MemorySwap}},"NanoCpus":{{.HostConfig.NanoCpus}}},"Mounts":{{json .Mounts}},'
     '"NetworkSettings":{"Networks":{{json .NetworkSettings.Networks}}}}')
 NETWORK_FORMAT = ('{"Id":{{json .Id}},"Name":{{json .Name}},"Labels":{{json (index . "Labels")}},'
                   '"Driver":{{json .Driver}},"Containers":{{with index . "Containers"}}{{json .}}{{else}}{}{{end}}}')
@@ -65,6 +70,9 @@ VOLUME_FORMAT = '{"Name":{{json .Name}},"Labels":{{json (index . "Labels")}}}'
 
 class Refused(RuntimeError):
     pass
+
+
+qa.Refused = Refused
 
 
 class ObservationNoRedirect(urllib.request.HTTPRedirectHandler):
@@ -77,30 +85,54 @@ def require(condition, message):
         raise Refused(message)
 
 
-def run(args, *, input=None, timeout=60, cwd=None, log_path=None):
+def local_docker_endpoint():
+    endpoint = os.environ.get('DOCKER_HOST') if not os.environ.get('DOCKER_CONTEXT') else None
+    if endpoint is None:
+        endpoint = run(['docker', 'context', 'inspect', '--format', '{{.Endpoints.docker.Host}}']).decode().strip()
+    require(endpoint.startswith('unix:///') and '\n' not in endpoint, 'Only a local Unix Docker endpoint is allowed')
+    return endpoint
+
+
+def run(args, *, input=None, timeout=60, cwd=None, log_path=None, buildx_config=None):
     # Never echo argv, child output or environment: these may contain new fixtures.
     env = {k: os.environ[k] for k in ('PATH', 'HOME', 'TMPDIR', 'DOCKER_HOST',
            'DOCKER_CONTEXT', 'DOCKER_CONFIG', 'SSH_AUTH_SOCK') if k in os.environ}
     env.update(LANG='C.UTF-8', COMPOSE_DISABLE_ENV_FILE='1', NEXT_TELEMETRY_DISABLED='1')
+    if buildx_config is not None:
+        require(args[:2] == ['docker', 'buildx'], 'Private Buildx config is only for Buildx commands')
+        env['BUILDX_CONFIG'] = str(private_path(buildx_config, directory=True))
     if args[0] == 'docker' and args[1:3] != ['context', 'inspect']:
         # DOCKER_CONTEXT overrides DOCKER_HOST; a remote daemon would violate localhost custody.
-        endpoint = env.get('DOCKER_HOST') if not env.get('DOCKER_CONTEXT') else None
-        if endpoint is None:
-            endpoint = run(['docker', 'context', 'inspect', '--format', '{{.Endpoints.docker.Host}}']).decode().strip()
-        require(endpoint.startswith('unix:///') and '\n' not in endpoint, 'Only a local Unix Docker endpoint is allowed')
+        local_docker_endpoint()
     log = None
     try:
         if log_path is not None:
             log = os.fdopen(os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), 'wb')
-        p = subprocess.run(args, input=input, stdout=log if log else subprocess.PIPE,
-                           stderr=subprocess.STDOUT if log else subprocess.PIPE, cwd=cwd, env=env, timeout=timeout)
+        if buildx_config is not None:
+            # Kill the owned CLI/plugin group before checking for late metadata.
+            p = subprocess.Popen(args, stdin=subprocess.PIPE if input is not None else None,
+                stdout=log if log else subprocess.PIPE, stderr=subprocess.STDOUT if log else subprocess.PIPE,
+                cwd=cwd, env=env, start_new_session=True)
+            try:
+                output, _ = p.communicate(input=input, timeout=timeout)
+            except BaseException:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                p.wait()
+                raise
+        else:
+            p = subprocess.run(args, input=input, stdout=log if log else subprocess.PIPE,
+                               stderr=subprocess.STDOUT if log else subprocess.PIPE, cwd=cwd, env=env, timeout=timeout)
+            output = p.stdout
     except subprocess.TimeoutExpired:
         raise Refused('Command timed out; owned resources and custody preserved') from None
     finally:
         if log is not None:
             log.close()
     require(p.returncode == 0, 'Command failed; private output suppressed, custody preserved')
-    return p.stdout or b''
+    return output or b''
 
 
 def git(repo, *args):
@@ -137,9 +169,9 @@ def identity(record, read_only=False):
     observation.selected(record)
     nonce = record.get('nonce', '')
     require(re.fullmatch('[a-f0-9]{16}', nonce), 'Invalid nonce')
-    require(record.get('project') == 'osglha' + nonce and record.get('serverId') == 'lha' + nonce,
+    require(record.get('project') == qa.project(record) and record.get('serverId') == 'lha' + nonce,
             'Project/server identity mismatch')
-    require(record.get('origin') == ORIGIN and record.get('worldId') == 160 and record.get('generation') == 0,
+    require(record.get('origin') == qa.origin(record) and record.get('worldId') == 160 and record.get('generation') == 0,
             'Local identity mismatch')
     require(re.fullmatch('[a-f0-9]{40}', record.get('appSha', '')) and
             re.fullmatch('[a-f0-9]{40}', record.get('dockerSha', '')), 'Full source SHA required')
@@ -300,10 +332,10 @@ def profile_fixtures(record, fixtures):
 
 def build_args(record, service):
     if service == 'web-gateway':
-        return {'NEXT_PUBLIC_GAME_URL': ORIGIN + '/game/' + record['serverId'],
+        return {'NEXT_PUBLIC_GAME_URL': qa.origin(record) + '/game/' + record['serverId'],
                 'NEXT_PUBLIC_TOPDOWN_SCREENS': '1'}
     if service == 'web-game':
-        return {'NEXT_PUBLIC_GATEWAY_URL': ORIGIN, 'GATEWAY_WEB_URL': 'http://web-gateway:3000',
+        return {'NEXT_PUBLIC_GATEWAY_URL': qa.origin(record), 'GATEWAY_WEB_URL': 'http://web-gateway:3000',
                 'ASSET_PREFIX': '/game', 'NEXT_PUBLIC_TOPDOWN_SCREENS': '1'}
     return {'IMAGE_TAG': record['appSha']}
 
@@ -311,7 +343,7 @@ def build_args(record, service):
 def registry(record):
     sid = record['serverId']
     return [{'id': sid, 'name': 'Local acceptance', 'generation': 0,
-             'gameUrl': ORIGIN + '/game/' + sid, 'gameApiUrl': f'http://s{sid}-game-api:8081',
+             'gameUrl': qa.origin(record) + '/game/' + sid, 'gameApiUrl': f'http://s{sid}-game-api:8081',
              'gameEngineUrl': f'http://s{sid}-game-engine:8082',
              'deployProject': 'opensamguk-s' + sid, 'scenarioCode': 'scenario_3190'}]
 
@@ -339,7 +371,7 @@ def model_for(record, fixtures):
         key = tactical_key(fixtures.get(TACTICAL_KEY))
         require(key not in [value for name, value in fixtures.items() if name != TACTICAL_KEY],
                 'Dedicated tactical signing key must not be reused')
-        model['services']['game-api']['environment'].update({**TACTICAL_API, TACTICAL_KEY: key})
+        model['services']['game-api']['environment'].update({**TACTICAL_API, 'BATTLE_WS_ALLOWED_ORIGINS': qa.origin(record), TACTICAL_KEY: key})
         model['services']['game-engine']['environment'].update(TACTICAL_ENGINE)
     map_env, map_mounts = topdown.settings(record)
     model['services']['game-api']['environment'].update(map_env)
@@ -348,11 +380,13 @@ def model_for(record, fixtures):
     if paused:
         model['services']['game-engine']['environment'][STARTUP_PAUSE_ENV] = 'true'
     model['services']['game-api']['environment'].update(observation.environment(record))
+    qa.apply(model, record)
     validate_model(model, record)
     return model
 
 
 def validate_model(model, record):
+    qa.validate(model, record)
     expected_services = set(SERVICES) | {'gateway-postgres', 'game-postgres', 'gateway-redis', 'game-redis', 'nginx'}
     require(model.get('name') == record['project'] and set(model.get('services', {})) == expected_services,
             'Unexpected project or service')
@@ -382,7 +416,7 @@ def validate_model(model, record):
                 'Unsafe service option')
         require(svc.get('labels') == labels(record) and set(svc.get('networks', {})) == {'local'},
                 'Service ownership/network mismatch')
-        require(svc.get('ports', []) == ([{'target': 443, 'published': '443', 'host_ip': '127.0.0.1', 'protocol': 'tcp'}]
+        require(svc.get('ports', []) == ([{'target': 443, 'published': str(qa.port(record)), 'host_ip': '127.0.0.1', 'protocol': 'tcp'}]
                 if name == 'nginx' else []), 'Only loopback TLS publish is allowed')
         require(svc.get('image') == (image_ref(record, name) if name in SERVICES else
                 'nginx:1.30.5-alpine' if name == 'nginx' else
@@ -413,7 +447,7 @@ def validate_profile_model(model, record):
         return
     api = model['services']['game-api']['environment']
     engine = model['services']['game-engine']['environment']
-    require(all(api.get(key) == value for key, value in TACTICAL_API.items()) and
+    require(all(api.get(key) == value for key, value in {**TACTICAL_API, 'BATTLE_WS_ALLOWED_ORIGINS': qa.origin(record)}.items()) and
             all(engine.get(key) == value for key, value in TACTICAL_ENGINE.items()),
             'Tactical runtime configuration differs from its contract')
     key = tactical_key(api.get(TACTICAL_KEY))
@@ -455,7 +489,9 @@ def assert_owned(record, resources, empty=False):
     require(not empty or not any(resources.values()), 'Project/nonce already exists; fresh resources required')
 
 
-def port_free():
+def port_free(record=None):
+    if record is not None and qa.selected(record):
+        return qa.free_port()
     with socket.socket() as sock:
         try:
             sock.bind(('127.0.0.1', 443))
@@ -470,11 +506,13 @@ def port_free():
                         'Loopback 443 listener or uncertain port state; preserved')
 
 
-def resource_gate(directory, phase):
+def resource_gate(directory, phase, record=None):
     require(phase in ('build', 'startup', 'gateway-repair'), 'Unknown resource phase')
     minimum = {'build': 12, 'startup': 8, 'gateway-repair': 8}[phase]
     require(shutil.disk_usage(directory).free >= minimum * GIB,
             f'At least {minimum} GiB free disk required for {phase}')
+    if record is not None and qa.selected(record):
+        return qa.admission(record, 'build' if phase == 'build' else 'startup')
     info = json.loads(run(['docker', 'info', '--format', '{"NCPU":{{json .NCPU}},"MemTotal":{{json .MemTotal}}}'], timeout=30))
     require(info['NCPU'] >= 2 and info['MemTotal'] >= 6 * GIB, 'Docker needs 2 CPUs and 6 GiB memory')
     # Account for other running stacks without reading their environments or logs.
@@ -496,6 +534,12 @@ def resource_gate(directory, phase):
 @contextlib.contextmanager
 def heavy(meta, record, phase):
     require(phase in ('build', 'startup', 'gateway-repair', 'route-repair', 'cleanup'), 'Unknown resource phase')
+    if qa.selected(record):
+        with qa.lock('host-heavy.lock'):
+            if phase not in ('cleanup', 'route-repair'):
+                resource_gate(record['custody'], phase, record)
+            yield
+        return
     lock = Path(meta).resolve() / '.locks/heavy-run'
     require((Path(meta) / 'bin/start-task').is_file(), 'Managed meta root required')
     lock.parent.mkdir(exist_ok=True)
@@ -637,6 +681,8 @@ def tree_hash(directory):
 
 
 def prepare(args):
+    qa_task = getattr(args, 'hostinger_qa_task', None)
+    qa_option = qa.selection(qa_task) if qa_task is not None else None
     selected_profile = getattr(args, 'profile', 'standard')
     require(selected_profile in ('standard', 'tactical'), 'Unknown local fixture profile')
     selected_pause = startup_paused({'startupPaused': getattr(args, 'startup_paused', False)})
@@ -653,6 +699,9 @@ def prepare(args):
     observation_pins = (observation.source_pins(lambda path: git(args.source, 'show', args.app_sha + ':' + path))
                         if selected_observation else None)
     nginx = git(ROOT, 'show', args.docker_sha + ':infra/nginx/nginx.conf')
+    if qa_option is not None:
+        require(sha(git(ROOT, 'show', args.docker_sha + ':tools/localhost-acceptance/hostinger_qa.py')) ==
+                qa_option['policySha256'], 'Canonical Hostinger QA source required')
     directory = Path(args.custody).absolute()
     map_args = [getattr(args, key, None) for key in ('topdown_bundle', 'topdown_bake_id', 'topdown_manifest_sha256')]
     map_record = None
@@ -670,6 +719,12 @@ def prepare(args):
               'appSha': args.app_sha, 'dockerSha': args.docker_sha, 'nginxSha256': sha(nginx),
               'templateSha256': sha((ROOT / 'docker-compose.localhost-acceptance.yml').read_bytes()),
               'status': 'PREPARED', 'images': {}}
+    if qa_option is not None:
+        record.update(hostingerQA=qa_option, origin=qa.ORIGIN)
+        record['project'] = qa.project(record)
+        nginx = qa.nginx(record, nginx)
+        record['nginxSha256'] = sha(nginx)
+        write_json(directory / 'hostinger-qa.json', {'nonce': nonce, 'selection': qa_option})
     if selected_profile == 'tactical':
         record['profile'] = selected_profile
         record['battleRouting'] = battle_route_binding(record)
@@ -681,7 +736,7 @@ def prepare(args):
         record['topdown'] = map_record
     write_json(directory / 'contract.json', record)
     assert_owned(record, inventory(record), empty=True)
-    port_free()
+    port_free(record)
     if args.clone_source_custody:
         previous, previous_record = load(args.clone_source_custody)
         require(previous_record['appSha'] == record['appSha'], 'Clone source SHA mismatch')
@@ -728,9 +783,16 @@ def prepare(args):
 
 
 def verify_custody_files(directory, record, *, legacy_route=False):
+    if qa.selected(record):
+        require(json.loads(private_path(directory / 'hostinger-qa.json').read_bytes()) ==
+                {'nonce': record['nonce'], 'selection': record['hostingerQA']}, 'Fresh QA selection receipt differs')
+        require(sha(git(ROOT, 'show', record['dockerSha'] + ':tools/localhost-acceptance/hostinger_qa.py')) ==
+                record['hostingerQA']['policySha256'], 'Canonical QA policy source differs')
+    else:
+        require(not (directory / 'hostinger-qa.json').exists(), 'Existing QA custody cannot change selection')
     nginx_file_identity(directory / 'nginx.conf')
     require(sha(private_path(directory / 'nginx.conf').read_bytes()) == record.get('runtimeNginxSha256', record['nginxSha256']) and
-            sha(git(ROOT, 'show', record['dockerSha'] + ':infra/nginx/nginx.conf')) == record['nginxSha256'],
+            sha(qa.nginx(record, git(ROOT, 'show', record['dockerSha'] + ':infra/nginx/nginx.conf'))) == record['nginxSha256'],
             'Canonical nginx mismatch')
     require(('runtimeNginxSha256' not in record and 'runtimeNginxFileIdentity' not in record) or
             'runtimeVerifierHarnessSha256' in record, 'Unbound runtime nginx override')
@@ -797,11 +859,158 @@ def verify_images(record):
         check_image(record, svc, inspect_image(image_ref(record, svc)))
 
 
+QA_BUILDER_FORMAT = ('{"Id":{{json .Id}},"Name":{{json .Name}},"Memory":{{.HostConfig.Memory}},'
+    '"MemorySwap":{{.HostConfig.MemorySwap}},"CgroupParent":{{json .HostConfig.CgroupParent}},'
+    '"CpuQuota":{{.HostConfig.CpuQuota}},"CpuPeriod":{{.HostConfig.CpuPeriod}},"Mounts":{{json .Mounts}}}')
+
+
+def qa_builder_metadata(intent):
+    config = private_path(intent['config'], directory=True)
+    st = config.stat()
+    require([st.st_dev, st.st_ino] == intent['configIdentity'], 'QA builder config replaced')
+    path = config / 'instances' / intent['name']
+    if not path.exists() and not path.is_symlink():
+        return None
+    data = private_path(path).read_bytes()
+    row = json.loads(data)
+    nodes = row.get('Nodes', [])
+    require(row.get('Name') == intent['name'] and row.get('Driver') == 'docker-container' and
+            row.get('Dynamic') is False and len(nodes) == 1 and
+            nodes[0].get('Name') == intent['node'] and nodes[0].get('Endpoint') == intent['endpoint'] and
+            nodes[0].get('DriverOpts') == intent['driverOpts'], 'Foreign QA builder metadata preserved')
+    st = path.stat()
+    return [st.st_dev, st.st_ino, sha(data)]
+
+
+def qa_builder_ids(intent):
+    ids = run(['docker', 'ps', '-aq', '--no-trunc', '--filter', 'name=^/' + intent['container'] + '$']).decode().split()
+    require(len(ids) <= 1 and all(re.fullmatch('[a-f0-9]{64}', cid) for cid in ids),
+            'Invalid QA builder container identity')
+    return ids
+
+
+def qa_builder_container(intent, cid):
+    row = json.loads(run(['docker', 'inspect', '--format', QA_BUILDER_FORMAT, cid]))
+    require(row.get('Id') == cid and row.get('Name') == '/' + intent['container'],
+            'Foreign QA builder container preserved')
+    require(all(row.get(k) == v for k, v in {
+        'Memory': qa.BUILD_MEMORY, 'MemorySwap': qa.BUILD_MEMORY, 'CgroupParent': qa.CGROUP,
+        'CpuQuota': 100000, 'CpuPeriod': 100000}.items()), 'QA builder actual cgroup/caps differ')
+    return row
+
+
+def qa_builder_volume(intent):
+    names = run(['docker', 'volume', 'ls', '-q', '--filter', 'name=^' + intent['volume'] + '$']).decode().split()
+    require(names in ([], [intent['volume']]), 'Foreign QA builder volume preserved')
+    if not names:
+        return None
+    row = json.loads(run(['docker', 'volume', 'inspect', '--format',
+        '{"Name":{{json .Name}},"Driver":{{json .Driver}},"CreatedAt":{{json .CreatedAt}},'
+        '"Labels":{{json .Labels}},"Options":{{json .Options}}}', intent['volume']]))
+    require(row.get('Name') == intent['volume'] and row.get('Driver') == 'local' and
+            row.get('CreatedAt') and not row.get('Labels') and not row.get('Options'),
+            'Foreign QA builder state volume preserved')
+    return row
+
+
+def qa_builder_cleanup(intent, metadata, cid, bootstrap_attempted):
+    # No cleanup admission: exhausted capacity must not prevent reconciliation.
+    current = qa_builder_metadata(intent)
+    require(metadata is None or current == metadata, 'QA builder metadata changed; preserved')
+    ids = qa_builder_ids(intent)
+    require(cid is None or ids in ([], [cid]), 'QA builder container replaced; preserved')
+    volume = qa_builder_volume(intent)
+    if current is None:
+        require(not ids and volume is None, 'QA builder ownership missing; resources preserved')
+        return
+    if ids:
+        row = qa_builder_container(intent, ids[0])
+        require(volume is not None and any(m.get('Type') == 'volume' and m.get('Name') == intent['volume'] and
+                m.get('Destination') == '/var/lib/buildkit' for m in row.get('Mounts', [])),
+                'QA builder state mount differs; preserved')
+    else:
+        # A cancelled bootstrap can leave a daemon request in flight even after
+        # its CLI/plugin is reaped. An empty query is not proof of quiescence.
+        require(not bootstrap_attempted, 'QA builder bootstrap outcome unconfirmed; preserved')
+        require(volume is None, 'Unbound QA builder state volume preserved')
+    require(qa_builder_metadata(intent) == current, 'QA builder metadata changed; preserved')
+    if ids:
+        require(qa_builder_ids(intent) == ids, 'QA builder container replaced; preserved')
+        run(['docker', 'container', 'rm', '-f', ids[0]], timeout=180)
+    require(not qa_builder_ids(intent), 'QA builder container cleanup incomplete')
+    if volume is not None:
+        require(qa_builder_volume(intent) == volume, 'QA builder state volume replaced; preserved')
+        # Never force volume removal; Docker refuses a newly mounted/in-use volume.
+        run(['docker', 'volume', 'rm', intent['volume']], timeout=180)
+    require(qa_builder_volume(intent) is None, 'QA builder volume cleanup incomplete')
+    require(qa_builder_metadata(intent) == current, 'QA builder metadata changed; preserved')
+    # Metadata-only removal: Buildx must never delete a mutable container name.
+    run(['docker', 'buildx', 'rm', '--force', '--keep-daemon', intent['name']],
+        timeout=180, buildx_config=intent['config'])
+    require(qa_builder_metadata(intent) is None and not qa_builder_ids(intent) and
+            qa_builder_volume(intent) is None, 'QA builder cleanup incomplete')
+
+
+@contextlib.contextmanager
+def qa_builder(directory, record):
+    if not qa.selected(record):
+        yield None
+        return
+    require(not list(directory.glob('qa-buildx-*-cleanup-required.json')),
+            'QA builder cleanup-required from a prior attempt; preserved')
+    name = 'opensamguk-qa-build-' + record['nonce']
+    container = 'buildx_buildkit_' + name + '0'
+    existing = run(['docker', 'buildx', 'ls', '--format', '{{.Name}}']).decode().split()
+    require(name not in existing and not run(['docker', 'ps', '-aq', '--filter', 'name=^/' + container + '$']).strip(),
+            'QA builder already exists; preserved')
+    qa.admission(record, 'build')
+    # Per-attempt private store and unpredictable node: never adopt a shared builder.
+    config = directory / ('qa-buildx-' + secrets.token_hex(16))
+    config.mkdir(mode=0o700)
+    st = private_path(config, directory=True).stat()
+    node = 'osgqa-' + secrets.token_hex(16)
+    endpoint = local_docker_endpoint()
+    intent = {'name': name, 'node': node, 'config': str(config), 'configIdentity': [st.st_dev, st.st_ino],
+              'container': 'buildx_buildkit_' + node, 'endpoint': endpoint,
+              'driverOpts': {'cgroup-parent': qa.CGROUP, 'memory': '2g', 'memory-swap': '2g',
+                             'cpu-period': '100000', 'cpu-quota': '100000'}}
+    intent['volume'] = intent['container'] + '_state'
+    require(not qa_builder_ids(intent) and qa_builder_volume(intent) is None, 'QA builder node already exists; preserved')
+    write_json(config / 'ownership-intent.json', {**intent, **labels(record), 'project': record['project']})
+    metadata, cid, bootstrap_attempted = None, None, False
+    try:
+        command = ['docker', 'buildx', 'create', '--name', name, '--node', node, '--driver', 'docker-container']
+        for key, value in intent['driverOpts'].items():
+            command += ['--driver-opt', key + '=' + value]
+        run([*command, endpoint], timeout=60, buildx_config=config)
+        metadata = qa_builder_metadata(intent)
+        require(metadata is not None, 'QA builder metadata missing after create')
+        bootstrap_attempted = True
+        run(['docker', 'buildx', 'inspect', '--bootstrap', name], timeout=180,
+            log_path=directory / ('qa-builder-' + secrets.token_hex(4) + '.log'), buildx_config=config)
+        ids = qa_builder_ids(intent)
+        require(len(ids) == 1, 'QA builder container missing after bootstrap')
+        qa_builder_container(intent, ids[0])
+        cid = ids[0]
+        yield {'name': name, 'config': config}
+    finally:
+        try:
+            qa_builder_cleanup(intent, metadata, cid, bootstrap_attempted)
+        except BaseException as error:
+            # Covers interruption of cleanup itself; never imply successful absence.
+            try:
+                write_json(directory / (config.name + '-cleanup-required.json'), {'status': 'cleanup-required',
+                           'errorType': type(error).__name__, 'builder': name, 'node': node})
+            except OSError:
+                pass  # Still raise an explicit status if custody is no longer writable.
+            raise Refused('QA builder cleanup-required; private ownership intent and resources preserved') from error
+
+
 def build(args):
     directory, record = load(args.custody)
     require(record['status'] in ('PREPARED', 'BUILDING'), 'Stack already built/started')
     verify_files(directory, record)
-    with heavy(args.meta, record, 'build'):
+    with heavy(args.meta, record, 'build'), qa_builder(directory, record) as builder:
         assert_owned(record, inventory(record), empty=True)
         record['status'] = 'BUILDING'
         write_json(directory / 'contract.json', record, replace=True)
@@ -821,12 +1030,14 @@ def build(args):
             if svc in record['images']:
                 check_image(record, svc, inspect_image(image_ref(record, svc)))
                 continue
-            resource_gate(directory, 'build')
+            resource_gate(directory, 'build', record) if qa.selected(record) else resource_gate(directory, 'build')
             verify_files(directory, record)
             existing = run(['docker', 'image', 'ls', '-q', '--filter', 'reference=' + image_ref(record, svc)])
             require(not existing.strip(), 'Unrecorded image already exists; preserved')
             command = ['docker', 'build', '--progress=plain', '-f', str(directory / 'source/docker' / (svc + '.Dockerfile')),
                        '-t', image_ref(record, svc)]
+            if builder:
+                command = ['docker', 'buildx', 'build', '--builder', builder['name'], '--load', *command[2:]]
             for k, v in build_args(record, svc).items():
                 command += ['--build-arg', k + '=' + v]
             for k, v in image_metadata(record, svc, {}).items():
@@ -834,7 +1045,8 @@ def build(args):
             command += [str(directory / 'source')]
             print('Building ' + svc, flush=True)
             # Build output contains no fixture values; keep it private and never echo errors.
-            run(command, timeout=3600, log_path=directory / (svc + '.build.log'))
+            run(command, timeout=3600, log_path=directory / (svc + '.build.log'),
+                **({'buildx_config': builder['config']} if builder else {}))
             image = inspect_image(image_ref(record, svc))
             record['images'][svc] = {'imageId': image['Id'], 'dockerfileSha256': image_metadata(record, svc, {})['org.opensamguk.local.dockerfile'],
                                      'buildArgs': build_args(record, svc)}
@@ -898,8 +1110,10 @@ def verify_running(record, resources, model, *, bootstrap=False):
         networks = row['NetworkSettings']['Networks']
         require(set(networks) == {record['project'] + '_local'}, 'Foreign runtime network')
         ports = row['HostConfig'].get('PortBindings') or {}
-        require(ports == ({'443/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '443'}]} if svc == 'nginx' else {}),
+        require(ports == ({'443/tcp': [{'HostIp': '127.0.0.1', 'HostPort': str(qa.port(record))}]} if svc == 'nginx' else {}),
                 'Runtime port binding differs')
+        if qa.selected(record):
+            qa.runtime_cap(row, svc)
         verify_mounts(row.get('Mounts', []), model['services'][svc], model)
     for row in resources['network']:
         require(row.get('Driver') == 'bridge', 'Foreign runtime network driver')
@@ -1056,11 +1270,13 @@ def up(args):
     verify_images(record)
     with heavy(args.meta, record, 'startup'):
         assert_owned(record, inventory(record), empty=True)
-        port_free()
+        port_free(record)
         # config output contains credentials and stays in process memory.
         normalized = json.loads(compose(directory, record, 'config', '--format', 'json'))
         require(normalized['name'] == record['project'] and set(normalized['services']) == set(model['services']),
                 'Compose normalization changed identity')
+        if qa.selected(record):
+            qa.normalized(normalized, model, record)
         initial_free = shutil.disk_usage(directory).free
         write_json(directory / 'startup-disk.json', {'startupFreeBytes': initial_free})
         record['status'] = 'STARTING'
@@ -1138,13 +1354,15 @@ def route_resource_ids(resources):
 def wait_tactical_route(directory, record):
     context = ssl.create_default_context(cafile=str(directory / 'certs/opensamguk.crt'))
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context))
+    if qa.selected(record):
+        opener.add_handler(ObservationNoRedirect())
     deadline = time.monotonic() + 30
     while True:
         statuses = []
         for prefix in ('/api/battle-ws', '/ws/battles'):
             for sid in (record['serverId'], 'foreign'):
                 try:
-                    with opener.open(ORIGIN + prefix + '/' + sid + '/160/probe', timeout=3) as response:
+                    with opener.open(qa.origin(record) + prefix + '/' + sid + '/160/probe', timeout=3) as response:
                         statuses.append(response.status)
                 except urllib.error.HTTPError as error:
                     statuses.append(error.code)
@@ -1328,7 +1546,7 @@ def observation_smoke(directory, record, model, opener):
     observation.validate_status(observation_status(directory, record, 'game-api', observation.ORIGIN), binding, time.time())
     # The public response need not claim RUNNING: PAUSED/STALLED are valid observed states.
     try:
-        with opener.open(ORIGIN + '/api/server-basic-info/' + record['serverId'], timeout=5) as response:
+        with opener.open(qa.origin(record) + '/api/server-basic-info/' + record['serverId'], timeout=5) as response:
             require(response.status == 200, 'Public collector HTTP probe failed')
             payload = observation.decode(response.read(65537))
         observation.validate_public(payload, binding, time.time())
@@ -1420,6 +1638,12 @@ def startup_pause_smoke(directory, record):
 
 def smoke(args, *, finalize=True):
     directory, record = load(args.custody)
+    with qa.lock('browser.lock') if qa.selected(record) else contextlib.nullcontext():
+        return smoke_locked(args, finalize=finalize)
+
+
+def smoke_locked(args, *, finalize=True):
+    directory, record = load(args.custody)
     model = verify_files(directory, record)
     verify_images(record)
     verify_running(record, inventory(record), model)
@@ -1427,14 +1651,14 @@ def smoke(args, *, finalize=True):
             log_path=directory / ('nginx-test-' + secrets.token_hex(4) + '.log'))
     context = ssl.create_default_context(cafile=str(directory / 'certs/opensamguk.crt'))
     handlers = [urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context)]
-    if observation.selected(record) is not None:
+    if observation.selected(record) is not None or qa.selected(record):
         handlers.append(ObservationNoRedirect())
     opener = urllib.request.build_opener(*handlers)
     checks = [('/health', {200}), ('/api/gateway/auth/me', {401}), *battle_boundary_checks(record),
               ('/d_pic/.ops/private', {404}), ('/game/', {404}), ('/', {200})]
     for path, expected in checks:
         try:
-            with opener.open(ORIGIN + path, timeout=30) as response:
+            with opener.open(qa.origin(record) + path, timeout=30) as response:
                 status = response.status
         except urllib.error.HTTPError as e:
             status = e.code
@@ -1540,6 +1764,7 @@ def main():
     p.add_argument('--app-sha', required=True)
     p.add_argument('--docker-sha', required=True)
     p.add_argument('--custody', required=True, type=Path)
+    p.add_argument('--hostinger-qa-task', help='Fresh-only fixed localhost:18443/cgroup policy; exact t_<8hex> task ID')
     p.add_argument('--profile', choices=('standard', 'tactical'), default='standard',
                    help='Explicit opt-in for a new fixture; never modifies an existing custody')
     p.add_argument('--startup-paused', action='store_true',
@@ -1572,9 +1797,9 @@ def main():
             print('Owned source/config validated')
         else:
             globals()[args.command.replace('-', '_')](args)
-    except (Refused, OSError, ValueError, KeyError, TypeError, EOFError) as e:
+    except (Refused, qa.Refused, OSError, ValueError, KeyError, TypeError, EOFError) as e:
         # Never print child exceptions, config values, tokens or arbitrary untrusted filenames.
-        print('REFUSED: ' + str(e) if isinstance(e, (Refused, topdown.Refused, observation.Refused)) else 'REFUSED: invalid input or unavailable dependency; custody preserved')
+        print('REFUSED: ' + str(e) if isinstance(e, (Refused, qa.Refused, topdown.Refused, observation.Refused)) else 'REFUSED: invalid input or unavailable dependency; custody preserved')
         return 1
     return 0
 

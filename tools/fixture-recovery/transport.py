@@ -95,6 +95,11 @@ class LocalIO:
 
     def user_probe(self, custody, identity, general_id, request_id):
         """Normal USER login only, without register/join/SQL repair or returned credentials."""
+        contract_path = Path(custody) / 'contract.json'
+        record = json.loads(private(contract_path).read_bytes()) if contract_path.exists() else identity
+        origin = record.get('origin', 'https://localhost')
+        need(origin == identity.get('origin', 'https://localhost') and
+             origin == ('https://localhost:18443' if 'hostingerQA' in record else 'https://localhost'), 'USER_PROBE_ORIGIN')
         fixture = json.loads(private(Path(custody) / 'fixture.json').read_bytes())
         context = ssl.create_default_context(cafile=str(Path(custody) / 'certs/opensamguk.crt'))
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect(),
@@ -102,20 +107,18 @@ class LocalIO:
             urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
         def request(path, body=None, json_body=True):
             payload = None if body is None else json.dumps(body).encode()
-            req = urllib.request.Request('https://localhost' + path, data=payload,
+            req = urllib.request.Request(origin + path, data=payload,
                 headers={'Content-Type': 'application/json'}, method='GET' if body is None else 'POST')
             with opener.open(req, timeout=30) as response:
                 need(response.status == 200, 'HTTP_STATUS')
                 raw = response.read(4 * 1024 * 1024)
                 return json.loads(raw) if json_body else True
         request('/health', json_body=False)
-        contract_path = Path(custody) / 'contract.json'
-        record = json.loads(private(contract_path).read_bytes()) if contract_path.exists() else identity
         need(record.get('serverId') == identity['serverId'], 'USER_PROBE_IDENTITY')
         for path, status in [('/api/gateway/auth/me', 401), *route.boundaries(record),
             ('/d_pic/.ops/private', 404), ('/game/', 404), ('/', 200)]:
             try:
-                with opener.open('https://localhost' + path, timeout=30) as response:
+                with opener.open(origin + path, timeout=30) as response:
                     need(response.status == status, 'BOUNDARY_STATUS')
             except urllib.error.HTTPError as error:
                 code = error.code
