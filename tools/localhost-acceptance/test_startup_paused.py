@@ -194,7 +194,7 @@ class StartupPauseTests(unittest.TestCase):
             record = copy.deepcopy(base)
             payload = self.payload(); payload['paused'] = paused
             opener = MagicMock()
-            statuses = (200, 401, 403, 404, 404, 200)
+            statuses = (200, 401, 403, 404, 404, 404, 403, 404, 404, 404, 404, 404, 200)
             responses = [MagicMock() for _ in statuses]
             for response, status in zip(responses, statuses): response.__enter__.return_value.status = status
             opener.open.side_effect = responses
