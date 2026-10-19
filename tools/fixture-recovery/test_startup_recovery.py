@@ -1,28 +1,24 @@
 """Combined startup/tactical/map fixtures. Every runtime operation uses the stateful fake CLI."""
-import base64
 import copy
 import unittest
 
 import recovery as r
 import test_topdown_recovery as mapped
+import test_runtime_binding as routed
 from storage import read, write, digest
 
 
 class StartupRecoveryTests(unittest.TestCase):
     def setUp(self):
         mapped.SelectedRecoveryTests.setUp(self)
-        self.record.update(startupPaused=True, profile='tactical')
-        fixtures = read(self.source / 'runtime.json')
-        fixtures[r.fresh.TACTICAL_KEY] = base64.b64encode(b'z' * 32).decode()
-        write(self.source / 'runtime.json', fixtures, replace=True)
-        self.model = r.fresh.model_for(self.record, fixtures)
-        write(self.source / 'compose.json', self.model, replace=True)
-        self.record['configSha256'] = digest(self.source / 'compose.json')
-        write(self.source / 'contract.json', self.record, replace=True)
-        self.io.install(self.record, self.model)
+        routed.RuntimeBindingTests.reviewed_route_fixture(self)
+
+    git = routed.RuntimeBindingTests.git
 
     backup = mapped.SelectedRecoveryTests.backup
-    version = mapped.SelectedRecoveryTests.version
+    def version(self):
+        self.version_sources = dict(self.map.sources)
+        return routed.RuntimeBindingTests.version(self)
 
     def test_combined_A_B_A_keeps_pause_profile_private_map_and_environment_without_resume(self):
         self.backup(); version = self.version()

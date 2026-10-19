@@ -19,6 +19,9 @@ from test_transport import Response
 class RuntimeBindingTests(unittest.TestCase):
     def setUp(self):
         base.RecoveryTests.setUp(self)
+        self.reviewed_route_fixture()
+
+    def reviewed_route_fixture(self):
         self.verifier = newdir(self.root / 'verifier')
         newdir(self.verifier / 'tools'); newdir(self.verifier / 'tools/localhost-acceptance')
         self.harness = b'FAKE REVIEWED PUBLIC HARNESS'
@@ -28,11 +31,16 @@ class RuntimeBindingTests(unittest.TestCase):
         patched.start(); self.addCleanup(patched.stop)
         self.dirty = False
         self.head = route.VERIFIER_HEAD
-        self.old_nginx = (r.ROOT / 'infra/nginx/nginx.conf').read_bytes()
+        # The legacy proof starts at d35, independently of later canonical main routes.
+        self.old_nginx = (Path(__file__).parent / 'fixtures/nginx-d35.conf').read_bytes()
+        self.assertEqual(hashlib.sha256(self.old_nginx).hexdigest(),
+                         'e2a4a6fa66cf4a2583b83f90a7d38c13c6e7dad02e163f6974fc6029f83f4268')
         pattern = b'location ~ "^/api/battle-ws/'
         block = b'        location /api/battle-ws/ {\n            access_log off;\n            return 404;\n        }\n'
         alias = b'        location = /ws/battles {\n            access_log off;\n            return 404;\n        }\n        location /ws/battles/ {\n            access_log off;\n            return 404;\n        }\n'
         self.new_nginx = self.old_nginx.replace(pattern, b'location ~ "^/(?:api/battle-ws|ws/battles)/').replace(block, block + alias)
+        self.assertEqual(hashlib.sha256(self.new_nginx).hexdigest(),
+                         'd23ce61bb12751acb806e04cacd39bf73255bcd186c61171deb032cc7a753900')
         patched = patch.object(r.fresh, 'git', side_effect=self.git)
         patched.start(); self.addCleanup(patched.stop)
         self.record.update(dockerSha=route.BUILD_HEAD, profile='tactical', startupPaused=True,
@@ -81,6 +89,9 @@ class RuntimeBindingTests(unittest.TestCase):
                 if args[1].endswith(':tools/localhost-acceptance/harness.py'): return self.harness
                 return self.old_nginx if args[1].startswith(route.BUILD_HEAD + ':') else self.new_nginx
         if args[0] == 'show' and ':docker/' in args[-1]: return b'FROM fixture'
+        if args[0] == 'show':
+            path = args[-1].split(':', 1)[-1]
+            if path in getattr(self, 'version_sources', {}): return self.version_sources[path]
         raise AssertionError('Unexpected synthetic public Git request')
 
     def version(self):
