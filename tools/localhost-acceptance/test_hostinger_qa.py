@@ -10,6 +10,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from test_qa_builder import BuilderCLI
 
 spec = importlib.util.spec_from_file_location('hostinger_test_harness', Path(__file__).with_name('harness.py'))
 h = importlib.util.module_from_spec(spec)
@@ -197,21 +198,17 @@ class HostingerTests(unittest.TestCase):
 
     def test_qa_builder_bounds_and_cleanup_even_when_build_raises(self):
         record = self.qa_record()
-        calls = []
+        cli = BuilderCLI(h)
         name = 'opensamguk-qa-build-' + record['nonce']
-        def run(args, **kwargs):
-            calls.append(args)
-            if args[:2] == ['docker', 'inspect']:
-                return json.dumps({'Name':'/buildx_buildkit_'+name+'0','Memory':q.BUILD_MEMORY,'MemorySwap':q.BUILD_MEMORY,'CgroupParent':q.CGROUP,'CpuQuota':100000,'CpuPeriod':100000}).encode()
-            return b''
-        with patch.object(q, 'admission'), patch.object(h, 'run', side_effect=run):
+        with patch.object(q, 'admission'), patch.object(h, 'run', side_effect=cli):
             with self.assertRaisesRegex(RuntimeError, 'synthetic'), h.qa_builder(self.directory, record) as actual:
-                self.assertEqual(name, actual)
+                self.assertEqual(name, actual['name'])
                 raise RuntimeError('synthetic')
+        calls = [args for args, kwargs in cli.calls]
         create = next(a for a in calls if a[:3] == ['docker','buildx','create'])
         for option in ('cgroup-parent=user-999.slice','memory=2g','memory-swap=2g','cpu-quota=100000','cpu-period=100000'):
             self.assertIn(option, create)
-        self.assertIn(['docker','buildx','rm','--force',name], calls)
+        self.assertIn(['docker','buildx','rm','--force','--keep-daemon',name], calls)
 
     def test_builder_collision_is_preserved_not_removed(self):
         name = 'opensamguk-qa-build-' + self.record['nonce']

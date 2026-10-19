@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -84,30 +85,54 @@ def require(condition, message):
         raise Refused(message)
 
 
-def run(args, *, input=None, timeout=60, cwd=None, log_path=None):
+def local_docker_endpoint():
+    endpoint = os.environ.get('DOCKER_HOST') if not os.environ.get('DOCKER_CONTEXT') else None
+    if endpoint is None:
+        endpoint = run(['docker', 'context', 'inspect', '--format', '{{.Endpoints.docker.Host}}']).decode().strip()
+    require(endpoint.startswith('unix:///') and '\n' not in endpoint, 'Only a local Unix Docker endpoint is allowed')
+    return endpoint
+
+
+def run(args, *, input=None, timeout=60, cwd=None, log_path=None, buildx_config=None):
     # Never echo argv, child output or environment: these may contain new fixtures.
     env = {k: os.environ[k] for k in ('PATH', 'HOME', 'TMPDIR', 'DOCKER_HOST',
            'DOCKER_CONTEXT', 'DOCKER_CONFIG', 'SSH_AUTH_SOCK') if k in os.environ}
     env.update(LANG='C.UTF-8', COMPOSE_DISABLE_ENV_FILE='1', NEXT_TELEMETRY_DISABLED='1')
+    if buildx_config is not None:
+        require(args[:2] == ['docker', 'buildx'], 'Private Buildx config is only for Buildx commands')
+        env['BUILDX_CONFIG'] = str(private_path(buildx_config, directory=True))
     if args[0] == 'docker' and args[1:3] != ['context', 'inspect']:
         # DOCKER_CONTEXT overrides DOCKER_HOST; a remote daemon would violate localhost custody.
-        endpoint = env.get('DOCKER_HOST') if not env.get('DOCKER_CONTEXT') else None
-        if endpoint is None:
-            endpoint = run(['docker', 'context', 'inspect', '--format', '{{.Endpoints.docker.Host}}']).decode().strip()
-        require(endpoint.startswith('unix:///') and '\n' not in endpoint, 'Only a local Unix Docker endpoint is allowed')
+        local_docker_endpoint()
     log = None
     try:
         if log_path is not None:
             log = os.fdopen(os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), 'wb')
-        p = subprocess.run(args, input=input, stdout=log if log else subprocess.PIPE,
-                           stderr=subprocess.STDOUT if log else subprocess.PIPE, cwd=cwd, env=env, timeout=timeout)
+        if buildx_config is not None:
+            # Kill the owned CLI/plugin group before checking for late metadata.
+            p = subprocess.Popen(args, stdin=subprocess.PIPE if input is not None else None,
+                stdout=log if log else subprocess.PIPE, stderr=subprocess.STDOUT if log else subprocess.PIPE,
+                cwd=cwd, env=env, start_new_session=True)
+            try:
+                output, _ = p.communicate(input=input, timeout=timeout)
+            except BaseException:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                p.wait()
+                raise
+        else:
+            p = subprocess.run(args, input=input, stdout=log if log else subprocess.PIPE,
+                               stderr=subprocess.STDOUT if log else subprocess.PIPE, cwd=cwd, env=env, timeout=timeout)
+            output = p.stdout
     except subprocess.TimeoutExpired:
         raise Refused('Command timed out; owned resources and custody preserved') from None
     finally:
         if log is not None:
             log.close()
     require(p.returncode == 0, 'Command failed; private output suppressed, custody preserved')
-    return p.stdout or b''
+    return output or b''
 
 
 def git(repo, *args):
@@ -834,39 +859,151 @@ def verify_images(record):
         check_image(record, svc, inspect_image(image_ref(record, svc)))
 
 
+QA_BUILDER_FORMAT = ('{"Id":{{json .Id}},"Name":{{json .Name}},"Memory":{{.HostConfig.Memory}},'
+    '"MemorySwap":{{.HostConfig.MemorySwap}},"CgroupParent":{{json .HostConfig.CgroupParent}},'
+    '"CpuQuota":{{.HostConfig.CpuQuota}},"CpuPeriod":{{.HostConfig.CpuPeriod}},"Mounts":{{json .Mounts}}}')
+
+
+def qa_builder_metadata(intent):
+    config = private_path(intent['config'], directory=True)
+    st = config.stat()
+    require([st.st_dev, st.st_ino] == intent['configIdentity'], 'QA builder config replaced')
+    path = config / 'instances' / intent['name']
+    if not path.exists() and not path.is_symlink():
+        return None
+    data = private_path(path).read_bytes()
+    row = json.loads(data)
+    nodes = row.get('Nodes', [])
+    require(row.get('Name') == intent['name'] and row.get('Driver') == 'docker-container' and
+            row.get('Dynamic') is False and len(nodes) == 1 and
+            nodes[0].get('Name') == intent['node'] and nodes[0].get('Endpoint') == intent['endpoint'] and
+            nodes[0].get('DriverOpts') == intent['driverOpts'], 'Foreign QA builder metadata preserved')
+    st = path.stat()
+    return [st.st_dev, st.st_ino, sha(data)]
+
+
+def qa_builder_ids(intent):
+    ids = run(['docker', 'ps', '-aq', '--no-trunc', '--filter', 'name=^/' + intent['container'] + '$']).decode().split()
+    require(len(ids) <= 1 and all(re.fullmatch('[a-f0-9]{64}', cid) for cid in ids),
+            'Invalid QA builder container identity')
+    return ids
+
+
+def qa_builder_container(intent, cid):
+    row = json.loads(run(['docker', 'inspect', '--format', QA_BUILDER_FORMAT, cid]))
+    require(row.get('Id') == cid and row.get('Name') == '/' + intent['container'],
+            'Foreign QA builder container preserved')
+    require(all(row.get(k) == v for k, v in {
+        'Memory': qa.BUILD_MEMORY, 'MemorySwap': qa.BUILD_MEMORY, 'CgroupParent': qa.CGROUP,
+        'CpuQuota': 100000, 'CpuPeriod': 100000}.items()), 'QA builder actual cgroup/caps differ')
+    return row
+
+
+def qa_builder_volume(intent):
+    names = run(['docker', 'volume', 'ls', '-q', '--filter', 'name=^' + intent['volume'] + '$']).decode().split()
+    require(names in ([], [intent['volume']]), 'Foreign QA builder volume preserved')
+    if not names:
+        return None
+    row = json.loads(run(['docker', 'volume', 'inspect', '--format',
+        '{"Name":{{json .Name}},"Driver":{{json .Driver}},"CreatedAt":{{json .CreatedAt}},'
+        '"Labels":{{json .Labels}},"Options":{{json .Options}}}', intent['volume']]))
+    require(row.get('Name') == intent['volume'] and row.get('Driver') == 'local' and
+            row.get('CreatedAt') and not row.get('Labels') and not row.get('Options'),
+            'Foreign QA builder state volume preserved')
+    return row
+
+
+def qa_builder_cleanup(intent, metadata, cid, bootstrap_attempted):
+    # No cleanup admission: exhausted capacity must not prevent reconciliation.
+    current = qa_builder_metadata(intent)
+    require(metadata is None or current == metadata, 'QA builder metadata changed; preserved')
+    ids = qa_builder_ids(intent)
+    require(cid is None or ids in ([], [cid]), 'QA builder container replaced; preserved')
+    volume = qa_builder_volume(intent)
+    if current is None:
+        require(not ids and volume is None, 'QA builder ownership missing; resources preserved')
+        return
+    if ids:
+        row = qa_builder_container(intent, ids[0])
+        require(volume is not None and any(m.get('Type') == 'volume' and m.get('Name') == intent['volume'] and
+                m.get('Destination') == '/var/lib/buildkit' for m in row.get('Mounts', [])),
+                'QA builder state mount differs; preserved')
+    else:
+        # A cancelled bootstrap can leave a daemon request in flight even after
+        # its CLI/plugin is reaped. An empty query is not proof of quiescence.
+        require(not bootstrap_attempted, 'QA builder bootstrap outcome unconfirmed; preserved')
+        require(volume is None, 'Unbound QA builder state volume preserved')
+    require(qa_builder_metadata(intent) == current, 'QA builder metadata changed; preserved')
+    if ids:
+        require(qa_builder_ids(intent) == ids, 'QA builder container replaced; preserved')
+        run(['docker', 'container', 'rm', '-f', ids[0]], timeout=180)
+    require(not qa_builder_ids(intent), 'QA builder container cleanup incomplete')
+    if volume is not None:
+        require(qa_builder_volume(intent) == volume, 'QA builder state volume replaced; preserved')
+        # Never force volume removal; Docker refuses a newly mounted/in-use volume.
+        run(['docker', 'volume', 'rm', intent['volume']], timeout=180)
+    require(qa_builder_volume(intent) is None, 'QA builder volume cleanup incomplete')
+    require(qa_builder_metadata(intent) == current, 'QA builder metadata changed; preserved')
+    # Metadata-only removal: Buildx must never delete a mutable container name.
+    run(['docker', 'buildx', 'rm', '--force', '--keep-daemon', intent['name']],
+        timeout=180, buildx_config=intent['config'])
+    require(qa_builder_metadata(intent) is None and not qa_builder_ids(intent) and
+            qa_builder_volume(intent) is None, 'QA builder cleanup incomplete')
+
+
 @contextlib.contextmanager
 def qa_builder(directory, record):
     if not qa.selected(record):
         yield None
         return
+    require(not list(directory.glob('qa-buildx-*-cleanup-required.json')),
+            'QA builder cleanup-required from a prior attempt; preserved')
     name = 'opensamguk-qa-build-' + record['nonce']
     container = 'buildx_buildkit_' + name + '0'
     existing = run(['docker', 'buildx', 'ls', '--format', '{{.Name}}']).decode().split()
     require(name not in existing and not run(['docker', 'ps', '-aq', '--filter', 'name=^/' + container + '$']).strip(),
             'QA builder already exists; preserved')
     qa.admission(record, 'build')
-    created = False
+    # Per-attempt private store and unpredictable node: never adopt a shared builder.
+    config = directory / ('qa-buildx-' + secrets.token_hex(16))
+    config.mkdir(mode=0o700)
+    st = private_path(config, directory=True).stat()
+    node = 'osgqa-' + secrets.token_hex(16)
+    endpoint = local_docker_endpoint()
+    intent = {'name': name, 'node': node, 'config': str(config), 'configIdentity': [st.st_dev, st.st_ino],
+              'container': 'buildx_buildkit_' + node, 'endpoint': endpoint,
+              'driverOpts': {'cgroup-parent': qa.CGROUP, 'memory': '2g', 'memory-swap': '2g',
+                             'cpu-period': '100000', 'cpu-quota': '100000'}}
+    intent['volume'] = intent['container'] + '_state'
+    require(not qa_builder_ids(intent) and qa_builder_volume(intent) is None, 'QA builder node already exists; preserved')
+    write_json(config / 'ownership-intent.json', {**intent, **labels(record), 'project': record['project']})
+    metadata, cid, bootstrap_attempted = None, None, False
     try:
-        run(['docker', 'buildx', 'create', '--name', name, '--driver', 'docker-container',
-             '--driver-opt', 'cgroup-parent=' + qa.CGROUP, '--driver-opt', 'memory=2g',
-             '--driver-opt', 'memory-swap=2g', '--driver-opt', 'cpu-period=100000',
-             '--driver-opt', 'cpu-quota=100000'], timeout=60)
-        created = True
+        command = ['docker', 'buildx', 'create', '--name', name, '--node', node, '--driver', 'docker-container']
+        for key, value in intent['driverOpts'].items():
+            command += ['--driver-opt', key + '=' + value]
+        run([*command, endpoint], timeout=60, buildx_config=config)
+        metadata = qa_builder_metadata(intent)
+        require(metadata is not None, 'QA builder metadata missing after create')
+        bootstrap_attempted = True
         run(['docker', 'buildx', 'inspect', '--bootstrap', name], timeout=180,
-            log_path=directory / ('qa-builder-' + secrets.token_hex(4) + '.log'))
-        cap = json.loads(run(['docker', 'inspect', '--format',
-            '{"Name":{{json .Name}},"Memory":{{.HostConfig.Memory}},"MemorySwap":{{.HostConfig.MemorySwap}},'
-            '"CgroupParent":{{json .HostConfig.CgroupParent}},"CpuQuota":{{.HostConfig.CpuQuota}},'
-            '"CpuPeriod":{{.HostConfig.CpuPeriod}}}', container]))
-        require(cap == {'Name': '/' + container, 'Memory': qa.BUILD_MEMORY, 'MemorySwap': qa.BUILD_MEMORY,
-                        'CgroupParent': qa.CGROUP, 'CpuQuota': 100000, 'CpuPeriod': 100000},
-                'QA builder actual cgroup/caps differ')
-        yield name
+            log_path=directory / ('qa-builder-' + secrets.token_hex(4) + '.log'), buildx_config=config)
+        ids = qa_builder_ids(intent)
+        require(len(ids) == 1, 'QA builder container missing after bootstrap')
+        qa_builder_container(intent, ids[0])
+        cid = ids[0]
+        yield {'name': name, 'config': config}
     finally:
-        if created:
-            run(['docker', 'buildx', 'rm', '--force', name], timeout=180)
-            require(not run(['docker', 'ps', '-aq', '--filter', 'name=^/' + container + '$']).strip(),
-                    'QA builder cleanup incomplete')
+        try:
+            qa_builder_cleanup(intent, metadata, cid, bootstrap_attempted)
+        except BaseException as error:
+            # Covers interruption of cleanup itself; never imply successful absence.
+            try:
+                write_json(directory / (config.name + '-cleanup-required.json'), {'status': 'cleanup-required',
+                           'errorType': type(error).__name__, 'builder': name, 'node': node})
+            except OSError:
+                pass  # Still raise an explicit status if custody is no longer writable.
+            raise Refused('QA builder cleanup-required; private ownership intent and resources preserved') from error
 
 
 def build(args):
@@ -900,7 +1037,7 @@ def build(args):
             command = ['docker', 'build', '--progress=plain', '-f', str(directory / 'source/docker' / (svc + '.Dockerfile')),
                        '-t', image_ref(record, svc)]
             if builder:
-                command = ['docker', 'buildx', 'build', '--builder', builder, '--load', *command[2:]]
+                command = ['docker', 'buildx', 'build', '--builder', builder['name'], '--load', *command[2:]]
             for k, v in build_args(record, svc).items():
                 command += ['--build-arg', k + '=' + v]
             for k, v in image_metadata(record, svc, {}).items():
@@ -908,7 +1045,8 @@ def build(args):
             command += [str(directory / 'source')]
             print('Building ' + svc, flush=True)
             # Build output contains no fixture values; keep it private and never echo errors.
-            run(command, timeout=3600, log_path=directory / (svc + '.build.log'))
+            run(command, timeout=3600, log_path=directory / (svc + '.build.log'),
+                **({'buildx_config': builder['config']} if builder else {}))
             image = inspect_image(image_ref(record, svc))
             record['images'][svc] = {'imageId': image['Id'], 'dockerfileSha256': image_metadata(record, svc, {})['org.opensamguk.local.dockerfile'],
                                      'buildArgs': build_args(record, svc)}

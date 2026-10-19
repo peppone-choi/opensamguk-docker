@@ -48,7 +48,28 @@ free headroom are necessary. Never lower the numbers just to obtain PASS.
 QA build uses an explicit isolated docker-container Buildx builder:2GiB RAM+swap,
 CPU1.0, cgroup_parent user-999.slice. Driver caps are inspected after bootstrap;
 all six builds use that named builder/--load and original Dockerfiles/JVM settings.
-The builder is removed in finally and absence is checked. Per-service admission is
+Each attempt has a fresh private `BUILDX_CONFIG` directory and random explicit node,
+with a private ownership-intent receipt written before create. The effective local
+Unix endpoint, node, driver options and config directory identity are bound. The
+same private store is used for create, bootstrap and all six builds. The normal
+shared Buildx store is not modified; a pre-existing legacy builder is still refused.
+Timeout/cancellation kills and waits for the owned CLI/plugin process group before
+finally reconciles metadata, even when create never returned success. Cleanup checks
+the exact metadata identity/hash and actual container ID/caps/state mount. It removes
+only that verified container ID, then the matching local state volume (without force),
+and uses `buildx rm --keep-daemon` for metadata only, never container-name deletion.
+Metadata, container and volume absence are each checked. External changes, unknown
+ownership, cap mismatch, incomplete cleanup or cancellation during cleanup produce
+`cleanup-required` (with a private custody marker when writable), not a false PASS.
+An interrupted bootstrap with no visible container is also unconfirmed, not clean:
+the daemon may still be processing the request. A cleanup-required marker refuses
+another attempt until the preserved intent/resources have been independently resolved.
+Ownership receipts/private stores remain as evidence; do not manually delete foreign
+resources or use a broad prune. A reconciled create timeout/cancel propagates its
+original error, but a subsequent same-custody attempt gets a fresh node/store and can
+retry without stale metadata collisions. These guarantees are synthetic regressions,
+not evidence of a real Docker leak or real bootstrap/cleanup success.
+Per-service admission is
 conservative and can refuse after builder allocation. This does not establish that
 original full-memory Gradle builds can complete inside2GiB. Actual builder capability,
 cold/warm/cache hits and image identity are downstream QA, not synthetic evidence.
